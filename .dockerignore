@@ -1,0 +1,7 @@
+**
+!deployment/
+!deployment/HmiAcceptance.Dockerfile
+!deployment/hmi-acceptance.sh
+!hmi/
+!hmi/dist/
+!hmi/dist/*.deb

@@ -1,0 +1,22 @@
+# Context profiles for rp1-reliability-platform /api/v1/ingestion.
+#
+# The UUIDs must reference rows that already exist in the target database and
+# must be mutually consistent. They cannot be derived safely from display
+# codes, so no example UUID is invented here.
+profiles: []
+
+# TODO(PLATFORM-DEPLOYMENT): add one or more reviewed profiles:
+# profiles:
+#   - key: upper-body-aging
+#     label: 上半身老化 / 正式工位
+#     campaign_id: null           # TODO: test.test_campaign public UUID
+#     cycle_id: null              # TODO: test.test_cycle public UUID
+#     segment_id: null            # TODO: test.analysis_segment public UUID
+#     asset_id: null              # TODO: test.asset public UUID
+#     configuration_id: null      # TODO: test.configuration_snapshot public UUID
+#     test_case_version_id: null  # TODO: catalog.test_case_version public UUID
+#     station_id: null            # TODO: test.station public UUID
+#     stage_code: AGING
+#     stage_name: 老化运行
+#     subject_map:                # HMI joint name -> catalog subject code
+#       joint_name_from_yaml: null # TODO
