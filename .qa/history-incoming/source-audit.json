@@ -1,0 +1,263 @@
+{
+  "audit_version": 1,
+  "created_utc": "2026-10-08T07:34:21.442609Z",
+  "source_host": "shn-REDMI-Book-Pro-14-2025",
+  "repository": {
+    "deployed_directory": "/home/shn/Desktop/FAE培训/rp1-reliability-platform",
+    "git_metadata_present": false,
+    "git_commit": null,
+    "version_basis": "deployed file SHA256 and database migration; no .git in running directory",
+    "file_sha256": {
+      "compose.yml": "42aa81d0537c10987ea9d9aa8d776190bd34b3cfccf45c1dba1c79bb77b0f80e",
+      "README.md": "51b9025982d80062b6ed94f4821eeec19f113ce2a4d6be246a845dd54c9fd8a5",
+      "scripts/backup-postgres.sh": "0961e53fb07952bd85d6cfed8b95e2d26f149f7e9264c4b6c97c061769d2fff8",
+      "scripts/verify-backup-restore.sh": "6c4d122f8b1575fe8286ae1502425790daac4627937205c668d767bfa05bc286",
+      "database/imports/execution_csv.py": "7695b45a57f4f380dec0c13feb9c6ef63c8fe7723e38426e36b644b28fb24b0d",
+      "database/alembic/versions/20261008_0024_hmi_presence.py": "52a2cdaf037ba817622a43e42ded10479ed66a7e5117865b24e4777343232afb",
+      "database/sql/024_hmi_presence.sql": "2d752dbc09713eeffd9acdd2069d8529d5f55b8fbb6cd062ea0ed16d61d32a9c"
+    }
+  },
+  "database": {
+    "before": {
+      "assets": 19,
+      "database": "rp1_reliability",
+      "as_of_utc": "2026-10-08T07:33:58.832407Z",
+      "campaigns": 6,
+      "migration": "20261008_0024",
+      "executions": 240,
+      "catalog_cases": 71,
+      "legacy_assets": 7,
+      "legacy_imports": 135,
+      "showcase_assets": 12,
+      "legacy_campaigns": 4,
+      "legacy_intervals": 124,
+      "postgres_version": "16.14",
+      "showcase_campaigns": 2,
+      "showcase_executions": 105,
+      "legacy_eligible_exposure": 0,
+      "nonshowcase_mtbf_results": 0,
+      "nonshowcase_metric_series": 0,
+      "nonshowcase_metric_observations": 0,
+      "legacy_included_scope_assignments": 0
+    },
+    "after": {
+      "assets": 19,
+      "database": "rp1_reliability",
+      "as_of_utc": "2026-10-08T07:34:21.095162Z",
+      "campaigns": 6,
+      "migration": "20261008_0024",
+      "executions": 240,
+      "catalog_cases": 71,
+      "legacy_assets": 7,
+      "legacy_imports": 135,
+      "showcase_assets": 12,
+      "legacy_campaigns": 4,
+      "legacy_intervals": 124,
+      "postgres_version": "16.14",
+      "showcase_campaigns": 2,
+      "showcase_executions": 105,
+      "legacy_eligible_exposure": 0,
+      "nonshowcase_mtbf_results": 0,
+      "nonshowcase_metric_series": 0,
+      "nonshowcase_metric_observations": 0,
+      "legacy_included_scope_assignments": 0
+    },
+    "aggregate_counts_unchanged": true
+  },
+  "csv": {
+    "file_name": "executions_202609181314.csv",
+    "original_path": "/home/shn/Desktop/FAE培训/executions_202609181314.csv",
+    "bytes": 63678,
+    "sha256": "d4b4c6e96ed9fb9e05267d77cea0f747931ea72458f30994e538e24f1cd68c0c",
+    "export_filename_local_date": "2026-09-18T13:14",
+    "filename_timezone": "not encoded; local file metadata is +08:00",
+    "original_mtime_utc": "2026-09-18T05:14:26.688016Z",
+    "provenance": {
+      "repository_copy_byte_identical": true,
+      "source_execution_keys_matched": 135,
+      "database_lineage_row_hashes_matched": 135,
+      "database_lineage_raw_payloads_matched": 135,
+      "total_database_lineage_rows": 135,
+      "canonical_row_hash_method": "SHA256(JSON ensure_ascii=False, sort_keys=True, separators comma/colon, UTF8)"
+    },
+    "format": {
+      "encoding": "UTF-8",
+      "standard_comma_quoted_csv": true,
+      "within_16MiB": true,
+      "column_count": 23,
+      "columns": [
+        "test_id",
+        "test_case_id",
+        "test_case_name",
+        "sample_id",
+        "bench_id",
+        "robot_id",
+        "status",
+        "started_at",
+        "ended_at",
+        "duration_hours",
+        "duration_display",
+        "executor",
+        "environment",
+        "summary",
+        "issues",
+        "exception_count",
+        "last_data_at",
+        "report_url",
+        "telemetry_source",
+        "archive_status",
+        "archive_path",
+        "created_at",
+        "updated_at"
+      ],
+      "timezone_and_end_status_checks": "source load_csv / validate_rows passed"
+    },
+    "aggregates": {
+      "executions": 135,
+      "source_status_counts": {
+        "passed": 89,
+        "failed": 17,
+        "blocked": 18,
+        "scheduled": 9,
+        "running": 2
+      },
+      "bench_counts": {
+        "RD-01": 30,
+        "RD-02": 72,
+        "RD-03": 33
+      },
+      "normalized_assets": 7,
+      "normalized_campaigns": 4,
+      "stations": 3,
+      "ended_intervals": 124,
+      "source_test_cases": 9,
+      "normalization_warning_counts": {
+        "case_part_overrode_source_part": 60,
+        "asset_code_normalized": 134,
+        "robot_sample_sequence_conflict": 2,
+        "active_seconds_conservative_minimum": 88,
+        "last_data_window_shorter_than_elapsed": 10,
+        "source_status_semantic_conflict": 49,
+        "reported_duration_mismatch": 6
+      }
+    },
+    "sensitivity_review": {
+      "detected_sensitive_pattern_categories": {},
+      "checked_categories": [
+        "email_contact",
+        "mobile_contact",
+        "identity_number",
+        "private_key",
+        "credential_value",
+        "url_userinfo"
+      ],
+      "executor_labels": "ordinary business executor display names and aliases in authorized execution metadata; 23 rows use CJK display names; no user accounts or sessions exported",
+      "telemetry_content": "execution metadata only; no raw measurement time-series",
+      "scope": "CSV fields scanned including free text and path/URL references; no contact/identity/private-key/credential patterns detected; pattern scan does not prove absence of every possible secret"
+    }
+  },
+  "backup": {
+    "local_only_directory": "/home/shn/Documents/Codex/2026-10-08/task-3/source-backups/20261008T073358Z",
+    "started_utc": "2026-10-08T07:33:59.349885Z",
+    "completed_utc": "2026-10-08T07:34:03.619607Z",
+    "format": "PostgreSQL custom pg_dump -Fc; equivalent to project latest.dump, uniquely named postgres.dump; old latest.dump left unchanged",
+    "artifacts": {
+      "postgres.dump": {
+        "bytes": 34137198,
+        "sha256": "db3f5850a462839f0f1254da51e22f5faff439efb39502c0fff9c8dcbf01ccd7"
+      },
+      "config.tar.gz": {
+        "bytes": 3035,
+        "sha256": "766504d28aab39af7747f0e3c8c1fe7848bd7b2929f129481d3af8a4962fba44"
+      },
+      "postgres.contents": {
+        "bytes": 122112,
+        "sha256": "6464271808944c4bf0384867f83a6edbb172f577066dfcb6563b2af40de5242f"
+      },
+      "metadata.json": {
+        "bytes": 5870,
+        "sha256": "0cbdb98d401f38a868a6df347f9724a89fd8af581e3bf847a6060d48ff65065a"
+      },
+      "SHA256SUMS": {
+        "bytes": 324,
+        "sha256": "2448dc2b6d8b6f87f26680f65c25ea572dae2cab453d2fe10597881e68513e4d"
+      }
+    },
+    "checksum_verification": true,
+    "toc_readable": true,
+    "toc_entry_count": 1541,
+    "restore_verification": {
+      "database": "rp1_restore_verify_20261008t073358z",
+      "started_utc": "2026-10-08T07:34:03.919827Z",
+      "full_restore_success": true,
+      "source_database_untouched": true,
+      "temporary_database_removed": true,
+      "restored_counts": {
+        "assets": 19,
+        "database": "rp1_restore_verify_20261008t073358z",
+        "as_of_utc": "2026-10-08T07:34:18.834108Z",
+        "campaigns": 6,
+        "migration": "20261008_0024",
+        "executions": 240,
+        "catalog_cases": 71,
+        "legacy_assets": 7,
+        "legacy_imports": 135,
+        "showcase_assets": 12,
+        "legacy_campaigns": 4,
+        "legacy_intervals": 124,
+        "postgres_version": "16.14",
+        "showcase_campaigns": 2,
+        "showcase_executions": 105,
+        "legacy_eligible_exposure": 0,
+        "nonshowcase_mtbf_results": 0,
+        "nonshowcase_metric_series": 0,
+        "nonshowcase_metric_observations": 0,
+        "legacy_included_scope_assignments": 0
+      },
+      "aggregate_counts_match": true,
+      "project_verify_database_exit_code": 0,
+      "project_verify_database_summary": {
+        "total": 83,
+        "passed": 83,
+        "failed": 0
+      },
+      "completed_utc": "2026-10-08T07:34:20.259363Z"
+    },
+    "configuration_transfer_forbidden": true
+  },
+  "scope": {
+    "include": "135 original non-SHOWCASE history execution metadata; normalized 7 samples, 4 campaigns and 3 bench references",
+    "excluded": [
+      "SHOWCASE business data",
+      "metric curves",
+      "MTBF results",
+      "user accounts and sessions",
+      "credentials and private keys",
+      "presence",
+      "workstation identities",
+      "raw telemetry / time-series"
+    ],
+    "duration_policy": "LEGACY_REPORTED only; never formal eligible exposure or MTBF"
+  },
+  "service_verification": {
+    "same_container_ids_and_health_before_after": true,
+    "no_start_stop_restart": true,
+    "no_hardware_activation": true
+  },
+  "handoff": {
+    "files_only": [
+      "executions_202609181314.csv",
+      "executions_202609181314.csv.sha256",
+      "source-audit.json"
+    ],
+    "destination_on_computer3": "/home/shn/Documents/Codex/2026-10-08/task/rp1_test_shn-e56cabd/.qa/history-incoming/",
+    "transferred": false,
+    "transport": "parent session coordinates owner-mediated local file transfer or explicit approved encrypted transfer of exactly three files; no direct connection from this task",
+    "receiver_checks": [
+      "independently compute sha256sum and compare source digest",
+      "verify supplied SHA256 file then receiver preflight-history.py",
+      "verify row counts and approved scope before import",
+      "do not transfer full backup or config archive"
+    ]
+  }
+}
