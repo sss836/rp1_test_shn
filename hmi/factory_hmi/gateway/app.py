@@ -23,7 +23,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse
 
-from factory_hmi.plc.service import PlcCabinetService
+from factory_hmi.plc.service import PlcCabinetService, PlcControlDisabledError
 from factory_hmi.sync.outbox import Outbox
 
 from .lease import ControlLease, LeaseConflict
@@ -293,6 +293,8 @@ class GatewayRuntime:
             raise RuntimeError("controller snapshot must be a mapping")
         lease = self.lease.snapshot()
         value = dict(result)
+        if value.get("config_path"):
+            value["config_path"] = self._config_reference(Path(value["config_path"]))
         station = value.get("station")
         if "state" not in value and isinstance(station, dict):
             value["state"] = station.get("state")
@@ -375,13 +377,33 @@ class GatewayRuntime:
 
         config_path = self._allowed_config_path(request.config_path)
         result = preview_station_config(request.limb, config_path)
-        result["config_path"] = str(config_path)
+        result["config_path"] = self._config_reference(config_path)
         return result
+
+    def _config_reference(self, path: Path) -> str:
+        """Expose portable YAML references while retaining resolved paths internally."""
+        resolved = path.expanduser().resolve()
+        if resolved.is_relative_to(self.config_root):
+            return "uploaded/" + resolved.relative_to(self.config_root).as_posix()
+        configured = os.environ.get("RP1_FACTORY_ALLOWED_CONFIG_ROOT", "").strip()
+        roots = (
+            tuple(Path(item).expanduser().resolve() for item in configured.split(os.pathsep) if item)
+            if configured else (self.repo_root / "scripts" / "config",)
+        )
+        for root in roots:
+            if resolved.is_relative_to(root):
+                return resolved.relative_to(root).as_posix()
+        return str(path)
 
     def _allowed_config_path(self, value: str) -> Path:
         uploaded = Path(value).expanduser()
+        if not uploaded.is_absolute() and uploaded.parts and uploaded.parts[0] == "uploaded":
+            uploaded = self.config_root.joinpath(*uploaded.parts[1:])
         if uploaded.is_absolute():
-            uploaded = uploaded.resolve(strict=True)
+            try:
+                uploaded = uploaded.resolve(strict=True)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail="配置文件不存在，请选择有效的 YAML 文件或相对配置文件名") from exc
             if (
                 uploaded.suffix.lower() in {".yaml", ".yml"}
                 and self.config_root in uploaded.parents
@@ -452,7 +474,7 @@ class GatewayRuntime:
                 result.append(
                     {
                         "name": path.stem,
-                        "path": str(resolved),
+                        "path": self._config_reference(resolved),
                         "limbs": sorted(limb_by_path.get(resolved, [])),
                     }
                 )
@@ -487,7 +509,10 @@ class GatewayRuntime:
                 (candidate for candidate in candidates if candidate.is_file()),
                 candidates[0],
             )
-        path = path.resolve(strict=True)
+        try:
+            path = path.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="配置文件不存在，请选择有效的 YAML 文件或相对配置文件名") from exc
         if path.suffix.lower() not in suffixes:
             allowed = ", ".join(sorted(suffixes))
             raise ValueError(f"{path.name} must use one of: {allowed}")
@@ -876,6 +901,10 @@ def create_app(
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.exception_handler(PlcControlDisabledError)
+    async def plc_control_disabled(_request: Request, exc: PlcControlDisabledError) -> JSONResponse:
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
+
     @app.exception_handler(Exception)
     async def unexpected_error(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=500, content={"detail": str(exc)})
@@ -1062,7 +1091,7 @@ def create_app(
             temporary.unlink(missing_ok=True)
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         temporary.replace(target)
-        result["config_path"] = str(target)
+        result["config_path"] = f"uploaded/{target.name}"
         return {"ok": True, "result": result}
 
     @app.get("/api/v1/can/status")

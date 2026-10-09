@@ -40,6 +40,7 @@ class PlcSetpointConfig:
 @dataclass(frozen=True)
 class PlcCabinetConfig:
     driver: str = "mock"
+    access_mode: str = "control"
     timings: PlcTimingConfig = field(default_factory=PlcTimingConfig)
     setpoints: PlcSetpointConfig = field(default_factory=PlcSetpointConfig)
     protocol: dict[str, Any] = field(default_factory=dict)
@@ -75,6 +76,9 @@ def load_plc_config(path: Path | str | None = None) -> PlcCabinetConfig:
     driver = str(raw.get("driver", "mock")).strip().lower()
     if driver not in {"mock", "s7", "modbus_tcp"}:
         raise ValueError("PLC driver must be mock, s7, or modbus_tcp")
+    access_mode = str(raw.get("access_mode", "control")).strip().lower()
+    if access_mode not in {"monitor", "control"}:
+        raise ValueError("PLC access_mode must be monitor or control")
     timing_raw = raw.get("timings") or {}
     if not isinstance(timing_raw, Mapping):
         raise ValueError("plc timings must be a mapping")
@@ -132,6 +136,7 @@ def load_plc_config(path: Path | str | None = None) -> PlcCabinetConfig:
         raise ValueError(f"plc {driver} configuration must be a mapping")
     return PlcCabinetConfig(
         driver=driver,
+        access_mode=access_mode,
         timings=timings,
         setpoints=setpoints,
         protocol=dict(protocol),

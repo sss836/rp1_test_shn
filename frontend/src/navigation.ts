@@ -1,6 +1,8 @@
 import type { AssetKind, TargetPartCode } from "./types";
 
 export type View =
+  | "catalog"
+  | "planning"
   | "home"
   | "durations"
   | "mtbf"
@@ -21,6 +23,8 @@ export type LocationState = {
 };
 
 const views = new Set<View>([
+  "catalog",
+  "planning",
   "home",
   "durations",
   "mtbf",

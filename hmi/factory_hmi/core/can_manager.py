@@ -494,6 +494,8 @@ class PkexecHelperClient:
         dbitrate: int | None = None,
         fd: bool | None = None,
     ) -> Mapping[str, Any]:
+        if os.environ.get("RP1_FACTORY_CAN_DISABLED") == "1":
+            raise HelperExecutionError("CAN 配置未启用：当前包仅提供 PLC 通信，不配置物理 CAN")
         names = validate_interfaces(interfaces)
         request: dict[str, Any] = {"action": action, "interfaces": list(names)}
         if action in {"connect", "recover"}:

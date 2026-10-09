@@ -34,6 +34,7 @@ import {
   ShowcaseBadge
 } from "../components/Workbench";
 import { JointAnalysisPanel } from "../components/JointAnalysisPanel";
+import { AssetCreateForm } from "./SetupPages";
 import { StatusMark } from "../components/StatusMark";
 
 type Navigate = (view: "asset" | "test-case" | "execution" | "assets", id?: string) => void;
@@ -396,13 +397,13 @@ export function AssetsPage({
   );
   const moduleParts: TargetPartCode[] = ["SARM", "SLEG", "UPPER", "LOWER", "CHEST", "HEAD", "BAT"];
   const partGroups = moduleParts
-    .map((code) => ({ code, items: items.filter((item) => item.target_part_code === code) }))
-    .filter((group) => group.items.length > 0);
+    .map((code) => ({ code, items: items.filter((item) => item.target_part_code === code) }));
   const isLoading = showPartDirectory ? directory.isLoading : query.isLoading;
   const loadError = showPartDirectory ? directory.error : query.error;
   return (
     <>
       <PageTitle eyebrow="ASSET FLEET / STATUS WALL" title={part ? `${targetPartNames[part]} / ${part} 样品` : `${assetKind === "MODULE" ? "模块" : "整机"}样品中心`} trailing={data && <div className="title-status">{hasShowcase && <ShowcaseBadge />}<Cutoff value={data.data_cutoff_at} asOf={data.as_of_at} /></div>} />
+      <AssetCreateForm key={assetKind} assetKind={assetKind} />
       {part && <div className="active-part-filter"><span>部位筛选：{targetPartNames[part]} / {part}</span><button type="button" onClick={clearPart}>清除筛选</button></div>}
       <form className="filter-bar" role="search" onSubmit={(event) => { event.preventDefault(); setSearch(draft.trim()); }}>
         <label>样品搜索<input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="编号、名称或序列号" /></label>
@@ -416,7 +417,7 @@ export function AssetsPage({
         />
       ) : (
         <Panel className="fleet-panel" title={showPartDirectory ? "按部位浏览" : part ? `${targetPartNames[part]}部位样品` : "整机样品"}>
-          {items.length === 0 ? <EmptyState title={part ? `没有可见的${targetPartNames[part]}样品` : "没有匹配样品"} description="未返回任何可访问样品；请检查筛选和 Campaign 授权。" /> : (
+          {items.length === 0 && !showPartDirectory ? <EmptyState title={part ? `没有可见的${targetPartNames[part]}样品` : "没有匹配样品"} description="未返回任何可访问样品；请检查筛选和 Campaign 授权。" /> : (
             <>
               {showPartDirectory ? (
                 <div className="asset-part-directory">

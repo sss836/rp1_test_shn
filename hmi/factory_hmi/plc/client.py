@@ -42,6 +42,29 @@ class PlcClient(ABC):
     def write_command(self, command: PlcCommand) -> None: ...
 
 
+class ReadOnlyPlcClient(PlcClient):
+    """Enforce read-only access even if a controller accidentally attempts a write."""
+
+    def __init__(self, client: PlcClient) -> None:
+        self.client = client
+
+    @property
+    def connected(self) -> bool:
+        return self.client.connected
+
+    def connect(self) -> None:
+        self.client.connect()
+
+    def disconnect(self) -> None:
+        self.client.disconnect()
+
+    def read_status(self) -> PlcStatus:
+        return self.client.read_status()
+
+    def write_command(self, command: PlcCommand) -> None:
+        raise PlcConfigurationError("PLC 处于实机只读监控模式，禁止写命令")
+
+
 class MockPlcClient(PlcClient):
     """Deterministic in-memory PLC used by the UI and automated tests."""
 

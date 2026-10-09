@@ -9,9 +9,14 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from .client import PlcCommunicationError, build_plc_client
+from .client import PlcCommunicationError, ReadOnlyPlcClient, build_plc_client
 from .config import PlcCabinetConfig, load_plc_config
+from .models import CabinetPhase
 from .state_machine import PlcCabinetController
+
+
+class PlcControlDisabledError(RuntimeError):
+    pass
 
 
 class PlcCabinetService:
@@ -24,6 +29,9 @@ class PlcCabinetService:
     ) -> None:
         self.config = config or load_plc_config(config_path)
         self.client = build_plc_client(self.config.driver, self.config.protocol)
+        self.read_only = self.config.access_mode == "monitor"
+        if self.read_only:
+            self.client = ReadOnlyPlcClient(self.client)
         self.controller = PlcCabinetController(
             self.client,
             self.config.timings,
@@ -69,6 +77,9 @@ class PlcCabinetService:
             thread.join(timeout=2.0)
         with self._lock:
             if self.client.connected:
+                if self.read_only:
+                    self.controller.disconnect()
+                    return
                 try:
                     self.controller.request_stop(user="system-shutdown")
                     deadline = time.monotonic() + 1.0
@@ -83,10 +94,19 @@ class PlcCabinetService:
 
     def _try_connect(self, user: str) -> None:
         try:
-            self.controller.connect(user=user)
+            if self.read_only:
+                self.client.connect()
+                self.controller.status = self.client.read_status()
+                self.controller.communication_state = "LIVE"
+                self.controller.phase = CabinetPhase.MONITORING
+                self.controller.last_error = ""
+            else:
+                self.controller.connect(user=user)
         except Exception as exc:
+            self.client.disconnect()
             self.controller.last_error = str(exc)
             self.controller.communication_state = "COMM_LOST"
+            self.controller.phase = CabinetPhase.COMM_LOST
             self._last_reconnect = time.monotonic()
 
     def connect(self, *, user: str) -> dict[str, Any]:
@@ -101,6 +121,10 @@ class PlcCabinetService:
                 self.controller.disconnect()
             return self.snapshot()
 
+    def _require_control(self) -> None:
+        if self.read_only:
+            raise PlcControlDisabledError("PLC 处于实机只读监控模式，未启用控制操作")
+
     def start_sequence(
         self,
         channels: list[int],
@@ -109,6 +133,7 @@ class PlcCabinetService:
         voltage: float | None = None,
         current: float | None = None,
     ) -> dict[str, Any]:
+        self._require_control()
         selected = tuple(index in set(channels) for index in range(1, 5))
         with self._lock:
             self.controller.request_start(
@@ -120,11 +145,13 @@ class PlcCabinetService:
             return self.snapshot()
 
     def stop_sequence(self, *, user: str) -> dict[str, Any]:
+        self._require_control()
         with self._lock:
             self.controller.request_stop(user=user)
             return self.snapshot()
 
     def set_channel(self, channel: int, enabled: bool, *, user: str) -> dict[str, Any]:
+        self._require_control()
         with self._lock:
             self.controller.request_channel(channel, enabled, user=user)
             return self.snapshot()
@@ -136,16 +163,19 @@ class PlcCabinetService:
         *,
         user: str,
     ) -> dict[str, Any]:
+        self._require_control()
         with self._lock:
             self.controller.request_setpoints(voltage, current, user=user)
             return self.snapshot()
 
     def reset_fault(self, *, user: str) -> dict[str, Any]:
+        self._require_control()
         with self._lock:
             self.controller.request_reset_fault(user=user)
             return self.snapshot()
 
     def all_stop(self, *, user: str) -> dict[str, Any]:
+        self._require_control()
         with self._lock:
             self.controller.request_all_stop(user=user)
             return self.snapshot()
@@ -154,6 +184,12 @@ class PlcCabinetService:
         with self._lock:
             value = self.controller.snapshot()
             value["driver"] = self.config.driver
+            value["access_mode"] = self.config.access_mode
+            value["read_only"] = self.read_only
+            value["endpoint"] = (
+                f"{self.config.protocol.get('host')}:{self.config.protocol.get('port')} / Unit {self.config.protocol.get('unit_id')}"
+                if self.config.driver == "modbus_tcp" else self.config.driver
+            )
             value["timings"] = {
                 "heartbeat_ms": self.config.timings.heartbeat_ms,
                 "poll_ms": self.config.timings.poll_ms,
@@ -186,8 +222,14 @@ class PlcCabinetService:
                         self._try_connect("system-reconnect")
                     continue
                 try:
-                    self.controller.tick(now)
-                    if (
+                    if self.read_only:
+                        self.controller.status = self.client.read_status()
+                        self.controller.communication_state = "LIVE"
+                        self.controller.phase = CabinetPhase.MONITORING
+                        self.controller.last_error = ""
+                    else:
+                        self.controller.tick(now)
+                    if not self.read_only and (
                         now - self._last_heartbeat
                         >= self.config.timings.heartbeat_ms / 1000.0
                     ):

@@ -195,7 +195,7 @@ export function HomePage({
           {assetKind === "MODULE" && objects.length > 0 && (
             <div className="module-selector" role="group" aria-label="选择模块部位范围">
               {objects.map((object, objectIndex) => {
-                const active = objectIndex === index;
+                const active = objectIndex === activeIndex;
                 return (
                   <button
                     key={object.id}
@@ -249,7 +249,7 @@ export function HomePage({
                 <div className="stage-orbit orbit-one" aria-hidden="true" />
                 <div className="stage-orbit orbit-two" aria-hidden="true" />
                 <div className="asset-index">
-                  <span>{assetKind === "MODULE" ? "MODULE PART SCOPE" : "SYSTEM SCOPE"} / {String(index + 1).padStart(2, "0")}</span>
+                  <span>{assetKind === "MODULE" ? "MODULE PART SCOPE" : "SYSTEM SCOPE"} / {String(activeIndex + 1).padStart(2, "0")}</span>
                   <strong>{current.target_part_name} · {current.code}</strong>
                 </div>
                 {modelAsset ? (
@@ -287,19 +287,21 @@ export function HomePage({
                     </div>
                   </>
                 )}
-                <div className="stage-callout callout-elapsed">
-                  <span>运行中 elapsed</span>
-                  <strong>{formatDuration(current.part_durations.active_elapsed_seconds)}</strong>
-                </div>
-                <div className="stage-callout callout-exposure">
-                  <span>有效暴露</span>
-                  <strong>{formatDuration(current.part_durations.effective_exposure_seconds)}</strong>
+                <div className="stage-metrics">
+                  <div className="stage-callout callout-elapsed">
+                    <span>运行中 elapsed</span>
+                    <strong>{formatDuration(current.part_durations.active_elapsed_seconds)}</strong>
+                  </div>
+                  <div className="stage-callout callout-exposure">
+                    <span>有效暴露</span>
+                    <strong>{formatDuration(current.part_durations.effective_exposure_seconds)}</strong>
+                  </div>
                 </div>
                 <div className="stage-floor" aria-hidden="true" />
               </div>
               <div className="object-console">
                 <div className="object-identity">
-                  <span>{String(index + 1).padStart(2, "0")} / {String(objects.length).padStart(2, "0")} · {assetKind}</span>
+                  <span>{String(activeIndex + 1).padStart(2, "0")} / {String(objects.length).padStart(2, "0")} · {assetKind}</span>
                   <h2>{current.target_part_name} / {current.code}</h2>
                   <StatusMark
                     tone={current.status === "RUNNING" ? "normal" : current.status === "BLOCKED" || current.status === "FAILED" ? "danger" : "muted"}

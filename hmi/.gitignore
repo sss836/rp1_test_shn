@@ -8,6 +8,8 @@ build/
 dist/
 *.spec
 factory_data/
+.local-runtime/
+.local-state/
 motors/build/
 motors/build-*/
 motors/install/

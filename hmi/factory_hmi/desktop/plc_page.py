@@ -136,7 +136,8 @@ class PlcCabinetPage(QWidget):
         self._pending = False
         self._snapshot: dict[str, Any] = {}
         self._setpoint_dirty = False
-        self._setpoint_initialized = False
+        self._setpoint_edit_revision = 0
+        self._submitted_setpoint_revision: int | None = None
         self._last_setpoint_feedback = ""
         self._build()
         self.timer = QTimer(self)
@@ -159,6 +160,7 @@ class PlcCabinetPage(QWidget):
             "所有操作发送逻辑命令并等待 PLC 序号确认。"
         )
         description.setObjectName("pageDescription")
+        self.description = description
         layout.addWidget(title)
         layout.addWidget(description)
 
@@ -267,6 +269,7 @@ class PlcCabinetPage(QWidget):
         self.voltage_setpoint.setValue(3.0)
         self.voltage_setpoint.setKeyboardTracking(False)
         self.voltage_setpoint.valueChanged.connect(self._mark_setpoint_dirty)
+        self.voltage_setpoint.lineEdit().textEdited.connect(self._mark_setpoint_dirty)
         current_label = QLabel("限流值")
         current_label.setObjectName("fieldLabel")
         self.current_setpoint = QDoubleSpinBox()
@@ -275,6 +278,7 @@ class PlcCabinetPage(QWidget):
         self.current_setpoint.setValue(0.5)
         self.current_setpoint.setKeyboardTracking(False)
         self.current_setpoint.valueChanged.connect(self._mark_setpoint_dirty)
+        self.current_setpoint.lineEdit().textEdited.connect(self._mark_setpoint_dirty)
         setpoint_layout.addWidget(voltage_label, 0, 0)
         setpoint_layout.addWidget(self.voltage_setpoint, 0, 1)
         setpoint_layout.addWidget(current_label, 1, 0)
@@ -414,19 +418,23 @@ class PlcCabinetPage(QWidget):
         )
 
     def _start(self) -> None:
+        if self._pending:
+            return
+        # Commit drafts on the GUI thread before the runner queues its worker.
+        self.voltage_setpoint.interpretText()
+        self.current_setpoint.interpretText()
+        voltage = self.voltage_setpoint.value()
+        current = self.current_setpoint.value()
+        user = self._user()
         channels = [
             index
             for index, checkbox in enumerate(self.channel_checks, start=1)
             if checkbox.isChecked()
         ]
+        self._submitted_setpoint_revision = self._setpoint_edit_revision
         self._command(
             "启动 PLC 供电顺序",
-            lambda: self.client.plc_start(
-                channels,
-                self._user(),
-                self.voltage_setpoint.value(),
-                self.current_setpoint.value(),
-            ),
+            lambda: self.client.plc_start(channels, user, voltage, current),
         )
 
     def _toggle_channel(self, channel: int) -> None:
@@ -438,9 +446,9 @@ class PlcCabinetPage(QWidget):
             lambda: self.client.plc_set_channel(channel, enabled, self._user()),
         )
 
-    def _mark_setpoint_dirty(self, _value: float) -> None:
-        if self._setpoint_initialized:
-            self._setpoint_dirty = True
+    def _mark_setpoint_dirty(self, _value: float | str) -> None:
+        self._setpoint_dirty = True
+        self._setpoint_edit_revision += 1
 
     def _apply_setpoints(self) -> None:
         self._start()
@@ -458,13 +466,22 @@ class PlcCabinetPage(QWidget):
         snapshot = self._snapshot
         communication = str(snapshot.get("communication_state") or "DISCONNECTED")
         stale = bool(snapshot.get("stale"))
-        live = communication == "LIVE" and not stale
+        fresh = communication == "LIVE" and not stale
+        read_only = bool(snapshot.get("read_only"))
+        live = fresh and not read_only
+        driver = str(snapshot.get("driver") or "未知")
+        connection_type = "PLC 模拟" if driver == "mock" else f"PLC 实机 · {driver}"
+        access = "只读监控" if read_only else "控制模式"
+        self.description.setText(
+            "读取实物 PLC 状态；当前未启用心跳、启停、使能和设定值写入。"
+            if read_only else "系统总使能严格执行“主回路 → PS1 实际输出 → 通道许可”；操作等待 PLC 序号确认。"
+        )
         self.communication.setText(
-            f"通信：{communication}{' / STALE' if stale else ''}"
+            f"{connection_type} · {access} · {snapshot.get('endpoint', '')}\n通信：{communication}{' / STALE' if stale else ''}"
         )
         set_tone(
             self.communication,
-            "success" if live else "danger",
+            "warning" if driver == "mock" else "success" if fresh else "danger",
         )
         phase = str(snapshot.get("phase") or "—")
         self.phase.setText(f"阶段：{phase}")
@@ -682,7 +699,9 @@ class PlcCabinetPage(QWidget):
         setpoint_state = str(setpoint_feedback.get("state") or "confirmed")
         setpoint_detail = str(setpoint_feedback.get("detail") or "")
         if self._last_setpoint_feedback == "pending" and setpoint_state == "confirmed":
-            self._setpoint_dirty = False
+            if self._submitted_setpoint_revision == self._setpoint_edit_revision:
+                self._setpoint_dirty = False
+            self._submitted_setpoint_revision = None
         self._last_setpoint_feedback = setpoint_state
         ranges_valid = (
             setpoint_enabled
@@ -696,17 +715,18 @@ class PlcCabinetPage(QWidget):
                 (self.current_setpoint, current_min, current_max),
             ):
                 editor.blockSignals(True)
-                editor.setRange(minimum, maximum)
-                editor.setSingleStep(step)
+                # Even an unchanged setRange normalizes uncommitted text.
+                if editor.minimum() != minimum or editor.maximum() != maximum:
+                    editor.setRange(minimum, maximum)
+                if editor.singleStep() != step:
+                    editor.setSingleStep(step)
                 editor.blockSignals(False)
             readback_available = bool(status.get("PS1CommOK"))
-            should_sync = readback_available and (
-                not self._setpoint_initialized
-                or (
-                    not self._setpoint_dirty
-                    and not self.voltage_setpoint.hasFocus()
-                    and not self.current_setpoint.hasFocus()
-                )
+            should_sync = (
+                readback_available
+                and not self._setpoint_dirty
+                and not self.voltage_setpoint.hasFocus()
+                and not self.current_setpoint.hasFocus()
             )
             if should_sync:
                 self.voltage_setpoint.blockSignals(True)
@@ -719,7 +739,6 @@ class PlcCabinetPage(QWidget):
                 )
                 self.voltage_setpoint.blockSignals(False)
                 self.current_setpoint.blockSignals(False)
-                self._setpoint_initialized = True
         setpoint_can_edit = (
             ranges_valid
             and live

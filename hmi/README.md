@@ -12,3 +12,8 @@ Ubuntu 24.04 amd64 上位机源码。新机安装、平台部署和账号接入�
 [监控与升级](docs/PLATFORM-PRESENCE.md) · [PLC 实现](docs/PLC_CABINET_IMPLEMENTATION.md) · [PLC 映射](docs/PLC_INTERFACE_MAPPING.md) · [Modbus 协议](docs/HOST_MODBUS_TCP_PROTOCOL_V1.0.md)
 
 源码构建：在仓库根执行 `sudo bash scripts/install-build-deps-ubuntu24.sh`，再执行 `./scripts/build-hmi.sh`。
+# 本机最新源码与 PLC 实机控制
+
+当前本地控制版本、相对 YAML、源码启动和从本目录生成 deb 的入口见
+[LOCAL_CONTROL_BUILD.md](docs/LOCAL_CONTROL_BUILD.md)。新打包命令为
+`python3 tools/build_local_deb.py --runtime-dir .local-runtime`；不会启动设备。

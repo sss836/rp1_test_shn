@@ -10,7 +10,7 @@
 
 MotorDriver::MotorDriver() {
     std::vector<spdlog::sink_ptr> sinks;
-    sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_st>());
+    sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_mt>());
     logger_ = setup_logger(sinks, "motors");
 }
 std::shared_ptr<MotorDriver> MotorDriver::create_motor(uint16_t motor_id, const std::string& interface_type, const std::string& interface,

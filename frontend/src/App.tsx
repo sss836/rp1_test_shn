@@ -28,6 +28,8 @@ import type { AssetKind, TargetPartCode } from "./types";
 import { adminApi } from "./securityApi";
 import { roleLabels } from "./security";
 
+const CatalogPage = lazy(() => import("./pages/SetupPages").then((module) => ({ default: module.CatalogPage })));
+const PlanningPage = lazy(() => import("./pages/SetupPages").then((module) => ({ default: module.PlanningPage })));
 const AccountPage = lazy(() => import("./pages/SecurityPages").then((module) => ({ default: module.AccountPage })));
 const AccessRequestPage = lazy(() => import("./pages/SecurityPages").then((module) => ({ default: module.AccessRequestPage })));
 const AdminWorkspace = lazy(() => import("./pages/SecurityPages").then((module) => ({ default: module.AdminWorkspace })));
@@ -40,6 +42,8 @@ const TestCaseDetailPage = lazy(() => import("./pages/ReadModelPages").then((mod
 const HmiStationsPage = lazy(() => import("./pages/HmiStationsPage"));
 
 const navItems: Array<{ view: View; label: string; icon: typeof LayoutDashboard }> = [
+  { view: "catalog", label: "测试目录", icon: Boxes },
+  { view: "planning", label: "测试计划", icon: Clock3 },
   { view: "home", label: "测试总控", icon: LayoutDashboard },
   { view: "durations", label: "时长台账", icon: Clock3 },
   { view: "mtbf", label: "MTBF 结论", icon: Gauge },
@@ -67,7 +71,7 @@ export default function App() {
   const pending = useQuery({
     queryKey: ["admin-pending"],
     queryFn: ({ signal }) => adminApi.requests("PENDING", signal),
-    enabled: status === "authenticated" && session?.user.role === "SYSTEM_ADMIN",
+    enabled: status === "authenticated" && session?.user.role === "SYSTEM_ADMIN" && !session.user.must_change_password,
     refetchInterval: 30_000,
     refetchOnWindowFocus: true
   });
@@ -240,6 +244,8 @@ export default function App() {
       </header>
       <main id="main-content" tabIndex={-1}>
         <Suspense fallback={<LoadingState label="正在加载页面" />}>
+        {location.view === "catalog" && <CatalogPage assetKind={location.kind} navigate={(id) => go("test-case", id)} />}
+        {location.view === "planning" && <PlanningPage key={location.kind} assetKind={location.kind} />}
         {location.view === "home" && <HomePage assetKind={location.kind} navigate={(view, id, part) => go(view, id ?? null, location.kind, part ?? null)} />}
         {location.view === "durations" && <DurationsPage assetKind={location.kind} navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "mtbf" && <MtbfPage assetKind={location.kind} />}

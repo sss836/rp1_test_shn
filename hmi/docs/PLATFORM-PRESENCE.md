@@ -1,3 +1,5 @@
+> v2.0.0 使用用户 GUI/网关入口，当前安装与配置见 [LOCAL_CONTROL_BUILD.md](LOCAL_CONTROL_BUILD.md)。本页记录旧版 systemd 安装的接入方法。
+
 # Reliability Platform 工位监控
 
 新版网关在 `reliability_v1` 模式下，使用平台 `TEST_EXECUTOR` 或 `SYSTEM_ADMIN` 账号登录后立即上报，此后每 10 秒上报当前所有测试会话及 PLC 状态。平台“工位监控”每 5 秒刷新；管理员看全部，其他账号只看自己登录的工位。

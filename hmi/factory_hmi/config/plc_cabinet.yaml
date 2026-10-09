@@ -2,10 +2,11 @@
 #
 # The Linux<->PLC Modbus TCP V1.0 window below is frozen by
 # HOST_MODBUS_TCP_PROTOCOL_V1.0.md.  The S7 direct mapping and three logical
-# feedback fields explicitly called out below remain TODO.  Mock stays the
-# default so development machines never energize hardware implicitly.
+# feedback fields explicitly called out below remain TODO. This workstation
+# profile uses the confirmed real PLC. Use launch.py --offline-check for tests.
 
-driver: mock  # mock | s7 | modbus_tcp
+driver: modbus_tcp  # mock | s7 | modbus_tcp
+access_mode: control  # control | monitor; monitor never writes PLC commands
 
 timings:
   heartbeat_ms: 500

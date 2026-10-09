@@ -5,6 +5,7 @@ import App from "./App";
 import { AuthProvider } from "./auth";
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import "./styles.css";
+import "./homeLayout.css";
 
 const queryClient = new QueryClient({
   defaultOptions: {

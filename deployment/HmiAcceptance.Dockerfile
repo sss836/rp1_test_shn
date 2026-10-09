@@ -1,5 +1,5 @@
 FROM ubuntu:24.04
-ARG HMI_VERSION=1.0.1+ubuntu24.04
+ARG HMI_VERSION=2.0.0+ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HMI_EXPECTED_VERSION=${HMI_VERSION}
 COPY hmi/dist/rp1-test-hmi_${HMI_VERSION}_amd64.deb /tmp/rp1-test-hmi.deb

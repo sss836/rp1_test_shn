@@ -756,6 +756,8 @@ class ReadModelRepository:
             warning_count=sum(_is_source_warning(item.freshness_status) for item in sources),
         )
 
+    # Audited imported history retains its status but cannot represent a live run.
+    # Apply the lineage exclusion to active counts, contexts and elapsed clocks.
     def dashboard_home(self) -> DashboardHome:
         as_of_at = self._as_of()
         freshness = self._global_freshness(as_of_at)
@@ -795,12 +797,14 @@ class ReadModelRepository:
                         ON mp.asset_id = a.id AND a.asset_kind = 'MODULE'
                       WHERE NOT a.voided
                     )
-                    SELECT scoped.asset_kind,
+                    SELECT target_part.asset_kind,
                            target_part.part_code AS target_part_code,
                            target_part.name AS target_part_name,
                            count(DISTINCT scoped.id) AS asset_count,
                            count(DISTINCT e.id) FILTER (
                              WHERE e.status = 'RUNNING'
+                               AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                               WHERE history.execution_id = e.id)
                            ) AS active_execution_count,
                            count(DISTINCT scoped.id) FILTER (
                              WHERE latest_health.health_status = 'ABNORMAL'
@@ -813,9 +817,10 @@ class ReadModelRepository:
                              WHEN count(*) FILTER (WHERE e.status = 'COMPLETED') > 0 THEN 'COMPLETED'
                              ELSE 'NOT_STARTED'
                            END AS status
-                    FROM scoped_assets scoped
-                    JOIN catalog.test_target_part target_part
+                    FROM catalog.test_target_part target_part
+                    LEFT JOIN scoped_assets scoped
                       ON target_part.part_code = scoped.target_part_code
+                     AND target_part.asset_kind = scoped.asset_kind
                     LEFT JOIN test.test_execution e
                       ON e.asset_id = scoped.id AND e.status <> 'VOIDED'
                     LEFT JOIN LATERAL (
@@ -827,8 +832,9 @@ class ReadModelRepository:
                       ) DESC NULLS LAST, health.id DESC
                       LIMIT 1
                     ) latest_health ON true
-                    GROUP BY scoped.asset_kind, target_part.part_code, target_part.name
-                    ORDER BY scoped.asset_kind, target_part.part_code
+                    WHERE target_part.enabled
+                    GROUP BY target_part.asset_kind, target_part.part_code, target_part.name
+                    ORDER BY target_part.asset_kind, target_part.part_code
                     """
                 )
             ).mappings()
@@ -868,7 +874,7 @@ class ReadModelRepository:
                               ELSE mp.target_part_code
                             END = ANY(CAST(:part_codes AS text[]))
                     )
-                    SELECT scoped_assets.asset_kind, tc.public_id, tc.case_code, tc.name,
+                    SELECT tc.asset_kind, tc.public_id, tc.case_code, tc.name,
                            tc.target_part_code, target_part.name AS target_part_name,
                            CASE
                              WHEN count(*) FILTER (WHERE e.status = 'RUNNING') > 0 THEN 'RUNNING'
@@ -887,6 +893,8 @@ class ReadModelRepository:
                            coalesce(sum(el.pending_seconds), 0) AS pending_seconds,
                            coalesce(sum(
                              CASE WHEN e.status = 'RUNNING' AND e.normalized_started_at IS NOT NULL
+                             AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                             WHERE history.execution_id = e.id)
                                THEN greatest(0, extract(epoch FROM (
                                  CASE
                                    WHEN e.received_at IS NULL THEN e.normalized_started_at
@@ -901,7 +909,7 @@ class ReadModelRepository:
                              THEN (published.procedure_spec ->> 'target_duration_seconds')::numeric
                              ELSE NULL END) AS target_seconds
                     FROM catalog.test_case tc
-                    JOIN scoped_assets
+                    LEFT JOIN scoped_assets
                       ON scoped_assets.target_part_code = tc.target_part_code
                      AND scoped_assets.asset_kind = tc.asset_kind
                     JOIN catalog.test_target_part target_part
@@ -924,9 +932,9 @@ class ReadModelRepository:
                     LEFT JOIN execution_ledger el ON el.execution_id = e.id
                     WHERE tc.enabled
                       AND tc.target_part_code = ANY(CAST(:part_codes AS text[]))
-                    GROUP BY scoped_assets.asset_kind, tc.id, tc.public_id, tc.case_code, tc.name,
+                    GROUP BY tc.asset_kind, tc.id, tc.public_id, tc.case_code, tc.name,
                              tc.target_part_code, target_part.name
-                    ORDER BY scoped_assets.asset_kind, tc.target_part_code,
+                    ORDER BY tc.asset_kind, tc.target_part_code,
                       (count(*) FILTER (WHERE e.status = 'RUNNING') > 0) DESC,
                       tc.case_code
                     """
@@ -1048,6 +1056,8 @@ class ReadModelRepository:
                         coalesce(sum(el.pending_seconds), 0) AS pending_seconds,
                         coalesce(sum(CASE
                           WHEN e.status = 'RUNNING' AND e.normalized_started_at IS NOT NULL
+                             AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                             WHERE history.execution_id = e.id)
                           THEN greatest(0, extract(epoch FROM (
                             CASE
                               WHEN e.received_at IS NULL THEN e.normalized_started_at
@@ -1217,6 +1227,8 @@ class ReadModelRepository:
                     LEFT JOIN LATERAL (
                       SELECT e.public_id, e.execution_code, tc.case_code,
                         CASE WHEN e.status = 'RUNNING' AND e.normalized_started_at IS NOT NULL
+                             AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                             WHERE history.execution_id = e.id)
                           THEN greatest(0, extract(epoch FROM (
                             CASE
                               WHEN e.received_at IS NULL THEN e.normalized_started_at
@@ -1229,6 +1241,8 @@ class ReadModelRepository:
                       JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
                       JOIN catalog.test_case tc ON tc.id = tcv.test_case_id
                       WHERE e.asset_id = a.id AND e.status IN ('RUNNING', 'PAUSED', 'BLOCKED')
+                        AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                        WHERE history.execution_id = e.id)
                       ORDER BY (e.status = 'RUNNING') DESC,
                                e.normalized_started_at DESC NULLS LAST, e.id DESC
                       LIMIT 1
@@ -1360,6 +1374,8 @@ class ReadModelRepository:
                 LEFT JOIN LATERAL (
                   SELECT e.public_id, e.execution_code, tc.case_code,
                     CASE WHEN e.status = 'RUNNING' AND e.normalized_started_at IS NOT NULL
+                             AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                             WHERE history.execution_id = e.id)
                       THEN greatest(0, extract(epoch FROM (
                         CASE
                           WHEN e.received_at IS NULL THEN e.normalized_started_at
@@ -1372,6 +1388,8 @@ class ReadModelRepository:
                   JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
                   JOIN catalog.test_case tc ON tc.id = tcv.test_case_id
                   WHERE e.asset_id = a.id AND e.status IN ('RUNNING', 'PAUSED', 'BLOCKED')
+                        AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                        WHERE history.execution_id = e.id)
                   ORDER BY (e.status = 'RUNNING') DESC,
                            e.normalized_started_at DESC NULLS LAST, e.id DESC LIMIT 1
                 ) current_execution ON true
@@ -1405,6 +1423,8 @@ class ReadModelRepository:
                 ) st ON true
                 WHERE e.asset_id = :asset_id
                   AND e.status IN ('RUNNING', 'PAUSED', 'BLOCKED')
+                  AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                  WHERE history.execution_id = e.id)
                 ORDER BY (e.status = 'RUNNING') DESC,
                          e.normalized_started_at DESC NULLS LAST, e.id DESC
                 LIMIT 1
@@ -1695,6 +1715,8 @@ class ReadModelRepository:
                            coalesce(stage_totals.stage_count, 0) AS stage_count,
                            coalesce(runtime_totals.closed_duration_seconds, 0) AS closed_duration_seconds,
                            CASE WHEN e.status = 'RUNNING' AND e.normalized_started_at IS NOT NULL
+                             AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                             WHERE history.execution_id = e.id)
                              THEN greatest(0, extract(epoch FROM (
                                CASE
                                  WHEN e.received_at IS NULL THEN e.normalized_started_at
@@ -1875,6 +1897,8 @@ class ReadModelRepository:
                   coalesce(sum(et.excluded_seconds), 0) AS excluded_seconds,
                   coalesce(sum(et.pending_seconds), 0) AS pending_seconds,
                   coalesce(sum(CASE WHEN et.status = 'RUNNING'
+                    AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                    WHERE history.execution_id = et.id)
                     THEN greatest(0, extract(epoch FROM (
                       CASE
                         WHEN et.received_at IS NULL THEN et.normalized_started_at
@@ -2397,6 +2421,8 @@ class ReadModelRepository:
                        coalesce(stage_totals.stage_count, 0) AS stage_count,
                        coalesce(runtime_totals.closed_duration_seconds, 0) AS closed_duration_seconds,
                        CASE WHEN e.status = 'RUNNING' AND e.normalized_started_at IS NOT NULL
+                             AND NOT EXISTS (SELECT 1 FROM integration.execution_import_record history
+                                             WHERE history.execution_id = e.id)
                          THEN greatest(0, extract(epoch FROM (
                            CASE
                              WHEN e.received_at IS NULL THEN e.normalized_started_at

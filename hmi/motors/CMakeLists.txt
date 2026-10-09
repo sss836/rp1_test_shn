@@ -118,3 +118,12 @@ if(ament_cmake_FOUND)
     ament_export_include_directories(include)
     ament_package()
 endif()
+
+# An offline fake uses the exact production bindings; never install this module.
+option(RP1_BUILD_SDK_TESTS "Build offline native SDK concurrency regression" OFF)
+if(RP1_BUILD_SDK_TESTS)
+    pybind11_add_module(motors_py_testing src/pybind_module.cpp)
+    target_compile_definitions(motors_py_testing PRIVATE RP1_SDK_MODULE_NAME=motors_py_testing RP1_SDK_TESTING=1)
+    target_include_directories(motors_py_testing PRIVATE include src tests)
+    target_link_libraries(motors_py_testing PRIVATE motors)
+endif()

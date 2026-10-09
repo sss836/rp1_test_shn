@@ -11,7 +11,14 @@
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(motors_py, m) {
+#ifndef RP1_SDK_MODULE_NAME
+#define RP1_SDK_MODULE_NAME motors_py
+#endif
+#ifdef RP1_SDK_TESTING
+#include "fake_motor.hpp"
+#endif
+
+PYBIND11_MODULE(RP1_SDK_MODULE_NAME, m) {
     m.doc() = "Motor Driver Python SDK"; 
 
     py::enum_<MotorDriver::MotorControlMode_e>(m, "MotorControlMode")
@@ -21,6 +28,8 @@ PYBIND11_MODULE(motors_py, m) {
         .value("SPD", MotorDriver::MotorControlMode_e::SPD)
         .export_values();
 
+    // Blocking native maintenance calls must not pause other station threads.
+    // Argument conversion occurs with the GIL held; these methods use C++ only.
     py::class_<MotorDriver, std::shared_ptr<MotorDriver>>(m, "MotorDriver")
         .def_static("create_motor", &MotorDriver::create_motor,
             py::arg("motor_id"),
@@ -30,13 +39,13 @@ PYBIND11_MODULE(motors_py, m) {
             py::arg("motor_model"),
             py::arg("master_id_offset") = 0,
             py::arg("motor_zero_offset") = 0.0)
-        .def("lock_motor", &MotorDriver::lock_motor)
-        .def("unlock_motor", &MotorDriver::unlock_motor)
-        .def("init_motor", &MotorDriver::init_motor)
-        .def("deinit_motor", &MotorDriver::deinit_motor)
-        .def("set_motor_zero", &MotorDriver::set_motor_zero)
-        .def("write_motor_flash", &MotorDriver::write_motor_flash)
-        .def("get_motor_param", &MotorDriver::get_motor_param)
+        .def("lock_motor", &MotorDriver::lock_motor, py::call_guard<py::gil_scoped_release>())
+        .def("unlock_motor", &MotorDriver::unlock_motor, py::call_guard<py::gil_scoped_release>())
+        .def("init_motor", &MotorDriver::init_motor, py::call_guard<py::gil_scoped_release>())
+        .def("deinit_motor", &MotorDriver::deinit_motor, py::call_guard<py::gil_scoped_release>())
+        .def("set_motor_zero", &MotorDriver::set_motor_zero, py::call_guard<py::gil_scoped_release>())
+        .def("write_motor_flash", &MotorDriver::write_motor_flash, py::call_guard<py::gil_scoped_release>())
+        .def("get_motor_param", &MotorDriver::get_motor_param, py::call_guard<py::gil_scoped_release>())
         .def("motor_pos_cmd", &MotorDriver::motor_pos_cmd, py::arg("pos"), py::arg("spd"), py::arg("ignore_limit") = false)
         .def("motor_spd_cmd", &MotorDriver::motor_spd_cmd)
         .def("motor_mit_cmd", static_cast<void (MotorDriver::*)(float, float, float, float, float)>(&MotorDriver::motor_mit_cmd))
@@ -55,8 +64,8 @@ PYBIND11_MODULE(motors_py, m) {
         .def("set_motor_control_mode", &MotorDriver::set_motor_control_mode)
         .def("get_response_count", &MotorDriver::get_response_count)
         .def("get_feedback_count", &MotorDriver::get_feedback_count)
-        .def("refresh_motor_status", &MotorDriver::refresh_motor_status)
-        .def("reset_motor_id", &MotorDriver::reset_motor_id)
+        .def("refresh_motor_status", &MotorDriver::refresh_motor_status, py::call_guard<py::gil_scoped_release>())
+        .def("reset_motor_id", &MotorDriver::reset_motor_id, py::call_guard<py::gil_scoped_release>())
         .def("get_motor_id", &MotorDriver::get_motor_id)
         .def("get_motor_control_mode", &MotorDriver::get_motor_control_mode)
         .def("get_error_id", &MotorDriver::get_error_id)
@@ -64,7 +73,13 @@ PYBIND11_MODULE(motors_py, m) {
         .def("get_motor_spd", &MotorDriver::get_motor_spd)
         .def("get_motor_current", &MotorDriver::get_motor_current)
         .def("get_motor_temperature", &MotorDriver::get_motor_temperature)
-        .def("clear_motor_error", &MotorDriver::clear_motor_error)
+        .def("clear_motor_error", &MotorDriver::clear_motor_error, py::call_guard<py::gil_scoped_release>())
         .def("get_can_name", &MotorDriver::get_can_name);
 
+#ifdef RP1_SDK_TESTING
+    // This factory is compiled only into the separate, uninstalled test module.
+    m.def("_test_create_motor", []() -> std::shared_ptr<MotorDriver> {
+        return std::make_shared<FakeMotor>();
+    });
+#endif
 }

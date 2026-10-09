@@ -73,6 +73,33 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
         self.assertEqual(self.window._platform_operator, "")
         self.assertFalse(self.window.platform_logout_button.isEnabled())
 
+    def test_primary_fault_and_critical_bus_diagnosis_are_visible(self) -> None:
+        self.window._render_fault({"fault": {
+            "message": "feedback stale 2.0s",
+            "diagnoses": [
+                {"severity": "warning", "suspected_component": "motor:2", "evidence": ["tracking error"]},
+                {"severity": "critical", "suspected_component": "communication_bus:can0", "evidence": ["7 motors stale"]},
+            ],
+        }})
+        text = self.window.global_fault.text()
+        self.assertIn("feedback stale 2.0s", text)
+        self.assertIn("communication_bus:can0", text)
+        self.assertIn("7 motors stale", text)
+        self.assertNotIn("疑似部件：motor:2", text)
+
+    def test_fault_message_survives_missing_or_invalid_diagnoses(self) -> None:
+        for diagnoses in (None, [], [None, "invalid"]):
+            with self.subTest(diagnoses=diagnoses):
+                self.window._render_fault({"fault": {"message": "driver failed", "diagnoses": diagnoses}})
+                self.assertIn("driver failed", self.window.global_fault.text())
+                self.assertEqual(self.window.global_fault.objectName(), "faultBarError")
+
+    def test_fault_banner_clears_after_fault_is_removed(self) -> None:
+        self.window._render_fault({"fault": "fault"})
+        self.window._render_fault({"fault": None})
+        self.assertIn("全局故障：无", self.window.global_fault.text())
+        self.assertEqual(self.window.global_fault.objectName(), "faultBarOk")
+
     def test_supported_resolutions_exceed_required_shell_minimums(self) -> None:
         minimum = self.window.minimumSize()
         for width, height in ((1600, 900), (1600, 1000), (1920, 1080)):

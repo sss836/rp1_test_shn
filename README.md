@@ -1,6 +1,6 @@
 # RP1 Test SHN — Reliability Platform 与 RP1 TEST HMI（PLC）
 
-当前工程版本 **1.0.1（预发布）**，目标系统 **Ubuntu 24.04 LTS amd64**。包含当前可靠性平台的 React 前端、FastAPI 后端、PostgreSQL 数据库、MTBF Worker，以及 PLC/CAN 上位机完整源码和构建工具。仓库采用 `reliability_v1` 协议；不是旧版 dashboard 平台。
+当前工程版本 **2.0.0**，目标系统 **Ubuntu 24.04 LTS amd64**。包含当前可靠性平台的 React 前端、FastAPI 后端、PostgreSQL 数据库、MTBF Worker，以及 PLC/CAN 上位机完整源码和构建工具。仓库采用 `reliability_v1` 协议；不是旧版 dashboard 平台。
 
 **已实现：**账号与权限、可靠性数据查询/计算、上位机登录在线监控、并行测试状态、运行时长/循环数、PLC 通信状态、断线与过期状态提示。
 
@@ -30,7 +30,7 @@ sudo apt update
 sudo apt install -y git ca-certificates openssl python3 curl
 git clone https://github.com/sss836/rp1_test_shn.git
 cd rp1_test_shn
-git checkout v1.0.1
+git checkout v2.0.0
 sudo bash scripts/install-docker-ubuntu24.sh
 sudo usermod -aG docker "$USER"
 ```
@@ -76,31 +76,42 @@ python3 scripts/verify.py
 
 ## 4. 安装上位机
 
-到 [v1.0.1 下载页](https://github.com/sss836/rp1_test_shn/releases/tag/v1.0.1) 下载 deb 与同名 `.sha256`，放在同一目录。安装/升级会重启网关，须在测试结束后进行：
+到 [v2.0.0 下载页](https://github.com/sss836/rp1_test_shn/releases/tag/v2.0.0) 下载
+`rp1-test-hmi_2.0.0+ubuntu24.04_amd64.deb` 与同名 `.sha256`，放在同一目录。
+先在现场完成正常停止并关闭自己的上位机，再安装：
 
 ```bash
-sha256sum -c rp1-test-hmi_1.0.1+ubuntu24.04_amd64.deb.sha256
-sudo apt install -o Dpkg::Options::=--force-confold ./rp1-test-hmi_1.0.1+ubuntu24.04_amd64.deb
-sudo usermod -aG rp1-factory "$USER"
+sha256sum -c rp1-test-hmi_2.0.0+ubuntu24.04_amd64.deb.sha256
+sudo apt install -o Dpkg::Options::=--force-confold ./rp1-test-hmi_2.0.0+ubuntu24.04_amd64.deb
 ```
 
-注销并重新登录。包包含 Python/Qt 运行时和 motors 扩展，不需要在操作员工位安装开发环境。配置位于 `/etc/rp1-test-hmi`，CSV、记录与 outbox 位于 `/var/lib/rp1-test-hmi`，服务为 `rp1-test-gateway.service`，应用菜单名称 **RP1 Test HMI (PLC)**。
-
-在平台源码目录配置工位，例如同机部署：
+应用菜单名称为 **rp1-test-hmi**，也可运行 `rp1-test-hmi`。
+包包含 Python 3.12 / Qt 运行库和按当前 C++ 源码构建的电机 SDK，目标 Ubuntu 24.04 amd64。
+本版由用户启动自己的 GUI 和网关，不安装自动启动服务，不配置免密提权。
 
 ```bash
-sudo python3 scripts/configure-hmi.py   --url https://localhost:8443   --station-id SHN-PLC-01 --bench-id RD-01   --ca deployment/secrets/root-ca.crt --outputs-off
+rp1-test-hmi status
+rp1-test-hmi stop
 ```
 
-分机时替换为实际服务器 HTTPS 地址及本机收到的 CA 文件路径。此脚本设置 `RP1_FACTORY_PLATFORM_MODE=reliability_v1`，不索取旧平台 machine token。在线监控只需真实平台账号，不要求服务 API key。
+配置首次复制到 `~/.local/state/rp1-test-hmi/config/`，之后保留用户配置；
+日志与本地记录分别在该状态目录的 `logs/` 和 `data/`。
+系统 CAN 策略在 `/etc/rp1-test-hmi/can-policy.yaml`，配置接口需要管理员认证。
+模块 YAML 使用相对引用，例如 `left_arm_motors.yaml`；网关仍检查配置根目录边界。
 
-打开 HMI，在“老化测试”中的平台登录区域输入执行员账号密码。看到“监控在线”后，在网页打开 **工位监控**。监控每 10 秒上报、页面每 5 秒刷新、45 秒无心跳离线；管理员看全部工位，执行员看自己登录的工位。控制器采样或网页响应过期时显示未知/历史状态，不把历史运行信息当作当前状态。并行模块分别显示测试单号、样品、状态、时长和循环。
+本版 PLC 模板为 `modbus_tcp`、`access_mode: control`、`192.168.137.10:502`、Unit ID 1、RP1 V1.0。
+投用前核对本站实际设备参数及 [协议](hmi/docs/HOST_MODBUS_TCP_PROTOCOL_V1.0.md)，
+在用户配置中设置。控制模式连接包含控制心跳及全部输出关闭的安全初始化；
+需按现场操作流程进行。仅查看状态可使用 `access_mode: monitor`，离线验证使用
+`--offline-check` 专用 mock 配置，不连接实际 PLC/CAN。
 
-只需监控时，测试上下文选择“未选择（仅本地保存）”；不要为监控填写虚构上传 UUID。HMI 提供“退出平台”按钮。关闭窗口与退出账号不同，网关服务可能继续上报；会话默认 8 小时，过期后重新登录。原始 CSV 始终由本地采集/记录流程保存，状态监控不将其写入正式统计。
+默认平台为同机 `https://localhost:8443`、协议 `reliability_v1`。
+用户配置 `config/platform-ca.crt` 应为该站点实际 CA 公共证书，不能复用其它站点的证书。
+执行员先通过网页登录完成首次改密，再在“老化测试”页登录平台；
+只需在线监控时保留“未选择（仅本地保存）”上下文。
+原始采集 CSV 保留在工位本地，监控状态不自动成为正式统计。
 
-默认 PLC 配置为 mock，页面会明确标记模拟。真实硬件投用必须按 [PLC 接口映射](hmi/docs/PLC_INTERFACE_MAPPING.md)、[协议](hmi/docs/HOST_MODBUS_TCP_PROTOCOL_V1.0.md) 和现场验收确认；不能用模拟结果代替真实设备验收。
-
-已有本机开发平台若使用 HTTP 8088，需手动设置对应地址，详见 [上位机接入](hmi/docs/PLATFORM-PRESENCE.md)。这与本仓库全新部署的 HTTPS 8443 是两种配置，不要混用。
+详细说明见 [当前上位机构建说明](hmi/docs/LOCAL_CONTROL_BUILD.md)。
 
 ## 5. 构建与维护
 
@@ -119,6 +130,6 @@ sudo bash scripts/install-build-deps-ubuntu24.sh
 python3 scripts/backup.py --maintenance
 ```
 
-平台备份包含 PostgreSQL 与站点密钥，不包含工位本地 CSV；工位 `/etc/rp1-test-hmi` 和 `/var/lib/rp1-test-hmi` 须另行备份。恢复只面向新的克隆和新的 Compose 项目，详细步骤见 [运维](docs/OPERATIONS.md)。不要执行 `down -v` 清空生产数据。
+平台备份包含 PostgreSQL 与站点密钥，不包含工位本地 CSV；工位用户状态目录 `~/.local/state/rp1-test-hmi/` 和 CAN 策略 `/etc/rp1-test-hmi/can-policy.yaml` 须另行备份。恢复只面向新的克隆和新的 Compose 项目，详细步骤见 [运维](docs/OPERATIONS.md)。不要执行 `down -v` 清空生产数据。
 
 本版本的自动化、隔离联调、已知限制与现场验收事项见 [验收记录](docs/ACCEPTANCE.md)。

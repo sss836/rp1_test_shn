@@ -3,16 +3,21 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 . /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 && $(uname -m) == x86_64 ]] || {
-  echo 'Build on Ubuntu 24.04 x86_64; do not ship an incompatible Python/CPU binary.' >&2; exit 1;
+  echo 'Build on Ubuntu 24.04 x86_64.' >&2; exit 1;
 }
-unset PYTHONPATH
+unset PYTHONPATH LD_PRELOAD
+runtime_dir="$PWD/hmi/build/release-runtime"
+[[ ! -e "$runtime_dir" ]] || { echo 'Use a fresh hmi/build/release-runtime directory.' >&2; exit 1; }
 python3 -m venv .venv-hmi
-.venv-hmi/bin/python -m pip install -r hmi/requirements.lock
-.venv-hmi/bin/python -m pip install --no-deps --no-build-isolation -e './hmi[desktop,test,build]'
-# Run from the HMI package root so its scripts package cannot be shadowed by
-# the delivery repository's top-level scripts directory in an editable install.
-(cd hmi && QT_QPA_PLATFORM=offscreen ../.venv-hmi/bin/python -m pytest tests -q)
-.venv-hmi/bin/python hmi/tools/build_factory_hmi.py all --one-dir
-.venv-hmi/bin/python hmi/tools/build_factory_hmi_deb.py --version "$(cat VERSION)+ubuntu24.04"
-(cd hmi/dist && sha256sum "rp1-test-hmi_$(cat ../../VERSION)+ubuntu24.04_amd64.deb" > "rp1-test-hmi_$(cat ../../VERSION)+ubuntu24.04_amd64.deb.sha256")
-echo 'Package and SHA256 are in hmi/dist/.'
+.venv-hmi/bin/python -m pip install -r hmi/requirements.lock --target "$runtime_dir"
+python3 hmi/tools/rebuild_native_sdk.py --runtime-dir "$runtime_dir" --build-dir hmi/build/native-sdk --verify-concurrency
+export PYTHONPATH="$PWD/hmi:$runtime_dir"
+export LD_LIBRARY_PATH="$runtime_dir"
+export QT_QPA_PLATFORM=offscreen
+(cd hmi && ../.venv-hmi/bin/python -m pytest tests -q)
+python3 hmi/tools/verify_setpoint_input.py --runtime-dir "$runtime_dir"
+python3 hmi/tools/verify_can_support.py --runtime-dir "$runtime_dir"
+python3 hmi/tools/verify_local_control.py --runtime-dir "$runtime_dir"
+python3 hmi/tools/build_local_deb.py --runtime-dir "$runtime_dir"
+(cd hmi/dist && sha256sum "rp1-test-hmi_$(cat ../packaging/LOCAL_VERSION)_amd64.deb" > "rp1-test-hmi_$(cat ../packaging/LOCAL_VERSION)_amd64.deb.sha256")
+echo 'Package and checksums are in hmi/dist/.'

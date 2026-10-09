@@ -21,7 +21,7 @@ jobs:
           --health-cmd "pg_isready -U rp1_admin -d rp1_presence_ci"
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
-      PYTHONPATH: backend
+      PYTHONPATH: backend:database
       APP_ENV: test
       AUTH_MODE: session
       AUTH_COOKIE_SECURE: 'false'

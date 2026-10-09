@@ -2837,12 +2837,14 @@ class FactoryMainWindow(QMainWindow):
             if isinstance(fault, Mapping):
                 diagnoses = fault.get("diagnoses")
                 diagnosis: Mapping[str, Any] = fault
-                if (
-                    isinstance(diagnoses, list)
-                    and diagnoses
-                    and isinstance(diagnoses[0], Mapping)
-                ):
-                    diagnosis = diagnoses[0]
+                if isinstance(diagnoses, list):
+                    candidates = [item for item in diagnoses if isinstance(item, Mapping)]
+                    severity_order = {"critical": 4, "error": 3, "warning": 2, "warn": 2, "info": 1}
+                    diagnosis = max(
+                        candidates,
+                        key=lambda item: severity_order.get(str(item.get("severity", "")).lower(), 0),
+                        default=fault,
+                    )
                 suspected = self._pick(
                     diagnosis, "suspected_component", default="未知部件"
                 )
@@ -2851,8 +2853,10 @@ class FactoryMainWindow(QMainWindow):
                     evidence = "；".join(str(item) for item in evidence)
                 action = self._pick(diagnosis, "action", default="停机检查")
                 confidence = self._pick(diagnosis, "confidence", default="未知")
+                message = str(fault.get("message") or "").strip()
+                primary = f"故障：{message}  |  " if message else ""
                 text = (
-                    f"⚠  全局故障  |  疑似部件：{suspected}  |  证据：{evidence}  |  "
+                    f"⚠  全局故障  |  {primary}疑似部件：{suspected}  |  证据：{evidence}  |  "
                     f"处置：{action}  |  置信度：{confidence}"
                 )
             else:
@@ -3325,23 +3329,22 @@ class FactoryMainWindow(QMainWindow):
         window.show()
 
     def _suggest_config(self, limb: str) -> None:
-        root = "/etc/rp1-factory-hmi/stations"
         suggestions = {
-            "left_arm": f"{root}/left_arm_motors.yaml",
-            "right_arm": f"{root}/right_arm_motors.yaml",
-            "left_short_arm": f"{root}/left_short_arm_motors.yaml",
-            "right_short_arm": f"{root}/right_short_arm_motors.yaml",
-            "left_leg": f"{root}/left_leg_motors.yaml",
-            "right_leg": f"{root}/right_leg_motors.yaml",
-            "left_short_leg": f"{root}/left_short_leg_motors.yaml",
-            "right_short_leg": f"{root}/right_short_leg_motors.yaml",
-            "waist_hip": f"{root}/waist_hip_motors.yaml",
-            "biped_waist": f"{root}/biped_waist_motors.yaml",
-            "upper_body": f"{root}/upper_body_motors.yaml",
+            "left_arm": "left_arm_motors.yaml",
+            "right_arm": "right_arm_motors.yaml",
+            "left_short_arm": "left_short_arm_motors.yaml",
+            "right_short_arm": "right_short_arm_motors.yaml",
+            "left_leg": "left_leg_motors.yaml",
+            "right_leg": "right_leg_motors.yaml",
+            "left_short_leg": "left_short_leg_motors.yaml",
+            "right_short_leg": "right_short_leg_motors.yaml",
+            "waist_hip": "waist_hip_motors.yaml",
+            "biped_waist": "biped_waist_motors.yaml",
+            "upper_body": "upper_body_motors.yaml",
         }
         current = self.config_path.text().strip()
-        if not current or current.startswith(f"{root}/"):
-            self.config_path.setText(suggestions.get(limb, current))
+        if not current or current.startswith("/etc/rp1-factory-hmi/") or (not Path(current).is_absolute() and current in {value.lstrip("/") for value in suggestions.values()}):
+            self.config_path.setText(suggestions.get(limb, current).lstrip("/"))
             self.config_path.setCursorPosition(0)
         if self._config_preview and self._config_preview.get("limb") != limb:
             self._config_preview = {}

@@ -19,6 +19,7 @@ from app.api.routes import (
     ingestion,
     mtbf,
     read_models,
+    setup,
 )
 from app.core.config import get_settings
 from app.core.db import SessionLocal
@@ -143,3 +144,4 @@ app.include_router(ingestion.router)
 app.include_router(dashboard.router)
 app.include_router(read_models.router)
 app.include_router(mtbf.router)
+app.include_router(setup.router)
