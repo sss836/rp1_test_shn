@@ -12,6 +12,7 @@ from typing import Any
 
 from .client import PlcClient, PlcCommunicationError
 from .config import PlcSetpointConfig, PlcTimingConfig
+from .faults import cabinet_fault_messages
 from .models import (
     CabinetPhase,
     CommandFeedback,
@@ -19,6 +20,8 @@ from .models import (
     OperationLogEntry,
     PlcCommand,
     PlcStatus,
+    ResetResult,
+    sequence_reached,
 )
 
 
@@ -161,7 +164,15 @@ class PlcCabinetController:
             self.command = PlcCommand()
             raise
 
+    def _cancel_sequence_feedback(self, detail: str) -> None:
+        for control in ("Start", "Stop"):
+            if self.feedback[control].state == FeedbackState.PENDING:
+                self.feedback[control] = CommandFeedback(
+                    FeedbackState.REJECTED, self.command.command_sequence, detail,
+                )
+
     def disconnect(self) -> None:
+        self._cancel_sequence_feedback("PLC disconnected")
         self.client.disconnect()
         self.communication_state = "DISCONNECTED"
         self.phase = CabinetPhase.DISCONNECTED
@@ -241,11 +252,13 @@ class PlcCabinetController:
             or self.stale
         ):
             return self._reject("Start", user, "PLC communication is not live")
+        if self._pending is not None:
+            return self._reject("Start", user, "another command is awaiting PLC acknowledgement")
         if self.phase != CabinetPhase.OFF:
             return self._reject("Start", user, f"cannot start from {self.phase.value}")
         if self.status is None or not self.status.host_connected:
             return self._reject("Start", user, "PLC has not confirmed HostConnected")
-        if self.status and (self.status.fault_latched or self.status.ps1_fault):
+        if self.status and self.status.has_fault:
             return self._reject("Start", user, "PLC or PS1 fault is active")
         if (voltage is None) != (current is None):
             return self._reject(
@@ -319,6 +332,8 @@ class PlcCabinetController:
             return self._reject(
                 control, user, "another command is awaiting PLC acknowledgement"
             )
+        if self.phase != CabinetPhase.RUNNING:
+            return self._reject(control, user, "channel changes require RUNNING phase")
         if enabled:
             if self.phase != CabinetPhase.RUNNING:
                 return self._reject(
@@ -351,12 +366,19 @@ class PlcCabinetController:
             return self._reject(
                 "ResetFaultPulse", user, "PLC communication is not live"
             )
+        if self.status is None or not self.status.reset_results_supported:
+            return self._reject(
+                "ResetFaultPulse", user,
+                "旧协议/无复位结果回执：故障复位需要PLC Host Protocol V1.1（0x0101）",
+            )
         if self._pending is not None:
             return self._reject(
                 "ResetFaultPulse",
                 user,
                 "another command is awaiting PLC acknowledgement",
             )
+        if self.command.main_enable or any(self.command.channel_enable) or self.command.ps1_output_enable:
+            return self._reject("ResetFaultPulse", user, "请先关闭主回路、通道和PS1输出请求，再复位PLC控制故障")
         old_phase = CabinetPhase.OFF if self.phase == CabinetPhase.FAULT else self.phase
         sequence = self.command.command_sequence + 1
         pulse = replace(
@@ -378,12 +400,12 @@ class PlcCabinetController:
             True,
             sequence,
             FeedbackState.PENDING,
-            "single write pulse",
+            "复位脉冲已发送，等待PLC接收及复位结果；不复位PS1故障",
         )
         self.feedback["ResetFaultPulse"] = CommandFeedback(
             FeedbackState.PENDING,
             sequence,
-            "single write pulse",
+            "复位脉冲已发送，等待PLC接收及复位结果；不复位PS1故障",
         )
         self._pending = _PendingCommand(
             sequence=sequence,
@@ -392,6 +414,7 @@ class PlcCabinetController:
             controls=("ResetFaultPulse",),
             log_indexes=(log_index,),
         )
+        self.phase = CabinetPhase.WAIT_RESET_RESULT
         return True
 
     def request_setpoints(
@@ -536,6 +559,7 @@ class PlcCabinetController:
                 FeedbackState.REJECTED,
                 "superseded by AllStop",
             )
+        self._cancel_sequence_feedback("superseded by AllStop")
         self._start_requested = False
         self._start_setpoints = None
         self._requested_channels = (False, False, False, False)
@@ -549,6 +573,7 @@ class PlcCabinetController:
                 "all_stop": True,
             },
             detail=detail,
+            force=True,
         )
         return True
 
@@ -585,6 +610,9 @@ class PlcCabinetController:
             current - self.status.received_monotonic
             > self.timings.stale_timeout_ms / 1000.0
         ):
+            if self._pending is not None:
+                self._finish_pending(FeedbackState.TIMEOUT, "PLC status exceeded stale timeout")
+            self._cancel_sequence_feedback("PLC status exceeded stale timeout")
             self.communication_state = "STALE"
             self.phase = CabinetPhase.STALE
             self.last_error = "PLC status exceeded stale timeout"
@@ -614,9 +642,18 @@ class PlcCabinetController:
             )
             return
 
-        if self.status.fault_latched or self.status.ps1_fault:
+        if self._pending is not None and self._pending.controls == ("ResetFaultPulse",):
+            # The fault present before reset is expected during PLC judgement.
+            # AcceptedCommandSeq is receipt only, never reset completion.
+            if current >= self._pending.deadline:
+                detail = "等待PLC复位结果超时；PLC控制故障是否清除未确认"
+                self._finish_pending(FeedbackState.TIMEOUT, detail)
+                self._enter_fault(detail, "system")
+            return
+
+        if self.status.has_fault:
             if self.phase != CabinetPhase.FAULT:
-                self._enter_fault("PLC reported a latched fault", "system")
+                self._enter_fault("；".join(cabinet_fault_messages(self.status.to_dict())), "system")
             return
 
         if self._pending is not None:
@@ -860,8 +897,11 @@ class PlcCabinetController:
         self.status = self.client.read_status()
         if (
             self._pending is not None
-            and self.status.acknowledged_sequence == self._pending.sequence
+            and sequence_reached(self.status.acknowledged_sequence, self._pending.sequence)
         ):
+            if self._pending.controls == ("ResetFaultPulse",):
+                self._resolve_reset_result()
+                return
             if self._pending.controls == ("Setpoints",):
                 next_phase = self._pending.next_phase
                 voltage_matches = self.command.set_voltage is not None and abs(
@@ -926,6 +966,33 @@ class PlcCabinetController:
             }:
                 self._phase_deadline = now + self.timings.command_timeout_ms / 1000.0
 
+    def _resolve_reset_result(self) -> None:
+        assert self.status is not None and self._pending is not None
+        if self.status.reset_ack_sequence != (self._pending.sequence & 0xFFFF):
+            return
+        result = self.status.reset_result
+        if result in {ResetResult.IDLE, ResetResult.PENDING}:
+            return
+        if result == ResetResult.SUCCEEDED:
+            self._finish_pending(FeedbackState.CONFIRMED, "PLC控制故障复位成功（不代表PS1通信或设备故障已清除）")
+            self.phase = CabinetPhase.FAULT if self.status.has_fault else CabinetPhase.OFF
+            self.last_error = "；".join(cabinet_fault_messages(self.status.to_dict()))
+        elif result == ResetResult.REJECTED_NOT_SAFE:
+            detail = "PLC拒绝复位：主回路/通道请求未全关闭，或KM0反馈仍在"
+            self._finish_pending(FeedbackState.REJECTED, detail)
+            self.phase = CabinetPhase.FAULT
+            self.last_error = detail
+        elif result == ResetResult.FAILED_STILL_LATCHED:
+            detail = "PLC复位失败：等待超时后PLC控制故障仍锁存"
+            self._finish_pending(FeedbackState.FAILED, detail)
+            self.phase = CabinetPhase.FAULT
+            self.last_error = detail
+        else:
+            detail = f"PLC复位结果无效（ResetResult={result}），执行结果未确认"
+            self._finish_pending(FeedbackState.FAILED, detail)
+            self.phase = CabinetPhase.FAULT
+            self.last_error = detail
+
     def _issue(
         self,
         *,
@@ -956,6 +1023,14 @@ class PlcCabinetController:
                 sequence,
                 detail,
             )
+            if field == "channel_enable":
+                for index, (before, after) in enumerate(zip(old_value, new_value), 1):
+                    if force or before != after:
+                        name = f"ChannelEnable{index}"
+                        controls.append(name)
+                        self.feedback[name] = CommandFeedback(
+                            FeedbackState.PENDING, sequence, detail,
+                        )
             indexes.append(
                 self._append_log(
                     user,
@@ -1289,6 +1364,7 @@ class PlcCabinetController:
             )
 
     def _communication_lost(self, detail: str) -> None:
+        self._cancel_sequence_feedback(detail)
         if self._pending is not None:
             self._finish_pending(FeedbackState.TIMEOUT, detail)
         self.communication_state = "COMM_LOST"

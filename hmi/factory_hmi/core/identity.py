@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+import uuid
 
 
 _SAMPLE_ID = re.compile(
@@ -30,3 +31,12 @@ def build_execution_code(
     if not _BENCH_ID.fullmatch(bench):
         raise ValueError("bench_id must match RD|MP|OUT-NN, for example MP-01")
     return "_".join((case, started_at.strftime("%y%m%d%H%M"), sample, bench))
+
+
+def build_local_execution_code(
+    test_case_id: str, started_at: datetime, execution_uuid: str
+) -> str:
+    """Name a local record without inventing a platform sample or bench ID."""
+    case = re.sub(r"[^A-Za-z0-9_.-]+", "_", test_case_id).strip("._")[:64] or "aging"
+    execution = uuid.UUID(execution_uuid)
+    return f"LOCAL_{case}_{started_at.strftime('%y%m%d%H%M%S%f')}_{execution.hex}"

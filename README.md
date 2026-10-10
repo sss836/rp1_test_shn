@@ -1,6 +1,6 @@
 # RP1 Test SHN — Reliability Platform 与 RP1 TEST HMI（PLC）
 
-当前工程版本 **2.0.0**，目标系统 **Ubuntu 24.04 LTS amd64**。包含当前可靠性平台的 React 前端、FastAPI 后端、PostgreSQL 数据库、MTBF Worker，以及 PLC/CAN 上位机完整源码和构建工具。仓库采用 `reliability_v1` 协议；不是旧版 dashboard 平台。
+当前工程版本 **2.0.4**，目标系统 **Ubuntu 24.04 LTS amd64**。包含当前可靠性平台的 React 前端、FastAPI 后端、PostgreSQL 数据库、MTBF Worker，以及 PLC/CAN 上位机完整源码和构建工具。仓库采用 `reliability_v1` 协议；不是旧版 dashboard 平台。
 
 **已实现：**账号与权限、可靠性数据查询/计算、上位机登录在线监控、并行测试状态、运行时长/循环数、PLC 通信状态、断线与过期状态提示。
 
@@ -30,7 +30,7 @@ sudo apt update
 sudo apt install -y git ca-certificates openssl python3 curl
 git clone https://github.com/sss836/rp1_test_shn.git
 cd rp1_test_shn
-git checkout v2.0.0
+git checkout v2.0.4
 sudo bash scripts/install-docker-ubuntu24.sh
 sudo usermod -aG docker "$USER"
 ```
@@ -76,13 +76,13 @@ python3 scripts/verify.py
 
 ## 4. 安装上位机
 
-到 [v2.0.0 下载页](https://github.com/sss836/rp1_test_shn/releases/tag/v2.0.0) 下载
-`rp1-test-hmi_2.0.0+ubuntu24.04_amd64.deb` 与同名 `.sha256`，放在同一目录。
+到 [v2.0.4 下载页](https://github.com/sss836/rp1_test_shn/releases/tag/v2.0.4) 下载
+`rp1-test-hmi_2.0.4+ubuntu24.04_amd64.deb` 与同名 `.sha256`，放在同一目录。
 先在现场完成正常停止并关闭自己的上位机，再安装：
 
 ```bash
-sha256sum -c rp1-test-hmi_2.0.0+ubuntu24.04_amd64.deb.sha256
-sudo apt install -o Dpkg::Options::=--force-confold ./rp1-test-hmi_2.0.0+ubuntu24.04_amd64.deb
+sha256sum -c rp1-test-hmi_2.0.4+ubuntu24.04_amd64.deb.sha256
+sudo apt install -o Dpkg::Options::=--force-confold ./rp1-test-hmi_2.0.4+ubuntu24.04_amd64.deb
 ```
 
 应用菜单名称为 **rp1-test-hmi**，也可运行 `rp1-test-hmi`。
@@ -99,8 +99,8 @@ rp1-test-hmi stop
 系统 CAN 策略在 `/etc/rp1-test-hmi/can-policy.yaml`，配置接口需要管理员认证。
 模块 YAML 使用相对引用，例如 `left_arm_motors.yaml`；网关仍检查配置根目录边界。
 
-本版 PLC 模板为 `modbus_tcp`、`access_mode: control`、`192.168.137.10:502`、Unit ID 1、RP1 V1.0。
-投用前核对本站实际设备参数及 [协议](hmi/docs/HOST_MODBUS_TCP_PROTOCOL_V1.0.md)，
+本版 PLC 模板为 `modbus_tcp`、`access_mode: control`、`192.168.137.10:502`、Unit ID 1，支持 Host Protocol V1.1 并兼容 V1.0。
+投用前核对本站实际设备参数及 [V1.1 协议](hmi/docs/HOST_MODBUS_TCP_PROTOCOL_V1.1.md)，
 在用户配置中设置。控制模式连接包含控制心跳及全部输出关闭的安全初始化；
 需按现场操作流程进行。仅查看状态可使用 `access_mode: monitor`，离线验证使用
 `--offline-check` 专用 mock 配置，不连接实际 PLC/CAN。
@@ -111,7 +111,10 @@ rp1-test-hmi stop
 只需在线监控时保留“未选择（仅本地保存）”上下文。
 原始采集 CSV 保留在工位本地，监控状态不自动成为正式统计。
 
-详细说明见 [当前上位机构建说明](hmi/docs/LOCAL_CONTROL_BUILD.md)。
+V1.1 故障复位等待 PLC 最终结果回执，需 PLC 程序实现 HR21～23；V1.0 禁用故障复位。
+电压/电流趋势自动缩放；勾选本地记录不要求平台 bench_id，原始 CSV 保留本地。
+
+详细说明见 [当前上位机构建说明](hmi/docs/LOCAL_CONTROL_BUILD.md) 和 [v2.0.4 更新说明](docs/RELEASE-v2.0.4.md)。
 
 ## 5. 构建与维护
 

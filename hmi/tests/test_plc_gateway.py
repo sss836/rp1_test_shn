@@ -7,6 +7,14 @@ from fastapi.testclient import TestClient
 
 from factory_hmi.gateway.app import create_app
 
+def _post(client, path, payload):
+    import uuid
+    ctx = client.get("/api/v1/plc/snapshot").json()["coordination"]
+    return client.post(path, headers={"X-RP1-Client-ID": "test-window"}, json=dict(
+        payload, request_id=str(uuid.uuid4()), expected_epoch=ctx["epoch"], expected_revision=ctx["revision"],
+    ))
+
+
 
 def _wait_phase(client: TestClient, expected: str) -> dict:
     deadline = time.monotonic() + 2.0
@@ -32,9 +40,9 @@ def test_gateway_exposes_protocol_neutral_plc_sequence(tmp_path: Path) -> None:
             "DUT4": "can3",
         }
 
-        response = client.post(
+        response = _post(client,
             "/api/v1/plc/start",
-            json={
+            {
                 "user": "gateway-test",
                 "channels": [1, 2, 3, 4],
                 "voltage": 3.0,
@@ -48,9 +56,9 @@ def test_gateway_exposes_protocol_neutral_plc_sequence(tmp_path: Path) -> None:
         assert running["status"]["PS1SetVoltage"] == 3.0
         assert running["status"]["PS1SetCurrent"] == 0.5
 
-        response = client.post(
+        response = _post(client,
             "/api/v1/plc/stop",
-            json={"user": "gateway-test"},
+            {"user": "gateway-test"},
         )
         assert response.status_code == 200
         stopped = _wait_phase(client, "OFF")

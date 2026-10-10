@@ -281,3 +281,96 @@ def test_incomplete_mapping_is_rejected_before_network_access() -> None:
 
     with pytest.raises(PlcConfigurationError, match="status must be a mapping"):
         ModbusTcpPlcClient(config)
+
+
+@pytest.mark.parametrize("version", [0x0100, 0x0101])
+@pytest.mark.parametrize("raw,voltage,valid", [
+    (0, 0.0, True), (1, 0.001, True), (10000, 10.0, True),
+    (49999, 49.999, True), (50000, 50.0, True),
+    (50001, 50.001, False), (65535, 65.535, False),
+])
+def test_branch_voltage_1mv_50v_boundary_in_both_protocols(version, raw, voltage, valid):
+    registers = _registers()
+    registers[1] = version
+    registers[12:16] = [raw] * 4
+    registers[16:20] = [50000] * 4
+    client = _client(_FakeTransport(registers))
+    client.connect()
+    status = client.read_status()
+    assert status.voltage == pytest.approx((voltage,) * 4)
+    assert status.current == pytest.approx((50.0,) * 4)
+    assert status.power == pytest.approx((voltage * 50.0,) * 4)
+    assert status.analog_valid_mask == (0b1111 if valid else 0)
+    assert status.ps1_output_voltage == pytest.approx(3.0)
+    assert status.ps1_set_voltage == pytest.approx(5.0)
+
+
+def test_v11_decodes_reset_receipt_and_independent_faults_with_zero_code():
+    registers = _registers()
+    registers[1] = 0x0101
+    registers[2] = (1 << 6) | (1 << 7)
+    registers[4] = 0
+    registers[21:24] = [0xFFFF, 2, 6]
+    client = _client(_FakeTransport(registers))
+    client.connect()
+    snapshot = client.read_status().to_dict()
+    assert snapshot["ResetAckSeq"] == 0xFFFF
+    assert snapshot["ResetResult"] == 2
+    assert snapshot["FaultSourceFlags"] == 6
+    assert snapshot["FaultLatched"] is False
+    assert snapshot["PS1CommFault"] is True
+    assert snapshot["PS1DeviceFault"] is True
+    assert snapshot["PS1Fault"] is True
+    assert snapshot["FaultCode"] == 0
+
+
+def test_legacy_words_21_to_23_are_not_interpreted_as_v11_receipts():
+    registers = _registers()
+    registers[21:24] = [1234, 2, 7]
+    client = _client(_FakeTransport(registers))
+    client.connect()
+    snapshot = client.read_status().to_dict()
+    assert snapshot["ResetResultSupported"] is False
+    assert snapshot["ResetAckSeq"] is None
+    assert snapshot["ResetResult"] is None
+    assert snapshot["FaultSourceFlags"] == 0
+
+
+def test_persisted_v10_mapping_can_read_new_fixed_slots_without_config_mutation():
+    config = _protocol_config()
+    config["mapping"]["identity"]["protocol_version"] = 0x0100
+    for name in ("reset_ack_sequence", "reset_result", "fault_source_flags"):
+        config["mapping"]["status"]["registers"].pop(name)
+    registers = _registers()
+    registers[1] = 0x0101
+    registers[21:24] = [10, 2, 0]
+    client = ModbusTcpPlcClient(config, transport_factory=lambda *args, **kwargs: _FakeTransport(registers))
+    client.connect()
+    assert client.read_status().reset_ack_sequence == 10
+    assert "reset_ack_sequence" not in config["mapping"]["status"]["registers"]
+
+
+def test_unknown_protocol_version_is_rejected_before_commands():
+    registers = _registers()
+    registers[1] = 0x0102
+    transport = _FakeTransport(registers)
+    client = _client(transport)
+    with pytest.raises(PlcCommunicationError, match="unsupported PLC protocol version"):
+        client.connect()
+    assert transport.closed
+    assert transport.single_writes == transport.multi_writes == []
+
+
+@pytest.mark.parametrize("version", [0x0100, 0x0101])
+def test_legacy_100v_yaml_cannot_accept_measurements_beyond_confirmed_50v_range(version):
+    config = _protocol_config()
+    config["mapping"]["scaling"]["max_channel_voltage"] = 100.0
+    registers = _registers()
+    registers[1] = version
+    registers[12:16] = [50000, 50001, 60000, 65535]
+    client = ModbusTcpPlcClient(config, transport_factory=lambda *args, **kwargs: _FakeTransport(registers))
+    client.connect()
+    status = client.read_status()
+    assert status.voltage == pytest.approx((50.0, 50.001, 60.0, 65.535))
+    assert status.analog_valid_mask == 0b0001
+    assert config["mapping"]["scaling"]["max_channel_voltage"] == 100.0

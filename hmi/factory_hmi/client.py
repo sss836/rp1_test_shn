@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from copy import deepcopy
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -37,7 +39,7 @@ class GatewayError(RuntimeError):
             parts.append(f"HTTP {status_code}")
         if detail not in (None, ""):
             if isinstance(detail, (dict, list)):
-                rendered = json.dumps(detail, ensure_ascii=False, sort_keys=True)
+                rendered = str(detail["message"]) if isinstance(detail, Mapping) and detail.get("message") else json.dumps(detail, ensure_ascii=False, sort_keys=True)
             else:
                 rendered = str(detail)
             parts.append(f"gateway detail: {rendered}")
@@ -71,6 +73,9 @@ class GatewayClient:
         self.timeout = timeout
         self.client_id = (client_id or f"hmi-{uuid.uuid4()}").strip()
         self.operator_token = (operator_token or "").strip()
+        self._plc_lock = threading.RLock()
+        self._plc_snapshot: dict[str, Any] = {}
+        self._plc_retired_epochs: set[str] = set()
 
     @property
     def status_ws_url(self) -> str:
@@ -371,6 +376,7 @@ class GatewayClient:
         cycles: int,
         duration_hours: float | None,
         record: bool,
+        recording_scope: str | None = None,
         record_rate_hz: float = 20.0,
         test_id: str | None = None,
         robot_id: str | None = None,
@@ -401,6 +407,7 @@ class GatewayClient:
             "robot_id": robot_id,
         }
         optional = {
+            "recording_scope": recording_scope,
             "execution_uuid": execution_uuid,
             "campaign_id": campaign_id,
             "cycle_id": cycle_id,
@@ -525,61 +532,84 @@ class GatewayClient:
     def retry_execution(self, test_id: str) -> JsonValue:
         return self.post("/api/v1/executions/retry", {"test_id": test_id})
 
+    def _remember_plc_snapshot(self, payload: JsonValue) -> None:
+        value = payload
+        if isinstance(value, Mapping) and isinstance(value.get("result"), Mapping):
+            value = value["result"]
+        if not isinstance(value, Mapping) or not isinstance(value.get("coordination"), Mapping):
+            return
+        with self._plc_lock:
+            old = self._plc_snapshot.get("coordination", {})
+            new = value["coordination"]
+            epoch = str(new.get("epoch", ""))
+            if epoch in self._plc_retired_epochs:
+                return
+            if old.get("epoch") == epoch:
+                if new.get("snapshot_sequence", 0) < old.get("snapshot_sequence", 0):
+                    return
+            elif old.get("epoch"):
+                self._plc_retired_epochs.add(old["epoch"])
+            self._plc_snapshot = deepcopy(dict(value))
+
     def plc_snapshot(self) -> JsonValue:
-        return self.get("/api/v1/plc/snapshot")
+        result = self.get("/api/v1/plc/snapshot")
+        self._remember_plc_snapshot(result)
+        return result
 
-    def plc_connect(self, user: str) -> JsonValue:
-        return self.post("/api/v1/plc/connect", {"user": user})
-
-    def plc_disconnect(self) -> JsonValue:
-        return self.post("/api/v1/plc/disconnect", {})
-
-    def plc_start(
-        self,
-        channels: list[int],
-        user: str,
-        voltage: float,
-        current: float,
-    ) -> JsonValue:
-        return self.post(
-            "/api/v1/plc/start",
-            {
-                "channels": list(channels),
-                "voltage": float(voltage),
-                "current": float(current),
-                "user": user,
-            },
+    def _plc_post(self, operation: str, payload: Mapping[str, Any],
+                  context: Mapping[str, Any] | None = None) -> JsonValue:
+        if context is None:
+            with self._plc_lock:
+                context = dict(self._plc_snapshot.get("coordination", {}))
+            if not context and operation != "/api/v1/plc/all-stop":
+                self.plc_snapshot()
+                with self._plc_lock:
+                    context = dict(self._plc_snapshot.get("coordination", {}))
+        body = dict(payload)
+        body.update(
+            request_id=context.get("request_id") or str(uuid.uuid4()),
+            expected_epoch=context.get("epoch"),
+            expected_revision=context.get("revision"),
         )
+        try:
+            result = self.post(operation, body)
+        except GatewayError as exc:
+            if isinstance(exc.detail, Mapping):
+                self._remember_plc_snapshot(exc.detail.get("snapshot"))
+            # Never automatically refresh and re-send a conflicting command.
+            raise
+        self._remember_plc_snapshot(result)
+        return result
 
-    def plc_stop(self, user: str) -> JsonValue:
-        return self.post("/api/v1/plc/stop", {"user": user})
+    def plc_connect(self, user: str, *, context: Mapping[str, Any] | None = None) -> JsonValue:
+        return self._plc_post("/api/v1/plc/connect", {"user": user}, context)
 
-    def plc_all_stop(self, user: str) -> JsonValue:
-        return self.post("/api/v1/plc/all-stop", {"user": user})
+    def plc_disconnect(self, *, context: Mapping[str, Any] | None = None) -> JsonValue:
+        return self._plc_post("/api/v1/plc/disconnect", {}, context)
 
-    def plc_reset_fault(self, user: str) -> JsonValue:
-        return self.post("/api/v1/plc/reset-fault", {"user": user})
+    def plc_start(self, channels: list[int], user: str, voltage: float, current: float,
+                  *, context: Mapping[str, Any] | None = None) -> JsonValue:
+        return self._plc_post("/api/v1/plc/start", {
+            "channels": list(channels), "voltage": float(voltage),
+            "current": float(current), "user": user,
+        }, context)
 
-    def plc_set_channel(self, channel: int, enabled: bool, user: str) -> JsonValue:
-        return self.post(
-            f"/api/v1/plc/channels/{int(channel)}",
-            {"enabled": bool(enabled), "user": user},
-        )
+    def plc_stop(self, user: str, *, context: Mapping[str, Any] | None = None) -> JsonValue:
+        return self._plc_post("/api/v1/plc/stop", {"user": user}, context)
 
-    def plc_set_ps1_setpoints(
-        self,
-        voltage: float,
-        current: float,
-        user: str,
-    ) -> JsonValue:
-        return self.post(
-            "/api/v1/plc/setpoints",
-            {
-                "voltage": float(voltage),
-                "current": float(current),
-                "user": user,
-            },
-        )
+    def plc_all_stop(self, user: str, *, context: Mapping[str, Any] | None = None) -> JsonValue:
+        return self._plc_post("/api/v1/plc/all-stop", {"user": user}, context)
+
+    def plc_reset_fault(self, user: str, *, context: Mapping[str, Any] | None = None) -> JsonValue:
+        return self._plc_post("/api/v1/plc/reset-fault", {"user": user}, context)
+
+    def plc_set_channel(self, channel: int, enabled: bool, user: str,
+                        *, context: Mapping[str, Any] | None = None) -> JsonValue:
+        return self._plc_post(f"/api/v1/plc/channels/{int(channel)}", {"enabled": bool(enabled), "user": user}, context)
+
+    def plc_set_ps1_setpoints(self, voltage: float, current: float, user: str,
+                              *, context: Mapping[str, Any] | None = None) -> JsonValue:
+        return self._plc_post("/api/v1/plc/setpoints", {"voltage": float(voltage), "current": float(current), "user": user}, context)
 
     def zero_prepare(self, motor_index: int) -> JsonValue:
         return self.post("/api/v1/zero/prepare", {"motor_index": motor_index})

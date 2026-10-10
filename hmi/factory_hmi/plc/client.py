@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import replace
 from typing import Any
 
-from .models import PlcCommand, PlcStatus
+from .models import FaultSource, PlcCommand, PlcStatus, PROTOCOL_V10, PROTOCOL_V11, ResetResult
 
 
 class PlcCommunicationError(RuntimeError):
@@ -89,6 +89,8 @@ class MockPlcClient(PlcClient):
         self.last_command = PlcCommand()
         self.command_history: list[PlcCommand] = []
         self._status = PlcStatus(
+            protocol_magic=0x4C46,
+            protocol_version=PROTOCOL_V11,
             plc_ready=True,
             host_connected=True,
             ps1_comm_ok=True,
@@ -160,8 +162,21 @@ class MockPlcClient(PlcClient):
             fault_latched = self._status.fault_latched
             fault_code = self._status.fault_code
             if command.reset_fault_pulse:
-                fault_latched = False
-                fault_code = 0
+                safe = not command.main_enable and not any(command.channel_enable)
+                safe = safe and self._status.main_contactor_fb is not True
+                if safe:
+                    fault_latched = False
+                    fault_code = 0
+                    reset_result = ResetResult.SUCCEEDED
+                else:
+                    reset_result = ResetResult.REJECTED_NOT_SAFE
+                self._status = replace(
+                    self._status,
+                    reset_ack_sequence=command.command_sequence & 0xFFFF,
+                    reset_result=reset_result,
+                    fault_source_flags=(self._status.fault_source_flags & ~int(FaultSource.PLC_LATCHED)
+                                        if safe else self._status.fault_source_flags),
+                )
             set_voltage = self._status.ps1_set_voltage
             set_current = self._status.ps1_set_current
             setpoint_applied = self._status.setpoint_applied
@@ -316,7 +331,11 @@ class ModbusTcpPlcClient(PlcClient):
         mapping = _required_mapping(self.config, "mapping")
         self._identity = _required_mapping(mapping, "identity")
         self._status_map = _required_mapping(mapping, "status")
-        self._status_registers = _required_mapping(self._status_map, "registers")
+        self._status_registers = dict(_required_mapping(self._status_map, "registers"))
+        # Persisted V1.0 YAMLs already read the full 0..27 window. These fixed
+        # V1.1 slots can be decoded without rewriting a user's config file.
+        for name, address in (("reset_ack_sequence", 21), ("reset_result", 22), ("fault_source_flags", 23)):
+            self._status_registers.setdefault(name, address)
         self._status_bits = _required_mapping(self._status_map, "bits")
         self._command_map = _required_mapping(mapping, "command")
         self._command_registers = _required_mapping(self._command_map, "registers")
@@ -503,6 +522,9 @@ class ModbusTcpPlcClient(PlcClient):
             "heartbeat_echo",
             "host_server_status",
             "host_server_events",
+            "reset_ack_sequence",
+            "reset_result",
+            "fault_source_flags",
         }
         for name in required_status_registers:
             address = _required_int(self._status_registers, name, maximum=63)
@@ -577,10 +599,15 @@ class ModbusTcpPlcClient(PlcClient):
 
     def _decode_status(self, registers: list[int]) -> PlcStatus:
         status_flags = self._register(registers, "status_flags")
+        version = self._register(registers, "protocol_version")
+        v11 = version == PROTOCOL_V11
+        fault_sources = self._register(registers, "fault_source_flags") if v11 else 0
         channel_flags = self._register(registers, "channel_flags")
         accepted_flags = self._register(registers, "accepted_command_flags")
         voltage_scale = _required_float(self._scaling, "voltage_units_per_count")
         current_scale = _required_float(self._scaling, "current_units_per_count")
+        # V1.0 and V1.1 both use 1 mV/count for VS1..VS4 (0..50 V).
+        # V1.1 adds reset receipts and fault sources without changing units.
         voltage = tuple(
             self._register_offset(registers, "voltage_start", index) * voltage_scale
             for index in range(4)
@@ -607,8 +634,8 @@ class ModbusTcpPlcClient(PlcClient):
             self._bit(accepted_flags, self._command_bit("ps1_output_enable"))
             and not all_stop
         )
-        ps1_comm_fault = self._status_bit(status_flags, "ps1_comm_fault")
-        ps1_device_fault = self._status_bit(status_flags, "ps1_device_fault")
+        ps1_comm_fault = self._status_bit(status_flags, "ps1_comm_fault") or bool(fault_sources & FaultSource.PS1_COMM)
+        ps1_device_fault = self._status_bit(status_flags, "ps1_device_fault") or bool(fault_sources & FaultSource.PS1_DEVICE)
         return PlcStatus(
             plc_ready=self._status_bit(status_flags, "plc_ready"),
             host_connected=self._status_bit(status_flags, "host_connected"),
@@ -622,7 +649,9 @@ class ModbusTcpPlcClient(PlcClient):
                 self._status_bit(status_flags, "ps1_comm_ready") and not ps1_comm_fault
             ),
             ps1_fault=ps1_comm_fault or ps1_device_fault,
-            fault_latched=self._status_bit(status_flags, "fault_latched"),
+            ps1_comm_fault=ps1_comm_fault,
+            ps1_device_fault=ps1_device_fault,
+            fault_latched=self._status_bit(status_flags, "fault_latched") or bool(fault_sources & FaultSource.PLC_LATCHED),
             fault_code=self._register(registers, "fault_code"),
             voltage=voltage,  # type: ignore[arg-type]
             current=current,  # type: ignore[arg-type]
@@ -633,7 +662,11 @@ class ModbusTcpPlcClient(PlcClient):
             heartbeat_echo=self._register(registers, "heartbeat_echo"),
             accepted_command_flags=accepted_flags,
             protocol_magic=self._register(registers, "magic"),
-            protocol_version=self._register(registers, "protocol_version"),
+            protocol_version=version,
+            status_flags=status_flags,
+            reset_ack_sequence=self._register(registers, "reset_ack_sequence") if v11 else 0,
+            reset_result=self._register(registers, "reset_result") if v11 else ResetResult.IDLE,
+            fault_source_flags=fault_sources,
             ps1_mb_status=self._register(registers, "ps1_mb_status"),
             ps1_device_status=self._register(registers, "ps1_device_status"),
             ps1_manager_state=self._register(registers, "ps1_manager_state"),
@@ -672,7 +705,9 @@ class ModbusTcpPlcClient(PlcClient):
             # are rejected per channel.  The mapping table keeps the missing
             # PLC validity mask as an explicit TODO.
             mask = 0x0F
-        max_voltage = _required_float(self._scaling, "max_channel_voltage")
+        # Older user YAML may still say 100 V. The confirmed VS transducers
+        # measure 0..50 V; preserve stricter user limits, never widen this range.
+        max_voltage = min(50.0, _required_float(self._scaling, "max_channel_voltage"))
         max_current = _required_float(self._scaling, "max_channel_current")
         for index, (value_v, value_a) in enumerate(zip(voltage, current, strict=True)):
             if not 0.0 <= value_v <= max_voltage or not 0.0 <= value_a <= max_current:
@@ -770,11 +805,10 @@ class ModbusTcpPlcClient(PlcClient):
                 f"expected 0x{expected_magic:04X}"
             )
         version = self._register(registers, "protocol_version")
-        expected_version = _required_int(self._identity, "protocol_version")
-        if version != expected_version:
+        if version not in {PROTOCOL_V10, PROTOCOL_V11}:
             raise PlcCommunicationError(
                 f"unsupported PLC protocol version: got 0x{version:04X}, "
-                f"expected 0x{expected_version:04X}"
+                "supported 0x0100 (V1.0) and 0x0101 (V1.1)"
             )
 
     def _update_setpoint_cache(self, registers: list[int]) -> None:

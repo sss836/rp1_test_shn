@@ -8,10 +8,32 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from enum import Enum
+from enum import Enum, IntEnum, IntFlag
 from typing import Any
 
 CHANNEL_COUNT = 4
+PROTOCOL_V10 = 0x0100
+PROTOCOL_V11 = 0x0101
+
+
+class ResetResult(IntEnum):
+    IDLE = 0
+    PENDING = 1
+    SUCCEEDED = 2
+    REJECTED_NOT_SAFE = 3
+    FAILED_STILL_LATCHED = 4
+
+
+class FaultSource(IntFlag):
+    PLC_LATCHED = 1
+    PS1_COMM = 2
+    PS1_DEVICE = 4
+    HOST_SERVER = 8
+
+
+def sequence_reached(reported: int, requested: int) -> bool:
+    """Compare 16-bit transaction numbers, including 65535 -> 0 wrap."""
+    return ((reported - requested) & 0xFFFF) < 0x8000
 
 
 class CabinetPhase(str, Enum):
@@ -38,6 +60,7 @@ class CabinetPhase(str, Enum):
     WAIT_PS1_OFF = "WAIT_PS1_OFF"
     STOP_MAIN_ACK = "STOP_MAIN_ACK"
     WAIT_MAIN_OFF = "WAIT_MAIN_OFF"
+    WAIT_RESET_RESULT = "WAIT_RESET_RESULT"
     FAULT = "FAULT"
     COMM_LOST = "COMM_LOST"
     STALE = "STALE"
@@ -48,6 +71,7 @@ class FeedbackState(str, Enum):
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
     TIMEOUT = "timeout"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -94,6 +118,8 @@ class PlcStatus:
     ps1_actual_output: bool = False
     ps1_comm_ok: bool = False
     ps1_fault: bool = False
+    ps1_comm_fault: bool = False
+    ps1_device_fault: bool = False
     fault_latched: bool = False
     fault_code: int = 0
     voltage: tuple[float, float, float, float] = (0.0,) * CHANNEL_COUNT
@@ -106,6 +132,10 @@ class PlcStatus:
     accepted_command_flags: int = 0
     protocol_magic: int = 0
     protocol_version: int = 0
+    status_flags: int = 0
+    reset_ack_sequence: int = 0
+    reset_result: int = ResetResult.IDLE
+    fault_source_flags: int = 0
     ps1_mb_status: int = 0
     ps1_device_status: int = 0
     ps1_manager_state: int = 0
@@ -119,6 +149,23 @@ class PlcStatus:
     host_server_status: int = 0
     host_server_events: int = 0
     received_monotonic: float = 0.0
+
+    @property
+    def reset_results_supported(self) -> bool:
+        return self.protocol_version == PROTOCOL_V11
+
+    @property
+    def effective_fault_source_flags(self) -> int:
+        # Keep StatusFlags as a conservative fallback during an inconsistent
+        # PLC publication or when decoding V1.0, which has no source word.
+        return (self.fault_source_flags
+                | (int(FaultSource.PLC_LATCHED) if self.fault_latched else 0)
+                | (int(FaultSource.PS1_COMM) if self.ps1_comm_fault else 0)
+                | (int(FaultSource.PS1_DEVICE) if self.ps1_device_fault else 0))
+
+    @property
+    def has_fault(self) -> bool:
+        return bool(self.effective_fault_source_flags & 0x0F or self.ps1_fault)
 
     def to_dict(self, *, stale: bool = False) -> dict[str, Any]:
         # A stale analog sample must not look like a valid live value.
@@ -152,7 +199,9 @@ class PlcStatus:
             "PS1Request": self.ps1_request,
             "PS1ActualOutput": self.ps1_actual_output,
             "PS1CommOK": self.ps1_comm_ok,
-            "PS1Fault": self.ps1_fault,
+            "PS1Fault": bool(self.ps1_fault or self.effective_fault_source_flags & (FaultSource.PS1_COMM | FaultSource.PS1_DEVICE)),
+            "PS1CommFault": self.ps1_comm_fault,
+            "PS1DeviceFault": self.ps1_device_fault,
             "FaultLatched": self.fault_latched,
             "FaultCode": self.fault_code,
             "Voltage": analog,
@@ -165,6 +214,13 @@ class PlcStatus:
             "AcceptedCommandFlags": self.accepted_command_flags,
             "ProtocolMagic": self.protocol_magic,
             "ProtocolVersion": self.protocol_version,
+            "StatusFlags": self.status_flags,
+            "ResetAckSeq": self.reset_ack_sequence if self.reset_results_supported else None,
+            "ResetResult": int(self.reset_result) if self.reset_results_supported else None,
+            "ResetResultSupported": self.reset_results_supported,
+            "FaultSourceFlags": self.effective_fault_source_flags,
+            "RawFaultSourceFlags": self.fault_source_flags if self.reset_results_supported else None,
+            "ProtocolMode": "V1.1" if self.reset_results_supported else "旧协议/无复位结果回执",
             "PS1MbStatus": self.ps1_mb_status,
             "PS1DeviceStatus": self.ps1_device_status,
             "PS1ManagerState": self.ps1_manager_state,

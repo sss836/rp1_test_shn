@@ -30,11 +30,12 @@ from factory_hmi.desktop.plc_page import PlcCabinetPage
 class FakeClient:
     def __init__(self):
         self.calls = []
+        self.client_id = "offline-input"
 
     def plc_snapshot(self):
         return {}
 
-    def plc_start(self, channels, user, voltage, current):
+    def plc_start(self, channels, user, voltage, current, *, context=None):
         self.calls.append((channels, user, voltage, current))
         return {}
 

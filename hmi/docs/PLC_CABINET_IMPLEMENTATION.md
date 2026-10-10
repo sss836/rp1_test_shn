@@ -66,7 +66,7 @@ KM0 不参与 PS1 日常频繁启停。紧急的 AllStop 可以覆盖尚在等�
 - 每个控制事务递增 CommandSequence；适配器支持 16 bit 序号回卷；按钮保持 pending，直到 AcknowledgedSequence
   确认，随后显示 confirmed、rejected 或 timeout。
 - 超过 STALE 时限后，电压、电流和功率返回 null，AnalogValidMask 返回 0，启动命令被拒绝。
-- 单路模拟量无效时，该路三项测量显示 INVALID，不会沿用最后正常值。V1.0 暂无 PLC 有效位，只能使用新鲜读取与 0–100 V/0–50 A 范围判定，映射表保留高优先级 TODO。
+- 单路模拟量无效时，该路三项测量显示 INVALID，不会沿用最后正常值。V1.0 暂无 PLC 有效位，只能使用新鲜读取与 0–50 V/0–50 A 范围判定，映射表保留高优先级 TODO。
 - 通信中断进入 COMM_LOST，停止发送启动操作；重连后强制全部请求为关闭，必须由操作员重新启动。
 - ResetFaultPulse 仅执行一次 TRUE 写入，保留命令镜像与后续心跳立即恢复 FALSE。
 - 操作日志保存 UTC 时间、用户、字段、旧值、新值、命令序号、确认结果和详情，并写入
@@ -115,13 +115,12 @@ campaign/cycle/segment/asset/configuration/test-case-version/station UUID。
 
 优化方案：按 [PLC_INTERFACE_MAPPING.md](PLC_INTERFACE_MAPPING.md) 的 V1.1 补充表增加独立位；在此之前 UI 对缺失状态显示 INVALID，不使用其他状态伪造确认。
 
-【风险等级：高】
+【已确认的 VS 量程与编码】
 
-问题描述：V1.0 将支路电压定义为单个 UINT16 mV，数学上限为 65.535 V，但现场变送器量程为 0–100 V。
-
-影响：如果需要采集 65.535 V 以上的值，V1.0 无法无损表示；上位机无法从现有字段恢复真实值。
-
-优化方案：PLC V1.1 将支路电压改为 UINT16 0.01 V/LSB 或 UINT32 mV，并同步协议版本；在冻结前上位机仍严格按 V1.0 的 mV 规则解码，不自行猜测缩放。
+VS1～VS4 实测电压为 0–50 V，对应变送器输出 0–10 V。V1.0 与 V1.1 的
+HR12～15 均为 UINT16 mV，50000=50.000 V，可完整表示实际量程；不需要改成 10 mV 编码。
+超出 50 V 的工程值标记无效。V1.1 只扩展 HR21～23 的复位结果和故障来源，
+详细约定见 [HOST_MODBUS_TCP_PROTOCOL_V1.1.md](HOST_MODBUS_TCP_PROTOCOL_V1.1.md)。
 
 【风险等级：高】
 

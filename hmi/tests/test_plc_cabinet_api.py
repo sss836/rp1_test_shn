@@ -7,12 +7,20 @@ from fastapi.testclient import TestClient
 
 from factory_hmi.gateway.app import create_app
 
+def _post(client, path, payload):
+    import uuid
+    ctx = client.get("/api/v1/plc/snapshot").json()["coordination"]
+    return client.post(path, headers={"X-RP1-Client-ID": "test-window"}, json=dict(
+        payload, request_id=str(uuid.uuid4()), expected_epoch=ctx["epoch"], expected_revision=ctx["revision"],
+    ))
+
+
 
 def test_ps1_setpoint_api_waits_for_mock_plc_confirmation(tmp_path: Path) -> None:
     with TestClient(create_app(data_root=tmp_path)) as client:
-        response = client.post(
+        response = _post(client,
             "/api/v1/plc/setpoints",
-            json={"voltage": 24.0, "current": 8.0, "user": "tester"},
+            {"voltage": 24.0, "current": 8.0, "user": "tester"},
         )
         assert response.status_code == 200
         snapshot = response.json()["result"]
@@ -32,24 +40,23 @@ def test_ps1_setpoint_api_waits_for_mock_plc_confirmation(tmp_path: Path) -> Non
 
 def test_ps1_setpoint_api_rejects_configured_range_violation(tmp_path: Path) -> None:
     with TestClient(create_app(data_root=tmp_path)) as client:
-        response = client.post(
+        response = _post(client,
             "/api/v1/plc/setpoints",
-            json={"voltage": 80.0, "current": 8.0, "user": "tester"},
+            {"voltage": 80.0, "current": 8.0, "user": "tester"},
         )
 
-        assert response.status_code == 200
-        feedback = response.json()["result"]["feedback"]["Setpoints"]
-        assert feedback["state"] == "rejected"
-        assert "voltage" in feedback["detail"]
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "rejected"
+        assert "voltage" in response.json()["detail"]["message"]
 
 
 def test_start_api_allows_power_sequence_without_selected_channels(
     tmp_path: Path,
 ) -> None:
     with TestClient(create_app(data_root=tmp_path)) as client:
-        response = client.post(
+        response = _post(client,
             "/api/v1/plc/start",
-            json={
+            {
                 "channels": [],
                 "voltage": 3.0,
                 "current": 0.5,

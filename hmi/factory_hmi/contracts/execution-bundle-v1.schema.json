@@ -14,6 +14,11 @@
     "schema_version": {"const": "1.0"},
     "execution_uuid": {"type": "string", "format": "uuid"},
     "test_id": {"type": "string", "minLength": 1, "maxLength": 255},
+    "recording_scope": {
+      "type": "string",
+      "enum": ["local", "platform"],
+      "description": "Local records cannot enter the upload/review outbox."
+    },
     "campaign_id": {"type": ["string", "null"], "maxLength": 255},
     "cycle_id": {"type": "string", "maxLength": 255, "default": ""},
     "segment_id": {"type": "string", "maxLength": 255, "default": ""},

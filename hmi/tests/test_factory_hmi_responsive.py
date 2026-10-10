@@ -39,6 +39,21 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.window.deleteLater()
 
+    def test_default_return_failure_replaces_the_moving_notice(self) -> None:
+        from factory_hmi.client import GatewayHTTPError
+
+        self.window.preflight_result.setText("正在低速回默认位")
+        with mock.patch.object(self.window, "_run_rest"), mock.patch(
+            "factory_hmi.desktop.app.QMessageBox.critical"
+        ):
+            self.window._rest_failed(
+                "回默认位",
+                GatewayHTTPError("failed", status_code=409, detail="return to default feedback error: id=3:error_id=7"),
+                False,
+            )
+        self.assertIn("未完成", self.window.preflight_result.text())
+        self.assertNotIn("正在", self.window.preflight_result.text())
+
     def test_logged_in_operator_can_start_local_test_without_upload_profile(self) -> None:
         self.window._platform_operator = "qa-operator"
         self.window.robot_id.setText("RP1.3-UPPER-01")
@@ -49,6 +64,28 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
             run.call_args.args[1]()
             self.assertIsNone(start.call_args.kwargs["campaign_id"])
             self.assertEqual(start.call_args.kwargs["operator_id"], "qa-operator")
+            self.assertEqual(start.call_args.kwargs["recording_scope"], "local")
+            self.assertIsNone(start.call_args.kwargs["bench_id"])
+
+    def test_selected_platform_profile_passes_its_bench_code_to_start(self) -> None:
+        self.window.robot_id.setText("RP1.3-UPPER-01")
+        self.window.platform_test_profile.addItem("Ready", {"ready": True, "bench_id": "MP-02"})
+        self.window.platform_test_profile.setCurrentIndex(1)
+        with mock.patch.object(self.window, "_run_rest") as run, mock.patch.object(self.window.client, "playback_start") as start:
+            self.window._start_playback()
+            run.call_args.args[1]()
+            self.assertEqual(start.call_args.kwargs["recording_scope"], "platform")
+            self.assertEqual(start.call_args.kwargs["bench_id"], "MP-02")
+
+    def test_incomplete_selected_profile_blocks_even_without_platform_login(self) -> None:
+        self.window._platform_operator = ""
+        self.window.robot_id.setText("local-arm")
+        self.window.platform_test_profile.addItem("Incomplete", {"ready": False, "missing": ["campaign_id"]})
+        self.window.platform_test_profile.setCurrentIndex(1)
+        with mock.patch.object(self.window, "_run_rest") as run, mock.patch("factory_hmi.desktop.app.QMessageBox.warning") as warning:
+            self.window._start_playback()
+            run.assert_not_called()
+            warning.assert_called_once()
 
     def test_incomplete_selected_upload_profile_still_blocks_start(self) -> None:
         self.window._platform_operator = "qa-operator"

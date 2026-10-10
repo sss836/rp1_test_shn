@@ -79,6 +79,7 @@ class PlaybackStartRequest(BaseModel):
     cycles: int = Field(default=0, ge=0)
     duration_hours: float | None = Field(default=None, gt=0.0)
     record: bool = True
+    recording_scope: Literal["local", "platform"] | None = None
     record_rate_hz: float = Field(default=20.0, ge=1.0, le=20.0)
     test_id: str | None = None
     robot_id: str | None = None
@@ -169,6 +170,9 @@ class ExecutionActionRequest(BaseModel):
 
 
 class PlcOperatorRequest(BaseModel):
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    expected_epoch: str | None = Field(default=None, min_length=1, max_length=128)
+    expected_revision: int | None = Field(default=None, ge=0)
     user: str = Field(default="local-operator", min_length=1, max_length=128)
 
     @field_validator("user")

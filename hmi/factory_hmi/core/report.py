@@ -1011,6 +1011,7 @@ class ReportManager:
                     "execution_uuid": manifest["execution_uuid"],
                     "test_id": manifest["test_id"],
                     "sample_id": manifest["sample_id"],
+                    "recording_scope": manifest.get("recording_scope", "platform"),
                     "station_id": manifest.get("station_id", ""),
                     "operator_id": manifest.get("operator_id", ""),
                     "started_at": manifest["started_at"],
@@ -1039,7 +1040,9 @@ class ReportManager:
             value.get("sample_id") or value.get("robot_id") or "unknown"
         )
         value["bench_id"] = str(
-            value.get("bench_id") or value.get("station_id") or "unknown"
+            value.get("bench_id")
+            or (value.get("station_id") if value.get("recording_scope") != "local" else None)
+            or "unknown"
         )
         value["started_at"] = _utc_iso(value.get("started_at"))
         value["ended_at"] = _utc_iso(
@@ -1062,6 +1065,7 @@ class ReportManager:
         allowed = {
             "execution_uuid",
             "test_id",
+            "recording_scope",
             "campaign_id",
             "cycle_id",
             "segment_id",
@@ -1158,6 +1162,8 @@ class ReportManager:
                 ),
             },
         }
+        if "recording_scope" in context:
+            identity["recording_scope"] = str(context["recording_scope"])
         return identity
 
 

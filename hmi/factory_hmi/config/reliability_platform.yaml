@@ -16,6 +16,7 @@ profiles: []
 #     configuration_id: null      # TODO: test.configuration_snapshot public UUID
 #     test_case_version_id: null  # TODO: catalog.test_case_version public UUID
 #     station_id: null            # TODO: test.station public UUID
+#     bench_id: null              # TODO: actual bench code, e.g. RD-01 / MP-01
 #     stage_code: AGING
 #     stage_name: 老化运行
 #     subject_map:                # HMI joint name -> catalog subject code

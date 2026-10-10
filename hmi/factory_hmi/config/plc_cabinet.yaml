@@ -1,7 +1,9 @@
 # PLC cabinet communication configuration.
 #
-# The Linux<->PLC Modbus TCP V1.0 window below is frozen by
-# HOST_MODBUS_TCP_PROTOCOL_V1.0.md.  The S7 direct mapping and three logical
+# The Linux<->PLC Modbus TCP V1.1 window is defined by
+# HOST_MODBUS_TCP_PROTOCOL_V1.1.md; V1.0 connections remain compatible, with
+# reset disabled because they do not expose a final reset-result receipt.
+# The S7 direct mapping and three logical
 # feedback fields explicitly called out below remain TODO. This workstation
 # profile uses the confirmed real PLC. Use launch.py --offline-check for tests.
 
@@ -82,7 +84,7 @@ modbus_tcp:
     # Each word is unsigned 16-bit and transferred in Modbus big-endian order.
     identity:
       magic: 0x4C46
-      protocol_version: 0x0100
+      protocol_version: 0x0101
       control_key: 0x835A
     status:
       start_address: 0
@@ -103,6 +105,9 @@ modbus_tcp:
         voltage_start: 12
         current_start: 16
         accepted_command_flags: 20
+        reset_ack_sequence: 21
+        reset_result: 22
+        fault_source_flags: 23
         acknowledged_sequence: 24
         heartbeat_echo: 25
         host_server_status: 26
@@ -142,10 +147,10 @@ modbus_tcp:
     scaling:
       voltage_units_per_count: 0.001
       current_units_per_count: 0.001
-      # TODO(PLC-V1-GAP): UINT16 mV can represent only 0..65.535 V, while the
-      # field transducer requirement is 0..100 V. Keep V1.0 decoding exact;
-      # PLC V1.1 must change scaling or width before values above 65.535 V.
-      max_channel_voltage: 100.0
+      # VS1..VS4 measure 0..50 V with 0..10 V transducer outputs.
+      # HR12..15 remains 1 mV/count in both V1.0 and V1.1: 50000 = 50.000 V.
+      # PS1 voltage/output/setpoint also remains 1 mV/count.
+      max_channel_voltage: 50.0
       max_channel_current: 50.0
     compatibility:
       # Protocol V1.0 exposes MainReady but not the independent I0.1/KM0 bit.

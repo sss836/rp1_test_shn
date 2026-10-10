@@ -97,6 +97,8 @@ class FactoryController:
         self._position_hold_stop = threading.Event()
         self._position_hold_thread: threading.Thread | None = None
         self._position_hold_target: np.ndarray | None = None
+        self._default_return_active = threading.Event()
+        self._default_return_stop = threading.Event()
 
     @property
     def state(self) -> StationState:
@@ -459,6 +461,9 @@ class FactoryController:
                 raise InvalidStateTransition(
                     f"reset is not allowed from {state.value}"
                 )
+            self._default_return_stop.clear()
+            if to_default:
+                self._default_return_active.set()
             try:
                 recovery_required = (
                     state is StationState.FAULT
@@ -495,24 +500,47 @@ class FactoryController:
                     target = motor_default_positions(
                         self.config.raw, self.config.limb
                     )
-                    duration_s = 1.0
-                    steps = max(2, int(self.config.control_rate_hz * duration_s))
                     next_tick = time.monotonic()
-                    for step in range(steps):
-                        x = float(step + 1) / float(steps)
-                        blend = x * x * (3.0 - 2.0 * x)
-                        self.backend.command_mit(
-                            current + (target - current) * blend
-                        )
-                        next_tick += 1.0 / float(self.config.control_rate_hz)
-                        delay = next_tick - time.monotonic()
-                        if delay > 0.0:
-                            time.sleep(delay)
+                    last_feedback_at = float("-inf")
+                    # Match the script's KP schedule; KD stays at its normal
+                    # value. Keep a smooth approach during the half-KP stage.
+                    for duration_s, kp_scale in ((1.0, 0.5), (2.0, 1.0)):
+                        steps = max(2, round(self.config.control_rate_hz * duration_s))
+                        for step in range(steps):
+                            if self._default_return_stop.is_set():
+                                raise FactoryControllerError(
+                                    "return to default interrupted by stop request"
+                                )
+                            now = time.monotonic()
+                            if now - last_feedback_at >= 0.05:
+                                samples = self.backend.read_samples()
+                                self._last_samples = samples
+                                self._check_default_return_feedback(samples)
+                                last_feedback_at = now
+                            if kp_scale == 0.5:
+                                x = float(step + 1) / float(steps)
+                                blend = x * x * (3.0 - 2.0 * x)
+                                command = current + (target - current) * blend
+                            else:
+                                command = target
+                            self.backend.command_mit(command, kp_scale=kp_scale)
+                            next_tick += duration_s / steps
+                            delay = next_tick - time.monotonic()
+                            if delay > 0.0:
+                                time.sleep(delay)
                     hold_target = target.copy()
                 self._last_samples = self.backend.read_samples()
+                if to_default:
+                    if self._default_return_stop.is_set():
+                        raise FactoryControllerError(
+                            "return to default interrupted by stop request"
+                        )
+                    self._check_default_return_feedback(self._last_samples)
             except Exception as exc:
-                self._set_fault(exc)
+                self._set_fault(exc, samples=self._last_samples)
                 raise
+            finally:
+                self._default_return_active.clear()
             if state is not StationState.CONNECTED:
                 self.state_machine.transition(
                     StationState.CONNECTED, expected=state
@@ -528,7 +556,35 @@ class FactoryController:
                 self._set_fault(exc, samples=self._last_samples)
             raise
 
+    def request_motion_stop(self) -> bool:
+        """Signal a return-to-default cancellation without waiting for its lock.
+
+        This only cancels an existing return. It never enables, clears errors,
+        or starts motion; the caller still executes its normal disable command.
+        """
+        if not self._default_return_active.is_set():
+            return False
+        self._default_return_stop.set()
+        return True
+
+    def _check_default_return_feedback(self, samples: list[MotorSample]) -> None:
+        for sample in samples:
+            if sample.error_id != 0:
+                raise FactoryControllerError(
+                    f"return to default feedback error: id={sample.motor_id}:"
+                    f"error_id={sample.error_id}"
+                )
+            if not np.isfinite(sample.pos_rad):
+                raise FactoryControllerError(
+                    f"return to default has non-finite feedback: id={sample.motor_id}"
+                )
+            if sample.feedback_age_s >= self._diagnosis.thresholds.stale_seconds:
+                raise FactoryControllerError(
+                    f"return to default feedback stale: id={sample.motor_id}"
+                )
+
     def disconnect(self) -> None:
+        self.request_motion_stop()
         self._stop_manual_session()
         with self._lock:
             state = self.state_machine.state
@@ -576,6 +632,7 @@ class FactoryController:
     def disable_motors(self, *, reason: str = "software disable") -> None:
         """Immediately remove motor torque without closing the transport."""
 
+        self.request_motion_stop()
         self._stop_manual_session()
         self._stop_position_hold()
         with self._lock:

@@ -31,7 +31,7 @@ if os.environ.get("RP1_LOCAL_VERIFY_BOOTSTRAPPED") != "1":
     os.execve(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env)
 
 from PySide6.QtWidgets import QApplication
-from factory_hmi.client import GatewayClient
+from factory_hmi.client import GatewayClient, GatewayHTTPError
 from factory_hmi.core.can_manager import HelperExecutionError, PkexecHelperClient
 from factory_hmi.desktop.plc_page import PlcCabinetPage
 from factory_hmi.plc.client import MockPlcClient, ModbusTcpPlcClient, PlcCommunicationError
@@ -205,19 +205,28 @@ class ControlTests(unittest.TestCase):
                         self.assertEqual(status, 404)
                         status, _ = request('/api/v1/config/preview', {'config_path': '../../../../etc/passwd', 'limb': 'left_arm'})
                         self.assertNotEqual(status, 200)
-                        status, response = request('/api/v1/plc/start', {'channels': [1], 'voltage': 3.0, 'current': .5, 'user': 'offline'})
+                        client = GatewayClient(url, client_id='offline-verification')
+                        client.plc_snapshot()
                         if mode == 'monitor':
-                            self.assertEqual(status, 403, response)
+                            with self.assertRaises(GatewayHTTPError) as rejected:
+                                client.plc_start([1], 'offline', 3.0, .5)
+                            self.assertEqual(rejected.exception.status_code, 403)
                         else:
-                            self.assertEqual(status, 200, response)
+                            # Old callers must not bypass the shared command context.
+                            status, response = request('/api/v1/plc/start', {'channels': [1], 'voltage': 3.0, 'current': .5, 'user': 'offline'})
+                            self.assertEqual(status, 409, response)
+                            client.plc_snapshot()
+                            response = client.plc_start([1], 'offline', 3.0, .5)
+                            self.assertTrue(response['ok'], response)
                             for _ in range(50):
                                 _, snapshot = request('/api/v1/plc/snapshot')
                                 if snapshot['phase'] == 'RUNNING':
                                     break
                                 time.sleep(.1)
                             self.assertEqual(snapshot['phase'], 'RUNNING', snapshot)
-                            status, _ = request('/api/v1/plc/stop', {'user': 'offline'})
-                            self.assertEqual(status, 200)
+                            client.plc_snapshot()
+                            response = client.plc_stop('offline')
+                            self.assertTrue(response['ok'], response)
                     finally:
                         process.terminate()
                         process.wait(timeout=12)

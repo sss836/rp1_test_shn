@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
+import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -25,8 +27,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from factory_hmi.client import GatewayClient
+from factory_hmi.client import GatewayClient, GatewayError
 from factory_hmi.desktop.theme import set_tone
+from factory_hmi.plc.faults import cabinet_fault_messages
 
 
 def _text(value: Any) -> str:
@@ -61,55 +64,116 @@ class _TrendChart(QWidget):
         self.key = key
         self.unit = unit
         self.maximum = maximum
+        self.minimum_span = 0.2 if unit == "A" else 1.0
+        self.axis_range = (0.0, maximum)
+        self._has_valid_samples = False
         self.samples: list[Mapping[str, Any]] = []
+        self.channel_checks: list[QCheckBox] = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(64, 0, 16, 2)
+        layout.addStretch(1)
+        legend = QHBoxLayout()
+        for channel, color in enumerate(self.COLORS):
+            check = QCheckBox(f"CH{channel + 1}")
+            check.setChecked(True)
+            check.setStyleSheet(f"color: {color.name()};")
+            check.setToolTip("勾选显示此通道；纵轴按显示通道的有效数据自动缩放")
+            check.toggled.connect(self._channels_changed)
+            self.channel_checks.append(check)
+            legend.addWidget(check)
+        legend.addStretch(1)
+        layout.addLayout(legend)
         self.setMinimumHeight(190)
 
     def set_samples(self, samples: list[Mapping[str, Any]]) -> None:
         self.samples = samples[-300:]
+        self._update_range()
         self.update()
+
+    def _channels_changed(self, _checked: bool) -> None:
+        self._update_range(force=True)
+        self.update()
+
+    def _sample_value(self, sample: Mapping[str, Any], channel: int) -> float | None:
+        try:
+            if not int(sample.get("AnalogValidMask") or 0) & (1 << channel):
+                return None
+            values = sample.get(self.key)
+            if not isinstance(values, (list, tuple)):
+                return None
+            value = float(values[channel])
+        except (IndexError, TypeError, ValueError, OverflowError):
+            return None
+        return value if math.isfinite(value) and 0.0 <= value <= self.maximum else None
+
+    def _update_range(self, *, force: bool = False) -> None:
+        values = [
+            value
+            for sample in self.samples
+            for channel, check in enumerate(self.channel_checks)
+            if check.isChecked()
+            if (value := self._sample_value(sample, channel)) is not None
+        ]
+        self._has_valid_samples = bool(values)
+        if not values:
+            self.axis_range = (0.0, self.maximum)
+            return
+        low, high = min(values), max(values)
+        span = max(self.minimum_span, (high - low) * 1.2)
+        middle = (low + high) / 2
+        lower = max(0.0, min(middle - span / 2, self.maximum - span))
+        upper = min(self.maximum, lower + span)
+        # Rounded ticks with headroom, without forcing the axis to start at zero.
+        raw_step = (upper - lower) / 4
+        magnitude = 10 ** math.floor(math.log10(raw_step))
+        step = next(n * magnitude for n in (1, 2, 2.5, 5, 10) if n * magnitude >= raw_step)
+        lower = max(0.0, math.floor(lower / step + 1e-9) * step)
+        upper = min(self.maximum, math.ceil(upper / step - 1e-9) * step)
+        old_lower, old_upper = self.axis_range
+        # Expand immediately when needed; shrink only after a substantial change.
+        # This avoids axis jitter while a low-current signal fluctuates slightly.
+        if force or low < old_lower or high > old_upper or upper - lower < (old_upper - old_lower) * 0.65:
+            self.axis_range = (lower, upper)
 
     def paintEvent(self, _event: Any) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), QColor("#FFFFFF"))
-        left, top, right, bottom = 48, 30, 16, 28
+        left, top, right, bottom = 64, 30, 16, 36
         plot_width = max(1, self.width() - left - right)
         plot_height = max(1, self.height() - top - bottom)
         painter.setPen(QColor("#24435E"))
-        painter.drawText(left, 20, f"{self.title}  (0–{self.maximum:g} {self.unit})")
+        lower, upper = self.axis_range
+        painter.drawText(left, 20, f"{self.title}  (自动 {lower:g}–{upper:g} {self.unit})")
         painter.setPen(QPen(QColor("#DFE6EE"), 1))
         for row in range(5):
             y = top + plot_height * row / 4
             painter.drawLine(left, int(y), left + plot_width, int(y))
-            value = self.maximum * (4 - row) / 4
+            value = lower + (upper - lower) * (4 - row) / 4
             painter.setPen(QColor("#718096"))
-            painter.drawText(2, int(y) + 4, f"{value:g}")
+            painter.drawText(2, int(y) + 4, f"{value:.3f}".rstrip("0").rstrip("."))
             painter.setPen(QPen(QColor("#DFE6EE"), 1))
-        if len(self.samples) < 2:
+        selected = any(check.isChecked() for check in self.channel_checks)
+        if len(self.samples) < 2 or not selected or not self._has_valid_samples:
             painter.setPen(QColor("#718096"))
-            painter.drawText(
-                self.rect(),
-                Qt.AlignmentFlag.AlignCenter,
-                "等待实时样本",
+            message = "请选择趋势通道" if not selected else (
+                "等待实时样本" if len(self.samples) < 2 else "暂无有效样本"
             )
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, message)
             return
         count = len(self.samples)
         for channel in range(4):
+            if not self.channel_checks[channel].isChecked():
+                continue
             path = QPainterPath()
             started = False
             for index, sample in enumerate(self.samples):
-                mask = int(sample.get("AnalogValidMask") or 0)
-                values = sample.get(self.key)
-                if not isinstance(values, list) or not mask & (1 << channel):
-                    started = False
-                    continue
-                try:
-                    value = max(0.0, min(self.maximum, float(values[channel])))
-                except (IndexError, TypeError, ValueError):
+                value = self._sample_value(sample, channel)
+                if value is None:
                     started = False
                     continue
                 x = left + plot_width * index / max(1, count - 1)
-                y = top + plot_height * (1.0 - value / self.maximum)
+                y = top + plot_height * (1.0 - (value - lower) / (upper - lower))
                 point = QPointF(x, y)
                 if not started:
                     path.moveTo(point)
@@ -118,10 +182,11 @@ class _TrendChart(QWidget):
                     path.lineTo(point)
             painter.setPen(QPen(self.COLORS[channel], 2))
             painter.drawPath(path)
-            painter.drawText(left + channel * 72, self.height() - 7, f"CH{channel + 1}")
 
 
 class PlcCabinetPage(QWidget):
+    snapshot_changed = Signal(dict)
+
     def __init__(
         self,
         client: GatewayClient,
@@ -134,6 +199,10 @@ class PlcCabinetPage(QWidget):
         self.operator_provider = operator_provider
         self.setObjectName("tabPage")
         self._pending = False
+        self._pending_count = 0
+        self._retired_epochs: set[str] = set()
+        self._request_error = ""
+        self._submitted_request_id: str | None = None
         self._snapshot: dict[str, Any] = {}
         self._setpoint_dirty = False
         self._setpoint_edit_revision = 0
@@ -163,6 +232,10 @@ class PlcCabinetPage(QWidget):
         self.description = description
         layout.addWidget(title)
         layout.addWidget(description)
+        self.coordination_state = QLabel("PLC 为所有窗口共享；正在同步控制状态")
+        self.coordination_state.setObjectName("infoPanel")
+        self.coordination_state.setWordWrap(True)
+        layout.addWidget(self.coordination_state)
 
         flow = QFrame()
         flow.setObjectName("phasePanel")
@@ -211,7 +284,7 @@ class PlcCabinetPage(QWidget):
         self.connect_button.setObjectName("outlineButton")
         self.connect_button.clicked.connect(
             lambda: self._command(
-                "连接 PLC", lambda: self.client.plc_connect(self._user())
+                "连接 PLC", lambda context: self.client.plc_connect(self._user(), context=context)
             )
         )
         self.start_button = QPushButton("系统总使能（顺序启动）")
@@ -221,21 +294,21 @@ class PlcCabinetPage(QWidget):
         self.stop_button.setObjectName("criticalOutlineButton")
         self.stop_button.clicked.connect(
             lambda: self._command(
-                "正常停止", lambda: self.client.plc_stop(self._user())
+                "正常停止", lambda context: self.client.plc_stop(self._user(), context=context)
             )
         )
         self.all_stop_button = QPushButton("全部停止")
         self.all_stop_button.setObjectName("dangerButton")
         self.all_stop_button.clicked.connect(
             lambda: self._command(
-                "全部停止", lambda: self.client.plc_all_stop(self._user())
+                "全部停止", lambda context: self.client.plc_all_stop(self._user(), context=context), priority=True
             )
         )
         self.reset_button = QPushButton("故障复位脉冲")
         self.reset_button.setObjectName("outlineButton")
         self.reset_button.clicked.connect(
             lambda: self._command(
-                "故障复位", lambda: self.client.plc_reset_fault(self._user())
+                "故障复位", lambda context: self.client.plc_reset_fault(self._user(), context=context)
             )
         )
         primary_controls = QHBoxLayout()
@@ -253,6 +326,10 @@ class PlcCabinetPage(QWidget):
         self.sequence_feedback.setObjectName("controlHint")
         self.sequence_feedback.setWordWrap(True)
         system_layout.addWidget(self.sequence_feedback, 5, 0, 1, 2)
+        self.reset_feedback = QLabel("PLC控制故障复位：等待协议状态")
+        self.reset_feedback.setObjectName("controlHint")
+        self.reset_feedback.setWordWrap(True)
+        system_layout.addWidget(self.reset_feedback, 6, 0, 1, 2)
         control_row.addWidget(system_group, 3)
 
         setpoint_group = QGroupBox("PS1 电源设定")
@@ -365,7 +442,7 @@ class PlcCabinetPage(QWidget):
         trend_group.setObjectName("workflowCard")
         charts = QHBoxLayout(trend_group)
         charts.setContentsMargins(10, 16, 10, 8)
-        self.voltage_chart = _TrendChart("电压趋势", "Voltage", "V", 100.0)
+        self.voltage_chart = _TrendChart("电压趋势", "Voltage", "V", 50.0)
         self.current_chart = _TrendChart("电流趋势", "Current", "A", 50.0)
         charts.addWidget(self.voltage_chart, 1)
         charts.addWidget(self.current_chart, 1)
@@ -394,27 +471,40 @@ class PlcCabinetPage(QWidget):
     def _user(self) -> str:
         return self.operator_provider().strip() or "local-operator"
 
+    def _finished(self) -> None:
+        self._pending_count = max(0, self._pending_count - 1)
+        self._pending = self._pending_count > 0
+
     def refresh(self) -> None:
         if self._pending:
             return
+        self._pending_count += 1
         self._pending = True
         self.runner(
-            "刷新 PLC 状态",
-            self.client.plc_snapshot,
-            self._receive,
-            quiet=True,
-            on_finished=lambda: setattr(self, "_pending", False),
+            "刷新 PLC 状态", self.client.plc_snapshot, self._receive,
+            quiet=True, on_finished=self._finished,
         )
 
-    def _command(self, label: str, operation: Callable[[], Any]) -> None:
-        if self._pending:
+    def _failed(self, exc: Exception) -> None:
+        if isinstance(exc, GatewayError) and isinstance(exc.detail, Mapping):
+            self._request_error = str(exc.detail.get("message") or exc)
+            self._receive(exc.detail.get("snapshot"))
+        else:
+            self._request_error = str(exc)
+        self._render()
+
+    def _command(self, label: str, operation: Callable[[Mapping[str, Any]], Any],
+                 *, priority: bool = False, request_id: str | None = None) -> None:
+        if self._pending and not priority:
             return
+        context = dict(self._snapshot.get("coordination", {}))
+        context["request_id"] = request_id or str(uuid.uuid4())
+        self._request_error = ""
+        self._pending_count += 1
         self._pending = True
         self.runner(
-            label,
-            operation,
-            self._receive,
-            on_finished=lambda: setattr(self, "_pending", False),
+            label, lambda: operation(context), self._receive, quiet=True,
+            on_finished=self._finished, on_failure=self._failed,
         )
 
     def _start(self) -> None:
@@ -432,9 +522,11 @@ class PlcCabinetPage(QWidget):
             if checkbox.isChecked()
         ]
         self._submitted_setpoint_revision = self._setpoint_edit_revision
+        self._submitted_request_id = str(uuid.uuid4())
         self._command(
             "启动 PLC 供电顺序",
-            lambda: self.client.plc_start(channels, user, voltage, current),
+            lambda context: self.client.plc_start(channels, user, voltage, current, context=context),
+            request_id=self._submitted_request_id,
         )
 
     def _toggle_channel(self, channel: int) -> None:
@@ -443,7 +535,7 @@ class PlcCabinetPage(QWidget):
         enabled = not bool(permits[channel - 1]) if len(permits) >= channel else True
         self._command(
             f"CH{channel} {'投入' if enabled else '切除'}",
-            lambda: self.client.plc_set_channel(channel, enabled, self._user()),
+            lambda context: self.client.plc_set_channel(channel, enabled, self._user(), context=context),
         )
 
     def _mark_setpoint_dirty(self, _value: float | str) -> None:
@@ -459,8 +551,19 @@ class PlcCabinetPage(QWidget):
             value = value["result"]
         if not isinstance(value, Mapping):
             return
+        new = value.get("coordination", {})
+        old = self._snapshot.get("coordination", {})
+        epoch = str(new.get("epoch", ""))
+        if epoch in self._retired_epochs:
+            return
+        if old.get("epoch") == epoch:
+            if new.get("snapshot_sequence", 0) < old.get("snapshot_sequence", 0):
+                return
+        elif old.get("epoch"):
+            self._retired_epochs.add(old["epoch"])
         self._snapshot = dict(value)
         self._render()
+        self.snapshot_changed.emit(self._snapshot)
 
     def _render(self) -> None:
         snapshot = self._snapshot
@@ -468,6 +571,19 @@ class PlcCabinetPage(QWidget):
         stale = bool(snapshot.get("stale"))
         fresh = communication == "LIVE" and not stale
         read_only = bool(snapshot.get("read_only"))
+        coordination = snapshot.get("coordination", {})
+        busy = bool(coordination.get("busy"))
+        last = coordination.get("active_command") or coordination.get("last_command") or {}
+        states = {"pending": "等待 PLC 确认", "confirmed": "已确认", "rejected": "已拒绝", "superseded": "已被全部停止中止", "timeout": "确认超时", "failed": "执行未确认"}
+        operations = {"start": "总启动", "stop": "正常总停止", "all-stop": "全部停止", "channel": "通道切换", "setpoints": "电源设定", "reset-fault": "故障复位", "connect": "连接", "disconnect": "断开"}
+        text = "所有窗口共同控制同一 PLC；冲突操作不自动补发"
+        if last:
+            source = "本窗口" if last.get("client_id") == self.client.client_id else f"其他窗口 {str(last.get('client_id', ''))[-8:]}"
+            text += f"\n{source} · {last.get('user', '')} · {operations.get(last.get('operation'), '')} · {states.get(last.get('state'), last.get('state', ''))}"
+        if self._request_error:
+            text += f"\n本次操作未确认：{self._request_error}"
+        self.coordination_state.setText(text)
+        set_tone(self.coordination_state, "warning" if self._request_error or busy else "neutral")
         live = fresh and not read_only
         driver = str(snapshot.get("driver") or "未知")
         connection_type = "PLC 模拟" if driver == "mock" else f"PLC 实机 · {driver}"
@@ -511,12 +627,12 @@ class PlcCabinetPage(QWidget):
             f"请求 {_text(command.get('PS1OutputEnable'))}  /  "
             f"实际 {_text(status.get('PS1ActualOutput'))}"
         )
-        faulted = bool(status.get("FaultLatched") or status.get("PS1Fault"))
+        messages = cabinet_fault_messages(status)
+        faulted = bool(messages)
         last_error = str(snapshot.get("last_error") or "")
         self.fault.setText(
-            f"故障：{'已锁存' if faulted else '无'}  "
-            f"FaultCode={status.get('FaultCode', '—')}"
-            + (f"  |  {last_error}" if last_error else "")
+            ("故障：" + "；".join(messages) if messages else "故障：无")
+            + (f"  |  {last_error}" if last_error and last_error != "；".join(messages) else "")
         )
         self.fault.setObjectName(
             "faultBarError" if faulted or last_error else "faultBarOk"
@@ -629,6 +745,8 @@ class PlcCabinetPage(QWidget):
             )
             can_operate = (
                 live
+                and not busy
+                and phase == "RUNNING"
                 and feedback_state != "pending"
                 and (
                     permit_value
@@ -668,7 +786,7 @@ class PlcCabinetPage(QWidget):
         else:
             sequence_text = "总控反馈：尚未操作"
         self.sequence_feedback.setText(sequence_text)
-        any_pending = any(
+        any_pending = busy or any(
             isinstance(value, Mapping) and value.get("state") == "pending"
             for value in feedback.values()
         )
@@ -680,7 +798,22 @@ class PlcCabinetPage(QWidget):
             and phase not in {"OFF", "DISCONNECTED", "COMM_LOST", "STALE"}
             and not any_pending
         )
-        self.reset_button.setEnabled(live and faulted and not any_pending)
+        reset_supported = bool(status.get("ResetResultSupported"))
+        reset_feedback = feedback.get("ResetFaultPulse") or {}
+        reset_detail = str(reset_feedback.get("detail") or "")
+        reset_state = str(reset_feedback.get("state") or "confirmed")
+        if not reset_supported:
+            reset_text = "旧协议/无复位结果回执：复位需PLC Host Protocol V1.1（0x0101）"
+        elif reset_detail and reset_detail != "not requested":
+            reset_text = f"PLC控制故障复位：{states.get(reset_state, reset_state)} · {reset_detail}"
+        else:
+            reset_text = "V1.1：复位仅清除PLC控制故障，不清除PS1通信或设备故障"
+        self.reset_feedback.setText(reset_text)
+        set_tone(self.reset_feedback, "warning" if not reset_supported or reset_state in {"pending", "rejected", "timeout", "failed"} else "neutral")
+        self.reset_button.setText("复位PLC控制故障")
+        self.reset_button.setToolTip(reset_text)
+        requests_off = not command.get("MainEnable") and not command.get("PS1OutputEnable") and not any(command.get("ChannelEnable") or [])
+        self.reset_button.setEnabled(live and reset_supported and requests_off and not any_pending)
         self.all_stop_button.setEnabled(live)
         self.connect_button.setEnabled(communication != "LIVE")
 
@@ -698,10 +831,16 @@ class PlcCabinetPage(QWidget):
         )
         setpoint_state = str(setpoint_feedback.get("state") or "confirmed")
         setpoint_detail = str(setpoint_feedback.get("detail") or "")
-        if self._last_setpoint_feedback == "pending" and setpoint_state == "confirmed":
+        own = next((item for item in coordination.get("commands", [])
+                    if item.get("request_id") == self._submitted_request_id
+                    and item.get("client_id") == self.client.client_id), {})
+        own_confirmed = own.get("state") == "confirmed"
+        legacy_confirmed = not coordination and self._last_setpoint_feedback == "pending" and setpoint_state == "confirmed"
+        if own_confirmed or legacy_confirmed:
             if self._submitted_setpoint_revision == self._setpoint_edit_revision:
                 self._setpoint_dirty = False
             self._submitted_setpoint_revision = None
+            self._submitted_request_id = None
         self._last_setpoint_feedback = setpoint_state
         ranges_valid = (
             setpoint_enabled

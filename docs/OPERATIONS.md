@@ -17,7 +17,7 @@
 ```bash
 git clone https://github.com/sss836/rp1_test_shn.git rp1-restore
 cd rp1-restore
-git checkout v2.0.0
+git checkout v2.0.4
 python3 scripts/restore.py /安全备份目录 --project rp1-restored --port 9443
 python3 scripts/verify.py
 ```

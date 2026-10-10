@@ -204,6 +204,8 @@ class Outbox:
         manifest: Mapping[str, Any],
         bundle_path: Path | str,
     ) -> OutboxItem:
+        if manifest.get("recording_scope") == "local":
+            raise ValueError("仅本地记录没有平台测试上下文，不能加入上传或审批队列。")
         execution_uuid = str(manifest.get("execution_uuid") or "").strip()
         test_id = str(manifest.get("test_id") or "").strip()
         path = Path(bundle_path).expanduser().resolve()

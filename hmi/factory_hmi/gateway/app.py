@@ -24,6 +24,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse
 
 from factory_hmi.plc.service import PlcCabinetService, PlcControlDisabledError
+from factory_hmi.plc.coordination import PlcRequestConflict
 from factory_hmi.sync.outbox import Outbox
 
 from .lease import ControlLease, LeaseConflict
@@ -259,6 +260,9 @@ class GatewayRuntime:
         self._lease_thread: threading.Thread | None = None
         self._expiry_callback = expiry_callback
         self._lease_guard = threading.RLock()
+        self._motion_epoch_guard = threading.Lock()
+        self._motion_epoch = 0
+        self._motion_interrupts_pending = 0
         self.outbox = outbox
         self._platform = platform
 
@@ -879,12 +883,39 @@ def create_app(
         operation: Callable[[GatewayRuntime], Any],
         *,
         claim: bool = False,
+        preempt_motion: bool = False,
+        motion_command: bool = False,
     ) -> dict[str, Any]:
         require_token(token)
         owner = owner_id(request, client_id)
         runtime = hub.session(owner)
+        interrupt_registered = False
         try:
+            with runtime._motion_epoch_guard:
+                motion_epoch = runtime._motion_epoch
+            if preempt_motion:
+                # Authenticate and validate the lease before signalling the
+                # caller's own return operation. Do not wait behind its lease
+                # guard merely to request cancellation. Normal command writes
+                # remain serialized inside that guard below.
+                runtime.lease.refresh(owner)
+                with runtime._motion_epoch_guard:
+                    runtime._motion_epoch += 1
+                    runtime._motion_interrupts_pending += 1
+                    interrupt_registered = True
+                cancel = getattr(runtime.controller, "request_motion_stop", None)
+                if callable(cancel):
+                    cancel()
             with runtime._lease_guard:
+                with runtime._motion_epoch_guard:
+                    if motion_command and (
+                        motion_epoch != runtime._motion_epoch
+                        or runtime._motion_interrupts_pending
+                    ):
+                        raise RuntimeError(
+                            "queued motor command superseded by disable/disconnect; "
+                            "review the current state before sending a new command"
+                        )
                 if claim:
                     runtime.lease.claim(owner)
                 else:
@@ -900,6 +931,10 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            if interrupt_registered:
+                with runtime._motion_epoch_guard:
+                    runtime._motion_interrupts_pending -= 1
 
     @app.exception_handler(PlcControlDisabledError)
     async def plc_control_disabled(_request: Request, exc: PlcControlDisabledError) -> JSONResponse:
@@ -950,93 +985,88 @@ def create_app(
         require_token(x_rp1_operator_token)
         return {"ok": True, "result": hub._platform.options()}
 
+    @app.exception_handler(PlcRequestConflict)
+    async def plc_request_conflict(_request: Request, exc: PlcRequestConflict) -> JSONResponse:
+        snapshot = await asyncio.to_thread(hub.plc.snapshot)
+        return JSONResponse(status_code=409, content={"detail": {
+            "code": exc.code, "message": str(exc), "snapshot": snapshot,
+        }})
+
+    def plc_mutate(operation: str, body: PlcOperatorRequest, client_id: str | None,
+                   token: str | None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        require_token(token)
+        return hub.plc.coordination.execute(
+            operation, payload or {}, user=body.user, client_id=client_id,
+            request_id=body.request_id, expected_epoch=body.expected_epoch,
+            expected_revision=body.expected_revision,
+        )
+
     @app.post("/api/v1/plc/connect")
     def plc_connect(
         body: PlcOperatorRequest,
+        x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        require_token(x_rp1_operator_token)
-        return {"ok": True, "result": hub.plc.connect(user=body.user)}
+        return plc_mutate("connect", body, x_rp1_client_id, x_rp1_operator_token)
 
     @app.post("/api/v1/plc/disconnect")
     def plc_disconnect(
+        body: PlcOperatorRequest,
+        x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        require_token(x_rp1_operator_token)
-        return {"ok": True, "result": hub.plc.disconnect()}
+        return plc_mutate("disconnect", body, x_rp1_client_id, x_rp1_operator_token)
 
     @app.post("/api/v1/plc/start")
     def plc_start(
         body: PlcStartRequest,
+        x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        require_token(x_rp1_operator_token)
-        return {
-            "ok": True,
-            "result": hub.plc.start_sequence(
-                body.channels,
-                user=body.user,
-                voltage=body.voltage,
-                current=body.current,
-            ),
-        }
+        return plc_mutate("start", body, x_rp1_client_id, x_rp1_operator_token, {"channels": body.channels, "voltage": body.voltage, "current": body.current})
 
     @app.post("/api/v1/plc/stop")
     def plc_stop(
         body: PlcOperatorRequest,
+        x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        require_token(x_rp1_operator_token)
-        return {"ok": True, "result": hub.plc.stop_sequence(user=body.user)}
+        return plc_mutate("stop", body, x_rp1_client_id, x_rp1_operator_token)
 
     @app.post("/api/v1/plc/all-stop")
     def plc_all_stop(
         body: PlcOperatorRequest,
+        x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        require_token(x_rp1_operator_token)
-        return {"ok": True, "result": hub.plc.all_stop(user=body.user)}
+        return plc_mutate("all-stop", body, x_rp1_client_id, x_rp1_operator_token)
 
     @app.post("/api/v1/plc/reset-fault")
     def plc_reset_fault(
         body: PlcOperatorRequest,
+        x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        require_token(x_rp1_operator_token)
-        return {"ok": True, "result": hub.plc.reset_fault(user=body.user)}
+        return plc_mutate("reset-fault", body, x_rp1_client_id, x_rp1_operator_token)
 
     @app.post("/api/v1/plc/channels/{channel}")
     def plc_channel(
         channel: int,
         body: PlcChannelRequest,
+        x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        require_token(x_rp1_operator_token)
         if channel not in {1, 2, 3, 4}:
             raise HTTPException(status_code=422, detail="channel must be in [1, 4]")
-        return {
-            "ok": True,
-            "result": hub.plc.set_channel(
-                channel,
-                body.enabled,
-                user=body.user,
-            ),
-        }
+        return plc_mutate("channel", body, x_rp1_client_id, x_rp1_operator_token, {"channel": channel, "enabled": body.enabled})
 
     @app.post("/api/v1/plc/setpoints")
     def plc_setpoints(
         body: PlcSetpointRequest,
+        x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        require_token(x_rp1_operator_token)
-        return {
-            "ok": True,
-            "result": hub.plc.set_ps1_setpoints(
-                body.voltage,
-                body.current,
-                user=body.user,
-            ),
-        }
+        return plc_mutate("setpoints", body, x_rp1_client_id, x_rp1_operator_token, {"voltage": body.voltage, "current": body.current})
 
     @app.get("/api/v1/configs")
     def configs() -> dict[str, Any]:
@@ -1156,6 +1186,7 @@ def create_app(
         method_names: tuple[str, ...],
         *,
         release: bool = False,
+        preempt_motion: bool = False,
     ) -> None:
         def endpoint(
             request: Request,
@@ -1168,6 +1199,8 @@ def create_app(
                 x_rp1_client_id,
                 x_rp1_operator_token,
                 lambda runtime: runtime._invoke(method_names),
+                preempt_motion=preempt_motion,
+                motion_command=not preempt_motion,
             )
             if release:
                 hub.release_session(owner)
@@ -1189,15 +1222,15 @@ def create_app(
     simple_route("/api/v1/can/disconnect", ("can_disconnect",))
     simple_route("/api/v1/can/recover", ("can_recover",))
     simple_route("/api/v1/motors/discover", ("discover_motors",))
-    simple_route("/api/v1/motors/disable", ("disable_motors", "disable"))
-    simple_route("/api/v1/disconnect", ("disconnect",), release=True)
+    simple_route("/api/v1/motors/disable", ("disable_motors", "disable"), preempt_motion=True)
+    simple_route("/api/v1/disconnect", ("disconnect",), release=True, preempt_motion=True)
     simple_route("/api/v1/arm", ("arm",))
     simple_route("/api/v1/playback/pause", ("pause",))
     simple_route("/api/v1/playback/resume", ("resume",))
     simple_route("/api/v1/playback/stop", ("stop",))
     simple_route("/api/v1/playback/next", ("prepare_next_run",))
     simple_route("/api/v1/playback/reset", ("reset", "reset_to_default"))
-    simple_route("/api/v1/playback/disable", ("disable", "emergency_disable"))
+    simple_route("/api/v1/playback/disable", ("disable", "emergency_disable"), preempt_motion=True)
     simple_route("/api/v1/manual/stop", ("manual_stop",))
     simple_route("/api/v1/zero/all", ("zero_all_motors",))
     simple_route("/api/v1/zero/read", ("zero_read",))
@@ -1241,6 +1274,7 @@ def create_app(
                 ("enable_motors",),
                 physical_estop_confirmed=body.physical_estop_confirmed,
             ),
+            motion_command=True,
         )
 
     @app.post("/api/v1/trajectory/import")
@@ -1317,6 +1351,7 @@ def create_app(
             x_rp1_client_id,
             x_rp1_operator_token,
             lambda runtime: runtime._invoke(("start",), **body.model_dump()),
+            motion_command=True,
         )
 
     @app.post("/api/v1/manual/move")
@@ -1335,6 +1370,7 @@ def create_app(
                 targets_deg=body.targets_deg,
                 speed_deg_s=body.speed_deg_s,
             ),
+            motion_command=True,
         )
 
     @app.get("/api/v1/records/current.csv")

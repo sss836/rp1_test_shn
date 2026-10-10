@@ -76,6 +76,8 @@ def main() -> None:
     doc.mkdir(parents=True)
     shutil.copytree(SOURCE / "third-party-licenses", doc / "third-party-licenses")
     shutil.copy2(SOURCE / "docs/LOCAL_CONTROL_BUILD.md", doc / "README.zh_CN.md")
+    for name in ("HOST_MODBUS_TCP_PROTOCOL_V1.0.md", "HOST_MODBUS_TCP_PROTOCOL_V1.1.md"):
+        shutil.copy2(SOURCE / "docs" / name, doc / name)
     manifest = {
         str(p.relative_to(app)): hashlib.sha256(p.read_bytes()).hexdigest()
         for p in sorted(app.rglob("*")) if p.is_file() and not p.is_symlink() and app / "runtime" not in p.parents
@@ -95,7 +97,9 @@ Installed-Size: {installed_size}
 Maintainer: RP1 Test SHN
 Depends: python3 (>= 3.12), python3 (<< 3.13), python3-yaml, iproute2, pkexec, polkitd, ca-certificates, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libdbus-1-3, fonts-noto-cjk
 Description: RP1 Modbus TCP PLC and physical SocketCAN HMI
- Protocol V1.0 control and monitor profiles with relative YAML references.
+ Protocol V1.1 reset receipts and fault sources, with V1.0 compatibility.
+ Control and monitor profiles use relative YAML references.
+ Local recording works without platform bench identifiers.
  Physical CAN requires administrator authentication and a root-owned allowlist.
  Installation does not start hardware or configure CAN.
 """)

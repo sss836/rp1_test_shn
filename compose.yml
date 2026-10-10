@@ -4,7 +4,7 @@ x-logging: &logging
   options: {max-size: 10m, max-file: '5'}
 x-app-env: &app-env
   APP_ENV: production
-  APP_VERSION: ${RP1_VERSION:-2.0.0}
+  APP_VERSION: ${RP1_VERSION:-2.0.4}
   AUTH_MODE: session
   DATABASE_URL: postgresql+psycopg://${RP1_APP_USER}:${RP1_APP_PASSWORD}@postgres:5432/${POSTGRES_DB}
   WORKER_USER_PUBLIC_ID: 00000000-0000-7000-8000-000000000001
@@ -34,7 +34,7 @@ services:
       retries: 30
     logging: *logging
   migrate:
-    image: rp1-shn-migrate:${RP1_VERSION:-2.0.0}
+    image: rp1-shn-migrate:${RP1_VERSION:-2.0.4}
     build: ./database
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
@@ -46,7 +46,7 @@ services:
     restart: 'no'
     logging: *logging
   api:
-    image: rp1-shn-api:${RP1_VERSION:-2.0.0}
+    image: rp1-shn-api:${RP1_VERSION:-2.0.4}
     build: ./backend
     restart: unless-stopped
     environment:
@@ -65,7 +65,7 @@ services:
     cap_drop: [ALL]
     logging: *logging
   worker:
-    image: rp1-shn-api:${RP1_VERSION:-2.0.0}
+    image: rp1-shn-api:${RP1_VERSION:-2.0.4}
     build: ./backend
     restart: unless-stopped
     command: [python, -m, app.services.worker]
@@ -82,7 +82,7 @@ services:
     cap_drop: [ALL]
     logging: *logging
   web:
-    image: rp1-shn-web:${RP1_VERSION:-2.0.0}
+    image: rp1-shn-web:${RP1_VERSION:-2.0.4}
     build: ./frontend
     restart: unless-stopped
     ports: ['${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8443}:8443']

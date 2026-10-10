@@ -12,6 +12,7 @@ from typing import Any
 from .client import PlcCommunicationError, ReadOnlyPlcClient, build_plc_client
 from .config import PlcCabinetConfig, load_plc_config
 from .models import CabinetPhase
+from .coordination import PlcCommandCoordinator, PlcRequestConflict
 from .state_machine import PlcCabinetController
 
 
@@ -57,6 +58,17 @@ class PlcCabinetService:
             Path(data_root).expanduser().resolve() / "plc" / "operations.jsonl"
         )
 
+        self.coordination = PlcCommandCoordinator(self)
+
+    def _checked(self, control: str, operation: Any) -> None:
+        previous = dict(self.controller.feedback)
+        if not operation():
+            detail = self.controller.feedback[control].detail
+            # A competing rejection belongs to its request, never to the
+            # currently executing shared command. Keep its audit log entry.
+            self.controller.feedback = previous
+            raise PlcRequestConflict("rejected", detail)
+
     def start(self) -> None:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -93,6 +105,7 @@ class PlcCabinetService:
             self._persist_logs()
 
     def _try_connect(self, user: str) -> None:
+        self.coordination.revision += 1
         try:
             if self.read_only:
                 self.client.connect()
@@ -136,24 +149,21 @@ class PlcCabinetService:
         self._require_control()
         selected = tuple(index in set(channels) for index in range(1, 5))
         with self._lock:
-            self.controller.request_start(
-                selected,
-                user=user,
-                voltage=voltage,
-                current=current,
-            )
+            self._checked("Start", lambda: self.controller.request_start(
+                selected, user=user, voltage=voltage, current=current,
+            ))
             return self.snapshot()
 
     def stop_sequence(self, *, user: str) -> dict[str, Any]:
         self._require_control()
         with self._lock:
-            self.controller.request_stop(user=user)
+            self._checked('Stop', lambda: self.controller.request_stop(user=user))
             return self.snapshot()
 
     def set_channel(self, channel: int, enabled: bool, *, user: str) -> dict[str, Any]:
         self._require_control()
         with self._lock:
-            self.controller.request_channel(channel, enabled, user=user)
+            self._checked(f"ChannelEnable{channel}", lambda: self.controller.request_channel(channel, enabled, user=user))
             return self.snapshot()
 
     def set_ps1_setpoints(
@@ -165,23 +175,24 @@ class PlcCabinetService:
     ) -> dict[str, Any]:
         self._require_control()
         with self._lock:
-            self.controller.request_setpoints(voltage, current, user=user)
+            self._checked('Setpoints', lambda: self.controller.request_setpoints(voltage, current, user=user))
             return self.snapshot()
 
     def reset_fault(self, *, user: str) -> dict[str, Any]:
         self._require_control()
         with self._lock:
-            self.controller.request_reset_fault(user=user)
+            self._checked('ResetFaultPulse', lambda: self.controller.request_reset_fault(user=user))
             return self.snapshot()
 
     def all_stop(self, *, user: str) -> dict[str, Any]:
         self._require_control()
         with self._lock:
-            self.controller.request_all_stop(user=user)
+            self._checked('AllStop', lambda: self.controller.request_all_stop(user=user))
             return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            coordination = self.coordination.snapshot()
             value = self.controller.snapshot()
             value["driver"] = self.config.driver
             value["access_mode"] = self.config.access_mode
@@ -205,6 +216,7 @@ class PlcCabinetService:
                 "current_max_a": self.config.setpoints.current_max_a,
                 "step": self.config.setpoints.step,
             }
+            value["coordination"] = coordination
             value["trend"] = list(self._trend)
             return value
 

@@ -78,6 +78,7 @@ from factory_hmi.desktop.table_models import (
 )
 from factory_hmi.desktop.plc_page import PlcCabinetPage
 from factory_hmi.desktop.theme import apply_theme, set_tone
+from factory_hmi.plc.faults import cabinet_fault_messages
 
 
 class WorkerSignals(QObject):
@@ -192,6 +193,8 @@ class FactoryMainWindow(QMainWindow):
         self._configuration_pending = False
         self._active_limb: str | None = None
         self._last_snapshot: dict[str, Any] = {}
+        self._last_motor_fault_snapshot: dict[str, Any] = {}
+        self._last_plc_fault_snapshot: dict[str, Any] = {}
         self._last_trajectory: dict[str, Any] = {}
         self._config_preview: dict[str, Any] = {}
         self._available_can: list[dict[str, Any]] = []
@@ -319,6 +322,7 @@ class FactoryMainWindow(QMainWindow):
             self._run_rest,
             lambda: self._platform_operator or "local-operator",
         )
+        self.plc_page.snapshot_changed.connect(self._render_plc_fault)
         self._build_config_dialog()
         self._build_motor_dialog()
         self._build_zero_dialog()
@@ -707,6 +711,7 @@ class FactoryMainWindow(QMainWindow):
         self.duration_mode.setChecked(True)
         self.duration_mode.toggled.connect(self._update_run_limit_mode)
         self.record = QCheckBox("记录")
+        self.record.setToolTip("记录采集数据到本机。未选择平台档案时，无需平台登录或工位编号；选择档案时校验对应的平台信息。")
         self.record.setChecked(True)
         self.record_rate_hz = QSpinBox()
         self.record_rate_hz.setRange(1, 20)
@@ -1075,6 +1080,7 @@ class FactoryMainWindow(QMainWindow):
         self.duration_mode.setChecked(True)
         self.duration_mode.toggled.connect(self._update_run_limit_mode)
         self.record = QCheckBox("记录")
+        self.record.setToolTip("记录采集数据到本机。未选择平台档案时，无需平台登录或工位编号；选择档案时校验对应的平台信息。")
         self.record.setChecked(True)
         self.record_rate_hz = QSpinBox()
         self.record_rate_hz.setRange(1, 20)
@@ -2051,6 +2057,7 @@ class FactoryMainWindow(QMainWindow):
         *,
         quiet: bool = False,
         on_finished: Callable[[], None] | None = None,
+        on_failure: Callable[[Exception], None] | None = None,
     ) -> None:
         worker = RestWorker(operation)
         self._workers.add(worker)
@@ -2063,6 +2070,8 @@ class FactoryMainWindow(QMainWindow):
                     f"{action}成功", 4000
                 )
             )
+        if on_failure is not None:
+            worker.signals.failed.connect(on_failure)
         worker.signals.failed.connect(
             lambda exc, action=label, silent=quiet: self._rest_failed(
                 action, exc, silent
@@ -2077,6 +2086,10 @@ class FactoryMainWindow(QMainWindow):
 
     def _rest_failed(self, action: str, exc: Exception, quiet: bool) -> None:
         detail = str(exc.detail or "") if isinstance(exc, GatewayError) else ""
+        if action == "回默认位":
+            self._preflight_ok = False
+            self.preflight_result.setText("回默认位未完成，请查看故障信息。")
+            self.preflight_result.setStyleSheet("color: #d92d20; font-weight: 700;")
         if action == "进入 Armed" and "first-frame delta too large" in detail:
             self._handle_first_frame_preflight_failure(detail)
             self._run_rest(
@@ -2118,6 +2131,8 @@ class FactoryMainWindow(QMainWindow):
                 )
             else:
                 message = f"{action}失败：{exc}"
+        elif "return to default interrupted by stop request" in detail:
+            message = f"{action}未完成：已被失能或断开请求中止。"
         elif "failed to enable with error_id=7" in detail:
             motor_id = "未知"
             if " id=" in detail:
@@ -2828,7 +2843,12 @@ class FactoryMainWindow(QMainWindow):
             return QColor("#fff0bd")
         return QColor("#e7f6e9")
 
+    def _render_plc_fault(self, snapshot: dict[str, Any]) -> None:
+        self._last_plc_fault_snapshot = snapshot
+        self._render_fault(self._last_motor_fault_snapshot)
+
     def _render_fault(self, snapshot: Mapping[str, Any]) -> None:
+        self._last_motor_fault_snapshot = dict(snapshot)
         fault = snapshot.get("global_fault", snapshot.get("fault"))
         if not fault:
             self.global_fault.setText("●  全局故障：无")
@@ -2862,6 +2882,15 @@ class FactoryMainWindow(QMainWindow):
             else:
                 text = f"⚠  全局故障：{fault}"
             self.global_fault.setText(text)
+            self.global_fault.setObjectName("faultBarError")
+        status = self._last_plc_fault_snapshot.get("status")
+        messages = cabinet_fault_messages(status) if isinstance(status, Mapping) else []
+        if messages:
+            cabinet_text = "；".join(messages)
+            self.global_fault.setText(
+                self.global_fault.text() + "\n配电柜：" + cabinet_text
+                if fault else "⚠  全局故障  |  " + cabinet_text
+            )
             self.global_fault.setObjectName("faultBarError")
         self.global_fault.style().unpolish(self.global_fault)
         self.global_fault.style().polish(self.global_fault)
@@ -4132,6 +4161,10 @@ class FactoryMainWindow(QMainWindow):
         )
 
     def _submit_execution(self) -> None:
+        selected = self._selected_execution()
+        if selected and selected.get("recording_scope") == "local":
+            QMessageBox.warning(self, "仅本地记录", "这条记录没有平台测试上下文，仅保存在本机，不能提交审批或上传。")
+            return
         test_id = self._selected_test_id()
         if not test_id:
             QMessageBox.warning(self, "未选择记录", "请选择一条执行记录。")
@@ -4145,6 +4178,10 @@ class FactoryMainWindow(QMainWindow):
         )
 
     def _retry_execution(self) -> None:
+        selected = self._selected_execution()
+        if selected and selected.get("recording_scope") == "local":
+            QMessageBox.warning(self, "仅本地记录", "这条记录没有平台测试上下文，仅保存在本机，不能提交审批或上传。")
+            return
         test_id = self._selected_test_id()
         if not test_id:
             QMessageBox.warning(self, "未选择记录", "请选择一条执行记录。")
@@ -4216,7 +4253,7 @@ class FactoryMainWindow(QMainWindow):
             return
         context = self.platform_test_profile.currentData()
         context = dict(context) if isinstance(context, Mapping) else {}
-        if self._platform_operator and context and not bool(context.get("ready")):
+        if context and not bool(context.get("ready")):
             missing = "、".join(str(item) for item in context.get("missing") or [])
             QMessageBox.warning(
                 self,
@@ -4235,6 +4272,7 @@ class FactoryMainWindow(QMainWindow):
                 cycles=0 if use_duration else self.cycles.value(),
                 duration_hours=(self.duration_hours.value() if use_duration else None),
                 record=self.record.isChecked(),
+                recording_scope="platform" if context else "local",
                 record_rate_hz=self.record_rate_hz.value(),
                 test_id=None,
                 robot_id=robot_id,
@@ -4245,6 +4283,7 @@ class FactoryMainWindow(QMainWindow):
                 configuration_id=context.get("configuration_id"),
                 test_case_version_id=context.get("test_case_version_id"),
                 test_case_id=self._active_limb or self.limb.currentText().strip(),
+                bench_id=context.get("bench_id"),
                 station_id=(
                     context.get("station_id")
                     or self.platform_station_id.text().strip()
@@ -4283,7 +4322,7 @@ class FactoryMainWindow(QMainWindow):
             self,
             "确认回默认位",
             "确认测试区域无人、机构运动路径无干涉？\n"
-            "机械臂将低速回到 YAML 中配置的默认位置。",
+            "机械臂将以半 KP 平滑回默认位 1 秒，再以正常 KP 保持 2 秒；KD 不变。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -4293,7 +4332,7 @@ class FactoryMainWindow(QMainWindow):
     def _start_default_return(self, *, recheck: bool) -> None:
         self.reset_button.setEnabled(False)
         self.preflight_button.setEnabled(False)
-        self.preflight_result.setText("正在低速回默认位，请勿进入设备运动范围。")
+        self.preflight_result.setText("回默认位：半 KP 1 秒 → 正常 KP 2 秒，请勿进入运动范围。")
         self.preflight_result.setStyleSheet("color: #8a5a00; font-weight: 700;")
         self._run_rest(
             "回默认位",

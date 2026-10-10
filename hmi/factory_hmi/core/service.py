@@ -28,7 +28,7 @@ from .can_manager import (
 )
 from .config import load_station_config
 from .controller import FactoryController
-from .identity import build_execution_code
+from .identity import build_execution_code, build_local_execution_code
 from .report import ReportManager, ReportResult
 from .zeroing import MotorZeroingSession
 from factory_hmi.sync.outbox import Outbox
@@ -514,6 +514,7 @@ class FactoryService:
         cycles: int = 0,
         duration_hours: float | None = None,
         record: bool = True,
+        recording_scope: str | None = None,
         record_rate_hz: float = 20.0,
         test_id: str | None = None,
         robot_id: str | None = None,
@@ -542,12 +543,40 @@ class FactoryService:
             resolved_test_case = test_case_id or controller.config.limb
             resolved_sample = robot_id or ""
             resolved_bench = bench_id or os.environ.get("RP1_FACTORY_BENCH_ID", "")
-            canonical_test_id = build_execution_code(
-                resolved_test_case,
-                started_at,
-                resolved_sample,
-                resolved_bench,
-            )
+            platform_context = {
+                "campaign_id": campaign_id, "cycle_id": cycle_id,
+                "segment_id": segment_id, "asset_id": asset_id,
+                "configuration_id": configuration_id,
+                "test_case_version_id": test_case_version_id,
+            }
+            has_platform_context = any(platform_context.values())
+            scope = recording_scope or ("platform" if has_platform_context else "local")
+            if scope not in {"local", "platform"}:
+                raise ValueError("recording_scope must be local or platform")
+            if scope == "local" and has_platform_context:
+                raise ValueError("本地记录不能同时携带平台测试上下文；请明确选择记录用途。")
+            execution_id = str(execution_uuid or uuid.uuid4())
+            uuid.UUID(execution_id)
+            if scope == "local":
+                canonical_test_id = build_local_execution_code(
+                    resolved_test_case, started_at, execution_id
+                )
+            else:
+                platform_context["station_id"] = station_id or os.environ.get("RP1_FACTORY_STATION_ID", "")
+                missing = [key for key, value in platform_context.items() if not value]
+                if missing:
+                    raise ValueError("平台记录上下文不完整，缺少：" + "、".join(missing))
+                for key, value in platform_context.items():
+                    try:
+                        uuid.UUID(str(value))
+                    except ValueError as exc:
+                        raise ValueError(f"平台记录 {key} 必须是真实上下文的 UUID，不能使用显示编号。") from exc
+                try:
+                    canonical_test_id = build_execution_code(
+                        resolved_test_case, started_at, resolved_sample, resolved_bench
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"平台记录编号不符合要求：{exc}。仅本地保存请取消选择平台档案。") from exc
             if test_id and test_id != canonical_test_id:
                 raise ValueError(
                     "test_id does not match the canonical execution identity"
@@ -556,16 +585,17 @@ class FactoryService:
             effective_test_id = safe_test_id
             if not safe_test_id:
                 raise ValueError("test_id does not contain a usable filename")
-            controller.enable_recording = True
             record_path = self.record_root / f"{safe_test_id}.csv"
+            if record_path.exists() or record_path.with_suffix(".context.json").exists():
+                raise ValueError("记录编号已存在，不能覆盖之前的记录。")
+            controller.enable_recording = True
             controller.record_output = record_path
             trajectory = controller.trajectory
-            execution_id = str(execution_uuid or uuid.uuid4())
-            uuid.UUID(execution_id)
             now = started_at.isoformat().replace("+00:00", "Z")
             report_context = {
                 "execution_uuid": execution_id,
                 "test_id": safe_test_id,
+                "recording_scope": scope,
                 "campaign_id": campaign_id,
                 "cycle_id": cycle_id,
                 "segment_id": segment_id,
@@ -829,6 +859,12 @@ class FactoryService:
         return self.snapshot()
 
     reset_to_default = reset
+
+    def request_motion_stop(self) -> bool:
+        # Do not take the controller's command lock: reset holds it while
+        # returning. Signalling is cancellation-only and does not touch CAN.
+        controller = self._controller
+        return bool(controller and controller.request_motion_stop())
 
     def disable(self) -> dict[str, Any]:
         controller = self.controller

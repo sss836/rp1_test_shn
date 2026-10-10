@@ -50,7 +50,7 @@
 | `PS1Fault` | `2 bit6 OR bit7` | 通信故障或设备故障 | 已冻结 |
 | `FaultLatched` | `2 bit5` | PLC 故障锁存 | 已冻结 |
 | `FaultCode` | `4` | 控制柜故障字 | 已冻结；故障码字典待 PLC 方提供 |
-| `Voltage[4]` | `12..15` | V1.0 按 mV × `0.001` = V 解码；单个 UINT16 只能表示到 65.535 V，与 0–100 V 变送器量程冲突 | **TODO(PLC-V1-GAP)** |
+| `Voltage[4]` | `12..15` | V1.0/V1.1 均按 mV × `0.001` = V 解码；VS1～VS4 为 0–50 V 对应 0–10 V 输出，50000=50.000 V | 已确认 |
 | `Current[4]` | `16..19` | mA × `0.001` = A，0–50 A | 已冻结 |
 | `Power[4]` | 派生 | `Voltage × Current`，W | 上位机派生 |
 | `AnalogValidMask` | — | V1.0 无有效位；当前仅以“本次 FC03 成功+工程量未超界”判定 | **TODO(PLC-V1-GAP)** |
@@ -74,7 +74,6 @@
 | `PhysicalPermit[4]` | 4 bit | 单独暴露 I0.2–I0.5，用于投入前预检 |
 | `AnalogValidMask` | 4 bit | 区分传感器/模块无效与合法的 0 V/0 A |
 | `StatusCounter` | `UINT16` | 识别 PLC 状态快照是否真正更新 |
-| `Voltage[4]` 编码 | `UINT16 @ 0.01 V` 或 `UINT32 mV` | 覆盖完整 0–100 V 量程，避免 65.535 V 上限 |
 | `FaultCode` 字典 | 文档 | UI 显示可执行的故障原因和处置 |
 
 补充后只需在 YAML 中填入新地址/位并切换有效位策略，不需要改动业务状态机。

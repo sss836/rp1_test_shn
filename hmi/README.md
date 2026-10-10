@@ -17,3 +17,5 @@ Ubuntu 24.04 amd64 上位机源码。新机安装、平台部署和账号接入�
 当前本地控制版本、相对 YAML、源码启动和从本目录生成 deb 的入口见
 [LOCAL_CONTROL_BUILD.md](docs/LOCAL_CONTROL_BUILD.md)。新打包命令为
 `python3 tools/build_local_deb.py --runtime-dir .local-runtime`；不会启动设备。
+
+多窗口 PLC 共享控制已加入请求版本校验、幂等回执、冲突拒绝和全部停止优先，两个窗口均可控制。详见 [多窗口控制规则](docs/LOCAL_CONTROL_BUILD.md#两个窗口共同控制-plc)。
