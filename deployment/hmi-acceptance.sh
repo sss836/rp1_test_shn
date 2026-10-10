@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-test "$(dpkg-query -W -f='${Version}' rp1-test-hmi)" = "${HMI_EXPECTED_VERSION:-2.0.0+ubuntu24.04}"
+test "$(dpkg-query -W -f='${Version}' rp1-test-hmi)" = "${HMI_EXPECTED_VERSION:?Set HMI_VERSION when building the acceptance image}"
 useradd --create-home --shell /bin/bash hmi-qa
 runuser -u hmi-qa -- rp1-test-hmi --offline-check --gateway-only --duration 2 --port 18766
 runuser -u hmi-qa -- rp1-test-hmi --offline-check --gateway-only --offline-access monitor --duration 2 --port 18767 --state-dir /home/hmi-qa/monitor

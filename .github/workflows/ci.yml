@@ -62,7 +62,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: sudo bash scripts/install-build-deps-ubuntu24.sh
       - run: ./scripts/build-hmi.sh
-      - run: docker build -f deployment/HmiAcceptance.Dockerfile -t rp1-hmi-acceptance .
+      - run: docker build --build-arg HMI_VERSION="$(cat hmi/packaging/LOCAL_VERSION)" -f deployment/HmiAcceptance.Dockerfile -t rp1-hmi-acceptance .
       - run: docker run --rm --network none rp1-hmi-acceptance
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
