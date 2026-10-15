@@ -1,8 +1,8 @@
 # PLC cabinet communication configuration.
 #
-# The Linux<->PLC Modbus TCP V1.1 window is defined by
-# HOST_MODBUS_TCP_PROTOCOL_V1.1.md; V1.0 connections remain compatible, with
-# reset disabled because they do not expose a final reset-result receipt.
+# The Linux<->PLC Modbus TCP V1.2 window is defined by
+# HOST_MODBUS_TCP_PROTOCOL_V1.2.md; V1.0/V1.1 are monitor-only.
+# Control requires the paired PLC V1.5 / Host Protocol V1.2 source.
 # The S7 direct mapping and three logical
 # feedback fields explicitly called out below remain TODO. This workstation
 # profile uses the confirmed real PLC. Use launch.py --offline-check for tests.
@@ -74,7 +74,7 @@ s7:
     StatusCounter: null
 
 modbus_tcp:
-  host: 192.168.137.10      # Protocol V1.0, isolated control VLAN only
+  host: 192.168.137.10      # Protocol V1.2, isolated control VLAN only
   port: 502
   unit_id: 1
   timeout_ms: 2000
@@ -84,11 +84,11 @@ modbus_tcp:
     # Each word is unsigned 16-bit and transferred in Modbus big-endian order.
     identity:
       magic: 0x4C46
-      protocol_version: 0x0101
+      protocol_version: 0x0102
       control_key: 0x835A
     status:
       start_address: 0
-      count: 28
+      count: 32
       registers:
         magic: 0
         protocol_version: 1
@@ -112,8 +112,10 @@ modbus_tcp:
         heartbeat_echo: 25
         host_server_status: 26
         host_server_events: 27
-        # analog_valid_mask: TODO(PLC-V1-GAP)
-        # status_counter: TODO(PLC-V1-GAP)
+        ps1_feedback_flags: 28
+        ps1_status_sequence: 29
+        ps1_power_cycle: 30
+        ps1_status_age_ms: 31
       bits:
         plc_ready: 0
         host_connected: 1
@@ -148,7 +150,7 @@ modbus_tcp:
       voltage_units_per_count: 0.001
       current_units_per_count: 0.001
       # VS1..VS4 measure 0..50 V with 0..10 V transducer outputs.
-      # HR12..15 remains 1 mV/count in both V1.0 and V1.1: 50000 = 50.000 V.
+      # HR12..15 remains 1 mV/count in V1.0, V1.1 and V1.2: 50000 = 50.000 V.
       # PS1 voltage/output/setpoint also remains 1 mV/count.
       max_channel_voltage: 50.0
       max_channel_current: 50.0
@@ -157,7 +159,7 @@ modbus_tcp:
       main_contactor_fb: null  # TODO(PLC-V1-GAP): add explicit feedback bit
       # ChannelFlags are final relay/permit outputs, not raw I0.2-I0.5 states.
       physical_permit: null    # TODO(PLC-V1-GAP): add four S1-S4 input bits
-      # Until a PLC mask exists, a fresh FC03 sample is accepted only while
-      # values stay inside the documented engineering ranges.
+      # Range validation is combined with V1.2 HR28 validity and HR29 progress;
+      # a fresh FC03 sample alone is never PS1 feedback confirmation.
       analog_valid_policy: fresh_read_and_range
-      status_counter_source: local_poll  # TODO(PLC-V1-GAP): PLC counter absent
+      status_counter_source: local_poll  # TCP snapshot only; PS1 progress is HR29

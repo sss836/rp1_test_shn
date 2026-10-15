@@ -1,5 +1,7 @@
 # 2.0.0 软件发布验证
 
+本文保留2.0.0发布时的验收口径。2026-10-15 中央归档与详细曲线源码的验收见 [CSV-ARCHIVE-IMPLEMENTATION.md](CSV-ARCHIVE-IMPLEMENTATION.md)，未部署生产或进行实物联调。2026-10-12工作区新增测试数据摘要审批，状态与验证以 [TEST-DATA-APPROVAL.md](TEST-DATA-APPROVAL.md) 为准；尚未应用到生产服务或已安装HMI。
+
 本版从桌面项目源码构建 Ubuntu 24.04 amd64 deb。发布前已通过：
 
 - 前端 lint、类型检查、47 项测试及生产构建；

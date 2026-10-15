@@ -44,6 +44,7 @@ print(json.dumps(dict(ok=True, runtime=str(runtime), libraries_sha256=libraries,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--runtime-dir', type=Path, required=True)
+    parser.add_argument('--provenance', type=Path, default=SOURCE / 'packaging/native-sdk-runtime.json')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
     runtime = args.runtime_dir.expanduser().resolve(strict=True)
@@ -57,7 +58,7 @@ def main() -> int:
         print(result.stderr.strip(), file=sys.stderr)
         return 1
     report = json.loads(result.stdout)
-    provenance = SOURCE / 'packaging/native-sdk-runtime.json'
+    provenance = args.provenance.expanduser()
     if provenance.exists():
         metadata = json.loads(provenance.read_text())
         if metadata['libraries_sha256'] != report['libraries_sha256']:

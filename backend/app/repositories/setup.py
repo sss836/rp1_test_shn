@@ -10,6 +10,12 @@ from app.core.errors import ApiError
 from app.schemas.setup import AssetCreate, CampaignCreate, ContextCreate, ProgramCreate, StationCreate
 
 
+def _parts_match(case_part: str | None, asset_part: str | None) -> bool:
+    if case_part == asset_part:
+        return True
+    return (case_part, asset_part) in {("ARM", "SARM"), ("LEG", "SLEG")}
+
+
 class SetupRepository:
     """Uses the existing app role, RLS and row-change audit; never writes runtime facts."""
 
@@ -58,7 +64,8 @@ class SetupRepository:
                    c.planned_start,c.planned_end,p.program_code,p.name AS program_name,
                    iam.can_access_campaign(c.id,true) AS can_edit,
                    (SELECT count(*) FROM test.campaign_asset a WHERE a.campaign_id=c.id AND a.left_at IS NULL) AS asset_count,
-                   (SELECT count(*) FROM test.campaign_coverage_item ci WHERE ci.campaign_id=c.id) AS case_count
+                   (SELECT count(*) FROM test.campaign_coverage_item ci WHERE ci.campaign_id=c.id) AS case_count,
+                   COALESCE((SELECT jsonb_agg(jsonb_build_object('sequence_no', s.sequence_no, 'stage_name', s.stage_name) ORDER BY s.sequence_no) FROM test.campaign_stage s WHERE s.campaign_id=c.id), '[]'::jsonb) AS stages
             FROM test.test_campaign c LEFT JOIN test.test_program p ON p.id=c.program_id ORDER BY c.id DESC
         """)
 
@@ -142,7 +149,7 @@ class SetupRepository:
         case = self.one("SELECT v.id,tc.asset_kind,tc.target_part_code FROM catalog.test_case_version v JOIN catalog.test_case tc ON tc.id=v.test_case_id WHERE v.public_id=:test_case_version_id AND v.status='PUBLISHED' AND tc.enabled", params)
         station = self.one("SELECT s.id,s.station_type FROM test.station s JOIN test.lab l ON l.id=s.lab_id JOIN test.site t ON t.id=l.site_id WHERE s.public_id=:station_id AND s.enabled AND l.enabled AND t.enabled", params)
         config = self.one("SELECT id,asset_id FROM test.configuration_snapshot WHERE public_id=:configuration_id", params)
-        if asset["asset_kind"] != campaign["asset_kind"] or case["asset_kind"] != asset["asset_kind"] or case["target_part_code"] != asset["part"] or config["asset_id"] != asset["id"] or station["station_type"] not in {"SHARED", asset["asset_kind"]}:
+        if asset["asset_kind"] != campaign["asset_kind"] or case["asset_kind"] != asset["asset_kind"] or not _parts_match(case["target_part_code"], asset["part"]) or config["asset_id"] != asset["id"] or station["station_type"] not in {"SHARED", asset["asset_kind"]}:
             raise ApiError(422, "context_mismatch", "计划、样品、用例部位、配置快照或台架类型不匹配。")
         params.update(campaign=campaign["id"], asset=asset["id"], case=case["id"], config=config["id"])
         if self.rows("SELECT id FROM test.campaign_coverage_item WHERE campaign_id=:campaign AND target_asset_id=:asset AND test_case_version_id=:case AND status<>'CANCELLED'", params):

@@ -11,6 +11,7 @@ x-app-env: &app-env
   SERVICE_API_KEY_HMAC_SECRET: ${SERVICE_API_KEY_HMAC_SECRET}
   AUTH_COOKIE_SECURE: 'true'
   CORS_ORIGINS: ${PLATFORM_URL}
+  ARCHIVE_ROOT: /var/lib/rp1/archives
 services:
   postgres:
     image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
@@ -63,6 +64,8 @@ services:
       retries: 30
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    volumes:
+      - ${RP1_ARCHIVE_VOLUME:-archive-data}:/var/lib/rp1/archives
     logging: *logging
   worker:
     image: rp1-shn-api:${RP1_VERSION:-2.0.4}
@@ -74,6 +77,25 @@ services:
       migrate: {condition: service_completed_successfully}
     healthcheck:
       test: [CMD, python, scripts/check_worker.py]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 4
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    logging: *logging
+  archive-worker:
+    image: rp1-shn-api:${RP1_VERSION:-2.0.4}
+    build: ./backend
+    restart: unless-stopped
+    command: [python, -m, app.services.archive_worker]
+    environment: *app-env
+    volumes:
+      - ${RP1_ARCHIVE_VOLUME:-archive-data}:/var/lib/rp1/archives
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, scripts/check_archive_worker.py]
       interval: 15s
       timeout: 5s
       start_period: 30s
@@ -99,6 +121,7 @@ services:
     logging: *logging
 volumes:
   postgres-data:
+  archive-data:
 secrets:
   tls-cert: {file: ./deployment/secrets/server.crt}
   tls-key: {file: ./deployment/secrets/server.key}

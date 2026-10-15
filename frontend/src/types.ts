@@ -1,6 +1,8 @@
 export type AssetKind = "WHOLE_MACHINE" | "MODULE";
 export type TargetPartCode =
+  | "ARM"
   | "SARM"
+  | "LEG"
   | "SLEG"
   | "SYS"
   | "UPPER"
@@ -39,6 +41,16 @@ export type HomeTestCase = {
   pending_seconds: number;
   execution_count: number;
   scope_asset_count: number;
+  historical_execution_count: number;
+  platform_execution_count: number;
+  passed_execution_count: number;
+  failed_execution_count: number;
+  inconclusive_execution_count: number;
+  not_evaluated_execution_count: number;
+  exception_count: number;
+  first_recorded_at: string | null;
+  latest_recorded_at: string | null;
+  station_codes: string[];
   target_duration_seconds: number | null;
   target_progress_percent: number | null;
 };
@@ -229,6 +241,7 @@ export type ExecutionListItem = {
   active_elapsed_seconds: number;
   data_quality: string;
   clock_quality: string;
+  station_code?: string | null;
 };
 
 export type ExecutionList = {
@@ -318,6 +331,7 @@ export type ExecutionResult = {
   issues: string;
   exception_count: number;
   reported_duration_seconds: number;
+  completed_cycles?: number | null;
   executor_display: string;
   environment_label: string;
   last_data_at: string | null;
@@ -326,6 +340,26 @@ export type ExecutionResult = {
   archive_path: string;
   report_reference: string;
   normalization_flags: Array<Record<string, unknown>>;
+};
+
+export type JointRecordSummary = {
+  joint: string;
+  source_kind: string;
+  sample_count: number;
+  mean_abs_torque_nm: number | null;
+  peak_abs_torque_nm: number | null;
+  bus_voltage_mean_v: number | null;
+  bus_voltage_min_v: number | null;
+  bus_voltage_max_v: number | null;
+  bus_current_mean_abs_a: number | null;
+  bus_current_peak_abs_a: number | null;
+  estimated_mean_power_w: number | null;
+  temp_start_c: number | null;
+  temp_end_c: number | null;
+  temp_rise_c: number | null;
+  temp_max_c: number | null;
+  tracking_rms_deg: number | null;
+  formal_eligible: boolean;
 };
 
 export type ExecutionDetail = {
@@ -344,6 +378,7 @@ export type ExecutionDetail = {
     observed_at: string;
   }>;
   metrics: MetricObservation[];
+  joint_records?: JointRecordSummary[];
   data_quality_summary: Record<string, unknown>;
   evidence: Array<{
     id: string;

@@ -29,11 +29,13 @@ from factory_hmi.sync.outbox import Outbox
 
 from .lease import ControlLease, LeaseConflict
 from .schemas import (
+    BenchCodeRequest,
     CanConnectRequest,
     ConfigPreviewRequest,
     ConfigureRequest,
     EnableMotorsRequest,
     ExecutionActionRequest,
+    HistoryImportRequest,
     ManualMoveRequest,
     PlatformLoginRequest,
     PlaybackStartRequest,
@@ -73,12 +75,19 @@ def _json_result(result: Any) -> Any:
 class _PlatformCoordinator:
     """Own the one uploader allowed to consume the gateway-wide Outbox."""
 
-    def __init__(self, outbox: Outbox, *, snapshot_provider: Callable[[], dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        outbox: Outbox,
+        *,
+        snapshot_provider: Callable[[], dict[str, Any]] | None = None,
+        on_execution: Callable[[str, str], None] | None = None,
+    ) -> None:
         self.outbox = outbox
         self._lock = threading.RLock()
         self._uploader: Any | None = None
         self._identity = ""
         self._snapshot_provider = snapshot_provider
+        self._on_execution = on_execution
         self._mode = (
             os.environ.get("RP1_FACTORY_PLATFORM_MODE", "reliability_v1")
             .strip()
@@ -99,13 +108,47 @@ class _PlatformCoordinator:
                 "presence": presence.status() if presence else None,
             }
 
+    def submit(self, operation: Callable[[], Any], test_id: str) -> Any:
+        with self._lock:
+            if self._mode != "reliability_v1" or not self._identity:
+                raise ValueError("请先登录当前平台再核实归档测试数据。")
+            existing = self.outbox.get_by_test_id(test_id)
+            if existing and existing.submission_owner and existing.submission_owner != self._identity:
+                raise ValueError("此记录已绑定其他提交账号，请使用原账号处理。")
+            result = operation()
+            if isinstance(result, dict) and result.get("execution_uuid"):
+                self.outbox.update(result["execution_uuid"], submission_owner=self._identity)
+                result = self.outbox.get(result["execution_uuid"]).to_dict()
+            self.wake()
+            return result
+
     def options(self) -> dict[str, Any]:
         from factory_hmi.sync.reliability_platform import load_test_profiles
+        from factory_hmi.sync.uploader import PlatformError
 
         path = os.environ.get("RP1_RELIABILITY_PROFILES", "").strip() or None
+        yaml_profiles = load_test_profiles(path)
+        live: list[dict[str, Any]] = []
+        context_error = ""
+        stations: list[dict[str, Any]] = []
+        with self._lock:
+            uploader = self._uploader
+            identity = self._identity
+        if uploader is not None and identity:
+            try:
+                live = uploader.context_profiles()
+                stations = uploader.station_options()
+            except PlatformError as exc:
+                context_error = str(exc)
+        live_keys = {str(item.get("key") or "") for item in live}
+        profiles = live + [
+            item for item in yaml_profiles if str(item.get("key") or "") not in live_keys
+        ]
         return {
             "mode": self._mode,
-            "profiles": load_test_profiles(path),
+            "profiles": profiles,
+            "context_error": context_error,
+            "stations": stations,
         }
 
     def set_presence(self, payload: dict[str, Any]) -> None:
@@ -123,13 +166,17 @@ class _PlatformCoordinator:
             with self._lock:
                 if self._uploader is None:
                     self.outbox.recover_interrupted()
-                    self._uploader = reliability_worker_from_environment(self.outbox, snapshot_provider=self._snapshot_provider)
+                    self._uploader = reliability_worker_from_environment(
+                        self.outbox,
+                        snapshot_provider=self._snapshot_provider,
+                        on_execution=self._on_execution,
+                    )
                 grant = self._uploader.authenticate(
                     request.username,
                     request.password,
                 )
                 self._uploader.start()
-                self._identity = request.username.strip()
+                self._identity = str((grant.get("user") or {}).get("username") or request.username).strip()
                 self._uploader.wake()
             return {
                 "operator": self._identity,
@@ -349,11 +396,29 @@ class GatewayRuntime:
     def platform_logout(self) -> dict[str, Any]:
         return self._platform.logout()
 
-    def submit_execution(self, test_id: str, *, retry: bool = False) -> Any:
-        names = ("retry_submission",) if retry else ("submit_execution",)
-        result = self._invoke(names, test_id)
-        self._platform.wake()
-        return result
+    def submit_execution(
+        self,
+        test_id: str,
+        *,
+        retry: bool = False,
+        reason: str = "",
+        verified_status: str = "",
+        operator_summary: str = "",
+        review: dict[str, Any] | None = None,
+    ) -> Any:
+        if retry:
+            return self._platform.submit(lambda: self._invoke(("retry_submission",), test_id), test_id)
+        return self._platform.submit(
+            lambda: self._invoke(
+                ("submit_execution",),
+                test_id,
+                reason,
+                verified_status,
+                operator_summary,
+                review,
+            ),
+            test_id,
+        )
 
     def configure(self, request: ConfigureRequest) -> Any:
         config_path = self._allowed_config_path(request.config_path)
@@ -606,7 +671,11 @@ class GatewayHub:
                 except (OSError, sqlite3.DatabaseError, ValueError) as exc:
                     self.outbox_migration_errors.append(f"{legacy_path}: {exc}")
             self._migrate_session_reports(sessions_root)
-        self._platform = _PlatformCoordinator(self.outbox, snapshot_provider=self.presence_snapshot)
+        self._platform = _PlatformCoordinator(
+            self.outbox,
+            snapshot_provider=self.presence_snapshot,
+            on_execution=self.apply_live_execution_code,
+        )
         plc_config = os.environ.get("RP1_FACTORY_PLC_CONFIG", "").strip() or None
         self.plc = PlcCabinetService(
             config_path=plc_config,
@@ -617,6 +686,13 @@ class GatewayHub:
         self._last_owner: str | None = None
         self._lock = threading.RLock()
         self._started = False
+
+    def apply_live_execution_code(self, session_key: str, execution_code: str) -> None:
+        with self._lock:
+            runtime = self._sessions.get(session_key)
+        if runtime is None:
+            return
+        runtime._invoke(("adopt_platform_execution_code",), execution_code)
 
     def presence_snapshot(self) -> dict[str, Any]:
         from factory_hmi.sync.presence import build_presence_snapshot
@@ -1222,6 +1298,7 @@ def create_app(
     simple_route("/api/v1/can/disconnect", ("can_disconnect",))
     simple_route("/api/v1/can/recover", ("can_recover",))
     simple_route("/api/v1/motors/discover", ("discover_motors",))
+    simple_route("/api/v1/motors/reset-fault", ("reset_motor_fault",))
     simple_route("/api/v1/motors/disable", ("disable_motors", "disable"), preempt_motion=True)
     simple_route("/api/v1/disconnect", ("disconnect",), release=True, preempt_motion=True)
     simple_route("/api/v1/arm", ("arm",))
@@ -1393,6 +1470,27 @@ def create_app(
             filename=path.name,
         )
 
+    @app.get("/api/v1/platform/bench")
+    def read_bench(
+        x_rp1_operator_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        path = hub.data_root / "bench-code"
+        code = path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+        return {"ok": True, "bench_code": code}
+
+    @app.post("/api/v1/platform/bench")
+    def write_bench(
+        body: BenchCodeRequest,
+        x_rp1_operator_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        path = hub.data_root / "bench-code"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        code = body.bench_code.strip().upper()
+        path.write_text(code + "\n", encoding="utf-8")
+        return {"ok": True, "bench_code": code}
+
     @app.post("/api/v1/platform/login")
     def platform_login(
         body: PlatformLoginRequest,
@@ -1537,10 +1635,39 @@ def create_app(
         require_token(x_rp1_operator_token)
         runtime = hub.session(owner_id(request, x_rp1_client_id))
         try:
-            result = runtime.submit_execution(body.test_id)
+            result = runtime.submit_execution(
+                body.test_id,
+                reason=body.reason,
+                verified_status=body.verified_status,
+                operator_summary=body.operator_summary,
+                review={
+                    "tester": body.tester,
+                    "bench": body.bench,
+                    "outcome": body.outcome,
+                    "notes": body.notes,
+                    "analysis": body.analysis,
+                    "verified_status": body.verified_status,
+                    "station_id": body.station_id,
+                    "discrepancy_reason": body.discrepancy_reason,
+                    "test_name": body.test_name,
+                    "actual_object": body.actual_object,
+                } if body.verified_status else None,
+            )
         except (ValueError, RuntimeError, FileNotFoundError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True, "result": result}
+
+    @app.post("/api/v1/executions/import-history")
+    def import_history(body: HistoryImportRequest, request: Request,
+        x_rp1_client_id: str | None = Header(default=None),
+        x_rp1_operator_token: str | None = Header(default=None)) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        runtime = hub.session(owner_id(request, x_rp1_client_id))
+        try:
+            result = runtime._invoke(("import_history",), body.paths, body.model_dump(exclude={"paths"}))
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, "items": result}
 
     @app.post("/api/v1/executions/retry")
     def retry_execution(

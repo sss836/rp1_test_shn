@@ -174,8 +174,8 @@ def test_legacy_protocol_rejects_reset_without_any_write(service):
     snapshot = service.snapshot()
     assert snapshot["status"]["ResetResultSupported"] is False
     assert snapshot["status"]["ResetResult"] is None
-    assert snapshot["status"]["ProtocolMode"] == "旧协议/无复位结果回执"
-    assert "V1.1" in snapshot["feedback"]["ResetFaultPulse"]["detail"]
+    assert "旧协议/无复位结果回执" in snapshot["status"]["ProtocolMode"]
+    assert "V1.2" in snapshot["feedback"]["ResetFaultPulse"]["detail"]
 
 
 def test_all_stop_can_supersede_reset_without_replaying_pulse(service):

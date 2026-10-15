@@ -12,14 +12,15 @@ from fastapi.responses import JSONResponse
 from app.api.routes import (
     access,
     admin,
+    archives,
     auth,
     dashboard,
     health,
     hmi_presence,
-    ingestion,
     mtbf,
     read_models,
     setup,
+    submissions,
 )
 from app.core.config import get_settings
 from app.core.db import SessionLocal
@@ -140,8 +141,9 @@ app.include_router(hmi_presence.router)
 app.include_router(auth.router)
 app.include_router(access.router)
 app.include_router(admin.router)
-app.include_router(ingestion.router)
 app.include_router(dashboard.router)
 app.include_router(read_models.router)
 app.include_router(mtbf.router)
 app.include_router(setup.router)
+app.include_router(submissions.router)
+app.include_router(archives.router)

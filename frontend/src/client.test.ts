@@ -22,6 +22,21 @@ describe("authenticated API client", () => {
     expect(new Headers(init.headers).get("X-CSRF-Token")).toBe("csrf-value");
   });
 
+  it("encodes a Chinese approval reason so the browser can send the header", async () => {
+    vi.stubGlobal("document", { cookie: "" });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ data: { ok: true } }), { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await apiRequest("/api/v1/submissions/example/review", {
+      method: "POST",
+      headers: { "X-Change-Reason": "可以确认" },
+      body: "{}"
+    });
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(new Headers(init.headers).get("X-Change-Reason")).toBe(encodeURIComponent("可以确认"));
+  });
+
   it("generates a UUID request id when randomUUID is unavailable over LAN HTTP", async () => {
     vi.stubGlobal("document", { cookie: "" });
     vi.stubGlobal("crypto", {

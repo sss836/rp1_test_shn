@@ -44,6 +44,25 @@ main:has(> .home-page) {
 .home-page .object-carousel > .panel-head h2 { font-size: 18px; }
 .home-page .carousel-controls button,
 .home-page .case-rail-controls button { width: 36px; min-width: 36px; height: 36px; }
+.home-page .case-rail-controls button.case-zero-toggle {
+  width: 16px;
+  min-width: 16px;
+  height: 16px;
+  margin-right: 2px;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  opacity: 0.28;
+}
+.home-page .case-rail-controls button.case-zero-toggle:hover,
+.home-page .case-rail-controls button.case-zero-toggle[aria-pressed="true"] {
+  opacity: 0.85;
+  color: var(--brand-strong);
+  background: transparent;
+}
 .home-page .module-selector {
   display: grid;
   grid-template-columns: repeat(7, minmax(100px, 1fr));
@@ -147,6 +166,7 @@ main:has(> .home-page) {
 .home-page .object-facts dt { color: var(--muted); font-size: clamp(12px, .8vw, 15px); }
 .home-page .object-facts dd,
 .home-page .object-facts .part-total-fact dd { margin: 0; font-size: clamp(16px, 1.05vw, 23px); line-height: 1.4; }
+.home-page .object-facts .record-time-fact dd { font-size: clamp(12px, .78vw, 16px); }
 .home-page .object-actions { margin: 0; padding-top: 10px; border-top: 1px solid var(--line); }
 .home-page .object-actions .text-action { min-height: 32px; }
 

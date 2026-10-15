@@ -27,12 +27,12 @@ def window(monkeypatch):
     assert application is not None
 
 
-def receive(window, flags, *, version=0x0101, feedback=None):
+def receive(window, flags, *, version=0x0102, feedback=None):
     snapshot = {
         "communication_state": "LIVE", "stale": False, "driver": "mock",
         "phase": "FAULT" if flags else "OFF", "read_only": False,
         "status": {
-            "ProtocolVersion": version, "ResetResultSupported": version == 0x0101,
+            "ProtocolVersion": version, "ResetResultSupported": version in {0x0101, 0x0102},
             "FaultSourceFlags": flags, "FaultLatched": bool(flags & 1),
             "PS1Fault": bool(flags & 6), "PS1CommFault": bool(flags & 2),
             "PS1DeviceFault": bool(flags & 4), "FaultCode": 0,
@@ -79,7 +79,23 @@ def test_legacy_mode_disables_reset_and_explains_required_upgrade(window):
     receive(window, 1, version=0x0100)
     assert not window.plc_page.reset_button.isEnabled()
     assert "旧协议/无复位结果回执" in window.plc_page.reset_feedback.text()
-    assert "V1.1" in window.plc_page.reset_button.toolTip()
+    assert "V1.2" in window.plc_page.reset_button.toolTip()
+
+
+def test_v11_retains_fault_display_but_cannot_control_new_flow(window):
+    receive(window, 2, version=0x0101)
+    assert "PLC↔PS1通信故障" in window.global_fault.text()
+    assert not window.plc_page.start_button.isEnabled()
+    assert not window.plc_page.reset_button.isEnabled()
+    assert "V1.2" in window.plc_page.start_button.toolTip()
+
+
+def test_unconfirmed_feedback_is_not_displayed_as_zero_or_off(window):
+    receive(window, 0)
+    assert "实际 未确认" in window.plc_page.ps1_state.text()
+    assert "3  PS1输出  未确认" in window.plc_page.flow_labels[2].text()
+    assert "TCP在线不代表设备反馈有效" in window.plc_page.setpoint_summary.text()
+    assert "0.000" not in window.plc_page.setpoint_summary.text()
 
 
 @pytest.mark.parametrize("state,detail", [

@@ -32,7 +32,7 @@ it("shows a published catalog without samples and preserves disabled catalog ent
 
 it("keeps all seven module groups with zero counts in an empty sample database", async () => {
   view(<AssetsPage assetKind="MODULE" part={null} selectPart={vi.fn()} clearPart={vi.fn()} navigate={vi.fn()} />);
-  await screen.findByText("SLEG");
+  await screen.findByText("ARM");
   expect(screen.getAllByText("0 台")).toHaveLength(14);
   expect(screen.getByText("HEAD")).toBeTruthy();
 });

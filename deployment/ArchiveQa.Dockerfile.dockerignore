@@ -1,0 +1,7 @@
+**
+!backend/
+!backend/requirements.txt
+!backend/requirements-dev.txt
+!backend/requirements.lock
+!database/
+!database/requirements.txt

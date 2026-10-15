@@ -9,7 +9,9 @@ import {
   Maximize2,
   Minimize2,
   Moon,
+  Activity,
   Monitor,
+  ChartNoAxesCombined,
   ShieldCheck,
   Sun
 } from "lucide-react";
@@ -39,7 +41,12 @@ const DurationsPage = lazy(() => import("./pages/ReadModelPages").then((module) 
 const ExecutionDetailPage = lazy(() => import("./pages/ReadModelPages").then((module) => ({ default: module.ExecutionDetailPage })));
 const MtbfPage = lazy(() => import("./pages/ReadModelPages").then((module) => ({ default: module.MtbfPage })));
 const TestCaseDetailPage = lazy(() => import("./pages/ReadModelPages").then((module) => ({ default: module.TestCaseDetailPage })));
+const LiveRunsPage = lazy(() => import("./pages/LiveRunsPage"));
 const HmiStationsPage = lazy(() => import("./pages/HmiStationsPage"));
+const SubmissionsPage = lazy(() => import("./pages/SubmissionsPage"));
+const ArchivesPage = lazy(() => import("./pages/ArchivesPage"));
+const ArchiveDetailPage = lazy(() => import("./pages/ArchivesPage").then((module) => ({ default: module.ArchiveDetailPage })));
+const CurveAnalysisPage = lazy(() => import("./pages/CurveAnalysisPage"));
 
 const navItems: Array<{ view: View; label: string; icon: typeof LayoutDashboard }> = [
   { view: "catalog", label: "测试目录", icon: Boxes },
@@ -48,7 +55,9 @@ const navItems: Array<{ view: View; label: string; icon: typeof LayoutDashboard 
   { view: "durations", label: "时长台账", icon: Clock3 },
   { view: "mtbf", label: "MTBF 结论", icon: Gauge },
   { view: "assets", label: "样品中心", icon: Boxes },
-  { view: "stations", label: "工位监控", icon: Monitor }
+  { view: "live", label: "正在运行", icon: Activity },
+  { view: "stations", label: "工位监控", icon: Monitor },
+  { view: "archives", label: "数据归档", icon: ChartNoAxesCombined }
 ];
 
 function initialTheme(): "day" | "night" {
@@ -152,7 +161,7 @@ export default function App() {
     }
   }
 
-  const navView = location.view === "asset" ? "assets" : location.view;
+  const navView = location.view === "asset" ? "assets" : ["archive", "curves"].includes(location.view) ? "archives" : location.view;
 
   if (status === "booting") return <AuthLoading />;
   if (status === "anonymous") return <LoginScreen />;
@@ -171,7 +180,7 @@ export default function App() {
           <button type="button" className={location.kind === "MODULE" ? "active" : ""} aria-pressed={location.kind === "MODULE"} onClick={() => switchKind("MODULE")}>模块</button>
         </div>
         <nav className="primary-nav" aria-label="主要页面">
-          {navItems.map((item) => {
+          {[...navItems, ...(session?.user.role !== "VIEWER" ? [{ view: "submissions" as View, label: "测试数据审批", icon: ShieldCheck }] : [])].map((item) => {
             const Icon = item.icon;
             const active = navView === item.view;
             return <button key={item.view} type="button" className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => go(item.view)}><Icon aria-hidden="true" />{item.label}</button>;
@@ -254,10 +263,15 @@ export default function App() {
         {location.view === "test-case" && location.id && <TestCaseDetailPage id={location.id} navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "execution" && location.id && <ExecutionDetailPage id={location.id} navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "account" && <AccountPage />}
+        {location.view === "live" && <LiveRunsPage navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "stations" && <HmiStationsPage />}
+        {location.view === "submissions" && <SubmissionsPage navigate={(id) => go("execution", id)} navigateArchive={(id) => go("archive", id)} />}
+        {location.view === "archives" && <ArchivesPage navigate={(view, id) => go(view, id ?? null)} />}
+        {location.view === "archive" && location.id && <ArchiveDetailPage id={location.id} navigate={(view, id) => go(view, id ?? null)} />}
+        {location.view === "curves" && location.id && <CurveAnalysisPage id={location.id} navigate={(view, id) => go(view, id)} />}
         {location.view === "access-request" && <AccessRequestPage />}
         {location.view === "admin" && <AdminWorkspace />}
-        {["asset", "test-case", "execution"].includes(location.view) && !location.id && (
+        {["asset", "test-case", "execution", "archive", "curves"].includes(location.view) && !location.id && (
           <EmptyState title="页面地址缺少业务标识" description="请通过样品、Test Case 或 Execution 列表重新进入详情。" />
         )}
         </Suspense>

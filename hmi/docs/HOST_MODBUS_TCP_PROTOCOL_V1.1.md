@@ -1,3 +1,5 @@
+> 本文保留V1.1历史契约。当前HMI对0100/0101仅监控，控制须配套 [V1.2](HOST_MODBUS_TCP_PROTOCOL_V1.2.md)。
+
 # LFD835 Host Protocol V1.1 — 上位机适配
 
 Modbus TCP 使用 PDU 0 起始地址。标识为 HR0=0x4C46、HR1=0x0101；

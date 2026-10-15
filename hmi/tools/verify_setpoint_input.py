@@ -57,7 +57,8 @@ class InputTests(unittest.TestCase):
         self.page.stop()
         self.snapshot = dict(
             communication_state='LIVE', stale=False, phase='OFF', driver='mock',
-            status=dict(PS1CommOK=True, PS1SetVoltage=3., PS1SetCurrent=.5),
+            status=dict(ProtocolVersion=0x0102, PS1CommOK=True,
+                        PS1SetpointValid=True, PS1SetVoltage=3., PS1SetCurrent=.5),
             feedback={},
             setpoint_limits=dict(enabled=True, voltage_min_v=.001, voltage_max_v=60.,
                                  current_min_a=.001, current_max_a=60., step=.001),
@@ -107,6 +108,7 @@ class InputTests(unittest.TestCase):
         self.page = PlcCabinetPage(self.client, lambda *a, **k: None, lambda: self.operator)
         self.page.stop()
         self.snapshot['status']['PS1CommOK'] = False
+        self.snapshot['status']['PS1SetpointValid'] = False
         self.refresh()
         self.page.show()
         QApplication.processEvents()
@@ -114,6 +116,7 @@ class InputTests(unittest.TestCase):
         self.page.voltage_setpoint.interpretText()
         self.page.current_setpoint.setFocus()
         self.snapshot['status']['PS1CommOK'] = True
+        self.snapshot['status']['PS1SetpointValid'] = True
         self.refresh()
         self.assertAlmostEqual(self.page.voltage_setpoint.value(), 9.876)
 

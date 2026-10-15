@@ -102,12 +102,32 @@ def test_history_transaction_lineage_idempotence_permissions_and_worker(environm
         home = api_data(admin,'dashboard/home')
         scopes = [s for group in home['groups'] for s in group['objects']]
         assert all(s['active_execution_count'] == 0 and s['part_durations']['active_elapsed_seconds'] == 0 for s in scopes)
+        home_cases = [case for scope in scopes for case in scope['test_cases']]
+        assert sum(scope['active_execution_count'] for scope in scopes) == 0
+        assert sum(scope['part_durations']['effective_exposure_seconds'] for scope in scopes) == 0
+        assert sum(scope['part_durations']['excluded_seconds'] for scope in scopes) == 0
+        assert sum(scope['part_durations']['pending_seconds'] for scope in scopes) == sum(scope['part_durations']['total_duration_seconds'] for scope in scopes)
+        assert sum(case['execution_count'] for case in home_cases) == 135
+        assert sum(case['historical_execution_count'] for case in home_cases) == 135
+        assert sum(case['platform_execution_count'] for case in home_cases) == 0
+        assert sum(case['passed_execution_count'] for case in home_cases) == 40
+        assert sum(case['failed_execution_count'] for case in home_cases) == 17
+        assert sum(case['inconclusive_execution_count'] for case in home_cases) == 67
+        assert sum(case['not_evaluated_execution_count'] for case in home_cases) == 11
+        assert sum(case['exception_count'] for case in home_cases) == 16
+        recorded_cases = [case for case in home_cases if case['execution_count']]
+        assert all(case['first_recorded_at'] and case['latest_recorded_at'] for case in recorded_cases)
+        assert {station for case in recorded_cases for station in case['station_codes']} == {'RD-01','RD-02','RD-03'}
         ledger = api_data(admin,'test-cases/durations?limit=100')
         assert ledger['totals']['active_elapsed_seconds'] == 0
-        assert len(api_data(admin,'setup/campaigns')) == 4
-        assert api_data(viewer_client,'assets?limit=100')['items'] == []
-        assert api_data(viewer_client,'setup/campaigns') == []
-        assert viewer_client.get('/api/v1/assets/'+assets[0]['id']).status_code == 404
+        all_campaigns = api_data(admin,'setup/campaigns')
+        assert len(all_campaigns) == 4
+        assert len(api_data(viewer_client,'setup/campaigns')) == 4
+        assert len(api_data(viewer_client,'assets?limit=100')['items']) == 7
+        for other in all_campaigns:
+            if other['id'] != str(campaign.public_id):
+                revoked = admin.request('DELETE', '/api/v1/admin/users/'+viewer+'/campaign-grants/'+other['id'], json={'reason':REASON})
+                assert revoked.status_code == 204, 'isolated default VIEW revoke failed'
         total = 0
         for asset in assets:
             asset_detail = api_data(admin,'assets/'+asset['id'])
@@ -121,10 +141,8 @@ def test_history_transaction_lineage_idempotence_permissions_and_worker(environm
                 assert all(e['active_elapsed_seconds'] == 0 for e in page['items'])
                 total += len(page['items'])
         assert total == 135
-        grant = admin.post('/api/v1/admin/users/'+viewer+'/campaign-grants', json={'campaign_id':str(campaign.public_id),'access_level':'VIEW','reason':REASON})
-        assert grant.status_code == 200, 'isolated VIEW grant failed'
-        assert len(api_data(viewer_client,'setup/campaigns')) == 1
-        assert len(api_data(viewer_client,'assets?limit=100')['items']) > 0
+        assert len(api_data(viewer_client,'setup/campaigns')) == 4
+        assert len(api_data(viewer_client,'assets?limit=100')['items']) == 7
         with engine.connect() as conn:
             warned_execution = str(conn.execute(text('SELECT e.public_id FROM test.test_execution e JOIN test.execution_result r ON r.execution_id=e.id WHERE jsonb_array_length(r.normalization_flags)>0 ORDER BY e.id LIMIT 1')).scalar_one())
         detail = api_data(admin,'executions/'+warned_execution)
@@ -132,7 +150,7 @@ def test_history_transaction_lineage_idempotence_permissions_and_worker(environm
         assert detail['execution']['active_elapsed_seconds'] == 0
         case = api_data(admin,'test-cases/REL-UPPER-001')
         assert case['durations']['active_elapsed_seconds'] == 0
-    # A real, non-imported mock run must keep its live clock; never alter source history.
+    # A RUNNING row without a fresh workstation heartbeat is not a live execution.
     with engine.connect() as conn:
         transaction = conn.begin()
         session = Session(bind=conn)
@@ -148,19 +166,19 @@ def test_history_transaction_lineage_idempotence_permissions_and_worker(environm
               RETURNING public_id,asset_id''')).one()
             repo = ReadModelRepository(session)
             native_detail = repo.get_execution(str(native.public_id))
-            assert native_detail.execution.active_elapsed_seconds >= 119
+            assert native_detail.execution.active_elapsed_seconds == 0
             asset_id = str(session.execute(text('SELECT public_id FROM test.asset WHERE id=:id'),{'id':native.asset_id}).scalar_one())
             asset_detail = repo.get_asset(asset_id)
-            assert asset_detail.current_context.execution_id == native.public_id
-            assert asset_detail.asset.durations.active_elapsed_seconds >= 119
+            assert asset_detail.current_context.execution_id is None
+            assert asset_detail.asset.durations.active_elapsed_seconds == 0
             home = repo.dashboard_home()
             scopes = [s for group in home.groups for s in group.objects]
-            assert sum(s.active_execution_count for s in scopes) == 1
-            assert sum(s.part_durations.active_elapsed_seconds for s in scopes) >= 119
+            assert sum(s.active_execution_count for s in scopes) == 0
+            assert sum(s.part_durations.active_elapsed_seconds for s in scopes) == 0
             ledger = repo.test_case_durations(asset_kind=None,asset=None,test_case=None,status=None,search=None,limit=100,cursor=None)
-            assert ledger.totals.active_elapsed_seconds >= 119
+            assert ledger.totals.active_elapsed_seconds == 0
             case = repo.get_test_case(native_detail.execution.test_case_code,limit=100,cursor=None)
-            assert case.durations.active_elapsed_seconds >= 119
+            assert case.durations.active_elapsed_seconds == 0
         finally:
             session.close()
             transaction.rollback()
@@ -175,7 +193,7 @@ def test_history_transaction_lineage_idempotence_permissions_and_worker(environm
             for campaign in campaigns:
                 now = datetime.now(timezone.utc)
                 intervals = _interval_rows(session,campaign.id,scope,now,now)
-                assert intervals and all(r['source_kind']=='LEGACY_REPORTED' and r['disposition']=='LEGACY_REPORTED' for r in intervals)
+                assert intervals and all(r['source_kind']=='LEGACY_REPORTED' and r['disposition']=='PENDING' for r in intervals)
                 MtbfRepository(session).upsert_config(campaign.public_id,'OVERALL',CampaignMtbfConfigRequest(target_hours=1000,confidence_levels=[.7,.9],settings={'source':'isolated history acceptance'}),None)
             for _ in campaigns:
                 job = claim_job(session,'pc3-isolated-history-worker')
@@ -185,6 +203,25 @@ def test_history_transaction_lineage_idempotence_permissions_and_worker(environm
             assert len(projections) == 4
             assert all(float(p['exposure_seconds']) == 0 and p['point_estimate_hours'] is None and float(p['lower_70_hours']) == 0 and p['result_payload']['point_estimate_status'] == 'NO_EXPOSURE' for p in projections), 'legacy data entered formal MTBF'
             assert all(p['result_payload']['total_test_duration_hours'] > 0 and p['result_payload']['eligible_exposure_hours'] == 0 for p in projections)
+            confirmation = (Path(__file__).resolve().parents[2] / 'database/sql/027_confirm_legacy_reported_exposure.sql').read_text()
+            session.connection().exec_driver_sql(confirmation)
+            confirmed_jobs = 0
+            while True:
+                job = claim_job(session, 'pc3-isolated-history-worker')
+                if job is None:
+                    break
+                process_job(session, job)
+                confirmed_jobs += 1
+            assert confirmed_jobs > 0
+            expected_seconds = session.execute(text("SELECT coalesce(sum(active_seconds),0) FROM test.runtime_interval WHERE source_kind='LEGACY_REPORTED' AND NOT voided")).scalar_one()
+            included_seconds = session.execute(text('SELECT coalesce(sum(exposure_seconds),0) FROM reliability.current_mtbf_result')).scalar_one()
+            assert included_seconds == expected_seconds
+            confirmed_home = ReadModelRepository(session).dashboard_home()
+            confirmed_scopes = [item for group in confirmed_home.groups for item in group.objects]
+            assert sum(item.active_execution_count for item in confirmed_scopes) == 0
+            assert abs(sum(item.part_durations.effective_exposure_seconds for item in confirmed_scopes) - float(expected_seconds)) < 0.001
+            assert sum(item.part_durations.excluded_seconds for item in confirmed_scopes) == 0
+            assert sum(item.part_durations.pending_seconds for item in confirmed_scopes) == 0
         finally:
             session.close()
             transaction.rollback()

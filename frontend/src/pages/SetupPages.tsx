@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../auth";
 import { setupApi } from "../setupApi";
+import { displayPartName, partsCompatible } from "../homeCarousel";
 import { formatDate } from "../navigation";
 import type { AssetKind } from "../types";
 import { EmptyState, ErrorState, LoadingState, PageTitle, Panel } from "../components/Workbench";
@@ -72,7 +73,7 @@ export function CatalogPage({ assetKind, navigate }: { assetKind: AssetKind; nav
     <PageTitle eyebrow="TEST CASE CATALOG" title={`${assetKind === "MODULE" ? "模块" : "整机"}测试目录`} description="独立展示全部测试项目及发布状态。样品和执行记录为零时也可浏览。" />
     <div className="filter-bar"><label>搜索测试项目<input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="编号、名称或部位" /></label><span>{items.length} 项 / 全目录 {catalog.data?.length ?? 0} 项</span></div>
     {catalog.isLoading ? <LoadingState /> : catalog.error ? <ErrorState error={catalog.error} retry={() => void catalog.refetch()} /> : <Panel title="测试项目与版本">
-      {items.length ? <div className="table-scroll"><table className="data-table"><thead><tr><th>编号</th><th>名称</th><th>部位</th><th>领域</th><th>发布版本</th><th>状态</th></tr></thead><tbody>{items.map((c) => <tr key={c.id}><td><button className="link-button" onClick={() => navigate(c.id)}>{c.code}</button></td><td>{c.name}</td><td>{c.target_part_name ?? "未指定"}</td><td>{c.domain}</td><td>{c.version ?? "未发布"}</td><td>{c.enabled ? c.version_id ? "可配置" : "待发布版本" : "已停用"}</td></tr>)}</tbody></table></div> : <EmptyState title="没有匹配测试项目" description="请调整搜索条件。" />}
+      {items.length ? <div className="table-scroll"><table className="data-table"><thead><tr><th>编号</th><th>名称</th><th>部位</th><th>领域</th><th>发布版本</th><th>状态</th></tr></thead><tbody>{items.map((c) => <tr key={c.id}><td><button className="link-button" onClick={() => navigate(c.id)}>{c.code}</button></td><td>{c.name}</td><td>{c.target_part_code ? displayPartName(c.target_part_code, c.target_part_name ?? "未指定") : "未指定"}</td><td>{c.domain}</td><td>{c.version ?? "未发布"}</td><td>{c.enabled ? c.version_id ? "可配置" : "待发布版本" : "已停用"}</td></tr>)}</tbody></table></div> : <EmptyState title="没有匹配测试项目" description="请调整搜索条件。" />}
     </Panel>}
   </>;
 }
@@ -90,7 +91,7 @@ export function PlanningPage({ assetKind }: { assetKind: AssetKind }) {
   const contexts = useQuery({ queryKey: ["setup-contexts", selected], queryFn: ({ signal }) => setupApi.contexts(selected, signal), enabled: Boolean(selected) });
   const campaign = plans.data?.find((p) => p.id === selected && p.asset_kind === assetKind);
   const asset = options.data?.assets.find((a) => a.id === assetId && a.asset_kind === assetKind);
-  const cases = (catalog.data ?? []).filter((c) => c.enabled && c.version_id && c.asset_kind === assetKind && c.target_part_code === asset?.target_part_code);
+  const cases = (catalog.data ?? []).filter((c) => c.enabled && c.version_id && c.asset_kind === assetKind && partsCompatible(c.target_part_code, asset?.target_part_code));
   const chosenCase = cases.find((c) => c.version_id === caseId);
   const error = plans.error ?? options.error ?? catalog.error;
   if (error) return <ErrorState error={error} retry={() => { void plans.refetch(); void options.refetch(); void catalog.refetch(); }} />;
@@ -109,7 +110,7 @@ export function PlanningPage({ assetKind }: { assetKind: AssetKind }) {
     ]} /></Panel>}
     {tab === "plans" && <>
       <Panel title="可访问的计划">
-        {plans.isLoading ? <LoadingState /> : !(plans.data ?? []).some((p) => p.asset_kind === assetKind) ? <EmptyState title="暂无可访问计划" description={admin ? "请使用“创建项目和计划”建立真实测试计划。" : "请联系管理员创建计划并授权。"} /> : <div className="setup-plan-list">{plans.data?.filter((p) => p.asset_kind === assetKind).map((p) => <button key={p.id} type="button" aria-pressed={selected === p.id} onClick={() => { setSelected(p.id); setAssetId(""); setCaseId(""); }}><strong>{p.code} · {p.name}</strong><span>{p.program_code ?? "项目详情不可见"} · {p.status} · {p.asset_count} 个样品 · {p.case_count} 个配置项</span><small>{formatDate(p.planned_start)} 至 {formatDate(p.planned_end)}</small></button>)}</div>}
+        {plans.isLoading ? <LoadingState /> : !(plans.data ?? []).some((p) => p.asset_kind === assetKind) ? <EmptyState title="暂无可访问计划" description={admin ? "请使用“创建项目和计划”建立真实测试计划。" : "请联系管理员创建计划并授权。"} /> : <div className="setup-plan-list">{plans.data?.filter((p) => p.asset_kind === assetKind).map((p) => <button key={p.id} type="button" aria-pressed={selected === p.id} onClick={() => { setSelected(p.id); setAssetId(""); setCaseId(""); }}><strong>{p.code} · {p.name}</strong><span>{p.program_code ?? "项目详情不可见"} · {p.status} · {(p.stages ?? []).map((stage) => stage.stage_name).join("、") || "测试阶段1"} · {p.asset_count} 个样品 · {p.case_count} 个配置项</span><small>{formatDate(p.planned_start)} 至 {formatDate(p.planned_end)}</small></button>)}</div>}
       </Panel>
       {campaign && <Panel title={`${campaign.code} · 样品与用例关联`} description={campaign.can_edit ? "配置所需样品和台架须先建档；执行员需要计划与样品的编辑权限。" : "当前计划为只读。"}>
         {admin && campaign.status === "PLANNED" && <CreateForm title="开放计划使用与权限申请（不启动硬件）" path={`campaigns/${campaign.id}/activate`} fields={[reason]} />}

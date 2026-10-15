@@ -6,6 +6,25 @@ import { getHmiStations, isStationTesting, runLabels, stationLabels, type HmiSta
 import { formatDate, formatDuration } from "../navigation";
 import { EmptyState, ErrorState, LoadingState, PageTitle } from "../components/Workbench";
 
+const limbLabels: Record<string, string> = {
+  left_arm: "左臂（7自由度）",
+  right_arm: "右臂（7自由度）",
+  left_short_arm: "左臂（5自由度）",
+  right_short_arm: "右臂（5自由度）",
+  left_leg: "左腿（6自由度）",
+  right_leg: "右腿（6自由度）",
+  left_short_leg: "左腿（5自由度）",
+  right_short_leg: "右腿（5自由度）",
+  upper_body: "上肢",
+  lower_body: "下肢",
+  waist_hip: "腰髋",
+  biped_waist: "双足腰"
+};
+
+function limbLabel(value: string) {
+  return limbLabels[value] || value || "—";
+}
+
 export function HmiStationCard({ station, live = true }: { station: HmiStation; live?: boolean }) {
   const current = live && station.online && station.snapshot_fresh;
   const label = live ? stationLabels[station.state] : "历史快照";
@@ -23,12 +42,17 @@ export function HmiStationCard({ station, live = true }: { station: HmiStation; 
       </dl>
       {!current && <p className="hmi-snapshot-note">以下为最后上报信息，不能据此判断设备当前是否仍在运行。</p>}
       <div className="hmi-runs">
-        {station.runs.length ? station.runs.map((run) => (
+        {station.runs.length ? station.runs.map((run) => {
+          const official = run.execution_code || "";
+          const localName = run.test_id && run.test_id !== official ? run.test_id : "";
+          return (
           <section className="hmi-run" key={run.session_key}>
-            <div className="hmi-run-heading"><strong>{run.test_id || "尚未开始测试"}</strong><span>{current ? "" : "最后状态："}{runLabels[run.state]}</span></div>
-            <dl><div><dt>样品</dt><dd>{run.sample_id || "—"}</dd></div><div><dt>测试对象</dt><dd>{run.test_case || "—"}</dd></div><div><dt>已运行</dt><dd>{formatDuration(run.active_seconds)}</dd></div><div><dt>已完成循环</dt><dd>{run.completed_cycles}</dd></div></dl>
+            <div className="hmi-run-heading"><strong>{official || run.test_id || "尚未开始测试"}</strong><span>{current ? "" : "最后状态："}{runLabels[run.state]}</span></div>
+            {localName && <p className="hmi-snapshot-note">本地记录：{localName}</p>}
+            <dl><div><dt>样品</dt><dd>{run.sample_id || "—"}</dd></div><div><dt>用例</dt><dd>{run.case_code || "—"}</dd></div><div><dt>总成</dt><dd>{limbLabel(run.test_case)}</dd></div><div><dt>已运行</dt><dd>{formatDuration(run.active_seconds)}</dd></div><div><dt>已完成循环</dt><dd>{run.completed_cycles}</dd></div></dl>
           </section>
-        )) : <p className="hmi-no-run">{current ? "上位机已登录，尚无测试会话。" : "最后快照没有测试会话。"}</p>}
+          );
+        }) : <p className="hmi-no-run">{current ? "上位机已登录，尚无测试会话。" : "最后快照没有测试会话。"}</p>}
       </div>
       <footer>状态采样：{formatDate(station.snapshot_at)} · 运行时长为上位机上报值</footer>
     </article>

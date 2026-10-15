@@ -3,6 +3,9 @@ import {
   caseSlot,
   circularIndex,
   initialCaseIndex,
+  foldDegreeScopes,
+  partsCompatible,
+  recordedCases,
   shouldAutoAdvance,
   uniquePartScopes
 } from "./homeCarousel";
@@ -32,6 +35,13 @@ describe("home Test Case carousel", () => {
     expect(initialCaseIndex(cases, "TC-MISSING")).toBe(0);
   });
 
+  it("drops cases whose recorded duration is zero", () => {
+    expect(recordedCases([
+      { code: "REL-ARM-001", cumulative_duration_seconds: 0 },
+      { code: "REL-ARM-002", cumulative_duration_seconds: 3600 }
+    ]).map((item) => item.code)).toEqual(["REL-ARM-002"]);
+  });
+
   it("never enables autoplay under reduced motion", () => {
     expect(shouldAutoAdvance({
       itemCount: cases.length,
@@ -49,6 +59,35 @@ describe("home Test Case carousel", () => {
     })).toBe(true);
   });
 
+  it("shows full and reduced arm or leg scopes as one part", () => {
+    const durations = {
+      total_duration_seconds: 10,
+      effective_exposure_seconds: 0,
+      excluded_seconds: 0,
+      pending_seconds: 0,
+      active_elapsed_seconds: 0
+    };
+    const scope = (code: string, seconds: number) => ({
+      id: `MODULE:${code}`,
+      code,
+      name: code,
+      asset_kind: "MODULE",
+      target_part_code: code,
+      target_part_name: code,
+      status: "COMPLETED",
+      part_asset_count: 1,
+      active_execution_count: 0,
+      abnormal_asset_count: 0,
+      part_durations: { ...durations, total_duration_seconds: seconds },
+      test_cases: [{ id: code, target_part_code: code, target_part_name: code, cumulative_duration_seconds: seconds }]
+    });
+    const folded = foldDegreeScopes([scope("ARM", 7), scope("SARM", 5), scope("CHEST", 1)]);
+    expect(folded.map((item) => item.target_part_name)).toEqual(["单臂", "CHEST"]);
+    expect(folded[0].part_asset_count).toBe(2);
+    expect(folded[0].part_durations.total_duration_seconds).toBe(12);
+    expect(folded[0].code).toBe("ARM");
+  });
+
   it("renders one selector for each part scope", () => {
     const scopes = uniquePartScopes([
       { asset_kind: "MODULE", target_part_code: "SLEG", label: "first leg" },
@@ -56,5 +95,11 @@ describe("home Test Case carousel", () => {
       { asset_kind: "MODULE", target_part_code: "SARM", label: "arm" }
     ]);
     expect(scopes.map((scope) => scope.target_part_code)).toEqual(["SLEG", "SARM"]);
+  });
+
+  it("lets a full-degree case use the reduced-degree sample", () => {
+    expect(partsCompatible("ARM", "SARM")).toBe(true);
+    expect(partsCompatible("LEG", "SLEG")).toBe(true);
+    expect(partsCompatible("ARM", "LEG")).toBe(false);
   });
 });

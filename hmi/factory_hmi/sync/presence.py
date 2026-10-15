@@ -37,11 +37,19 @@ def _number(value: Any) -> float:
     return max(0.0, min(result, 315360000)) if math.isfinite(result) else 0.0
 
 
+def _execution_uuid(value: Any) -> str | None:
+    try:
+        return str(UUID(str(value))) if value else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def build_presence_snapshot(runtimes: Mapping[str, Mapping[str, Any]], plc: Mapping[str, Any]) -> dict[str, Any]:
     runs = []
     for name, snapshot in list(runtimes.items())[:32]:
         station = snapshot.get("station") or {}
         playback = snapshot.get("playback") or {}
+        platform = snapshot.get("platform") or playback
         progress = playback.get("progress") or snapshot.get("progress") or {}
         state = str(snapshot.get("state") or station.get("state") or "idle").lower()
         if state in {"disconnected", "ready", "connected", "configured"}:
@@ -51,10 +59,19 @@ def build_presence_snapshot(runtimes: Mapping[str, Mapping[str, Any]], plc: Mapp
         runs.append({
             "session_key": _text(name, 128), "state": state,
             "test_id": _text(playback.get("test_id"), 255),
+            "execution_code": _text(playback.get("execution_code"), 255),
+            "execution_uuid": _execution_uuid(playback.get("execution_uuid") or platform.get("execution_uuid")),
+            "case_code": _text(playback.get("test_case_id") or platform.get("test_case_id"), 128),
             "sample_id": _text(playback.get("robot_id"), 128),
             "test_case": _text(station.get("limb"), 128),
             "active_seconds": _number(progress.get("active_seconds")),
             "completed_cycles": min(int(_number(progress.get("completed_cycles"))), 2147483647),
+            "campaign_id": _text(platform.get("campaign_id"), 36),
+            "cycle_id": _text(platform.get("cycle_id"), 36),
+            "asset_id": _text(platform.get("asset_id"), 36),
+            "configuration_id": _text(platform.get("configuration_id"), 36),
+            "test_case_version_id": _text(platform.get("test_case_version_id"), 36),
+            "station_id": _text(platform.get("station_id"), 36),
         })
     status = plc.get("status") or {}
     channels = status.get("ChannelPermit") or []
@@ -74,12 +91,15 @@ class HmiPresencePublisher:
     def __init__(
         self, client: Any, *, data_root: Path,
         snapshot_provider: Callable[[], dict[str, Any]], interval: float = 10.0,
+        on_execution: Callable[[str, str], None] | None = None,
     ) -> None:
         self.client = client
         self.installation_id = installation_id(data_root)
         self.station_name = (os.environ.get("RP1_FACTORY_STATION_NAME") or socket.gethostname())[:128]
+        self.data_root = data_root
         self.bench_id = os.environ.get("RP1_FACTORY_BENCH_ID", "")[:64]
         self.snapshot_provider = snapshot_provider
+        self.on_execution = on_execution
         self.interval = interval
         self.connection_id = ""
         self.sequence = 0
@@ -89,6 +109,14 @@ class HmiPresencePublisher:
         self._snapshot: dict[str, Any] = {"runs": [], "plc": {}}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def current_bench(self) -> str:
+        path = self.data_root / "bench-code"
+        try:
+            saved = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            saved = ""
+        return (saved or self.bench_id)[:64]
 
     def connect(self) -> None:
         self.connection_id = str(uuid4())
@@ -108,11 +136,17 @@ class HmiPresencePublisher:
             self._sampled_at = time.monotonic()
         age = min(86400.0, time.monotonic() - self._sampled_at) if self._sampled_at else 86400.0
         self.sequence += 1
-        self.client.heartbeat_presence(self.connection_id, {
+        ack = self.client.heartbeat_presence(self.connection_id, {
             "installation_id": self.installation_id, "station_name": self.station_name,
-            "bench_id": self.bench_id, "sequence": self.sequence,
+            "bench_id": self.current_bench(), "sequence": self.sequence,
             "snapshot_age_seconds": age, **self._snapshot,
         })
+        if self.on_execution is not None:
+            for item in (ack or {}).get("executions") or []:
+                code = str(item.get("execution_code") or "")
+                key = str(item.get("session_key") or "")
+                if key and code:
+                    self.on_execution(key, code)
         self.last_success_at = time.monotonic()
         self.last_error = ""
 

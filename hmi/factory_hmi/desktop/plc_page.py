@@ -50,6 +50,10 @@ def _at(values: Any, index: int, default: Any = None) -> Any:
     return default
 
 
+def _ps1_value(value: Any) -> str:
+    return "未确认" if value is None else f"{float(value):.3f}"
+
+
 class _TrendChart(QWidget):
     COLORS = (
         QColor("#2375C9"),
@@ -613,6 +617,7 @@ class PlcCabinetPage(QWidget):
         )
         status = snapshot.get("status")
         status = status if isinstance(status, Mapping) else {}
+        self.communication.setText(self.communication.text() + f"\n协议：{status.get('ProtocolMode') or '尚未确认'}")
         command = snapshot.get("command")
         command = command if isinstance(command, Mapping) else {}
         self.main_state.setText(
@@ -622,10 +627,11 @@ class PlcCabinetPage(QWidget):
             f"主回路就绪 {_text(status.get('MainReady'))}"
         )
         self.ps1_state.setText(
-            "PS1输出  ·  "
+            "PS1输出/真实反馈  ·  "
             f"通信 {_text(status.get('PS1CommOK'))}  /  "
             f"请求 {_text(command.get('PS1OutputEnable'))}  /  "
-            f"实际 {_text(status.get('PS1ActualOutput'))}"
+            f"实际 {_text(status.get('PS1ActualOutput')) if status.get('PS1ActualOutput') is not None else '未确认'}  /  "
+            f"PS1反馈 {'有效' if status.get('PS1FeedbackValid') else '未确认或过期'}"
         )
         messages = cabinet_fault_messages(status)
         faulted = bool(messages)
@@ -647,7 +653,7 @@ class PlcCabinetPage(QWidget):
         flow_states = (
             (f"1  PLC通信  {'LIVE' if live else communication}", live),
             (f"2  主回路  {'已就绪' if main_ready else '未就绪'}", main_ready),
-            (f"3  PS1输出  {'已开启' if ps1_actual else '已关闭'}", ps1_actual),
+            (f"3  PS1输出  {'未确认' if status.get('PS1ActualOutput') is None else '已开启' if ps1_actual else '已关闭'}", ps1_actual),
             (
                 f"4  通道投入  {'运行中' if any_channel else '未投入'}",
                 any_channel,
@@ -754,6 +760,7 @@ class PlcCabinetPage(QWidget):
                         phase == "RUNNING"
                         and ps1_actual
                         and physical_value is not False
+                        and bool((snapshot.get('output_admission') or {}).get('allowed'))
                     )
                 )
             )
@@ -792,7 +799,10 @@ class PlcCabinetPage(QWidget):
         )
         self.start_button.setEnabled(
             live and phase == "OFF" and not faulted and not any_pending
+            and status.get('ProtocolVersion') == 0x0102
+            and not status.get('PS1ManualRestartLock') and not status.get('PS1RecoveryExhausted')
         )
+        self.start_button.setToolTip("控制需配套PLC V1.5 / Host Protocol V1.2（0x0102）" if status.get('ProtocolVersion') != 0x0102 else "人工顺序启动；PS1真实反馈确认后才允许输出")
         self.stop_button.setEnabled(
             live
             and phase not in {"OFF", "DISCONNECTED", "COMM_LOST", "STALE"}
@@ -802,18 +812,19 @@ class PlcCabinetPage(QWidget):
         reset_feedback = feedback.get("ResetFaultPulse") or {}
         reset_detail = str(reset_feedback.get("detail") or "")
         reset_state = str(reset_feedback.get("state") or "confirmed")
-        if not reset_supported:
-            reset_text = "旧协议/无复位结果回执：复位需PLC Host Protocol V1.1（0x0101）"
+        if status.get("ProtocolVersion") != 0x0102:
+            reset_text = ("旧协议V1.1仅可监控；复位回执已解码，控制需配套PLC Host Protocol V1.2（0x0102）"
+                          if reset_supported else "旧协议/无复位结果回执：控制需配套PLC Host Protocol V1.2（0x0102）")
         elif reset_detail and reset_detail != "not requested":
             reset_text = f"PLC控制故障复位：{states.get(reset_state, reset_state)} · {reset_detail}"
         else:
-            reset_text = "V1.1：复位仅清除PLC控制故障，不清除PS1通信或设备故障"
+            reset_text = "V1.2：复位仅清除PLC控制故障，不清除PS1通信或设备故障"
         self.reset_feedback.setText(reset_text)
         set_tone(self.reset_feedback, "warning" if not reset_supported or reset_state in {"pending", "rejected", "timeout", "failed"} else "neutral")
         self.reset_button.setText("复位PLC控制故障")
         self.reset_button.setToolTip(reset_text)
         requests_off = not command.get("MainEnable") and not command.get("PS1OutputEnable") and not any(command.get("ChannelEnable") or [])
-        self.reset_button.setEnabled(live and reset_supported and requests_off and not any_pending)
+        self.reset_button.setEnabled(live and reset_supported and status.get('ProtocolVersion') == 0x0102 and requests_off and not any_pending)
         self.all_stop_button.setEnabled(live)
         self.connect_button.setEnabled(communication != "LIVE")
 
@@ -860,7 +871,7 @@ class PlcCabinetPage(QWidget):
                 if editor.singleStep() != step:
                     editor.setSingleStep(step)
                 editor.blockSignals(False)
-            readback_available = bool(status.get("PS1CommOK"))
+            readback_available = bool(status.get("PS1SetpointValid"))
             should_sync = (
                 readback_available
                 and not self._setpoint_dirty
@@ -885,17 +896,19 @@ class PlcCabinetPage(QWidget):
             and not ps1_actual
             and setpoint_state != "pending"
             and not any_pending
+            and status.get('ProtocolVersion') == 0x0102
         )
         self.voltage_setpoint.setEnabled(setpoint_can_edit)
         self.current_setpoint.setEnabled(setpoint_can_edit)
         self.apply_setpoints_button.setEnabled(setpoint_can_edit)
         self.setpoint_summary.setText(
             "设定回读："
-            f"{float(status.get('PS1SetVoltage') or 0.0):.3f} V / "
-            f"{float(status.get('PS1SetCurrent') or 0.0):.3f} A\n"
+            f"{_ps1_value(status.get('PS1SetVoltage'))} V / "
+            f"{_ps1_value(status.get('PS1SetCurrent'))} A\n"
             "实际输出："
-            f"{float(status.get('PS1OutputVoltage') or 0.0):.3f} V / "
-            f"{float(status.get('PS1OutputCurrent') or 0.0):.3f} A"
+            f"{_ps1_value(status.get('PS1OutputVoltage'))} V / "
+            f"{_ps1_value(status.get('PS1OutputCurrent'))} A"
+            + ("\nPS1状态/测量/设定尚未确认；TCP在线不代表设备反馈有效" if not status.get('PS1FeedbackValid') else "")
         )
         if setpoint_detail == "not requested" or not setpoint_detail:
             setpoint_feedback_text = "设定反馈：尚未操作"

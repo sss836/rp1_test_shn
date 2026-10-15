@@ -43,7 +43,16 @@ class HmiPresenceRepository:
         ).scalar_one_or_none()
         if result is None:
             raise ApiError(409, "presence_session_conflict", "上位机连接已关闭或属于其他登录会话，请重新登录。")
-        return {"connection_id": str(result), "heartbeat_interval_seconds": 10, "offline_after_seconds": 45}
+        executions = self.session.execute(
+            text("SELECT test.sync_live_runs(CAST(:connection_id AS uuid))"),
+            {"connection_id": str(connection_id)},
+        ).scalar_one()
+        return {
+            "connection_id": str(result),
+            "heartbeat_interval_seconds": 10,
+            "offline_after_seconds": 45,
+            "executions": executions or [],
+        }
 
     def disconnect(self, connection_id: UUID, actor: RequestActor) -> dict:
         closed = self.session.execute(
@@ -52,6 +61,10 @@ class HmiPresenceRepository:
         ).scalar_one()
         if not closed:
             raise ApiError(404, "presence_not_found", "当前登录会话没有这个上位机连接。")
+        self.session.execute(
+            text("SELECT test.sync_live_runs(CAST(:connection_id AS uuid))"),
+            {"connection_id": str(connection_id)},
+        )
         return {"connection_id": str(connection_id), "online": False}
 
     def list_stations(self, *, cursor: UUID | None, limit: int) -> HmiStationList:

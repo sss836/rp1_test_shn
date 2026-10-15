@@ -94,7 +94,11 @@ def gateway_environment(root: Path, runtime: Path | None, *, offline: bool, driv
         env["SSL_CERT_FILE"] = str(ca)
     if runtime is not None:
         env["PYTHONPATH"] += os.pathsep + str(runtime)
-        env["LD_LIBRARY_PATH"] = str(runtime)
+        library_paths = [runtime]
+        qt_libraries = runtime / "PySide6/Qt/lib"
+        if qt_libraries.is_dir():
+            library_paths.append(qt_libraries)
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(str(path) for path in library_paths)
         env["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(runtime / "PySide6/Qt/plugins")
     return env
 

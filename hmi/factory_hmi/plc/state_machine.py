@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .client import PlcClient, PlcCommunicationError
+from .client import PlcConfigurationError
 from .config import PlcSetpointConfig, PlcTimingConfig
+from .freshness import Ps1FeedbackTracker
 from .faults import cabinet_fault_messages
 from .models import (
     CabinetPhase,
@@ -21,6 +23,7 @@ from .models import (
     PlcCommand,
     PlcStatus,
     ResetResult,
+    Ps1FeedbackFlags,
     sequence_reached,
 )
 
@@ -67,6 +70,8 @@ class PlcCabinetController:
         self._start_setpoints: tuple[float, float] | None = None
         self._start_requested = False
         self._ever_connected = False
+        self._ps1_feedback = Ps1FeedbackTracker()
+        self._startup_deadline = 0.0
         self.feedback: dict[str, CommandFeedback] = {
             name: CommandFeedback(FeedbackState.CONFIRMED, detail="not requested")
             for name in (
@@ -102,6 +107,10 @@ class PlcCabinetController:
         try:
             self.client.connect()
             self.status = self.client.read_status()
+            if not self.status.control_protocol_supported:
+                raise PlcConfigurationError("控制需配套PLC V1.5 / Host Protocol V1.2（0x0102）；旧协议仅可监控，请升级配套源码")
+            self._ps1_feedback.reset()
+            self._ps1_feedback.observe(self.status, self.clock())
             # Start from the PLC's accepted transaction and heartbeat echo.
             # The first write keeps the current CommandSeq, so the protocol
             # adapter sends only ControlKey/Heartbeat and cannot energize an
@@ -181,6 +190,7 @@ class PlcCabinetController:
         self._start_requested = False
         self._start_setpoints = None
         self._requested_channels = (False, False, False, False)
+        self._ps1_feedback.reset()
         self.command = PlcCommand(command_sequence=self.command.command_sequence)
 
     def _establish_host_connection(self) -> None:
@@ -258,6 +268,10 @@ class PlcCabinetController:
             return self._reject("Start", user, f"cannot start from {self.phase.value}")
         if self.status is None or not self.status.host_connected:
             return self._reject("Start", user, "PLC has not confirmed HostConnected")
+        if not self.status.control_protocol_supported:
+            return self._reject("Start", user, "控制需配套PLC V1.5 / Host Protocol V1.2（0x0102）")
+        if self.status.ps1_manual_restart_locked or self.status.ps1_feedback_flags & 0xFF00:
+            return self._reject("Start", user, "PLC人工重启锁/恢复耗尽或反馈标志非法；请检查PLC诊断")
         if self.status and self.status.has_fault:
             return self._reject("Start", user, "PLC or PS1 fault is active")
         if (voltage is None) != (current is None):
@@ -277,6 +291,7 @@ class PlcCabinetController:
         self._requested_channels = tuple(bool(value) for value in channels)  # type: ignore[assignment]
         self._start_setpoints = start_setpoints
         self._start_requested = True
+        self._startup_deadline = self.clock() + self.startup_budget_ms / 1000.0
         self.feedback["Start"] = CommandFeedback(
             FeedbackState.PENDING,
             detail="re-arming acknowledged STOP before startup",
@@ -335,6 +350,9 @@ class PlcCabinetController:
         if self.phase != CabinetPhase.RUNNING:
             return self._reject(control, user, "channel changes require RUNNING phase")
         if enabled:
+            reason = self._output_admission_reason()
+            if reason:
+                return self._reject(control, user, reason)
             if self.phase != CabinetPhase.RUNNING:
                 return self._reject(
                     control, user, "channel enable requires RUNNING phase"
@@ -366,10 +384,10 @@ class PlcCabinetController:
             return self._reject(
                 "ResetFaultPulse", user, "PLC communication is not live"
             )
-        if self.status is None or not self.status.reset_results_supported:
+        if self.status is None or not self.status.control_protocol_supported:
             return self._reject(
                 "ResetFaultPulse", user,
-                "旧协议/无复位结果回执：故障复位需要PLC Host Protocol V1.1（0x0101）",
+                "旧协议仅可监控/无V1.2控制握手：故障复位需要配套PLC Host Protocol V1.2（0x0102）",
             )
         if self._pending is not None:
             return self._reject(
@@ -386,7 +404,7 @@ class PlcCabinetController:
             reset_fault_pulse=True,
             command_sequence=sequence,
         )
-        self.client.write_command(pulse)
+        self._write_checked(pulse)
         # The retained image is FALSE immediately. The TRUE value is sent only
         # once and can therefore never be held by the heartbeat writer.
         self.command = replace(
@@ -443,6 +461,8 @@ class PlcCabinetController:
                 user,
                 "PS1 setpoints may only be changed while the cabinet is OFF",
             )
+        if self.status is not None and (not self.status.control_protocol_supported or self.status.has_fault or self.status.ps1_manual_restart_locked):
+            return self._reject(control, user, "设定需V1.2、无故障及无人工锁")
         if self.status is None or self.status.ps1_actual_output:
             return self._reject(
                 control,
@@ -459,13 +479,12 @@ class PlcCabinetController:
             voltage_value, current_value = self._validated_setpoints(voltage, current)
         except ValueError as exc:
             return self._reject(control, user, str(exc))
-        self._issue_setpoints(
+        return self._issue_setpoints(
             voltage_value,
             current_value,
             user=user,
             next_phase=CabinetPhase.OFF,
         )
-        return True
 
     def _validated_setpoints(
         self,
@@ -505,7 +524,7 @@ class PlcCabinetController:
         *,
         user: str,
         next_phase: CabinetPhase,
-    ) -> None:
+    ) -> bool:
         assert self.status is not None
         old_value = {
             "voltage_v": self.status.ps1_set_voltage,
@@ -520,7 +539,8 @@ class PlcCabinetController:
             apply_setpoints=True,
             command_sequence=sequence,
         )
-        self.client.write_command(pulse)
+        if not self._write_checked(pulse):
+            return False
         self.command = replace(pulse, apply_setpoints=False)
         detail = "waiting for PLC setpoint application confirmation"
         log_index = self._append_log(
@@ -546,6 +566,7 @@ class PlcCabinetController:
             log_indexes=(log_index,),
             setpoint_rejection_preexisting=self.status.setpoint_rejected,
         )
+        return True
 
     def request_all_stop(self, *, user: str, detail: str = "operator all stop") -> bool:
         if (
@@ -589,7 +610,68 @@ class PlcCabinetController:
             heartbeat_counter=(self.command.heartbeat_counter + 1) & 0xFFFFFFFF,
             reset_fault_pulse=False,
         )
-        self.client.write_command(self.command)
+        self._write_checked(self.command)
+
+    @property
+    def startup_budget_ms(self) -> int:
+        # Sum of the existing bounded acknowledgement/feedback stages plus
+        # PLC V1.5's fixed MainReady delay. No retry can reset this deadline.
+        return (5000 + self.timings.km0_timeout_ms + 3 * self.timings.ps1_timeout_ms
+                + 9 * self.timings.command_timeout_ms + 2 * self.timings.poll_ms)
+
+    def _output_admission_reason(self, *, channels: bool = False) -> str:
+        status = self.status
+        if status is None or self.communication_state != "LIVE" or self.stale:
+            return "PLC TCP状态未确认或已过期"
+        if not status.control_protocol_supported:
+            return "控制需配套PLC Host Protocol V1.2（0x0102）"
+        if status.has_fault:
+            return "；".join(cabinet_fault_messages(status.to_dict())) or "PLC/PS1故障"
+        if status.ps1_feedback_flags & 0xFF00 or status.ps1_manual_restart_locked:
+            return "PLC人工重启锁/恢复耗尽或反馈标志非法"
+        if not status.plc_ready or not status.host_connected or not status.main_ready:
+            return "PLC/主回路尚未就绪"
+        required = (Ps1FeedbackFlags.POWER_DELAY_DONE | Ps1FeedbackFlags.PORT_LOADED
+                    | Ps1FeedbackFlags.STOP_OFF_CONFIRMED | Ps1FeedbackFlags.MEASUREMENT_VALID
+                    | Ps1FeedbackFlags.SETPOINT_VALID)
+        if (not self._ps1_feedback.fresh(status, self.clock())
+                or status.ps1_feedback_flags & required != required):
+            return "PS1本周期状态、测量、设定或STOP/OFF确认未齐备或已过期"
+        if not status.ps1_comm_ok or status.analog_valid_mask != 0x0F:
+            return "PS1设备未就绪或模拟量无效"
+        if status.setpoint_rejected or not status.setpoint_applied:
+            return "PS1设定未应用或被拒绝（仅撤运行许可）"
+        if channels and not status.ps1_actual_output:
+            return "PS1真实输出尚未确认ON"
+        return ""
+
+    def _write_checked(self, command: PlcCommand) -> bool:
+        """Single final entry for every retained ON payload, including pulses/HB."""
+        if not command.all_stop and (command.main_enable or command.ps1_output_enable or any(command.channel_enable)):
+            status = self.status
+            reason = ""
+            if status is None or not status.control_protocol_supported or self.stale or self.communication_state != "LIVE":
+                reason = "控制需V1.2及新鲜PLC TCP状态"
+            elif status.has_fault:
+                reason = "；".join(cabinet_fault_messages(status.to_dict()))
+            elif status.ps1_manual_restart_locked or status.ps1_feedback_flags & 0xFF00:
+                reason = "PLC人工重启锁/恢复耗尽或反馈标志非法"
+            elif not status.plc_ready or not status.host_connected:
+                reason = "PLC未就绪/主机连接未确认"
+            elif command.ps1_output_enable or any(command.channel_enable):
+                reason = self._output_admission_reason(channels=any(command.channel_enable))
+                if not reason and any(enabled and physical is False for enabled, physical in zip(command.channel_enable, status.physical_permit, strict=True)):
+                    reason = "通道物理许可缺失，禁止ON请求"
+            if reason:
+                # Fail closed before calling the transport, including same-frame
+                # SetpointApplied + Fault. This path never sends the candidate ON.
+                if (command.ps1_output_enable or any(command.channel_enable)) and self._only_setpoint_inhibited(self.clock()):
+                    self._inhibit_outputs(reason)
+                else:
+                    self._enter_fault(reason, "system")
+                return False
+        self.client.write_command(command)
+        return True
 
     def tick(self, now: float | None = None) -> None:
         current = self.clock() if now is None else float(now)
@@ -618,6 +700,10 @@ class PlcCabinetController:
             self.last_error = "PLC status exceeded stale timeout"
             self._start_requested = False
             self._requested_channels = (False, False, False, False)
+            return
+
+        if self._start_requested and current >= self._startup_deadline:
+            self._enter_fault("冷启动总时间预算耗尽；需人工重新检查并启动", "system")
             return
 
         if self.communication_state != "LIVE":
@@ -722,7 +808,8 @@ class PlcCabinetController:
         elif self.phase == CabinetPhase.WAIT_MAIN_READY:
             if self.status.main_ready and self.status.main_contactor_fb is not False:
                 self.phase = CabinetPhase.WAIT_PS1_COMM
-                self._phase_deadline = current + self.timings.ps1_timeout_ms / 1000.0
+                # HR28 bit0 is only the fixed 5s MainReady timer, not self-test.
+                self._phase_deadline = current + (5000 + self.timings.ps1_timeout_ms + 2 * self.timings.poll_ms) / 1000.0
             elif current >= self._phase_deadline:
                 self.feedback["MainEnable"] = CommandFeedback(
                     FeedbackState.TIMEOUT,
@@ -763,6 +850,10 @@ class PlcCabinetController:
                 self.status.ps1_comm_ok
                 and not self.status.ps1_actual_output
                 and not self.status.ps1_comm_busy
+                and self._ps1_feedback.fresh(self.status, current)
+                and self.status.ps1_feedback_flags & Ps1FeedbackFlags.STOP_OFF_CONFIRMED
+                and self.status.ps1_feedback_flags & Ps1FeedbackFlags.MEASUREMENT_VALID
+                and self.status.ps1_feedback_flags & Ps1FeedbackFlags.SETPOINT_VALID
             ):
                 self._continue_start_after_ps1_stop()
             elif current >= self._phase_deadline:
@@ -800,7 +891,7 @@ class PlcCabinetController:
                     expected, self.status.channel_permit, strict=True
                 )
             ):
-                self.phase = CabinetPhase.RUNNING
+                self._finish_startup()
                 self.feedback["Start"] = CommandFeedback(
                     FeedbackState.CONFIRMED,
                     self.command.command_sequence,
@@ -878,7 +969,7 @@ class PlcCabinetController:
             elif current >= self._phase_deadline:
                 self._enter_fault("channel shutdown feedback timeout", "system")
         elif self.phase == CabinetPhase.WAIT_PS1_OFF:
-            if not self.status.ps1_actual_output:
+            if self._ps1_feedback.fresh(self.status, current) and not self.status.ps1_actual_output:
                 self._stop_main("operator")
             elif current >= self._phase_deadline:
                 self._enter_fault("PS1 shutdown feedback timeout", "system")
@@ -894,7 +985,35 @@ class PlcCabinetController:
                 self._enter_fault("KM0 release feedback timeout", "system")
 
     def _read_and_resolve(self, now: float) -> None:
+        previous = self.status
         self.status = self.client.read_status()
+        if now - self.status.received_monotonic > self.timings.stale_timeout_ms / 1000.0:
+            return  # No acknowledgement or ON transition from a stale TCP frame.
+        boundary = self._ps1_feedback.observe(self.status, now)
+        reset_pending = self._pending is not None and self._pending.controls == ("ResetFaultPulse",)
+        if not reset_pending:
+            if self.status.has_fault:
+                if self.phase != CabinetPhase.FAULT:
+                    self._enter_fault("；".join(cabinet_fault_messages(self.status.to_dict())), "system")
+                    return
+            active = self.command.main_enable or self.command.ps1_output_enable or any(self.command.channel_enable)
+            expected_power_on = (previous is not None and not previous.main_ready and self.status.main_ready
+                                 and self.phase in {CabinetPhase.WAIT_MAIN_ACK, CabinetPhase.WAIT_MAIN_READY})
+            if boundary and active and not expected_power_on:
+                self._enter_fault("PS1上电周期/CPU状态发生变化；撤销本地确认并要求人工重新启动", "system")
+                return
+            if active and (not self.status.control_protocol_supported or self.status.ps1_manual_restart_locked or self.status.ps1_feedback_flags & 0xFF00 or not self.status.host_connected or not self.status.plc_ready):
+                if self.phase != CabinetPhase.FAULT:
+                    self._enter_fault("PLC协议/人工锁/恢复耗尽/反馈标志不允许控制", "system")
+                    return
+            if self.command.ps1_output_enable or any(self.command.channel_enable):
+                reason = self._output_admission_reason()
+                if reason:
+                    if self._only_setpoint_inhibited(now):
+                        self._inhibit_outputs(reason)
+                    else:
+                        self._enter_fault("PS1反馈周期变化/已过期" if boundary else reason, "system")
+                    return
         if (
             self._pending is not None
             and sequence_reached(self.status.acknowledged_sequence, self._pending.sequence)
@@ -910,7 +1029,10 @@ class PlcCabinetController:
                 current_matches = self.command.set_current is not None and abs(
                     self.status.ps1_set_current - self.command.set_current
                 ) <= max(self.setpoints.step / 2.0, 1e-9)
-                if self.status.setpoint_applied and voltage_matches and current_matches:
+                if (self.status.setpoint_applied and not self.status.setpoint_rejected
+                        and self._ps1_feedback.fresh(self.status, now)
+                        and self.status.ps1_feedback_flags & Ps1FeedbackFlags.SETPOINT_VALID
+                        and voltage_matches and current_matches):
                     self._finish_pending(
                         FeedbackState.CONFIRMED,
                         "PLC applied and echoed the PS1 setpoints",
@@ -1011,8 +1133,10 @@ class PlcCabinetController:
             if force or getattr(old, name) != value
         ]
         sequence = old.command_sequence + 1
-        self.command = replace(old, **changes, command_sequence=sequence)
-        self.client.write_command(self.command)
+        candidate = replace(old, **changes, command_sequence=sequence)
+        if not self._write_checked(candidate):
+            return
+        self.command = candidate
         controls: list[str] = []
         indexes: list[int] = []
         for field, old_value, new_value in changed:
@@ -1119,7 +1243,10 @@ class PlcCabinetController:
         assert self.status is not None
         tolerance = max(self.setpoints.step / 2.0, 1e-9)
         return (
-            abs(self.status.ps1_set_voltage - voltage) <= tolerance
+            self._ps1_feedback.fresh(self.status, self.clock())
+            and bool(self.status.ps1_feedback_flags & Ps1FeedbackFlags.SETPOINT_VALID)
+            and self.status.setpoint_applied and not self.status.setpoint_rejected
+            and abs(self.status.ps1_set_voltage - voltage) <= tolerance
             and abs(self.status.ps1_set_current - current) <= tolerance
         )
 
@@ -1144,10 +1271,16 @@ class PlcCabinetController:
         )
         self._start_setpoints = None
 
+    def _finish_startup(self) -> None:
+        """End the startup budget; RUNNING retains all runtime health guards."""
+        self._start_requested = False
+        self._startup_deadline = 0.0
+        self.phase = CabinetPhase.RUNNING
+
     def _enable_permitted_channels(self) -> None:
         assert self.status is not None
         if not any(self._requested_channels):
-            self.phase = CabinetPhase.RUNNING
+            self._finish_startup()
             self.feedback["Start"] = CommandFeedback(
                 FeedbackState.CONFIRMED,
                 self.command.command_sequence,
@@ -1171,7 +1304,7 @@ class PlcCabinetController:
                     "physical permit is absent",
                 )
         if not any(enabled):
-            self.phase = CabinetPhase.RUNNING
+            self._finish_startup()
             self.feedback["Start"] = CommandFeedback(
                 FeedbackState.REJECTED,
                 detail="no selected channel has physical permit",
@@ -1199,7 +1332,7 @@ class PlcCabinetController:
 
     def _stop_ps1(self, user: str) -> None:
         assert self.status is not None
-        if self.command.ps1_output_enable or self.status.ps1_actual_output:
+        if self.command.ps1_output_enable or self.status.ps1_actual_output or not self._ps1_feedback.fresh(self.status, self.clock()):
             self._issue(
                 user=user,
                 phase=CabinetPhase.STOP_PS1_ACK,
@@ -1247,6 +1380,31 @@ class PlcCabinetController:
             entry.confirmation = state
             entry.detail = detail
         self._pending = None
+
+    def _inhibit_outputs(self, detail: str) -> None:
+        """F003/setpoint mismatch withdraws run permission, retaining healthy KM0."""
+        if self._pending is not None:
+            self._finish_pending(FeedbackState.REJECTED, detail)
+        self._start_requested = False
+        self._start_setpoints = None
+        self._requested_channels = (False,) * 4
+        self.last_error = detail
+        self.feedback["Start"] = CommandFeedback(FeedbackState.FAILED, detail=detail)
+        self._issue(user="system", phase=CabinetPhase.FAULT,
+                    changes={"channel_enable": (False,) * 4, "ps1_output_enable": False},
+                    detail=detail, force=True)
+
+    def _only_setpoint_inhibited(self, now: float) -> bool:
+        status = self.status
+        required = int(Ps1FeedbackFlags.POWER_DELAY_DONE | Ps1FeedbackFlags.PORT_LOADED |
+                       Ps1FeedbackFlags.STATUS_VALID | Ps1FeedbackFlags.STOP_OFF_CONFIRMED |
+                       Ps1FeedbackFlags.MEASUREMENT_VALID)
+        return bool(status and not status.has_fault and not status.ps1_manual_restart_locked
+                    and not status.ps1_feedback_flags & 0xFF00 and status.ps1_comm_ok
+                    and status.main_ready and status.analog_valid_mask == 0x0F
+                    and status.ps1_feedback_flags & required == required
+                    and self._ps1_feedback.fresh(status, now)
+                    and (status.setpoint_rejected or status.ps1_mb_status == 0xF003))
 
     def _reject(self, control: str, user: str, detail: str) -> bool:
         self.feedback[control] = CommandFeedback(FeedbackState.REJECTED, detail=detail)
@@ -1349,6 +1507,7 @@ class PlcCabinetController:
             except PlcCommunicationError:
                 pass
         self.command = PlcCommand(command_sequence=self.command.command_sequence)
+        self._ps1_feedback.reset()
         self.phase = CabinetPhase.FAULT
         if start_in_progress:
             self.feedback["Start"] = CommandFeedback(
@@ -1364,6 +1523,7 @@ class PlcCabinetController:
             )
 
     def _communication_lost(self, detail: str) -> None:
+        self._ps1_feedback.reset()
         self._cancel_sequence_feedback(detail)
         if self._pending is not None:
             self._finish_pending(FeedbackState.TIMEOUT, detail)
@@ -1375,14 +1535,22 @@ class PlcCabinetController:
         self._requested_channels = (False, False, False, False)
         self.command = PlcCommand(command_sequence=self.command.command_sequence)
 
+    def notify_cpu_restart(self) -> None:
+        """Invalidate explicitly known restarts; 16-bit counters are not boot IDs."""
+        self._ps1_feedback.reset()
+        self._enter_fault("已知PLC CPU重启：本地反馈确认已撤销，需人工重新启动", "system")
+
     def snapshot(self) -> dict[str, Any]:
         stale = self.communication_state == "STALE" or self.stale
-        status = self.status.to_dict(stale=stale) if self.status else None
+        status = self.status.to_dict(stale=stale, ps1_fresh=self._ps1_feedback.fresh(self.status, self.clock())) if self.status else None
         return {
             "phase": self.phase.value,
             "communication_state": self.communication_state,
             "stale": stale,
             "last_error": self.last_error,
+            "output_admission": {"allowed": not bool(self._output_admission_reason()), "reason": self._output_admission_reason()},
+            "ps1_progress_age_ms": self._ps1_feedback.age_ms(self.clock()),
+            "startup_budget_ms": self.startup_budget_ms,
             "status": status,
             "command": self.command.to_dict(),
             "feedback": {key: value.to_dict() for key, value in self.feedback.items()},

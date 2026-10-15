@@ -32,6 +32,11 @@ class Settings(BaseSettings):
         "http://localhost:8088",
     ]
     worker_poll_seconds: float = 1.0
+    archive_root: str = "/var/lib/rp1/archives"
+    archive_max_chunk_bytes: int = Field(default=4 * 1024**2, ge=1024, le=16 * 1024**2)
+    archive_max_file_bytes: int = Field(default=50 * 1024**3, ge=1024, le=50 * 1024**3)
+    archive_query_memory_mb: int = Field(default=512, ge=128, le=4096)
+    archive_worker_poll_seconds: float = Field(default=2, ge=.1, le=60)
 
     @property
     def secure_auth_cookie(self) -> bool:

@@ -14,7 +14,7 @@ PLC_PAGE_SOURCE = (ROOT / "factory_hmi" / "desktop" / "plc_page.py").read_text(
 class FactoryHmiUiContractTests(unittest.TestCase):
     def test_operator_controls_keep_their_existing_labels(self) -> None:
         labels = (
-            "新增模块",
+            "应用模块",
             "模块参数…",
             "重新应用模块",
             "清除当前配置",
@@ -26,7 +26,7 @@ class FactoryHmiUiContractTests(unittest.TestCase):
             "打开电机标零…",
             "选择轨迹…",
             "回默认位",
-            "执行预检并进入 Armed",
+            "执行预检，通过后可以开始",
             "开始运行",
             "暂停",
             "继续",
@@ -35,7 +35,7 @@ class FactoryHmiUiContractTests(unittest.TestCase):
             "保存 CSV…",
             "导出执行包…",
             "提交审批",
-            "重试上传",
+            "重试归档",
             "查看审批意见",
             "重建报告",
             "登录测试平台",
@@ -57,7 +57,7 @@ class FactoryHmiUiContractTests(unittest.TestCase):
 
     def test_existing_signal_slot_bindings_remain_present(self) -> None:
         bindings = (
-            "self.new_window_button.clicked.connect(self._new_module_window)",
+            "self.limb.currentIndexChanged.connect(lambda _index: self._suggest_config(self._selected_limb()))",
             "self.limb.currentTextChanged.connect(self._suggest_config)",
             "self.module_config_button.clicked.connect(self._show_module_config_dialog)",
             "self.configure_button.clicked.connect(self._configure)",

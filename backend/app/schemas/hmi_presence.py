@@ -10,10 +10,19 @@ class HmiRun(BaseModel):
     session_key: str = Field(min_length=1, max_length=128)
     state: Literal["idle", "armed", "running", "paused", "stopping", "fault", "completed", "unknown"]
     test_id: str = Field(default="", max_length=255)
+    execution_code: str = Field(default="", max_length=255)
+    execution_uuid: UUID | None = None
+    case_code: str = Field(default="", max_length=128)
     sample_id: str = Field(default="", max_length=128)
     test_case: str = Field(default="", max_length=128)
     active_seconds: float = Field(default=0, ge=0, le=315360000)
     completed_cycles: int = Field(default=0, ge=0, le=2147483647)
+    campaign_id: str = Field(default="", max_length=36)
+    cycle_id: str = Field(default="", max_length=36)
+    asset_id: str = Field(default="", max_length=36)
+    configuration_id: str = Field(default="", max_length=36)
+    test_case_version_id: str = Field(default="", max_length=36)
+    station_id: str = Field(default="", max_length=36)
 
 
 class HmiPlcStatus(BaseModel):

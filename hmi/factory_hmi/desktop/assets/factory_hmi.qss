@@ -73,6 +73,19 @@ QPushButton#headerActionButton:hover {
 QPushButton#headerActionButton:pressed {
     background: #D8E8F4;
 }
+QWidget#appHeader QLineEdit#headerField {
+    min-height: 34px;
+    max-height: 34px;
+    padding: 0 10px;
+    color: #162434;
+    background: #FFFFFF;
+    border: 1px solid #D6E2EB;
+    border-radius: 6px;
+}
+QWidget#appHeader QPushButton {
+    min-height: 34px;
+    max-height: 34px;
+}
 
 QFrame#sideNavigation {
     background: #FFFFFF;
@@ -544,4 +557,15 @@ QScrollBar::handle:horizontal {
 QScrollBar::add-line:horizontal,
 QScrollBar::sub-line:horizontal {
     width: 0;
+}
+
+/* Named action colors must not override their disabled appearance. */
+QPushButton#primaryButton:disabled,
+QPushButton#startButton:disabled,
+QPushButton#dangerButton:disabled,
+QPushButton#outlineButton:disabled,
+QPushButton#criticalOutlineButton:disabled {
+    color: #8A98A8;
+    background: #EDF1F5;
+    border-color: #D9E0E7;
 }

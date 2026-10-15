@@ -1,4 +1,5 @@
 import os
+import re
 from contextlib import contextmanager
 from uuid import uuid4
 
@@ -124,3 +125,76 @@ def test_new_login_supersedes_old_station_session_and_logout_is_immediate(enviro
         assert find_station(first, installation) is None
         assert second.post("/api/v1/auth/logout").status_code == 204
         assert find_station(admin, installation)["state"] == "offline"
+
+
+def test_only_a_complete_running_heartbeat_opens_one_official_execution(environment):
+    engine, users = environment
+    suffix = uuid4().hex[:8]
+    with signed_in(users["admin"]) as admin, signed_in(users["first"]) as operator:
+        def create(path, payload):
+            response = admin.post("/api/v1/setup/" + path, json={**payload, "reason": "live running regression"})
+            assert response.status_code == 201, response.text
+            return response.json()["data"]
+
+        catalog = admin.get("/api/v1/setup/catalog")
+        assert catalog.status_code == 200, catalog.text
+        case = next(item for item in catalog.json()["data"] if item["target_part_code"] == "LEG" and item["enabled"] and item["version_id"])
+        sample = create("assets", {
+            "asset_code": f"RP1.3-SLEG-{int(suffix, 16) % 900 + 100:03d}",
+            "asset_kind": "MODULE", "target_part_code": "SLEG", "product_family": "QA",
+            "serial_number": suffix, "display_name": "Live sample", "model": "QA",
+            "configuration_fingerprint": "QA-" + suffix,
+        })
+        program = create("programs", {"program_code": "QA-LIVE-" + suffix, "name": "Live program"})
+        campaign = create("campaigns", {
+            "program_id": program["id"], "campaign_code": "QA-LIVE-PLAN-" + suffix,
+            "name": "Live plan", "asset_kind": "MODULE",
+        })
+        station = create("stations", {
+            "site_code": "QA-SITE-" + suffix, "site_name": "QA", "lab_code": "QA-LAB-" + suffix,
+            "lab_name": "QA", "station_code": "QA-" + suffix[:4].upper(), "name": "QA station",
+            "station_type": "MODULE",
+        })
+        created = create(f"campaigns/{campaign['id']}/contexts", {
+            "asset_id": sample["id"], "configuration_id": sample["configuration_id"],
+            "test_case_version_id": case["version_id"], "station_id": station["id"],
+            "cycle_code": "QA-LIVE-" + suffix,
+        })
+        context = created["context"]
+        payload = heartbeat_payload()
+        payload["runs"][0].update({
+            "state": "running", "active_seconds": 40,
+            "campaign_id": context["campaign_id"], "cycle_id": context["cycle_id"],
+            "asset_id": context["asset_id"], "configuration_id": context["configuration_id"],
+            "test_case_version_id": context["test_case_version_id"], "station_id": context["station_id"],
+        })
+        route = "/api/v1/hmi/presence/" + str(uuid4())
+        opened = operator.put(route, json=payload)
+        assert opened.status_code == 200, opened.text
+        live = opened.json()["data"]["executions"]
+        assert len(live) == 1
+        assert re.fullmatch(r".+_E[0-9]+", live[0]["execution_code"])
+        assert live[0]["status"] == "RUNNING"
+        repeated = operator.put(route, json={**payload, "sequence": 2, "runs": [{**payload["runs"][0], "active_seconds": 55}]})
+        assert repeated.status_code == 200, repeated.text
+        assert repeated.json()["data"]["executions"][0]["execution_id"] == live[0]["execution_id"]
+        home = operator.get("/api/v1/dashboard/home")
+        assert home.status_code == 200, home.text
+        scopes = [item for group in home.json()["data"]["groups"] for item in group["objects"]]
+        assert sum(item["active_execution_count"] for item in scopes) == 1
+        stopped = operator.put(route, json={
+            **payload, "sequence": 3,
+            "runs": [{**payload["runs"][0], "state": "completed", "active_seconds": 55}],
+        })
+        assert stopped.status_code == 200, stopped.text
+        assert stopped.json()["data"]["executions"][0]["status"] == "COMPLETED"
+    with engine.connect() as database:
+        row = database.execute(text("""
+            SELECT e.status, e.reported_active_seconds, ri.active_seconds
+            FROM test.test_execution e
+            LEFT JOIN test.runtime_interval ri ON ri.execution_id = e.id AND NOT ri.voided
+            WHERE e.public_id = :id
+        """), {"id": live[0]["execution_id"]}).one()
+        assert row.status == "COMPLETED"
+        assert float(row.reported_active_seconds) == 55
+        assert float(row.active_seconds) == 55

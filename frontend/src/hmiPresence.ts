@@ -4,6 +4,8 @@ export type HmiRun = {
   session_key: string;
   state: "idle" | "armed" | "running" | "paused" | "stopping" | "fault" | "completed" | "unknown";
   test_id: string;
+  execution_code?: string;
+  case_code?: string;
   sample_id: string;
   test_case: string;
   active_seconds: number;

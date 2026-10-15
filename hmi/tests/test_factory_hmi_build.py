@@ -83,7 +83,9 @@ class FactoryHmiBuildTests(unittest.TestCase):
             ROOT / "factory_hmi" / "desktop" / "app.py"
         ).read_text(encoding="utf-8")
 
-        self.assertIn('self.new_window_button = QPushButton("新增模块")', source)
+        self.assertIn('self.limb = QComboBox()', source)
+        self.assertIn('for key, label in LIMB_LABELS:', source)
+        self.assertIn('self.configure_button = QPushButton("应用模块")', source)
         self.assertIn("def _build_config_dialog(self) -> QDialog:", source)
         self.assertIn(
             'self.tabs.addTab(configuration_page, "样机配置与连接")',

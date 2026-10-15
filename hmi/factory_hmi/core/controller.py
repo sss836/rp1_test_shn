@@ -99,6 +99,7 @@ class FactoryController:
         self._position_hold_target: np.ndarray | None = None
         self._default_return_active = threading.Event()
         self._default_return_stop = threading.Event()
+        self._motor_recovery_active = threading.Event()
 
     @property
     def state(self) -> StationState:
@@ -136,90 +137,178 @@ class FactoryController:
     def discover_motors(self) -> None:
         with self._lock:
             self.state_machine.require(StationState.DISCONNECTED)
+            self._default_return_stop.clear()
+            self._motor_recovery_active.set()
             try:
                 self.backend.open_transport()
-                self.backend.refresh_feedback()
-                self._last_samples = self.backend.read_samples()
+                self._last_samples = self._confirm_motor_feedback(
+                    "motor discovery", allow_errors=True
+                )
+                self._fault = None
+                self.state_machine.transition(
+                    StationState.CONNECTED, expected=StationState.DISCONNECTED
+                )
             except Exception as exc:
-                self._set_fault(exc)
+                self._set_fault(exc, samples=self._last_samples)
                 raise
-            self._fault = None
-            self.state_machine.transition(
-                StationState.CONNECTED, expected=StationState.DISCONNECTED
-            )
+            finally:
+                self._motor_recovery_active.clear()
 
     def enable_motors(self) -> None:
         with self._lock:
             self.state_machine.require(StationState.CONNECTED)
             if self.backend.motors_enabled:
                 raise FactoryControllerError("motors are already enabled")
+            self._default_return_stop.clear()
+            self._motor_recovery_active.set()
             try:
+                before = self._confirm_motor_feedback("before motor enable")
+                self._check_motor_positions(before)
+                self._check_motor_operation_cancelled()
                 self.backend.enable_motors()
-                self._last_samples = self.backend.read_samples()
-            except Exception as exc:
-                self._set_fault(exc)
-                raise
-            faulted = [sample for sample in self._last_samples if sample.error_id != 0]
-            if faulted:
-                error = FactoryControllerError(
-                    "motor enable feedback contains errors: "
-                    + ", ".join(
-                        f"id={sample.motor_id}:error_id={sample.error_id}"
-                        for sample in faulted
-                    )
+                self._last_samples = self._confirm_motor_feedback(
+                    "after motor enable", baseline=before, updates=1
                 )
-                self._set_fault(error, samples=self._last_samples)
-                raise error
-            positions = np.asarray(
-                [sample.pos_rad for sample in self._last_samples],
-                dtype=np.float64,
-            )
-            if not np.all(np.isfinite(positions)):
-                error = FactoryControllerError(
-                    "motor enable feedback contains non-finite positions"
+                self._check_motor_positions(self._last_samples)
+                self._check_motor_operation_cancelled()
+                positions = np.asarray(
+                    [sample.pos_rad for sample in self._last_samples], dtype=np.float64
                 )
-                self._set_fault(error, samples=self._last_samples)
-                raise error
-            for name, raw_limit, comparison in (
-                (
-                    "motor_min_rad",
-                    self.config.safety_limits.motor_min_rad,
-                    np.less,
-                ),
-                (
-                    "motor_max_rad",
-                    self.config.safety_limits.motor_max_rad,
-                    np.greater,
-                ),
-            ):
-                if raw_limit is None:
-                    continue
-                limits = np.asarray(raw_limit, dtype=np.float64)
-                if limits.ndim == 0:
-                    limits = np.full(positions.shape, float(limits))
-                else:
-                    limits = limits.reshape(-1)
-                if limits.shape != positions.shape:
-                    error = FactoryControllerError(
-                        f"{name} must be scalar or contain {positions.size} values"
-                    )
-                    self._set_fault(error, samples=self._last_samples)
-                    raise error
-                violating = np.flatnonzero(comparison(positions, limits))
-                if violating.size:
-                    index = int(violating[0])
-                    error = FactoryControllerError(
-                        f"motor[{index}] initial position {positions[index]:.6f} "
-                        f"violates {name}={limits[index]:.6f}"
-                    )
-                    self._set_fault(error, samples=self._last_samples)
-                    raise error
-            self._fault = None
-            try:
+                self._fault = None
                 self._start_position_hold(positions)
             except Exception as exc:
                 self._set_fault(exc, samples=self._last_samples)
                 raise
+            finally:
+                self._motor_recovery_active.clear()
+
+    def _check_motor_operation_cancelled(self) -> None:
+        if self._default_return_stop.is_set():
+            raise FactoryControllerError("motor operation interrupted by stop request")
+
+    def _check_motor_positions(self, samples: list[MotorSample]) -> None:
+        positions = np.asarray([sample.pos_rad for sample in samples], dtype=np.float64)
+        if not np.all(np.isfinite(positions)):
+            raise FactoryControllerError("motor feedback contains non-finite positions")
+        for name, comparison in (("motor_min_rad", np.less), ("motor_max_rad", np.greater)):
+            raw = getattr(self.config.safety_limits, name)
+            if raw is None:
+                continue
+            limits = np.asarray(raw, dtype=np.float64)
+            if limits.ndim == 0:
+                limits = np.full(positions.shape, float(limits))
+            else:
+                limits = limits.reshape(-1)
+            if limits.shape != positions.shape:
+                raise FactoryControllerError(
+                    f"{name} must be scalar or contain {positions.size} values"
+                )
+            violating = np.flatnonzero(comparison(positions, limits))
+            if violating.size:
+                index = int(violating[0])
+                raise FactoryControllerError(
+                    f"motor[{index}] initial position {positions[index]:.6f} violates {name}={limits[index]:.6f}"
+                )
+
+    def _confirm_motor_feedback(
+        self,
+        phase: str,
+        *,
+        allow_errors: bool = False,
+        baseline: list[MotorSample] | None = None,
+        updates: int = 2,
+    ) -> list[MotorSample]:
+        """Require new replies from every motor; cached zero errors cannot pass.
+
+        Read-only refresh is backend/type-specific. In particular this never
+        calls EVO's enable-producing status query. After enable only passive
+        replies are accepted by the hardware backend, before position hold.
+        """
+        previous = baseline if baseline is not None else self.backend.read_samples()
+        stamps = [sample.timestamp_s for sample in previous]
+        progress = [0] * len(previous)
+        # A bounded confirmation window, capped by the existing stale limit.
+        deadline = time.monotonic() + min(1.0, self._diagnosis.thresholds.stale_seconds)
+        while True:
+            self._check_motor_operation_cancelled()
+            self.backend.refresh_feedback()
+            samples = self.backend.read_samples()
+            self._last_samples = samples
+            for index, sample in enumerate(samples):
+                if (
+                    np.isfinite(sample.timestamp_s)
+                    and sample.timestamp_s > stamps[index]
+                    and np.isfinite(sample.feedback_age_s)
+                    and sample.feedback_age_s < self._diagnosis.thresholds.stale_seconds
+                ):
+                    if not np.isfinite(sample.pos_rad):
+                        raise FactoryControllerError(f"{phase}: non-finite position: id={sample.motor_id}")
+                    if not allow_errors and sample.error_id != 0:
+                        raise FactoryControllerError(f"{phase}: motor error: id={sample.motor_id}:error_id={sample.error_id}")
+                    stamps[index] = sample.timestamp_s
+                    progress[index] += 1
+            self._check_motor_operation_cancelled()
+            if time.monotonic() >= deadline:
+                missing = ",".join(
+                    str(sample.motor_id) for index, sample in enumerate(samples)
+                    if progress[index] < updates
+                ) or "all"
+                raise FactoryControllerError(f"{phase}: fresh feedback timeout: motor_ids={missing}")
+            if all(count >= updates for count in progress) and all(
+                np.isfinite(sample.feedback_age_s)
+                and sample.feedback_age_s < self._diagnosis.thresholds.stale_seconds
+                for sample in samples
+            ):
+                return samples
+            time.sleep(0.005)
+
+    def reset_motor_fault(self) -> None:
+        """Explicit fault reset only; leave the transport open and torque disabled."""
+        # Reject a healthy enabled station before disturbing its position hold.
+        with self._lock:
+            self.state_machine.require({
+                StationState.DISCONNECTED, StationState.CONNECTED,
+                StationState.FAULT, StationState.ARMED, StationState.COMPLETED,
+            })
+            if self.backend.motors_enabled:
+                raise FactoryControllerError("disable motors before resetting motor faults")
+            playback, zeroing = self._playback, self._zeroing
+        if playback is not None and not playback.wait(timeout=1.0):
+            raise FactoryControllerError("wait for playback to stop before resetting motor faults")
+        if zeroing is not None and zeroing.state.value in {"idle", "prepared", "reading"}:
+            zeroing.abort("motor fault reset")
+        self._stop_manual_session()
+        self._stop_position_hold()
+        with self._lock:
+            self.state_machine.require({
+                StationState.DISCONNECTED, StationState.CONNECTED,
+                StationState.FAULT, StationState.ARMED, StationState.COMPLETED,
+            })
+            if self.backend.motors_enabled:
+                raise FactoryControllerError("disable motors before resetting motor faults")
+            self._default_return_stop.clear()
+            self._motor_recovery_active.set()
+            try:
+                if self.backend.connected:
+                    self.backend.disconnect()
+                self.backend.open_transport()
+                before = self._confirm_motor_feedback("before fault reset", allow_errors=True)
+                self._check_motor_operation_cancelled()
+                self.backend.clear_errors()
+                self._confirm_motor_feedback("after fault reset", baseline=before)
+                self._check_motor_operation_cancelled()
+                state = self.state_machine.state
+                if state is not StationState.CONNECTED:
+                    self.state_machine.transition(StationState.CONNECTED, expected=state)
+                self._fault = None
+                self._playback = None
+                self._zeroing = None
+                self._trajectory = None
+            except Exception as exc:
+                self._set_fault(exc, samples=self._last_samples)
+                raise
+            finally:
+                self._motor_recovery_active.clear()
 
     def load_trajectory(self, path: Path | str) -> TrajectoryData:
         with self._lock:
@@ -251,6 +340,11 @@ class FactoryController:
                 current_motor_pos=None,
             )
             self._trajectory = trajectory
+            if self.state_machine.state is StationState.COMPLETED:
+                # A new trajectory requires a fresh arm() with live feedback.
+                self.state_machine.transition(
+                    StationState.CONNECTED, expected=StationState.COMPLETED
+                )
             return trajectory
 
     # Name used by service/RPC layers.
@@ -433,6 +527,14 @@ class FactoryController:
             self._fault = None
 
     def reset(self, *, to_default: bool = False) -> None:
+        if not to_default:
+            self.reset_motor_fault()
+            return
+        with self._lock:
+            self.state_machine.require({StationState.CONNECTED, StationState.ARMED, StationState.COMPLETED})
+            if not self.backend.connected or not self.backend.motors_enabled:
+                raise FactoryControllerError("enable healthy motors before returning to default; reset motor faults separately")
+            self._check_default_return_feedback(self.backend.read_samples())
         self._stop_manual_session()
         with self._lock:
             state = self.state_machine.state
@@ -465,19 +567,10 @@ class FactoryController:
             if to_default:
                 self._default_return_active.set()
             try:
-                recovery_required = (
-                    state is StationState.FAULT
-                    or not self.backend.connected
-                    or not self.backend.motors_enabled
-                )
-                if recovery_required:
-                    # Fault recovery still requires a known disabled transport
-                    # and a fresh enable. Healthy "return to default" does not.
-                    if self.backend.connected:
-                        self.backend.disconnect()
-                    self.backend.connect()
-                    self.backend.clear_errors()
+                if state is StationState.FAULT or not self.backend.motors_enabled:
+                    raise FactoryControllerError("reset motor faults and explicitly enable before returning to default")
                 samples = self.backend.read_samples()
+                self._check_default_return_feedback(samples)
                 faulted = [sample for sample in samples if sample.error_id != 0]
                 if faulted:
                     raise FactoryControllerError(
@@ -557,30 +650,38 @@ class FactoryController:
             raise
 
     def request_motion_stop(self) -> bool:
-        """Signal a return-to-default cancellation without waiting for its lock.
+        """Cancel return, discovery, enable or fault reset without its command lock.
 
-        This only cancels an existing return. It never enables, clears errors,
+        This only cancels an existing operation. It never enables, clears errors,
         or starts motion; the caller still executes its normal disable command.
         """
-        if not self._default_return_active.is_set():
+        if not (self._default_return_active.is_set() or self._motor_recovery_active.is_set()):
             return False
         self._default_return_stop.set()
         return True
 
     def _check_default_return_feedback(self, samples: list[MotorSample]) -> None:
+        self._check_motor_feedback(samples, "return to default")
+
+    def _check_motor_feedback(self, samples: list[MotorSample], phase: str) -> None:
         for sample in samples:
             if sample.error_id != 0:
                 raise FactoryControllerError(
-                    f"return to default feedback error: id={sample.motor_id}:"
+                    f"{phase} feedback error: id={sample.motor_id}:"
                     f"error_id={sample.error_id}"
                 )
             if not np.isfinite(sample.pos_rad):
                 raise FactoryControllerError(
-                    f"return to default has non-finite feedback: id={sample.motor_id}"
+                    f"{phase} has non-finite feedback: id={sample.motor_id}"
                 )
-            if sample.feedback_age_s >= self._diagnosis.thresholds.stale_seconds:
+            if (
+                not np.isfinite(sample.feedback_age_s)
+                or not np.isfinite(sample.timestamp_s)
+                or sample.timestamp_s <= 0
+                or sample.feedback_age_s >= self._diagnosis.thresholds.stale_seconds
+            ):
                 raise FactoryControllerError(
-                    f"return to default feedback stale: id={sample.motor_id}"
+                    f"{phase} feedback stale: id={sample.motor_id}"
                 )
 
     def disconnect(self) -> None:
@@ -893,25 +994,17 @@ class FactoryController:
         samples: list[MotorSample] = []
         try:
             while not stop_event.is_set():
-                self.backend.command_mit(target)
                 now = time.monotonic()
                 if now - last_sample_at >= 0.05:
                     samples = self.backend.read_samples()
-                    faulted = [
-                        sample for sample in samples if sample.error_id != 0
-                    ]
-                    if faulted:
-                        raise FactoryControllerError(
-                            "position hold feedback contains errors: "
-                            + ", ".join(
-                                f"id={sample.motor_id}:error_id={sample.error_id}"
-                                for sample in faulted
-                            )
-                        )
+                    self._check_motor_feedback(samples, "position hold")
                     with self._lock:
                         if self._position_hold_stop is stop_event:
                             self._last_samples = samples
                     last_sample_at = now
+                if stop_event.is_set():
+                    break
+                self.backend.command_mit(target)
                 next_tick += period
                 delay = next_tick - time.monotonic()
                 if delay > 0.0:
@@ -1018,4 +1111,3 @@ class FactoryController:
 
 
 __all__ = ["FactoryController", "FactoryControllerError"]
-

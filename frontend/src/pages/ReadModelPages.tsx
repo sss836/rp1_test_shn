@@ -34,10 +34,12 @@ import {
   ShowcaseBadge
 } from "../components/Workbench";
 import { JointAnalysisPanel } from "../components/JointAnalysisPanel";
+import { JointRecordPanel } from "../components/JointRecordPanel";
+import { MODULE_DIRECTORY } from "../homeCarousel";
 import { AssetCreateForm } from "./SetupPages";
 import { StatusMark } from "../components/StatusMark";
 
-type Navigate = (view: "asset" | "test-case" | "execution" | "assets", id?: string) => void;
+type Navigate = (view: "asset" | "test-case" | "execution" | "assets" | "curves", id?: string) => void;
 
 function DurationBand({ totals }: { totals: DurationTotals }) {
   return (
@@ -341,7 +343,9 @@ export function MtbfPage({ assetKind }: { assetKind: AssetKind }) {
 }
 
 const targetPartNames: Record<TargetPartCode, string> = {
+  ARM: "单臂",
   SARM: "单臂",
+  LEG: "单腿",
   SLEG: "单腿",
   SYS: "整机系统",
   UPPER: "上肢",
@@ -395,9 +399,11 @@ export function AssetsPage({
   const hasShowcase = items.some(
     (item) => isShowcaseValue(item.batch_code) || isShowcaseValue(item.current_execution_code)
   );
-  const moduleParts: TargetPartCode[] = ["SARM", "SLEG", "UPPER", "LOWER", "CHEST", "HEAD", "BAT"];
-  const partGroups = moduleParts
-    .map((code) => ({ code, items: items.filter((item) => item.target_part_code === code) }));
+  const partGroups = MODULE_DIRECTORY
+    .map((group) => ({
+      code: group.code as TargetPartCode,
+      items: items.filter((item) => item.target_part_code !== null && (group.members as readonly string[]).includes(item.target_part_code))
+    }));
   const isLoading = showPartDirectory ? directory.isLoading : query.isLoading;
   const loadError = showPartDirectory ? directory.error : query.error;
   return (
@@ -581,6 +587,7 @@ export function ExecutionDetailPage({ id, navigate }: { id: string; navigate: Na
     <>
       <BackButton onClick={() => returnToPreviousPage(navigate)} label="返回上一页" />
       <PageTitle eyebrow="EXECUTION DATA & ANALYSIS" title={execution.code} description={`${execution.test_case_code} · ${execution.asset_code} · ${execution.campaign_code}`} trailing={<div className="title-status">{isShowcaseValue(execution.campaign_code) && <ShowcaseBadge />}<StatusMark tone={execution.status === "RUNNING" ? "normal" : execution.status === "FAILED" || execution.status === "BLOCKED" ? "danger" : "muted"} label={execution.status} /></div>} />
+      <button type="button" className="archive-curve-link" onClick={() => navigate("curves", execution.id)}>打开归档详细曲线</button>
       <section className="metric-strip">
         <div><span>闭合时长</span><strong>{formatDuration(execution.closed_duration_seconds)}</strong></div>
         <div><span>运行中 elapsed</span><strong>{formatDuration(execution.active_elapsed_seconds)}</strong></div>
@@ -590,6 +597,7 @@ export function ExecutionDetailPage({ id, navigate }: { id: string; navigate: Na
         {data.peak_summary.slice(0, 4).map((metric) => <div key={metric.metric_code}><span>{metric.metric_name}</span><strong>{metric.value.toLocaleString("zh-CN")} {metric.unit}</strong></div>)}
       </section>
       {data.result && <ExecutionResultSummary result={data.result} />}
+      <JointRecordPanel records={data.joint_records ?? []} />
       <JointAnalysisPanel executionId={id} />
       <Panel title="执行元数据" eyebrow="CONTEXT"><dl className="fact-grid"><div><dt>Test Case</dt><dd><button className="link-button" type="button" onClick={() => navigate("test-case", execution.test_case_code)}>{execution.test_case_code}</button></dd></div><div><dt>样品</dt><dd><button className="link-button" type="button" onClick={() => navigate("asset", execution.asset_code)}>{execution.asset_code}</button></dd></div><div><dt>台架</dt><dd>{data.station_code ?? "未记录"} · {data.station_name ?? "—"}</dd></div><div><dt>执行人</dt><dd>{data.operator_name ?? data.result?.executor_display ?? "未记录"}</dd></div><div><dt>数据源</dt><dd>{data.source_code ?? "未记录"}</dd></div><div><dt>配置指纹</dt><dd>{data.configuration.fingerprint ?? "未记录"}</dd></div></dl></Panel>
       <Panel title="逐关节 / 指标表" eyebrow="METRIC OBSERVATIONS">
@@ -641,6 +649,7 @@ function ExecutionResultSummary({ result }: { result: ExecutionResult }) {
         <div><dt>源记录时长</dt><dd>{formatDuration(result.reported_duration_seconds)}</dd></div>
         <div><dt>最后数据时间</dt><dd>{result.last_data_at ? formatDate(result.last_data_at) : "未记录"}</dd></div>
         <div><dt>异常计数</dt><dd>{result.exception_count}</dd></div>
+        <div><dt>申报完成循环</dt><dd>{result.completed_cycles ?? "未记录"}</dd></div>
         <div><dt>环境</dt><dd>{result.environment_label || "未记录"}</dd></div>
         <div><dt>遥测来源</dt><dd>{result.telemetry_source || "未记录"}</dd></div>
         <div><dt>归档状态</dt><dd>{result.archive_status}</dd></div>

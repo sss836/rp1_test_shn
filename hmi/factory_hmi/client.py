@@ -389,6 +389,7 @@ class GatewayClient:
         test_case_version_id: str | None = None,
         test_case_id: str | None = None,
         test_case_version: str | None = None,
+        test_name: str | None = None,
         bench_id: str | None = None,
         station_id: str | None = None,
         operator_id: str | None = None,
@@ -417,6 +418,7 @@ class GatewayClient:
             "test_case_version_id": test_case_version_id,
             "test_case_id": test_case_id,
             "test_case_version": test_case_version,
+            "test_name": test_name,
             "bench_id": bench_id,
             "station_id": station_id,
             "operator_id": operator_id,
@@ -446,6 +448,9 @@ class GatewayClient:
 
     def playback_reset(self) -> JsonValue:
         return self.post("/api/v1/playback/reset")
+
+    def reset_motor_fault(self) -> JsonValue:
+        return self.post("/api/v1/motors/reset-fault")
 
     def playback_disable(self) -> JsonValue:
         return self.post("/api/v1/playback/disable")
@@ -491,6 +496,42 @@ class GatewayClient:
     def platform_logout(self) -> JsonValue:
         return self.post("/api/v1/platform/logout")
 
+    def platform_bench(self) -> JsonValue:
+        return self.get("/api/v1/platform/bench")
+
+    def set_platform_bench(self, bench_code: str) -> JsonValue:
+        return self.post("/api/v1/platform/bench", {"bench_code": bench_code})
+
+    def submit_execution(
+        self,
+        test_id: str,
+        reason: str = "",
+        *,
+        verified_status: str = "",
+        operator_summary: str = "",
+        review: Mapping[str, Any] | None = None,
+    ) -> JsonValue:
+        payload = {
+            "test_id": test_id,
+            "reason": reason,
+            "verified_status": verified_status,
+            "operator_summary": operator_summary,
+            "tester": "",
+            "bench": "",
+            "outcome": "",
+            "notes": "",
+            "analysis": "",
+        }
+        if review:
+            payload["operator_summary"] = str(review.get("operator_summary") or operator_summary)
+            payload["verified_status"] = str(review.get("verified_status") or verified_status)
+            for name in ("tester", "bench", "outcome", "notes", "analysis", "station_id", "discrepancy_reason", "test_name", "actual_object"):
+                payload[name] = str(review.get(name) or "")
+        return self.post("/api/v1/executions/submit", payload)
+
+    def import_execution_history(self, paths: list[str], metadata: Mapping[str, str]) -> JsonValue:
+        return self.post("/api/v1/executions/import-history", {"paths": paths, **dict(metadata)})
+
     def execution_history(self, *, limit: int = 100) -> JsonValue:
         return self.get(f"/api/v1/executions?limit={int(limit)}")
 
@@ -525,9 +566,6 @@ class GatewayClient:
 
     def rebuild_execution(self, test_id: str) -> JsonValue:
         return self.post("/api/v1/executions/rebuild", {"test_id": test_id})
-
-    def submit_execution(self, test_id: str) -> JsonValue:
-        return self.post("/api/v1/executions/submit", {"test_id": test_id})
 
     def retry_execution(self, test_id: str) -> JsonValue:
         return self.post("/api/v1/executions/retry", {"test_id": test_id})

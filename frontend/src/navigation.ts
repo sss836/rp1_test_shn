@@ -7,7 +7,12 @@ export type View =
   | "durations"
   | "mtbf"
   | "assets"
+  | "live"
   | "stations"
+  | "submissions"
+  | "archives"
+  | "archive"
+  | "curves"
   | "asset"
   | "test-case"
   | "execution"
@@ -29,7 +34,12 @@ const views = new Set<View>([
   "durations",
   "mtbf",
   "assets",
+  "live",
   "stations",
+  "submissions",
+  "archives",
+  "archive",
+  "curves",
   "asset",
   "test-case",
   "execution",
@@ -38,7 +48,7 @@ const views = new Set<View>([
   "admin"
 ]);
 const targetParts = new Set<TargetPartCode>([
-  "SARM", "SLEG", "SYS", "UPPER", "LOWER", "CHEST", "HEAD", "BAT"
+  "ARM", "SARM", "LEG", "SLEG", "SYS", "UPPER", "LOWER", "CHEST", "HEAD", "BAT"
 ]);
 
 export function readLocation(search = window.location.search): LocationState {

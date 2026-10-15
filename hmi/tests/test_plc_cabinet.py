@@ -255,7 +255,8 @@ def test_ps1_communication_timeout_enters_fault() -> None:
     controller.request_start(user="alice")
     _tick_until(controller, CabinetPhase.WAIT_PS1_COMM)
 
-    controller.tick(time.monotonic() + 1.0)
+    # V1.5 has a fixed 5s MainReady delay before attempting PS1 I/O.
+    controller.tick(controller._phase_deadline + 0.001)
 
     assert controller.phase == CabinetPhase.FAULT
     assert controller.last_error == "PS1 communication timeout"

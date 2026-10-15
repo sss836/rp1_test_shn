@@ -110,6 +110,8 @@ class PlcCabinetService:
             if self.read_only:
                 self.client.connect()
                 self.controller.status = self.client.read_status()
+                self.controller._ps1_feedback.reset()
+                self.controller._ps1_feedback.observe(self.controller.status, time.monotonic())
                 self.controller.communication_state = "LIVE"
                 self.controller.phase = CabinetPhase.MONITORING
                 self.controller.last_error = ""
@@ -206,6 +208,9 @@ class PlcCabinetService:
                 "poll_ms": self.config.timings.poll_ms,
                 "stale_timeout_ms": self.config.timings.stale_timeout_ms,
                 "command_timeout_ms": self.config.timings.command_timeout_ms,
+                "km0_timeout_ms": self.config.timings.km0_timeout_ms,
+                "ps1_timeout_ms": self.config.timings.ps1_timeout_ms,
+                "startup_budget_ms": self.controller.startup_budget_ms,
             }
             value["dut_can_map"] = dict(self.config.dut_can_map)
             value["setpoint_limits"] = {
@@ -236,6 +241,7 @@ class PlcCabinetService:
                 try:
                     if self.read_only:
                         self.controller.status = self.client.read_status()
+                        self.controller._ps1_feedback.observe(self.controller.status, now)
                         self.controller.communication_state = "LIVE"
                         self.controller.phase = CabinetPhase.MONITORING
                         self.controller.last_error = ""
@@ -262,13 +268,14 @@ class PlcCabinetService:
         if status.status_counter == self._last_status_counter:
             return
         self._last_status_counter = status.status_counter
+        values = self.controller.snapshot()["status"]
         self._trend.append(
             {
                 "timestamp": time.time(),
-                "Voltage": list(status.voltage),
-                "Current": list(status.current),
-                "Power": list(status.power),
-                "AnalogValidMask": status.analog_valid_mask,
+                "Voltage": values["Voltage"],
+                "Current": values["Current"],
+                "Power": values["Power"],
+                "AnalogValidMask": values["AnalogValidMask"],
             }
         )
 

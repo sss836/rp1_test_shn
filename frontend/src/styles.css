@@ -2589,6 +2589,7 @@ main {
 .setup-section { margin: 12px 0; }
 .setup-tabs { display:flex; gap:10px; flex-wrap:wrap; margin:14px 0; }
 .setup-tabs button, .setup-plan-list button { padding:12px; border:1px solid var(--line); border-radius:6px; background:var(--surface); color:var(--text); text-align:left; }
+.setup-tabs button:disabled { opacity: 0.45; cursor: not-allowed; }
 .setup-tabs [aria-pressed=true], .setup-plan-list [aria-pressed=true] { border-color:var(--brand); background:var(--brand-soft); }
 .setup-fields { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr)); gap:16px; margin:16px 0; }
 .setup-fields label { display:grid; gap:6px; color:var(--text); }
@@ -2604,3 +2605,14 @@ main {
 .setup-context-list pre { white-space:pre-wrap; overflow-wrap:anywhere; padding:12px; background:var(--surface-subtle); }
 .primary-nav { min-width:0; overflow-x:auto; }
 @media (max-width: 1024px) { .setup-columns { grid-template-columns:1fr; } }
+.submission-evidence dd { overflow-wrap: anywhere; }
+.joint-record-note { margin: 0 0 12px; color: var(--muted); }
+.joint-temp-grid { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.joint-temp-summary { margin: 0; min-width: 220px; }
+.joint-temp-summary figcaption, .joint-temp-summary li { color: var(--muted); font-size: 12px; }
+.joint-temp-summary svg { width: 220px; height: 72px; }
+.joint-temp-summary path { fill: none; stroke: var(--text); stroke-width: 1.5; }
+.joint-temp-summary circle { fill: var(--text); }
+.joint-temp-summary ol { display: flex; gap: 10px; margin: 4px 0 0; padding: 0; list-style: none; }
+.case-jump { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.case-jump select { max-width: 180px; }

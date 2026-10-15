@@ -15,4 +15,5 @@ for route in ("/healthz", "/readyz", "/", "/openapi.json"):
         assert response.status == 200
         print("PASS HTTPS " + route)
 subprocess.run([str(ROOT / "scripts/compose.sh"), "exec", "-T", "worker", "python", "scripts/check_worker.py"], cwd=ROOT, check=True)
+subprocess.run([str(ROOT / "scripts/compose.sh"), "exec", "-T", "archive-worker", "python", "scripts/check_archive_worker.py"], cwd=ROOT, check=True)
 print("PASS HTTPS, API/PostgreSQL readiness and worker process/database connectivity")

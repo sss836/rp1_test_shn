@@ -62,7 +62,10 @@ def test_gateway_exposes_protocol_neutral_plc_sequence(tmp_path: Path) -> None:
         )
         assert response.status_code == 200
         stopped = _wait_phase(client, "OFF")
-        assert stopped["status"]["PS1ActualOutput"] is False
+        # Power-off invalidates PS1's prior-cycle feedback. TCP still works,
+        # but the unavailable device status is never presented as actual OFF.
+        assert stopped["status"]["PS1ActualOutput"] is None
+        assert stopped["status"]["PS1FeedbackValid"] is False
         assert stopped["status"]["MainContactorFB"] is False
         assert any(
             item["user"] == "gateway-test" and item["confirmation"] == "confirmed"

@@ -14,6 +14,18 @@ from typing import Any
 CHANNEL_COUNT = 4
 PROTOCOL_V10 = 0x0100
 PROTOCOL_V11 = 0x0101
+PROTOCOL_V12 = 0x0102
+
+
+class Ps1FeedbackFlags(IntFlag):
+    POWER_DELAY_DONE = 1
+    PORT_LOADED = 2
+    STATUS_VALID = 4
+    STOP_OFF_CONFIRMED = 8
+    MANUAL_RESTART_LOCK = 16
+    RECOVERY_EXHAUSTED = 32
+    MEASUREMENT_VALID = 64
+    SETPOINT_VALID = 128
 
 
 class ResetResult(IntEnum):
@@ -148,11 +160,30 @@ class PlcStatus:
     ps1_comm_busy: bool = False
     host_server_status: int = 0
     host_server_events: int = 0
+    ps1_feedback_flags: int = 0
+    ps1_status_sequence: int = 0
+    ps1_power_cycle: int = 0
+    ps1_status_age_ms: int = 65535
     received_monotonic: float = 0.0
 
     @property
     def reset_results_supported(self) -> bool:
-        return self.protocol_version == PROTOCOL_V11
+        return self.protocol_version in {PROTOCOL_V11, PROTOCOL_V12}
+
+    @property
+    def control_protocol_supported(self) -> bool:
+        return self.protocol_version == PROTOCOL_V12
+
+    @property
+    def ps1_status_valid(self) -> bool:
+        return (self.control_protocol_supported
+                and not self.ps1_feedback_flags & 0xFF00
+                and bool(self.ps1_feedback_flags & Ps1FeedbackFlags.STATUS_VALID)
+                and 0 <= self.ps1_status_age_ms < 5000)
+
+    @property
+    def ps1_manual_restart_locked(self) -> bool:
+        return bool(self.ps1_feedback_flags & (Ps1FeedbackFlags.MANUAL_RESTART_LOCK | Ps1FeedbackFlags.RECOVERY_EXHAUSTED))
 
     @property
     def effective_fault_source_flags(self) -> int:
@@ -167,12 +198,15 @@ class PlcStatus:
     def has_fault(self) -> bool:
         return bool(self.effective_fault_source_flags & 0x0F or self.ps1_fault)
 
-    def to_dict(self, *, stale: bool = False) -> dict[str, Any]:
+    def to_dict(self, *, stale: bool = False, ps1_fresh: bool | None = None) -> dict[str, Any]:
         # A stale analog sample must not look like a valid live value.
         analog: list[float | None]
         currents: list[float | None]
         powers: list[float | None]
-        if stale:
+        feedback_valid = (self.ps1_status_valid and ps1_fresh is not False and not stale)
+        measurement_valid = feedback_valid and bool(self.ps1_feedback_flags & Ps1FeedbackFlags.MEASUREMENT_VALID)
+        setpoint_valid = feedback_valid and bool(self.ps1_feedback_flags & Ps1FeedbackFlags.SETPOINT_VALID)
+        if stale or not measurement_valid:
             analog = [None] * CHANNEL_COUNT
             currents = [None] * CHANNEL_COUNT
             powers = [None] * CHANNEL_COUNT
@@ -197,7 +231,7 @@ class PlcStatus:
             "PhysicalPermit": list(self.physical_permit),
             "ChannelPermit": list(self.channel_permit),
             "PS1Request": self.ps1_request,
-            "PS1ActualOutput": self.ps1_actual_output,
+            "PS1ActualOutput": self.ps1_actual_output if feedback_valid else None,
             "PS1CommOK": self.ps1_comm_ok,
             "PS1Fault": bool(self.ps1_fault or self.effective_fault_source_flags & (FaultSource.PS1_COMM | FaultSource.PS1_DEVICE)),
             "PS1CommFault": self.ps1_comm_fault,
@@ -207,7 +241,7 @@ class PlcStatus:
             "Voltage": analog,
             "Current": currents,
             "Power": powers,
-            "AnalogValidMask": 0 if stale else self.analog_valid_mask,
+            "AnalogValidMask": 0 if stale or not measurement_valid else self.analog_valid_mask,
             "AcknowledgedSequence": self.acknowledged_sequence,
             "StatusCounter": self.status_counter,
             "HeartbeatEcho": self.heartbeat_echo,
@@ -220,14 +254,25 @@ class PlcStatus:
             "ResetResultSupported": self.reset_results_supported,
             "FaultSourceFlags": self.effective_fault_source_flags,
             "RawFaultSourceFlags": self.fault_source_flags if self.reset_results_supported else None,
-            "ProtocolMode": "V1.1" if self.reset_results_supported else "旧协议/无复位结果回执",
+            "ProtocolMode": "V1.2" if self.control_protocol_supported else "V1.1 / 需升级PLC至V1.2才能控制" if self.reset_results_supported else "旧协议/无复位结果回执；需升级PLC至V1.2才能控制",
+            "ControlProtocolSupported": self.control_protocol_supported,
+            "PS1FeedbackFlags": self.ps1_feedback_flags if self.control_protocol_supported else None,
+            "PS1StatusSeq": self.ps1_status_sequence if self.control_protocol_supported else None,
+            "PS1PowerCycle": self.ps1_power_cycle if self.control_protocol_supported else None,
+            "PS1StatusAgeMs": self.ps1_status_age_ms if self.control_protocol_supported else None,
+            "PS1FeedbackValid": feedback_valid,
+            "PS1MeasurementValid": measurement_valid and not stale,
+            "PS1SetpointValid": setpoint_valid and not stale,
+            "PS1StopOffConfirmed": feedback_valid and bool(self.ps1_feedback_flags & Ps1FeedbackFlags.STOP_OFF_CONFIRMED),
+            "PS1ManualRestartLock": bool(self.ps1_feedback_flags & Ps1FeedbackFlags.MANUAL_RESTART_LOCK),
+            "PS1RecoveryExhausted": bool(self.ps1_feedback_flags & Ps1FeedbackFlags.RECOVERY_EXHAUSTED),
             "PS1MbStatus": self.ps1_mb_status,
             "PS1DeviceStatus": self.ps1_device_status,
             "PS1ManagerState": self.ps1_manager_state,
-            "PS1OutputVoltage": self.ps1_output_voltage,
-            "PS1OutputCurrent": self.ps1_output_current,
-            "PS1SetVoltage": self.ps1_set_voltage,
-            "PS1SetCurrent": self.ps1_set_current,
+            "PS1OutputVoltage": self.ps1_output_voltage if measurement_valid and not stale else None,
+            "PS1OutputCurrent": self.ps1_output_current if measurement_valid and not stale else None,
+            "PS1SetVoltage": self.ps1_set_voltage if setpoint_valid and not stale else None,
+            "PS1SetCurrent": self.ps1_set_current if setpoint_valid and not stale else None,
             "SetpointApplied": self.setpoint_applied,
             "SetpointRejected": self.setpoint_rejected,
             "PS1CommBusy": self.ps1_comm_busy,

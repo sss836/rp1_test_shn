@@ -126,7 +126,7 @@ def test_decodes_v1_status_without_inventing_missing_feedback() -> None:
 
     status = client.read_status()
 
-    assert transport.read_calls == [(0, 28, 1), (0, 28, 1)]
+    assert transport.read_calls == [(0, 32, 1), (0, 32, 1)]
     assert status.plc_ready is True
     assert status.host_connected is True
     assert status.main_ready is True
@@ -151,6 +151,7 @@ def test_decodes_v1_status_without_inventing_missing_feedback() -> None:
 
 def test_command_writes_heartbeat_payload_then_sequence_and_unwraps_ack() -> None:
     transport = _FakeTransport(_registers())
+    transport.registers[1] = 0x0102
     client = _client(transport)
     client.connect()
     command = PlcCommand(
@@ -352,7 +353,7 @@ def test_persisted_v10_mapping_can_read_new_fixed_slots_without_config_mutation(
 
 def test_unknown_protocol_version_is_rejected_before_commands():
     registers = _registers()
-    registers[1] = 0x0102
+    registers[1] = 0x0103
     transport = _FakeTransport(registers)
     client = _client(transport)
     with pytest.raises(PlcCommunicationError, match="unsupported PLC protocol version"):

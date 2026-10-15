@@ -21,6 +21,7 @@ build-*/
 *.db
 *.log
 deployment/secrets/
+compose.override.yml
 backups/
 artifacts/
 .runtime/
@@ -29,3 +30,21 @@ data/
 !hmi/factory_hmi/core/data/
 
 *.spec
+
+# Acquisition files, execution packages and local restore material.
+*.csv
+!database/imports/test_cases_*.csv
+*.parquet
+*.npz
+*.npy
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.dump
+*.bak
+*.backup
+*.key
+*.pem
+*.p12
+*.pfx

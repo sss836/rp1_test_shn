@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import replace
 from typing import Any
 
-from .models import FaultSource, PlcCommand, PlcStatus, PROTOCOL_V10, PROTOCOL_V11, ResetResult
+from .models import FaultSource, PlcCommand, PlcStatus, PROTOCOL_V10, PROTOCOL_V11, PROTOCOL_V12, ResetResult
 
 
 class PlcCommunicationError(RuntimeError):
@@ -80,17 +80,23 @@ class MockPlcClient(PlcClient):
             True,
             True,
         ),
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.auto_ack = auto_ack
         self.auto_main_ready = auto_main_ready
         self.auto_ps1_output = auto_ps1_output
+        self._clock = clock
+        self.refresh_ps1_on_read = True
         self._connected = False
         self._lock = threading.RLock()
         self.last_command = PlcCommand()
         self.command_history: list[PlcCommand] = []
         self._status = PlcStatus(
             protocol_magic=0x4C46,
-            protocol_version=PROTOCOL_V11,
+            protocol_version=PROTOCOL_V12,
+            ps1_feedback_flags=0xCF,
+            ps1_status_age_ms=0,
+            setpoint_applied=True,
             plc_ready=True,
             host_connected=True,
             ps1_comm_ok=True,
@@ -109,7 +115,7 @@ class MockPlcClient(PlcClient):
             self._connected = True
             self._status = replace(
                 self._status,
-                received_monotonic=time.monotonic(),
+                received_monotonic=self._clock(),
                 status_counter=self._status.status_counter + 1,
             )
 
@@ -124,9 +130,12 @@ class MockPlcClient(PlcClient):
             if self.refresh_on_read:
                 self._status = replace(
                     self._status,
-                    received_monotonic=time.monotonic(),
+                    received_monotonic=self._clock(),
                     status_counter=self._status.status_counter + 1,
                 )
+                if self.refresh_ps1_on_read:
+                    self._status = replace(self._status,
+                        ps1_status_sequence=(self._status.ps1_status_sequence + 1) & 0xFFFF)
             return self._status
 
     def write_command(self, command: PlcCommand) -> None:
@@ -139,6 +148,9 @@ class MockPlcClient(PlcClient):
             ps1_request = command.ps1_output_enable and main and not command.all_stop
             main_fb = main and self.auto_main_ready
             main_ready = main_fb and self._status.plc_ready
+            cycle = self._status.ps1_power_cycle
+            if main_ready and not self._status.main_ready:
+                cycle = (cycle + 1) & 0xFFFF
             ps1_actual = (
                 ps1_request
                 and main_ready
@@ -193,6 +205,7 @@ class MockPlcClient(PlcClient):
             self._status = replace(
                 self._status,
                 host_connected=True,
+                ps1_power_cycle=cycle,
                 main_contactor_fb=main_fb,
                 main_ready=main_ready,
                 ps1_request=ps1_request,
@@ -211,7 +224,7 @@ class MockPlcClient(PlcClient):
                 ),
                 heartbeat_echo=command.heartbeat_counter & 0xFFFF,
                 status_counter=self._status.status_counter + 1,
-                received_monotonic=time.monotonic(),
+                received_monotonic=self._clock(),
             )
 
     def set_status(self, **changes: Any) -> None:
@@ -301,7 +314,7 @@ def _required_float(
 
 
 class ModbusTcpPlcClient(PlcClient):
-    """LFD835 V1.0 adapter for the PLC's 64-word Modbus TCP window.
+    """LFD835 V1.0/V1.1 monitoring and V1.2 control in the 64-word window.
 
     Numeric addresses and bit positions are loaded exclusively from the PLC
     configuration.  The controller above this class only sees logical command
@@ -332,10 +345,14 @@ class ModbusTcpPlcClient(PlcClient):
         self._identity = _required_mapping(mapping, "identity")
         self._status_map = _required_mapping(mapping, "status")
         self._status_registers = dict(_required_mapping(self._status_map, "registers"))
-        # Persisted V1.0 YAMLs already read the full 0..27 window. These fixed
-        # V1.1 slots can be decoded without rewriting a user's config file.
-        for name, address in (("reset_ack_sequence", 21), ("reset_result", 22), ("fault_source_flags", 23)):
+        # Frozen protocol slots; upgrade old persisted read windows in memory,
+        # without replacing the user's YAML or transport settings.
+        for name, address in (("reset_ack_sequence", 21), ("reset_result", 22), ("fault_source_flags", 23),
+                              ("ps1_feedback_flags", 28), ("ps1_status_sequence", 29),
+                              ("ps1_power_cycle", 30), ("ps1_status_age_ms", 31)):
             self._status_registers.setdefault(name, address)
+            if self._status_registers[name] != address:
+                raise PlcConfigurationError(f"V1.2 {name} must use frozen HR{address}")
         self._status_bits = _required_mapping(self._status_map, "bits")
         self._command_map = _required_mapping(mapping, "command")
         self._command_registers = _required_mapping(self._command_map, "registers")
@@ -349,6 +366,9 @@ class ModbusTcpPlcClient(PlcClient):
         self._status_count = _required_int(
             self._status_map, "count", minimum=1, maximum=64
         )
+        if self._status_start != 0:
+            raise PlcConfigurationError("V1.2 status must read one complete HR0..31 frame")
+        self._status_count = 32
         if self._status_start + self._status_count > 64:
             raise PlcConfigurationError(
                 "modbus_tcp status window must stay inside the 64-word PLC window"
@@ -364,6 +384,7 @@ class ModbusTcpPlcClient(PlcClient):
         self._set_voltage_raw = 0
         self._set_current_raw = 0
         self._local_status_counter = 0
+        self._protocol_version = 0
 
     @staticmethod
     def _default_transport_factory(host: str, **kwargs: Any) -> Any:
@@ -399,6 +420,7 @@ class ModbusTcpPlcClient(PlcClient):
                 self._connected = True
                 registers = self._read_registers_locked()
                 self._validate_identity(registers)
+                self._protocol_version = self._register(registers, "protocol_version")
                 self._update_setpoint_cache(registers)
                 accepted = self._register(registers, "acknowledged_sequence")
                 self._last_sent_logical_sequence = accepted
@@ -420,6 +442,7 @@ class ModbusTcpPlcClient(PlcClient):
             try:
                 registers = self._read_registers_locked()
                 self._validate_identity(registers)
+                self._protocol_version = self._register(registers, "protocol_version")
                 self._update_setpoint_cache(registers)
                 return self._decode_status(registers)
             except Exception as exc:
@@ -432,6 +455,8 @@ class ModbusTcpPlcClient(PlcClient):
     def write_command(self, command: PlcCommand) -> None:
         with self._lock:
             self._ensure_connected()
+            if self._protocol_version != PROTOCOL_V12 and not command.all_stop and (command.main_enable or command.ps1_output_enable or any(command.channel_enable)):
+                raise PlcConfigurationError("控制需配套PLC Host Protocol V1.2（0x0102）；旧协议仅可监控")
             heartbeat = command.heartbeat_counter & 0xFFFF
             control_address = self._command_register("control_key")
             heartbeat_address = self._command_register("heartbeat")
@@ -525,6 +550,10 @@ class ModbusTcpPlcClient(PlcClient):
             "reset_ack_sequence",
             "reset_result",
             "fault_source_flags",
+            "ps1_feedback_flags",
+            "ps1_status_sequence",
+            "ps1_power_cycle",
+            "ps1_status_age_ms",
         }
         for name in required_status_registers:
             address = _required_int(self._status_registers, name, maximum=63)
@@ -600,7 +629,7 @@ class ModbusTcpPlcClient(PlcClient):
     def _decode_status(self, registers: list[int]) -> PlcStatus:
         status_flags = self._register(registers, "status_flags")
         version = self._register(registers, "protocol_version")
-        v11 = version == PROTOCOL_V11
+        v11 = version in {PROTOCOL_V11, PROTOCOL_V12}
         fault_sources = self._register(registers, "fault_source_flags") if v11 else 0
         channel_flags = self._register(registers, "channel_flags")
         accepted_flags = self._register(registers, "accepted_command_flags")
@@ -687,6 +716,10 @@ class ModbusTcpPlcClient(PlcClient):
             ps1_comm_busy=self._status_bit(status_flags, "ps1_comm_busy"),
             host_server_status=self._register(registers, "host_server_status"),
             host_server_events=self._register(registers, "host_server_events"),
+            ps1_feedback_flags=self._register(registers, "ps1_feedback_flags") if version == PROTOCOL_V12 else 0,
+            ps1_status_sequence=self._register(registers, "ps1_status_sequence") if version == PROTOCOL_V12 else 0,
+            ps1_power_cycle=self._register(registers, "ps1_power_cycle") if version == PROTOCOL_V12 else 0,
+            ps1_status_age_ms=self._register(registers, "ps1_status_age_ms") if version == PROTOCOL_V12 else 65535,
             received_monotonic=self._clock(),
         )
 
@@ -805,10 +838,10 @@ class ModbusTcpPlcClient(PlcClient):
                 f"expected 0x{expected_magic:04X}"
             )
         version = self._register(registers, "protocol_version")
-        if version not in {PROTOCOL_V10, PROTOCOL_V11}:
+        if version not in {PROTOCOL_V10, PROTOCOL_V11, PROTOCOL_V12}:
             raise PlcCommunicationError(
                 f"unsupported PLC protocol version: got 0x{version:04X}, "
-                "supported 0x0100 (V1.0) and 0x0101 (V1.1)"
+                "未知协议不可控制；需配套0x0102 (V1.2)，0x0100/0x0101仅可监控"
             )
 
     def _update_setpoint_cache(self, registers: list[int]) -> None:

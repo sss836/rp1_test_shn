@@ -60,12 +60,31 @@ function requestId() {
   ].join("-");
 }
 
+function headerValue(value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) > 255) return encodeURIComponent(value);
+  }
+  return value;
+}
+
+function buildHeaders(source: HeadersInit | undefined) {
+  const headers = new Headers();
+  if (!source) return headers;
+  const pairs = source instanceof Headers
+    ? source.entries()
+    : Array.isArray(source)
+      ? source
+      : Object.entries(source);
+  for (const [name, value] of pairs) headers.set(name, headerValue(String(value)));
+  return headers;
+}
+
 export async function apiRequest<T>(
   path: string,
   init: RequestInit = {},
   parse?: (data: unknown) => T
 ): Promise<T> {
-  const headers = new Headers(init.headers);
+  const headers = buildHeaders(init.headers);
   const method = (init.method ?? "GET").toUpperCase();
   if (init.body != null && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");

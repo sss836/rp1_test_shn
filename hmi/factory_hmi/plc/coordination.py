@@ -228,8 +228,9 @@ class PlcCommandCoordinator:
             record.update(accepted=True, revision=self.revision)
             timings = service.config.timings
             record["_deadline"] = time.monotonic() + (
+                service.controller.startup_budget_ms if operation == "start" else
                 6 * timings.command_timeout_ms + timings.km0_timeout_ms + 4 * timings.ps1_timeout_ms
-                if operation in {"start", "stop"} else timings.command_timeout_ms
+                if operation == "stop" else timings.command_timeout_ms
             ) / 1000.0
             self._last = record
             self._active = record

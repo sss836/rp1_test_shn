@@ -1,11 +1,10 @@
-# Context profiles for rp1-reliability-platform /api/v1/ingestion.
-#
-# The UUIDs must reference rows that already exist in the target database and
-# must be mutually consistent. They cannot be derived safely from display
-# codes, so no example UUID is invented here.
+# Optional workstation shortcuts. An empty list is valid: the operator selects
+# a campaign context from GET /api/v1/setup/campaigns/{id}/contexts. LOCAL_
+# filenames stay on this workstation. The official execution number is the
+# execution_code returned by the platform heartbeat.
 profiles: []
 
-# TODO(PLATFORM-DEPLOYMENT): add one or more reviewed profiles:
+# Optional reviewed shortcuts:
 # profiles:
 #   - key: upper-body-aging
 #     label: 上半身老化 / 正式工位
@@ -15,8 +14,11 @@ profiles: []
 #     asset_id: null              # TODO: test.asset public UUID
 #     configuration_id: null      # TODO: test.configuration_snapshot public UUID
 #     test_case_version_id: null  # TODO: catalog.test_case_version public UUID
+#     test_case_code: null        # TODO: actual published code, e.g. REL-SARM-001
+#     asset_code: null            # TODO: actual sample code, e.g. RP1.3-SARM-001
+#     station_code: null          # TODO: actual test.station code, e.g. MP-01
 #     station_id: null            # TODO: test.station public UUID
-#     bench_id: null              # TODO: actual bench code, e.g. RD-01 / MP-01
+#     bench_id: null              # Legacy alias for station_code; must match it
 #     stage_code: AGING
 #     stage_name: 老化运行
 #     subject_map:                # HMI joint name -> catalog subject code

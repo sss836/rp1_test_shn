@@ -28,15 +28,35 @@ def test_station_identity_survives_gateway_restart(tmp_path: Path):
 
 def test_snapshot_contains_all_sessions_but_no_raw_csv_paths_or_secrets():
     snapshot = build_presence_snapshot({
-        "left": {"state": "running", "playback": {"test_id": "TEST-1", "robot_id": "SAMPLE-1", "progress": {"active_seconds": 12.5, "completed_cycles": 3}}, "record_path": "/private/raw.csv", "token": "SECRET"},
+        "left": {"state": "running", "playback": {"test_id": "LOCAL_1", "execution_uuid": "11111111-1111-4111-8111-111111111111", "execution_code": "REL-ARM-002_E1", "test_case_id": "REL-ARM-002", "robot_id": "SAMPLE-1", "progress": {"active_seconds": 12.5, "completed_cycles": 3}}, "record_path": "/private/raw.csv", "token": "SECRET"},
         "right": {"state": "paused", "playback": {"test_id": "TEST-2"}},
     }, {"driver": "mock", "phase": "RUNNING", "stale": False, "status": {"ChannelPermit": [True, False, True, False]}})
     assert len(snapshot["runs"]) == 2
     assert snapshot["runs"][0]["active_seconds"] == 12.5
+    assert snapshot["runs"][0]["execution_code"] == "REL-ARM-002_E1"
+    assert snapshot["runs"][0]["execution_uuid"] == "11111111-1111-4111-8111-111111111111"
+    assert snapshot["runs"][0]["case_code"] == "REL-ARM-002"
     assert snapshot["runs"][1]["state"] == "paused"
+    assert snapshot["runs"][1]["execution_uuid"] is None
     assert snapshot["plc"]["powered_channels"] == [1, 3]
     assert "raw.csv" not in json.dumps(snapshot)
     assert "SECRET" not in json.dumps(snapshot)
+
+
+@pytest.mark.parametrize("value,expected", [("not-a-uuid", None), ("11111111-1111-4111-8111-111111111111", "11111111-1111-4111-8111-111111111111")])
+def test_snapshot_uuid_falls_back_to_current_platform_context(value, expected):
+    snapshot = build_presence_snapshot({"test": {"playback": {"test_id": "local"}, "platform": {"execution_uuid": value}}}, {})
+    assert snapshot["runs"][0]["execution_uuid"] == expected
+
+
+def test_saved_bench_code_is_sent_on_the_heartbeat(tmp_path: Path):
+    (tmp_path / "bench-code").write_text("a10\n", encoding="utf-8")
+    client = Client()
+    publisher = HmiPresencePublisher(client, data_root=tmp_path, snapshot_provider=lambda: {"runs": [], "plc": {}}, interval=60)
+    publisher.bench_id = "RD-01"
+    publisher.connection_id = "test"
+    publisher.send_once()
+    assert client.messages[-1][1]["bench_id"] == "a10"
 
 
 def test_heartbeat_is_independent_of_upload_queue_and_disconnects(tmp_path: Path):

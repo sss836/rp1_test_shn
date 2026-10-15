@@ -25,8 +25,14 @@ export const partModelAssets: Partial<Record<TargetPartCode, PartModelAsset>> = 
   BAT: {
     poster: `/model-posters/bat.webp?v=${modelVersion}`
   },
+  ARM: {
+    poster: "/model-posters/single-arm-product-white.webp"
+  },
   SARM: {
     poster: "/model-posters/single-arm-product-white.webp"
+  },
+  LEG: {
+    poster: "/model-posters/single-leg-product-white.webp"
   },
   SLEG: {
     poster: "/model-posters/single-leg-product-white.webp"

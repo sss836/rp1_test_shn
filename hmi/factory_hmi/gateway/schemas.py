@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class MotorOverride(BaseModel):
@@ -74,6 +74,7 @@ class EnableMotorsRequest(BaseModel):
 
 
 class PlaybackStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     speed: float = Field(default=1.0, gt=0.0, le=4.0)
     loop: bool = True
     cycles: int = Field(default=0, ge=0)
@@ -92,6 +93,7 @@ class PlaybackStartRequest(BaseModel):
     test_case_version_id: str | None = None
     test_case_id: str | None = None
     test_case_version: str | None = None
+    test_name: str | None = Field(default=None, max_length=200)
     bench_id: str | None = None
     station_id: str | None = None
     operator_id: str | None = None
@@ -133,6 +135,17 @@ class PlaybackStartRequest(BaseModel):
             if str(joint).strip() and str(subject).strip()
         }
 
+    @model_validator(mode="after")
+    def require_test_identity(self) -> PlaybackStartRequest:
+        if not str(self.test_case_id or "").strip():
+            raise ValueError("测试用例编号必填，没有对应用例请选择 OTHER")
+        if self.test_case_id.upper() == "OTHER":
+            if not str(self.test_name or "").strip():
+                raise ValueError("其他用例必须填写临时测试名称")
+            if not str(self.robot_id or "").strip() or not str(self.bench_id or "").strip():
+                raise ValueError("其他用例必须填写实际测试对象和工位")
+        return self
+
 
 class ManualMoveRequest(BaseModel):
     targets_deg: list[float] = Field(min_length=1, max_length=32)
@@ -162,10 +175,40 @@ class PlatformLoginRequest(BaseModel):
 
 
 class ExecutionActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     test_id: str = Field(
         min_length=1,
         max_length=255,
         pattern=r"^[A-Za-z0-9._-]+$",
+    )
+    reason: str = Field(default="", max_length=300)
+    verified_status: str = Field(default="", max_length=16)
+    operator_summary: str = Field(default="", max_length=500)
+    tester: str = Field(default="", max_length=80)
+    bench: str = Field(default="", max_length=64)
+    outcome: str = Field(default="", max_length=8)
+    notes: str = Field(default="", max_length=300)
+    analysis: str = Field(default="", max_length=500)
+    station_id: str = Field(default="", max_length=64)
+    discrepancy_reason: str = Field(default="", max_length=300)
+    test_name: str = Field(default="", max_length=200)
+    actual_object: str = Field(default="", max_length=200)
+
+
+class HistoryImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    paths: list[str] = Field(min_length=1, max_length=100)
+    test_name: str = Field(min_length=1, max_length=200)
+    actual_object: str = Field(min_length=1, max_length=200)
+    bench_id: str = Field(min_length=1, max_length=64)
+    operator_id: str = Field(min_length=1, max_length=80)
+
+
+class BenchCodeRequest(BaseModel):
+    bench_code: str = Field(
+        default="",
+        max_length=64,
+        pattern=r"^(?:[A-Za-z0-9][A-Za-z0-9._-]*)?$",
     )
 
 

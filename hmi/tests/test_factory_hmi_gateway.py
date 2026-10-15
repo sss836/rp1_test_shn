@@ -939,6 +939,7 @@ class GatewayApiTests(unittest.TestCase):
                         "loop": False,
                         "cycles": 0,
                         "record": False,
+                        "test_case_id": "REL-ARM-001",
                     },
                 )
                 self.assertEqual(started.status_code, 200, started.text)

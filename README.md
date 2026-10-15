@@ -1,10 +1,10 @@
 # RP1 Test SHN — Reliability Platform 与 RP1 TEST HMI（PLC）
 
-当前工程版本 **2.0.4**，目标系统 **Ubuntu 24.04 LTS amd64**。包含当前可靠性平台的 React 前端、FastAPI 后端、PostgreSQL 数据库、MTBF Worker，以及 PLC/CAN 上位机完整源码和构建工具。仓库采用 `reliability_v1` 协议；不是旧版 dashboard 平台。
+当前工程版本 **2.0.6**，目标系统 **Ubuntu 24.04 LTS amd64**。包含当前可靠性平台的 React 前端、FastAPI 后端、PostgreSQL 数据库、MTBF Worker，以及 PLC/CAN 上位机完整源码和构建工具。仓库采用 `reliability_v1` 协议；不是旧版 dashboard 平台。
 
 **已实现：**账号与权限、可靠性数据查询/计算、上位机登录在线监控、并行测试状态、运行时长/循环数、PLC 通信状态、断线与过期状态提示。
 
-**尚未实现：测试数据提交→后台审核→批准后发布正式统计。** 账号权限申请审批与测试数据审批不同。旧 HMI 的“提交审批”文案和既有 ingestion 适配器不能视为新平台已具备数据审批；不要使用该旧提交链路作为正式审批交付。当前发布用于已验证功能的工程部署，不宣称完整商业验收完成。监控仅传有限结构化状态，原始采集 CSV 保留在工位本地，不上传 GitHub，也不经监控接口上传。
+**当前工作区已加入中央 CSV 归档、强制核实与详细曲线分析，需配套部署后使用。** 数据库迁移 `0037`～`0040`、API、归档 Worker、网页与 HMI 须一起更新。测试结束并经用户核实、显式提交后，原始 CSV 归档到平台持久存储，工位保留副本；待审、驳回和待归类记录不进入正式统计。执行员和管理员可审核，包括本人提交的记录。旧 ingestion 和执行包直接上传继续关闭。新增详细曲线支持横纵缩放、按视窗查询、参考线及多执行叠加；后补用例与追加分析保留原始证据和历史版本。批准不自动形成合格 MTBF 暴露。实施与验证见 [中央归档与曲线分析](docs/CSV-ARCHIVE-IMPLEMENTATION.md)。本次未更新生产服务、已安装 HMI 或操作真实硬件。
 
 ## 1. 目录与部署拓扑
 
@@ -109,7 +109,7 @@ rp1-test-hmi stop
 用户配置 `config/platform-ca.crt` 应为该站点实际 CA 公共证书，不能复用其它站点的证书。
 执行员先通过网页登录完成首次改密，再在“老化测试”页登录平台；
 只需在线监控时保留“未选择（仅本地保存）”上下文。
-原始采集 CSV 保留在工位本地，监控状态不自动成为正式统计。
+原始采集 CSV 保留工位副本，核实并显式提交后中央归档；监控状态不自动成为正式统计。
 
 V1.1 故障复位等待 PLC 最终结果回执，需 PLC 程序实现 HR21～23；V1.0 禁用故障复位。
 电压/电流趋势自动缩放；勾选本地记录不要求平台 bench_id，原始 CSV 保留本地。
@@ -133,6 +133,6 @@ sudo bash scripts/install-build-deps-ubuntu24.sh
 python3 scripts/backup.py --maintenance
 ```
 
-平台备份包含 PostgreSQL 与站点密钥，不包含工位本地 CSV；工位用户状态目录 `~/.local/state/rp1-test-hmi/` 和 CAN 策略 `/etc/rp1-test-hmi/can-policy.yaml` 须另行备份。恢复只面向新的克隆和新的 Compose 项目，详细步骤见 [运维](docs/OPERATIONS.md)。不要执行 `down -v` 清空生产数据。
+新版平台备份包含 PostgreSQL、中央归档与站点密钥；未提交的工位本地 CSV 仍需单独备份；工位用户状态目录 `~/.local/state/rp1-test-hmi/` 和 CAN 策略 `/etc/rp1-test-hmi/can-policy.yaml` 须另行备份。恢复只面向新的克隆和新的 Compose 项目，详细步骤见 [运维](docs/OPERATIONS.md)。不要执行 `down -v` 清空生产数据。
 
 本版本的自动化、隔离联调、已知限制与现场验收事项见 [验收记录](docs/ACCEPTANCE.md)。

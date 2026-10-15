@@ -7,3 +7,4 @@ Icon=rp1-test-hmi
 Terminal=false
 Categories=Utility;Engineering;
 StartupNotify=false
+StartupWMClass=rp1-test-hmi

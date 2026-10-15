@@ -1,3 +1,5 @@
+> 当前控制适配以 [Host Protocol V1.2](HOST_MODBUS_TCP_PROTOCOL_V1.2.md) 为准；下面的旧版实施记录不代表当前控制兼容范围。
+
 > 此文是 PLC 功能的来源设计记录；其中 reliability_v1 部分为另一套平台的可选适配器。本交付使用 legacy 审批模式，部署以根 README 为准。
 
 # 人形机器人老化配电柜上位机：审查与实现说明
