@@ -58,3 +58,8 @@ def stations(
     if actor.principal_kind != "HUMAN":
         raise ApiError(403, "forbidden", "工位监控需要登录账号。")
     return DataEnvelope(data=HmiPresenceRepository(session).list_stations(cursor=cursor, limit=limit))
+
+
+@router.get("/samples")
+def sample_options(actor: HmiOperator, session: DbSession) -> DataEnvelope[list[dict]]:
+    return DataEnvelope(data=HmiPresenceRepository(session).sample_options())

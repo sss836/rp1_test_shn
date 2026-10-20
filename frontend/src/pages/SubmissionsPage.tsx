@@ -1,9 +1,10 @@
 import { useRef, useState } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import { ChevronDown } from "lucide-react";
 import { useAuth } from "../auth";
 import { formatDate, formatDuration } from "../navigation";
 import { submissionLabels, submissionsApi, type Submission } from "../submissionsApi";
-import { archivesApi, verdictLabels } from "../archiveApi";
+import { archivesApi, formatArchiveTimestamp, verdictLabels } from "../archiveApi";
 import { AnalysisValue } from "./ArchivesPage";
 import { EmptyState, ErrorState, LoadingState, PageTitle, Panel } from "../components/Workbench";
 
@@ -44,13 +45,18 @@ function DecisionForm({ item, navigate, navigateArchive }: { item: Submission; n
       <div><dt>{latest.verification ? "人工核实结论" : "原始摘要结论"}</dt><dd>{latest.verification ? verdictLabels[latest.verification.verdict] : { passed: "通过", failed: "失败", blocked: "阻塞" }[latest.summary.source_status]}</dd></div>
       <div><dt>数据 / 时钟质量</dt><dd>{latest.summary.data_quality} / {latest.summary.clock_quality}</dd></div>
     </dl>
+    {latest.verification?.timing_evidence && <p role="status">时间由后台按上位机文件名与 CSV 采样轴自动识别（北京时间）：{formatArchiveTimestamp(latest.verification.timing_evidence.started_at)} 至 {formatArchiveTimestamp(latest.verification.timing_evidence.ended_at)}。结束对应末条采样；CSV 记录时长用于本次历史申报，未标为设备有效运行计时。</p>}
+    {latest.verification && [latest.verification.timing_evidence ? null : latest.verification.declared_active_seconds, latest.verification.declared_completed_cycles, latest.verification.declared_exception_count].some((value) => value != null) && <p role="status">历史 CSV 补录：循环、异常次数或未自动识别的时长包含人工申报信息，来源及核实版本已随审批保存，原始采集事实保留原值。</p>}
     <p>{latest.summary.summary || "无补充摘要"}</p>
-    {latest.analysis && <section className="submission-analysis"><h3>自动结果分析</h3><AnalysisValue value={latest.analysis} /></section>}
+    {latest.analysis && <details className="submission-analysis archive-analysis">
+      <summary className="panel-head archive-analysis-toggle"><h3>自动结果分析</h3><ChevronDown aria-hidden="true" /></summary>
+      <AnalysisValue value={latest.analysis} />
+    </details>}
     {latest.verification && <section className="submission-analysis"><h3>人工核实</h3><dl className="fact-grid"><div><dt>实际测试人</dt><dd>{latest.verification.tester}</dd></div><div><dt>人工结论</dt><dd>{verdictLabels[latest.verification.verdict]}</dd></div><div><dt>差异说明</dt><dd>{latest.verification.discrepancy_reason || "无"}</dd></div></dl><h3>测试员记录</h3><p className="archive-notes">{latest.verification.notes}</p></section>}
     {archiveId && navigateArchive && <button type="button" className="link-button" onClick={() => navigateArchive(archiveId)}>查看原始归档、自动分析与人工核实</button>}
     <details><summary>上下文与本地证据校验摘要</summary><dl className="submission-evidence">{Object.entries(latest.summary).filter(([key]) => key.endsWith("_id") || key === "execution_uuid" || key === "evidence_sha256").map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{String(value)}</dd></div>)}</dl></details>
     {item.execution_id && <button type="button" className="link-button" onClick={() => navigate(item.execution_id!)}>查看正式执行：{item.execution_code}</button>}
-    {resubmit && <div className="setup-section"><h3>核实后重新送审</h3><p>运行秒数、循环、异常次数及机器终态保持只读。请在归档核实页追加测试人、工位、人工结论和备注版本后送审。</p>{archive.isLoading ? <LoadingState label="正在查找原始归档" /> : archive.error ? <ErrorState error={archive.error} retry={() => void archive.refetch()} /> : archiveId && navigateArchive ? <button type="button" onClick={() => navigateArchive(archiveId)}>核实并重新送审</button> : <p>该历史摘要尚未关联原始归档，请通过上位机历史补录入口归档后再核实。</p>}</div>}
+    {resubmit && <div className="setup-section"><h3>核实后重新送审</h3><p>请在归档核实页追加核实版本，修正测试人、工位、人工结论、备注或历史人工申报信息后重新送审。原始采集事实继续保留。</p>{archive.isLoading ? <LoadingState label="正在查找原始归档" /> : archive.error ? <ErrorState error={archive.error} retry={() => void archive.refetch()} /> : archiveId && navigateArchive ? <button type="button" onClick={() => navigateArchive(archiveId)}>核实并重新送审</button> : <p>该历史摘要尚未关联原始归档，请通过上位机历史补录入口归档后再核实。</p>}</div>}
     {item.status === "PENDING" && item.can_review && <div className="setup-section">
       <label>审核意见<textarea maxLength={300} value={reason} onChange={(e) => setReason(e.target.value)} /></label>
       {reason.trim().length < 1 && <p>填写审核意见后即可批准或驳回。</p>}

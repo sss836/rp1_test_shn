@@ -25,7 +25,7 @@ from app.schemas.read_models import (
 router = APIRouter(prefix="/api/v1", tags=["read-models"])
 AssetKindFilter = Annotated[Literal["WHOLE_MACHINE", "MODULE"] | None, Query()]
 TargetPartFilter = Annotated[
-    Literal["ARM", "SARM", "LEG", "SLEG", "SYS", "UPPER", "LOWER", "CHEST", "HEAD", "BAT"] | None,
+    Literal["ARM", "SARM", "LEG", "SLEG", "SYS", "UPPER", "LOWER", "WAISTHIP", "CHEST", "HEAD", "BAT"] | None,
     Query(),
 ]
 PageLimit = Annotated[int, Query(ge=1, le=100)]

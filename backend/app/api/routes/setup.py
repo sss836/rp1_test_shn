@@ -1,15 +1,16 @@
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.exc import DBAPIError
 
-from app.core.auth import RequestActor, require_roles
+from app.core.auth import RequestActor, RequestActorDep, require_roles
 from app.core.db import DbSession
 from app.core.errors import ApiError
 from app.repositories.setup import SetupRepository
 from app.schemas.common import DataEnvelope
 from app.schemas.setup import AssetCreate, CampaignCreate, Change, ContextCreate, ProgramCreate, StationCreate
+from app.schemas.stations import RegisteredStationList
 
 router = APIRouter(prefix="/api/v1/setup", tags=["setup"])
 Admin = Annotated[RequestActor, Depends(require_roles("SYSTEM_ADMIN"))]
@@ -43,6 +44,18 @@ def options(session: DbSession):
 @router.get("/campaigns", response_model=DataEnvelope[list[dict[str, Any]]])
 def campaigns(session: DbSession):
     return DataEnvelope(data=SetupRepository(session).campaigns())
+
+
+@router.get("/stations", response_model=DataEnvelope[RegisteredStationList])
+def list_stations(
+    actor: RequestActorDep,
+    session: DbSession,
+    cursor: UUID | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 200,
+):
+    if actor.principal_kind != "HUMAN":
+        raise ApiError(403, "forbidden", "台架总览需要登录账号。")
+    return DataEnvelope(data=SetupRepository(session).stations(cursor=cursor, limit=limit))
 
 
 @router.get("/campaigns/{campaign_id}/contexts", response_model=DataEnvelope[list[dict[str, Any]]])

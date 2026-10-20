@@ -201,7 +201,7 @@ def test_review_versions_and_history_import_never_infer_absolute_clock(local_rec
     service, report, review = local_record
     service.report_manager.write_operator_review(report.manifest["test_id"], review)
     service.report_manager.write_operator_review(report.manifest["test_id"], {**review, "notes": "补充记录"})
-    service.report_manager.rebuild(report.manifest["test_id"])
+    service.report_manager.rebuild(report.manifest["test_id"], actor="synthetic-account", reason="回归验证")
     assert len(list((report.execution_dir / "analysis").glob("operator_review.v*.json"))) == 2
     history = tmp_path / "20200101_someone_station2.csv"
     history.write_text("time_s,hip_pos_rad\n0,1\n2,2\n", encoding="utf-8")
@@ -322,16 +322,20 @@ def generic_record(tmp_path, legacy_passed=False):
     source = tmp_path / "generic.csv"
     source.write_text("time_s,hip_cmd_pos_rad,hip_pos_rad,hip_torque_nm,hip_temp_c,hip_error_id\n0,0,0,1,20,0\n0.05,0,0,1,20,0\n0.1,0,0,1,20,0\n", encoding="utf-8")
     defaults = yaml.safe_load((Path(__file__).resolve().parents[1] / "factory_hmi/config/station_defaults.yaml").read_text(encoding="utf-8"))
-    report = service.report_manager.finalize(source, {**CTX, "execution_uuid": ID, "test_id": "synthetic-test", "test_case_id": "REL-ARM-001",
-        "test_name": "通用判据测试", "sample_id": "RP1.3-ARM-001", "actual_object": "RP1.3-ARM-001", "bench_id": "A10", "recording_scope": "platform",
-        "started_at": "2026-10-15T00:00:00Z", "ended_at": "2026-10-15T00:00:00.1Z", "active_seconds": .1, "completed_cycles": 0,
-        "outcome": "completed", "record_rate_hz": 20, "config": defaults})
-    if legacy_passed:
-        # An existing pre-fix local report can claim passed while central
-        # typed criteria correctly identify the missing torque acceptance.
-        summary = deepcopy(report.summary)
-        summary["verdict"]["status"] = "passed"
-        report.summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    # Model an older algorithm at initial sealing, not a post-seal mutation.
+    from unittest.mock import patch
+    import factory_hmi.core.report as report_module
+    builder = report_module._build_summary
+    def historical_algorithm(*args, **kwargs):
+        summary = builder(*args, **kwargs)
+        if legacy_passed:
+            summary["verdict"]["status"] = "passed"
+        return summary
+    with patch.object(report_module, "_build_summary", side_effect=historical_algorithm):
+        report = service.report_manager.finalize(source, {**CTX, "execution_uuid": ID, "test_id": "synthetic-test", "test_case_id": "REL-ARM-001",
+            "test_name": "通用判据测试", "sample_id": "RP1.3-ARM-001", "actual_object": "RP1.3-ARM-001", "bench_id": "A10", "recording_scope": "platform",
+            "started_at": "2026-10-15T00:00:00Z", "ended_at": "2026-10-15T00:00:00.1Z", "active_seconds": .1, "completed_cycles": 0,
+            "outcome": "completed", "record_rate_hz": 20, "config": defaults})
     review = {"tester": "实际测试人", "bench": "A10", "station_id": ID, "outcome": "成功", "notes": "无", "discrepancy_reason": "",
         "test_name": "通用判据测试", "actual_object": "RP1.3-ARM-001"}
     return service, report, review
@@ -381,7 +385,7 @@ def test_central_mismatch_422_is_visible_and_manual_reverification_recovers(tmp_
     reason = "中央额定力矩判据缺失；人工成功表示执行完成，本次未自动认定用例合格"
     service.submit_execution("synthetic-test", review={**review, "discrepancy_reason": reason})
     frozen = json.loads(service.outbox.get(ID).submission_payload)
-    assert frozen["create"] == original_create and set(frozen) == {"create", "review"}
+    assert frozen["create"] == original_create and set(frozen) == {"create", "review", "transport"}
     assert service.execution_summary("synthetic-test")["central_analysis"]["verdict"] == "unconfigured"
     worker.process_once()
     assert service.outbox.get(ID).state == "pending_review"
@@ -405,7 +409,7 @@ def test_rejected_station_reverification_preserves_frozen_create_and_raw_hash(tm
     actual_station = "44444444-4444-4444-8444-444444444444"
     service.submit_execution("synthetic-test", review={**initial_review, "station_id": actual_station, "bench": "B20", "notes": "修正实际工位"})
     frozen = json.loads(service.outbox.get(ID).submission_payload)
-    assert frozen["create"] == original and set(frozen) == {"create", "review"}
+    assert frozen["create"] == original and set(frozen) == {"create", "review", "transport"}
     worker.process_once()
     assert service.outbox.get(ID).state == "pending_review"
     assert len([call for call in client.calls if call[0] == "create"]) == 1

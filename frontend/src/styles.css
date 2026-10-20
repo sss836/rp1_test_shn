@@ -2616,3 +2616,18 @@ main {
 .joint-temp-summary ol { display: flex; gap: 10px; margin: 4px 0 0; padding: 0; list-style: none; }
 .case-jump { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 .case-jump select { max-width: 180px; }
+
+/* Keep archive and analysis entry visible beside the scrollable primary pages. */
+.primary-nav { overflow: visible; }
+.primary-nav-scroll { display: flex; flex: 1 1 0; min-width: 0; overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+.primary-nav-scroll > button { flex: 0 0 auto; white-space: nowrap; }
+.primary-nav-scroll-hint { display: flex; flex: 0 0 18px; align-items: center; justify-content: center; color: var(--muted); font-size: 13px; }
+.primary-nav-data { display: flex; flex: 0 0 auto; border-left: 1px solid var(--line); }
+.primary-nav-data button { flex: 0 0 auto; white-space: nowrap; }
+.archive-list-error { color: var(--danger); overflow-wrap: anywhere; max-width: 32rem; }
+@media (max-width: 1023px) {
+  .app-header { height: auto; }
+}
+@media (max-width: 760px) {
+  .primary-nav-data button { min-width: 92px; padding-inline: 6px; }
+}

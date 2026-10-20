@@ -28,6 +28,36 @@ beforeEach(() => {
   vi.spyOn(setupApi, "campaigns").mockResolvedValue([]);
 });
 
+it("uses one compact confirmation, preserves automatic time precision and sends no browser-generated timing", async () => {
+  mockClassificationOptions();
+  const detected = { version: "rp1-hmi-filename-csv-time/1", filename: "LOCAL_PERF-ARM-001_260101235959123456_" + "a".repeat(32) + ".csv",
+    evidence_sha256: archive.sha256, timezone: "UTC" as const, end_basis: "last_sample" as const,
+    started_at: "2026-01-01T23:59:59.123456Z", first_sample_at: "2026-01-01T23:59:59.173514Z",
+    ended_at: "2026-01-02T00:00:01.999999Z", recorded_seconds: 2.876543,
+    first_offset_seconds: 0.050057639, last_offset_seconds: 2.8765431123 };
+  const historical: Archive = { ...archive, origin: "HISTORY", station_label: "ST-1", detected_timing: detected,
+    facts: { ...archive.facts, started_at: null, ended_at: null, active_seconds: null, completed_cycles: null, exception_count: null, machine_status: "unknown" } };
+  vi.mocked(archivesApi.detail).mockResolvedValue(historical);
+  const submit = vi.spyOn(archivesApi, "intakeSubmit").mockResolvedValue({ ...historical, submission_status: "PENDING", can_edit: false });
+  mount(<ArchiveDetailPage id={archive.id} navigate={vi.fn()} />);
+  expect((await screen.findByText(/2026-01-02 07:59:59.123456/)).textContent).toContain("2026-01-02 08:00:01.999999");
+  await screen.findByRole("option", { name: /CASE-1/ });
+  expect((screen.getByLabelText("工位") as HTMLSelectElement).value).toBe("station-1");
+  expect(screen.queryByLabelText("核实说明")).toBeNull();
+  expect(screen.queryByLabelText("归类说明")).toBeNull();
+  expect(screen.queryByLabelText("提交说明")).toBeNull();
+  expect(screen.queryByLabelText("人工补录开始时间")).toBeNull();
+  fireEvent.change(screen.getByLabelText("测试人"), { target: { value: "张工" } });
+  fireEvent.change(screen.getByLabelText("测试结论"), { target: { value: "blocked" } });
+  fireEvent.change(screen.getByLabelText(/^备注/), { target: { value: "核对原始文件" } });
+  fireEvent.change(screen.getByLabelText("完成循环"), { target: { value: "1" } });
+  fireEvent.change(screen.getByLabelText("异常次数"), { target: { value: "0" } });
+  fireEvent.click(screen.getByRole("button", { name: "确认并送审" }));
+  await waitFor(() => expect(submit).toHaveBeenCalled());
+  expect(submit.mock.calls[0][1]).toEqual({ verification: { expected_revision: 2, tester: "张工", station_id: "station-1", verdict: "blocked",
+    notes: "核对原始文件", declared_completed_cycles: 1, declared_exception_count: 0 }, context: plannedContext, expected_submission_revision: 0 });
+});
+
 it("appends a published-rule analysis on an approved archive without reopening verification", async () => {
   const approved = { ...archive, can_edit: false, can_analyze: true, submission_status: "APPROVED" as const };
   vi.mocked(archivesApi.detail).mockResolvedValue(approved);
@@ -94,6 +124,8 @@ it("reloads a zoomed viewport from the backend and only overlays matching parame
   const fetchCurves = vi.spyOn(archivesApi, "curves").mockResolvedValue(curves);
   vi.spyOn(archivesApi, "list").mockResolvedValue({ items: [{ ...archive, id: "archive-2", archive_code: "ARC-002", manifest: { ...archive.manifest, catalog: [{ key: "j1_torque", subject: "j1", metric: "torque_nm", unit: "mNm" }] } }], next_cursor: null });
   mount(<CurveAnalysisPage id={archive.id} navigate={vi.fn()} />);
+  // This regression covers the preserved single-chart comparison workflow.
+  fireEvent.click(await screen.findByRole("button", { name: "单图对比" }));
   fireEvent.click(await screen.findByRole("button", { name: "缩放到 10–20 秒" }));
   await waitFor(() => expect(fetchCurves).toHaveBeenCalledWith(archive.id, expect.objectContaining({ metrics: "j1_torque_nm", start: 10, end: 20 }), expect.any(AbortSignal)));
   fireEvent.change(screen.getByLabelText("查找测试记录"), { target: { value: "ARC-002" } });
@@ -161,17 +193,37 @@ it("lets a rejected classified archive append the verified station correction be
   await waitFor(() => expect(submit).toHaveBeenCalledWith(archive.id, { expected_revision: 5, expected_submission_revision: 1, reason: "修正工位后重提" }, expect.any(String)));
 });
 
-it("preserves declared historical dates when a rejected verification changes only notes", async () => {
-  const started = "2026-10-11T01:02:03.456Z";
-  const ended = "2026-10-11T01:03:43.456Z";
-  vi.mocked(archivesApi.detail).mockResolvedValue({ ...archive, origin: "HISTORY", submission_status: "REJECTED", facts: { ...archive.facts, started_at: null, ended_at: null }, current_verification: { ...verification, station_id: "station-1", declared_started_at: started, declared_ended_at: ended } });
-  const verify = vi.spyOn(archivesApi, "verify").mockResolvedValue(archive);
+it("resubmits rejected history in one operation while preserving manually declared dates", async () => {
+  mockClassificationOptions();
+  const started = "2026-10-11T01:02:03.456Z", ended = "2026-10-11T01:03:43.456Z";
+  vi.mocked(archivesApi.detail).mockResolvedValue({ ...archive, origin: "HISTORY", submission_status: "REJECTED", submission_revision: 1,
+    facts: { ...archive.facts, started_at: null, ended_at: null }, current_verification: { ...verification, station_id: "station-1", declared_started_at: started, declared_ended_at: ended } });
+  const submit = vi.spyOn(archivesApi, "intakeSubmit").mockResolvedValue({ ...archive, origin: "HISTORY", submission_status: "PENDING" });
   mount(<ArchiveDetailPage id={archive.id} navigate={vi.fn()} />);
-  const startedInput = await screen.findByLabelText("人工补录开始时间");
+  const startedInput = await screen.findByLabelText("实际开始时间");
   expect(new Date((startedInput as HTMLInputElement).value).toISOString()).toBe(started);
-  expect(new Date((screen.getByLabelText("人工补录结束时间") as HTMLInputElement).value).toISOString()).toBe(ended);
-  fireEvent.change(screen.getByLabelText("测试员记录"), { target: { value: "补充驳回后的测试备注" } });
-  fireEvent.change(screen.getByLabelText("核实说明"), { target: { value: "只补充备注，保留历史补录时间" } });
-  fireEvent.click(screen.getByRole("button", { name: "保存核实版本" }));
-  await waitFor(() => expect(verify).toHaveBeenCalledWith(archive.id, expect.objectContaining({ declared_started_at: started, declared_ended_at: ended, notes: "补充驳回后的测试备注" }), expect.any(String)));
+  await screen.findByRole("option", { name: /CASE-1/ });
+  fireEvent.change(screen.getByLabelText(/^备注/), { target: { value: "补充驳回后的测试备注" } });
+  fireEvent.click(screen.getByRole("button", { name: "确认修改并重新送审" }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith(archive.id, expect.objectContaining({ verification: expect.objectContaining({ declared_started_at: started, declared_ended_at: ended, notes: "补充驳回后的测试备注" }), expected_submission_revision: 1 }), expect.any(String)));
+});
+
+it("submits history from one form while its acquisition facts remain unknown", async () => {
+  mockClassificationOptions();
+  const current: Archive = { ...archive, origin: "HISTORY", facts: { ...archive.facts, started_at: null, ended_at: null, active_seconds: null, completed_cycles: null, exception_count: null, machine_status: "unknown" }, classification_state: "CLASSIFIED", classification: { ...plannedContext, revision: 1 } };
+  vi.mocked(archivesApi.detail).mockResolvedValue(current);
+  const submit = vi.spyOn(archivesApi, "intakeSubmit").mockResolvedValue({ ...current, submission_status: "PENDING", can_edit: false });
+  mount(<ArchiveDetailPage id={archive.id} navigate={vi.fn()} />);
+  fireEvent.change(await screen.findByLabelText("测试人"), { target: { value: "张工" } });
+  await screen.findByRole("option", { name: /CASE-1/ });
+  fireEvent.change(screen.getByLabelText("测试结论"), { target: { value: "passed" } });
+  fireEvent.change(screen.getByLabelText(/^备注/), { target: { value: "3kg负载，根据现场记录核实" } });
+  fireEvent.change(screen.getByLabelText("实际开始时间"), { target: { value: "2026-10-01T08:00:00" } });
+  fireEvent.change(screen.getByLabelText("实际结束时间"), { target: { value: "2026-10-01T08:01:00" } });
+  fireEvent.change(screen.getByLabelText("运行时长（秒）"), { target: { value: "55" } });
+  fireEvent.change(screen.getByLabelText("完成循环"), { target: { value: "3" } });
+  fireEvent.change(screen.getByLabelText("异常次数"), { target: { value: "0" } });
+  fireEvent.click(screen.getByRole("button", { name: "确认并送审" }));
+  await waitFor(() => expect(submit).toHaveBeenCalledWith(archive.id, expect.objectContaining({ verification: expect.objectContaining({ declared_active_seconds: 55, declared_completed_cycles: 3, declared_exception_count: 0 }) }), expect.any(String)));
+  expect(current.facts.active_seconds).toBeNull(); expect(current.facts.machine_status).toBe("unknown");
 });

@@ -209,7 +209,8 @@ class CurveProcessor:
                    "non_monotonic": non_monotonic, "max_gap_seconds": max_gap}
         rules = archive["acceptance"]
         rate = rules.get("record_rate_hz")
-        expected = math.floor(archive["facts"]["active_seconds"] * rate) + 1 if rate else None
+        active = archive["facts"].get("active_seconds")
+        expected = math.floor(active * rate) + 1 if rate and active is not None else None
         quality["expected_sample_count"] = expected
         quality["sample_completeness"] = min(1.0, (rows_seen-invalid_time)/expected) if expected else None
         catalog = [catalog_item(key) for key in metric_keys]
@@ -254,7 +255,7 @@ class CurveProcessor:
         rule("invalid_time_rows", quality["invalid_time_rows"], 0)
         rule("non_monotonic_time_rows", quality["non_monotonic"], 0)
         rule("missing_numeric_samples", sum(stat.missing for stat in stats.values()), 0)
-        rule("execution_completed", 1 if facts["machine_status"]=="completed" else 0, 1, minimum=True)
+        rule("execution_completed", None if facts["machine_status"]=="unknown" else 1 if facts["machine_status"]=="completed" else 0, 1, minimum=True)
         for key, stat in stats.items():
             if key.endswith("_temp_c"):
                 rule(key+".rise", stat.maximum-stat.first if stat.count else None, acceptance.get("max_temperature_rise_c"), "°C")
@@ -272,9 +273,12 @@ class CurveProcessor:
                 rule(threshold+".missing_measurement",None,acceptance[threshold],unit)
         failures = [r for r in result if r["result"]=="failed"]
         product_failure = facts["machine_status"]=="failed" or (honor_recorded_verdict and facts["automatic_verdict"]=="failed") or any(r["name"].endswith((".rise", ".rms", ".peak_abs", ".faults")) for r in failures)
-        verdict = "failed" if product_failure else "blocked" if failures else "unconfigured" if acceptance.get("criteria_version", "UNCONFIGURED")=="UNCONFIGURED" or any(r["result"]=="unconfigured" for r in result) else "passed"
+        missing_facts = [key for key in ("active_seconds", "completed_cycles", "exception_count") if facts.get(key) is None]
+        if facts.get("machine_status") == "unknown":
+            missing_facts.append("machine_status")
+        verdict = "failed" if product_failure else "blocked" if failures or missing_facts else "unconfigured" if acceptance.get("criteria_version", "UNCONFIGURED")=="UNCONFIGURED" or any(r["result"]=="unconfigured" for r in result) else "passed"
         return {"version": PROCESSOR_VERSION, "criteria_version": acceptance.get("criteria_version", "UNCONFIGURED"), "verdict": verdict,
-                "rules": result, "metrics": [stat.export(key) for key, stat in stats.items()], "quality": quality, "timing": facts}
+                "missing_acquisition_facts": missing_facts, "rules": result, "metrics": [stat.export(key) for key, stat in stats.items()], "quality": quality, "timing": facts}
 
     def build_pyramids(self, conn, archive, catalog, start, end, heartbeat):
         if end <= start:
@@ -316,6 +320,79 @@ def minmax_query(column: str, source: str, bins: int) -> str:
             min(_row) FILTER(WHERE value IS NULL),max(_row) FILTER(WHERE value IS NULL)]) AS row_id
         FROM filtered GROUP BY bucket
     ) SELECT DISTINCT f.time_s,f.value,f._row FROM filtered f JOIN selected s ON f._row=s.row_id ORDER BY f.time_s,f._row"""
+
+
+def viewport_minmax_query(column: str, bins: int) -> str:
+    # Four source rows per bucket leave room for at most one break per pair.
+    # Keep the six-row persisted pyramid format above unchanged.
+    return f"""WITH filtered AS (
+        SELECT time_s,{column} AS value,_row,
+          least({bins-1},greatest(0,floor((time_s-?)/greatest(?-?,1e-12)*{bins}))) AS bucket
+        FROM viewport WHERE time_s BETWEEN ? AND ?
+    ), selected AS (
+        SELECT unnest([first(_row ORDER BY time_s,_row),last(_row ORDER BY time_s,_row),
+            arg_min(_row,value),arg_max(_row,value)]) AS row_id
+        FROM filtered GROUP BY bucket
+    ) SELECT DISTINCT f.time_s,f.value,f._row FROM filtered f JOIN selected s ON f._row=s.row_id
+      ORDER BY f.time_s,f._row"""
+
+
+def raw_curve_points(rows, gap_threshold):
+    points = []
+    previous = None
+    for t, value, row_id in rows:
+        if (previous is not None and previous[1] is not None and value is not None
+                and t-previous[0] > gap_threshold):
+            points.append([float(previous[0]+(t-previous[0])/2), None])
+        points.append([float(t), float(value) if value is not None else None])
+        previous = (t, value)
+    return points
+
+
+def sampled_curve_points(conn, column, rows, start, end, gap_threshold):
+    """Validate candidate adjacency against the selected original Parquet rows.
+
+    Window prefixes run before the candidate join, so omitted nulls and time
+    gaps remain visible. ROWS and _row preserve distinct samples at equal times.
+    Only the bounded candidate result is transferred to Python.
+    """
+    if not rows:
+        return []
+    candidates = pa.table({"row_id": pa.array([row[2] for row in rows], type=pa.int64())})
+    conn.register("curve_candidates", candidates)
+    try:
+        checked = conn.execute(f"""WITH ordered AS (
+            SELECT time_s,{column} AS value,_row,
+              lag(time_s) OVER(ORDER BY time_s,_row) AS previous_time
+            FROM viewport WHERE time_s BETWEEN ? AND ?
+        ), boundaries AS (
+            SELECT *,CASE WHEN value IS NULL THEN time_s END AS null_time,
+              CASE WHEN time_s-previous_time>? THEN previous_time+(time_s-previous_time)/2 END AS gap_time
+            FROM ordered
+        ), continuity AS (
+            SELECT time_s,value,_row,
+              count(null_time) OVER history AS null_count,count(gap_time) OVER history AS gap_count,
+              max(null_time) OVER history AS last_null,max(gap_time) OVER history AS last_gap
+            FROM boundaries
+            WINDOW history AS (ORDER BY time_s,_row ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+        ) SELECT c.time_s,c.value,c._row,c.null_count,c.gap_count,c.last_null,c.last_gap
+          FROM continuity c JOIN curve_candidates selected ON c._row=selected.row_id
+          ORDER BY c.time_s,c._row""", [start, end, gap_threshold]).fetchall()
+    finally:
+        conn.unregister("curve_candidates")
+    points = []
+    previous = None
+    for t, value, row_id, null_count, gap_count, last_null, last_gap in checked:
+        if (previous is not None and previous[0] is not None and value is not None
+                and (null_count, gap_count) != previous[1]):
+            # The latest crossed boundary lies between this pair's source rows.
+            # Insert before the right endpoint; sorting by x afterwards would
+            # incorrectly move a same-time null after its finite endpoint.
+            boundary = max(value for value in (last_null, last_gap) if value is not None)
+            points.append([float(boundary), None])
+        points.append([float(t), float(value) if value is not None else None])
+        previous = (value, (null_count, gap_count))
+    return points
 
 
 class CurveQueryService:
@@ -374,36 +451,28 @@ class CurveQueryService:
                     category_filter += " AND _cycle='"+cycle.replace("'", "''")+"'"
                 conn.execute(f"CREATE VIEW viewport AS SELECT * FROM samples WHERE {category_filter}")
                 count = manifest["row_count"] if start<=lower and end>=upper and stage is None and cycle is None else conn.execute(f"SELECT count(*) FROM samples WHERE {filters}",filter_parameters).fetchone()[0]
-                gap_bins = max(1,budget//8)
-                gap_points = conn.execute(f"""WITH times AS (
-                    SELECT time_s,lag(time_s) OVER(ORDER BY time_s,_row) previous FROM viewport WHERE time_s BETWEEN ? AND ?
-                ), gaps AS (
-                    SELECT (time_s+previous)/2 midpoint,
-                      least({gap_bins-1},greatest(0,floor((time_s-?)/greatest(?-?,1e-12)*{gap_bins}))) bucket
-                    FROM times WHERE time_s-previous>?
-                ) SELECT min(midpoint) FROM gaps GROUP BY bucket ORDER BY min(midpoint)""",
-                    [start,end,start,end,start,manifest.get("gap_threshold_seconds",0)]).fetchall()
+                gap_threshold = manifest.get("gap_threshold_seconds", 0)
                 for item in chosen:
                     column = quoted(item["key"])
                     if count<=budget//2:
                         rows = conn.execute(f"SELECT time_s,{column},_row FROM viewport WHERE time_s BETWEEN ? AND ? ORDER BY time_s,_row",[start,end]).fetchall()
+                        points = raw_curve_points(rows, gap_threshold)
                         downsampled = False
                     else:
                         bins = max(1, budget//8)
-                        # Full-range views can use precomputed immutable min/max.
-                        pyramid = next((p for p in manifest.get("pyramids", []) if p["bins"]*7<=budget), None) if start<=lower and end>=upper and stage is None and cycle is None else None
+                        # M candidates need at most M-1 separators. Dynamic has
+                        # <=4*bins candidates, old pyramids <=6*bins. Never trim
+                        # candidates after sampling: that could discard extrema.
+                        candidate_cap = (budget+1)//2
+                        pyramid = next((p for p in manifest.get("pyramids", []) if p["bins"]*12-1<=budget), None) if start<=lower and end>=upper and stage is None and cycle is None else None
+                        rows = None
                         if pyramid:
                             pyramid_path = self.storage.path(archive["execution_uuid"], f"pyramid-{pyramid['level']}.parquet")
-                            rows = conn.execute("SELECT t,y,row_id FROM read_parquet(?) WHERE key=? AND t BETWEEN ? AND ? ORDER BY t,row_id", [str(pyramid_path),item["key"],start,end]).fetchall()
-                        else:
-                            rows = conn.execute(minmax_query(column,"viewport",bins), [start,end,start,start,end]).fetchall()
+                            rows = conn.execute("SELECT t,y,row_id FROM read_parquet(?) WHERE key=? AND t BETWEEN ? AND ? ORDER BY t,row_id LIMIT ?", [str(pyramid_path),item["key"],start,end,candidate_cap+1]).fetchall()
+                        if rows is None or len(rows)>candidate_cap:
+                            rows = conn.execute(viewport_minmax_query(column,bins), [start,end,start,start,end]).fetchall()
+                        points = sampled_curve_points(conn, column, rows, start, end, gap_threshold)
                         downsampled = True
-                    # Null markers at genuine gaps prevent misleading connecting lines.
-                    points = [[float(t), float(value) if value is not None else None] for t,value,_ in rows]
-                    remaining = budget-len(points)
-                    for (midpoint,) in gap_points[:max(0,remaining)]:
-                        points.append([float(midpoint),None])
-                    points.sort(key=lambda point: point[0])
                     series.append({**item,"points": points,"sample_count": count,"returned_points": len(points),"downsampled": downsampled})
         except (duckdb.Error, OSError) as exc:
             raise ApiError(409, "curve_query_failed", "查询副本不可读或资源不足，请缩小范围或重新处理归档。") from exc

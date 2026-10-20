@@ -58,6 +58,22 @@ class SetupRepository:
             "configurations": self.rows("SELECT c.public_id AS id,a.public_id AS asset_id,c.fingerprint,c.reliability_impact FROM test.configuration_snapshot c JOIN test.asset a ON a.id=c.asset_id WHERE NOT a.voided ORDER BY c.effective_from DESC,c.id DESC"),
         }
 
+    def stations(self, *, cursor: UUID | None, limit: int):
+        """Read the registry, including disabled stations and disabled parents."""
+        rows = self.rows("""
+            SELECT s.public_id AS id, s.station_code AS code, s.name, s.station_type,
+                   s.enabled, l.lab_code, l.name AS lab_name, l.enabled AS lab_enabled,
+                   t.site_code, t.name AS site_name, t.location AS site_location,
+                   t.enabled AS site_enabled,
+                   (s.enabled AND l.enabled AND t.enabled) AS available
+            FROM test.station s
+            JOIN test.lab l ON l.id=s.lab_id
+            JOIN test.site t ON t.id=l.site_id
+            WHERE CAST(:cursor AS uuid) IS NULL OR s.public_id > CAST(:cursor AS uuid)
+            ORDER BY s.public_id LIMIT :limit
+        """, {"cursor": str(cursor) if cursor else None, "limit": limit + 1})
+        return {"items": rows[:limit], "next_cursor": rows[limit - 1]["id"] if len(rows) > limit else None}
+
     def campaigns(self):
         return self.rows("""
             SELECT c.public_id AS id,c.campaign_code AS code,c.name,c.asset_kind,c.status,

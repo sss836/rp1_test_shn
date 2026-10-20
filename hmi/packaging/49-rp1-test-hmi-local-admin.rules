@@ -1,0 +1,7 @@
+// Optional: installed by the administrator, never enabled by package installation.
+polkit.addRule(function(action, subject) {
+    if (action.id == "com.rp1.test-hmi.configure-can" &&
+        subject.local && subject.active && subject.isInGroup("sudo")) {
+        return polkit.Result.YES;
+    }
+});

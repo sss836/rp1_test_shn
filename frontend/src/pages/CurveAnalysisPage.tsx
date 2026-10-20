@@ -5,6 +5,9 @@ import { archivesApi, archiveTitle, archiveStation, type Archive, type ArchiveCa
 import { EmptyState, ErrorState, LoadingState } from "../components/Workbench";
 import { TimeSeriesChart, type CurveViewport, type PlotSeries, type ReferenceLine } from "../components/TimeSeriesChart";
 import { ArchiveStatus } from "./ArchivesPage";
+import { CurveWorkbench } from "./workspace/Workbench";
+import { readableName, shortCode } from "./workspace/config";
+import { useAuth } from "../auth";
 import "./curveAnalysis.css";
 
 const metricNames: Record<string, string> = { pos_rad: "实际位置", position_rad: "实际位置", cmd_pos_rad: "目标位置", target_pos_rad: "目标位置", target_position_rad: "目标位置", pos_ref_rad: "目标位置", spd_rad_s: "速度", vel_rad_s: "速度", velocity_rad_s: "速度", torque_nm: "力矩", temp_c: "温度", temperature_c: "温度", current_a: "电流", bus_current_a: "母线电流", voltage_v: "电压", bus_voltage_v: "母线电压", error_id: "故障码", tracking_error_rad: "跟踪误差" };
@@ -69,7 +72,7 @@ export function sampleLimitMarkers(points: PlotSeries["points"], limits: Referen
     .map(([time, value]) => ({ time, value, label: "采样越限" }));
 }
 
-function Explorer({ item, navigate }: { item: Archive; navigate: (view: "archive" | "curves", id: string) => void }) {
+function Explorer({ item, navigate, initialViewport, initialAlignment, onViewportChange, onWorkbench }: { item: Archive; navigate: (view: "archive" | "curves", id: string) => void; initialViewport: CurveViewport | null; initialAlignment: "elapsed" | "absolute"; onViewportChange: (value: CurveViewport | null, alignment: "elapsed" | "absolute") => void; onWorkbench: () => void }) {
   const catalog = item.manifest?.catalog ?? [];
   const metrics = [...new Map(catalog.map((entry) => [metricIdentity(entry), entry])).values()];
   const [selection, setSelection] = useState(metrics[0] ? metricIdentity(metrics[0]) : "");
@@ -78,9 +81,10 @@ function Explorer({ item, navigate }: { item: Archive; navigate: (view: "archive
   const [selectedSubjects, setSelectedSubjects] = useState<string[]>(subjects.slice(0, 1));
   const [stage, setStage] = useState("");
   const [cycle, setCycle] = useState("");
-  const [alignment, setAlignment] = useState<"elapsed" | "absolute">("elapsed");
+  const [alignment, setAlignment] = useState<"elapsed" | "absolute">(initialAlignment);
   const [layout, setLayout] = useState<"overlay" | "facets">("overlay");
-  const [viewport, setViewport] = useState<CurveViewport | null>(null);
+  const [viewport, updateViewport] = useState<CurveViewport | null>(initialViewport);
+  function setViewport(value: CurveViewport | null, nextAlignment = alignment) { updateViewport(value); onViewportChange(value, nextAlignment); }
   const [maxPoints, setMaxPoints] = useState(4000);
   const [showLimits, setShowLimits] = useState(true);
   const [showTargets, setShowTargets] = useState(false);
@@ -173,7 +177,7 @@ function Explorer({ item, navigate }: { item: Archive; navigate: (view: "archive
           const points = curve.points.map(([time, value]): [number, number | null] => [transformTime(time), value]);
           return {
             id: `${recordKey(record)}:${curve.key}`,
-            name: `${recordLabel(record)} · ${curve.subject || "全局"}${target ? " · 目标" : ""}`,
+            name: `${readableName(record)} · ${recordLabel(record)} · ${curve.subject || "全局"}${target ? " · 目标" : ""}`,
             unit: curve.unit, reference: !!record.comparison_id || target,
             color: target ? "#8895a7" : SERIES_COLORS[colorIndex % SERIES_COLORS.length],
             dash: target ? "dashed" as const : SERIES_DASHES[(colorIndex + Math.max(0, recordSubjects(record).indexOf(curve.subject))) % SERIES_DASHES.length],
@@ -201,7 +205,7 @@ function Explorer({ item, navigate }: { item: Archive; navigate: (view: "archive
   function switchMetric(value: string) {
     setSelection(value);
     setSelectedSubjects([...new Set(catalog.filter((entry) => metricIdentity(entry) === value).map((entry) => entry.subject))].slice(0, 1));
-    setCompareSubjects({}); setReferences([]); setShowTargets(false); setViewport(null); setSelectionNote("");
+    setCompareSubjects({}); setReferences([]); setShowTargets(false); setSelectionNote("参数已切换；保留当前时间区间，临时参考线已清空。");
   }
   function addRecord(record: Archive) {
     setCompared((current) => current.some((entry) => entry.id === record.id && !entry.comparison_id) || current.length >= 7 ? current : [...current, record]);
@@ -246,7 +250,7 @@ function Explorer({ item, navigate }: { item: Archive; navigate: (view: "archive
   </div>;
 
   return <>
-    <header className="curve-page-heading"><div className="curve-heading-copy"><h1 data-page-heading tabIndex={-1}>多执行对比</h1><p>{selectedSubjects.join(" / ").toUpperCase() || "未选关节"} · {label}</p></div><div className="curve-heading-actions"><button className="curve-button" type="button" aria-label="返回归档详情" onClick={() => navigate("archive", item.id)}>归档详情</button><button className="curve-button primary" type="button" onClick={() => { searchInput.current?.focus(); searchInput.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); }}><Plus aria-hidden="true" />添加执行</button></div></header>
+    <header className="curve-page-heading"><div className="curve-heading-copy"><h1 data-page-heading tabIndex={-1}>多执行对比</h1><p>{selectedSubjects.join(" / ").toUpperCase() || "未选关节"} · {label}</p></div><div className="curve-heading-actions"><button className="curve-button" type="button" onClick={() => { onViewportChange(viewport ? visible : null, absolute ? "absolute" : "elapsed"); onWorkbench(); }}>多面板工作台</button><button className="curve-button" type="button" aria-label="返回归档详情" onClick={() => navigate("archive", item.id)}>归档详情</button><button className="curve-button primary" type="button" onClick={() => { searchInput.current?.focus(); searchInput.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); }}><Plus aria-hidden="true" />添加执行</button></div></header>
     <div className="curve-workbench">
       <aside className="curve-execution-rail" aria-label="执行比较选择">
         <h2>已选执行 <span>{records.length} / 8</span></h2>
@@ -255,7 +259,7 @@ function Explorer({ item, navigate }: { item: Archive; navigate: (view: "archive
         {compareQuery.error && <ErrorState error={compareQuery.error} retry={() => void compareQuery.refetch()} />}
         {compareQuery.data && <div className="curve-results" aria-label="对比搜索结果">{compareQuery.data.items.filter((entry) => entry.id !== item.id && !compared.some((added) => added.id === entry.id && !added.comparison_id)).map((entry) => {
           const compatible = !!chosen && (entry.manifest?.catalog ?? []).some((column) => column.metric === chosen.metric && column.unit === chosen.unit);
-          return <button key={entry.id} type="button" disabled={!compatible || compared.length >= 7 || entry.processing_state !== "READY"} onClick={() => addRecord(entry)}><span><strong>{archiveTitle(entry)}</strong><small>{entry.test_name} · {compatible ? "添加叠加" : "缺少同参数、同单位的曲线"}</small></span><Plus aria-hidden="true" /></button>;
+          return <button key={entry.id} type="button" disabled={!compatible || compared.length >= 7 || entry.processing_state !== "READY"} onClick={() => addRecord(entry)}><span><strong>{readableName(entry)}</strong><small>{archiveTitle(entry)} · {compatible ? "添加叠加" : "缺少同参数、同单位的曲线"}</small></span><Plus aria-hidden="true" /></button>;
         })}{compareQuery.data.items.length === 0 && <p className="curve-reference-help">没有找到记录。</p>}<button type="button" className="curve-record-link" onClick={() => { setCompareSearch(""); setCompareDraft(""); }}>收起搜索结果</button></div>}
         <ul className="curve-execution-list">{allRecords.map((record, index) => {
           const key = recordKey(record);
@@ -263,13 +267,13 @@ function Explorer({ item, navigate }: { item: Archive; navigate: (view: "archive
           const selected = !excluded.includes(key) && (!record.comparison_id || showHistory) && compatible;
           const recordUnit = record.reference_unit ?? chosen?.unit;
           return <li key={key} className={`curve-execution-item${selected ? " selected" : ""}`}>
-            <div className="curve-execution-row"><label><input aria-label={`参与对比 ${recordLabel(record)}`} type="checkbox" checked={selected} disabled={!compatible || !!record.comparison_id && !showHistory} onChange={() => toggleRecord(record)} /><span className="curve-series-dot" style={{ "--series-color": SERIES_COLORS[index % SERIES_COLORS.length] } as CSSProperties} /><strong>{archiveTitle(record)}</strong></label>{index === 0 ? <span className="curve-execution-badge">基准</span> : <><span className="curve-execution-badge">{record.comparison_id ? "固定" : record.origin === "HISTORY" ? "历史" : "对比"}</span><button className="curve-row-action" type="button" aria-label={`移除对比 ${recordLabel(record)}`} onClick={() => { setCompared((current) => current.filter((entry) => recordKey(entry) !== key)); setExcluded((current) => current.filter((entry) => entry !== key)); setViewport(null); }}><X aria-hidden="true" /></button></>}</div>
-            <div className="curve-execution-meta"><span>{recordSubjects(record).join(" / ").toUpperCase() || "未选对象"} · {recordUnit || "无单位"}</span>{record.comparison_id && <p>阶段 {record.reference_stage || "全部"} · 循环 {record.reference_cycle || "全部"}</p>}{!compatible && <p>当前选择不兼容</p>}
+            <div className="curve-execution-row"><label><input aria-label={`参与对比 ${recordLabel(record)}`} type="checkbox" checked={selected} disabled={!compatible || !!record.comparison_id && !showHistory} onChange={() => toggleRecord(record)} /><span className="curve-series-dot" style={{ "--series-color": SERIES_COLORS[index % SERIES_COLORS.length] } as CSSProperties} /><strong title={readableName(record)}>{readableName(record)}</strong></label>{index === 0 ? <span className="curve-execution-badge">基准</span> : <><span className="curve-execution-badge">{record.comparison_id ? "固定" : record.origin === "HISTORY" ? "历史" : "对比"}</span><button className="curve-row-action" type="button" aria-label={`移除对比 ${recordLabel(record)}`} onClick={() => { setCompared((current) => current.filter((entry) => recordKey(entry) !== key)); setExcluded((current) => current.filter((entry) => entry !== key)); setViewport(null); }}><X aria-hidden="true" /></button></>}</div>
+            <div className="curve-execution-meta"><p title={archiveTitle(record)}>{shortCode(record)}</p><span>{recordSubjects(record).join(" / ").toUpperCase() || "未选对象"} · {recordUnit || "无单位"}</span>{record.comparison_id && <p>阶段 {record.reference_stage || "全部"} · 循环 {record.reference_cycle || "全部"}</p>}{!compatible && <p>当前选择不兼容</p>}
               {index > 0 && !record.comparison_id && <details><summary>对比关节</summary><div className="curve-execution-subjects">{[...new Set((record.manifest?.catalog ?? []).filter((column) => chosen && column.metric === chosen.metric && column.unit === chosen.unit).map((column) => column.subject))].map((subject) => <label key={subject}><input type="checkbox" checked={recordSubjects(record).includes(subject)} disabled={!recordSubjects(record).includes(subject) && recordSubjects(record).length >= (showTargets ? 16 : 32)} onChange={() => setCompareSubjects((current) => ({ ...current, [key]: recordSubjects(record).includes(subject) ? recordSubjects(record).filter((value) => value !== subject) : [...recordSubjects(record), subject] }))} />{subject || "全局"}</label>)}</div><button className="curve-record-link" type="button" onClick={() => navigate("curves", record.id)}>打开此执行曲线</button></details>}
             </div>
           </li>;
         })}</ul>
-        <section className="curve-comparison-options"><h3>对比方式</h3><div className="curve-mode-toggle"><button type="button" aria-pressed={layout === "overlay"} onClick={() => setLayout("overlay")}>叠加</button><button type="button" aria-pressed={layout === "facets"} onClick={() => setLayout("facets")}>分面</button></div><label>时间对齐<select value={alignment} onChange={(event) => { setAlignment(event.target.value as "elapsed" | "absolute"); setViewport(null); }}><option value="elapsed">测试开始</option><option value="absolute" disabled={absoluteUnavailable}>绝对时间</option></select></label><label>视窗点数上限<select value={maxPoints} onChange={(event) => setMaxPoints(Number(event.target.value))}><option value={1000}>1,000</option><option value={4000}>4,000</option><option value={10000}>10,000</option><option value={20000}>20,000</option></select></label></section>
+        <section className="curve-comparison-options"><h3>对比方式</h3><div className="curve-mode-toggle"><button type="button" aria-pressed={layout === "overlay"} onClick={() => setLayout("overlay")}>叠加</button><button type="button" aria-pressed={layout === "facets"} onClick={() => setLayout("facets")}>分面</button></div><label>时间对齐<select value={alignment} onChange={(event) => { const next = event.target.value as "elapsed" | "absolute"; setAlignment(next); setViewport(null, next); }}><option value="elapsed">测试开始</option><option value="absolute" disabled={absoluteUnavailable}>绝对时间</option></select></label><label>视窗点数上限<select value={maxPoints} onChange={(event) => setMaxPoints(Number(event.target.value))}><option value={1000}>1,000</option><option value={4000}>4,000</option><option value={10000}>10,000</option><option value={20000}>20,000</option></select></label></section>
         <p className="curve-contract-note"><Info aria-hidden="true" />仅同参数、同单位可比较。取消勾选只移出当前对比。</p>
         {absoluteUnavailable && <p className="curve-reference-help">选中执行缺少开始时间，绝对时间对齐不可用。</p>}
       </aside>
@@ -295,10 +299,19 @@ function Explorer({ item, navigate }: { item: Archive; navigate: (view: "archive
   </>;
 }
 
+function AnalysisModes({ item, navigate }: { item: Archive; navigate: (view: "archive" | "curves", id: string) => void }) {
+  const [single, setSingle] = useState(() => new URLSearchParams(window.location.search).get("curve_mode") === "single");
+  const [timeContext, setTimeContext] = useState<{ viewport: CurveViewport | null; alignment: "elapsed" | "absolute" } | null>(null);
+  function rememberTime(viewport: CurveViewport | null, alignment: "elapsed" | "absolute") { setTimeContext({ viewport, alignment }); }
+  return single ? <Explorer item={item} navigate={navigate} initialViewport={timeContext?.viewport ?? null} initialAlignment={timeContext?.alignment ?? "elapsed"} onViewportChange={rememberTime} onWorkbench={() => setSingle(false)} /> : <CurveWorkbench item={item} navigate={navigate} initialViewport={timeContext?.viewport} initialAlignment={timeContext?.alignment} onViewportChange={rememberTime} onSingle={() => setSingle(true)} />;
+}
+
 export default function CurveAnalysisPage({ id, navigate }: { id: string; navigate: (view: "archive" | "curves", id: string) => void }) {
-  const query = useQuery({ queryKey: ["archives", "detail", id], queryFn: ({ signal }) => archivesApi.detail(id, signal) });
+  const { session } = useAuth();
+  const userId = session?.user.id ?? "session";
+  const query = useQuery({ queryKey: ["archives", "detail", id, userId], queryFn: ({ signal }) => archivesApi.detail(id, signal) });
   if (query.isLoading) return <LoadingState label="正在加载曲线目录" />;
   if (query.error || !query.data) return <ErrorState error={query.error} retry={() => void query.refetch()} />;
   const item = query.data;
-  return <div className="curve-analysis-page"><nav className="curve-breadcrumb" aria-label="曲线页导航"><button type="button" onClick={() => navigate("archive", id)}><ArrowLeft aria-hidden="true" />数据归档</button><span>/</span><span>曲线分析</span></nav>{item.processing_state !== "READY" ? <><header className="curve-page-heading"><h1>{archiveTitle(item)}</h1><button className="curve-button" type="button" onClick={() => navigate("archive", id)}>返回归档详情</button></header><div className="curve-state-card"><EmptyState title="归档曲线尚未就绪" description={item.processing_error || "文件上传与解析完成后可在此查看详细曲线。"} /></div></> : <Explorer key={id} item={item} navigate={navigate} />}</div>;
+  return <div className="curve-analysis-page"><nav className="curve-breadcrumb" aria-label="曲线页导航"><button type="button" onClick={() => navigate("archive", id)}><ArrowLeft aria-hidden="true" />数据归档</button><span>/</span><span>曲线分析</span></nav>{item.processing_state !== "READY" ? <><header className="curve-page-heading"><h1>{archiveTitle(item)}</h1><button className="curve-button" type="button" onClick={() => navigate("archive", id)}>返回归档详情</button></header><div className="curve-state-card"><EmptyState title="归档曲线尚未就绪" description={item.processing_error || "文件上传与解析完成后可在此查看详细曲线。"} /></div></> : <AnalysisModes key={`${userId}:${id}`} item={item} navigate={navigate} />}</div>;
 }

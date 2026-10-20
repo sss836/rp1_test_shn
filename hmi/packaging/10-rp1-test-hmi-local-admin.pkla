@@ -1,0 +1,6 @@
+[Allow active local administrators to configure RP1 CAN]
+Identity=unix-group:sudo
+Action=com.rp1.test-hmi.configure-can
+ResultAny=no
+ResultInactive=no
+ResultActive=yes

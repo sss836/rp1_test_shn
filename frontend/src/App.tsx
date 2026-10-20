@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
+  Archive as ArchiveIcon,
   Boxes,
   ChevronDown,
   Clock3,
@@ -18,7 +19,7 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "./auth";
 import { HomePage } from "./pages/HomePage";
-import { AuthLoading, LoginScreen, PasswordChangeScreen } from "./pages/AuthScreens";
+import { AuthLoading, AuthUnavailable, LoginScreen, LogoutNotice, PasswordChangeScreen } from "./pages/AuthScreens";
 import { EmptyState, LoadingState } from "./components/Workbench";
 import {
   locationHref,
@@ -43,7 +44,9 @@ const MtbfPage = lazy(() => import("./pages/ReadModelPages").then((module) => ({
 const TestCaseDetailPage = lazy(() => import("./pages/ReadModelPages").then((module) => ({ default: module.TestCaseDetailPage })));
 const LiveRunsPage = lazy(() => import("./pages/LiveRunsPage"));
 const HmiStationsPage = lazy(() => import("./pages/HmiStationsPage"));
+const BenchOverviewPage = lazy(() => import("./pages/BenchOverviewPage"));
 const SubmissionsPage = lazy(() => import("./pages/SubmissionsPage"));
+const CsvImportPage = lazy(() => import("./pages/CsvImportPage"));
 const ArchivesPage = lazy(() => import("./pages/ArchivesPage"));
 const ArchiveDetailPage = lazy(() => import("./pages/ArchivesPage").then((module) => ({ default: module.ArchiveDetailPage })));
 const CurveAnalysisPage = lazy(() => import("./pages/CurveAnalysisPage"));
@@ -56,8 +59,13 @@ const navItems: Array<{ view: View; label: string; icon: typeof LayoutDashboard 
   { view: "mtbf", label: "MTBF 结论", icon: Gauge },
   { view: "assets", label: "样品中心", icon: Boxes },
   { view: "live", label: "正在运行", icon: Activity },
-  { view: "stations", label: "工位监控", icon: Monitor },
-  { view: "archives", label: "数据归档", icon: ChartNoAxesCombined }
+  { view: "benches", label: "台架总览", icon: Boxes },
+  { view: "stations", label: "工位监控", icon: Monitor }
+];
+
+const dataNavItems: typeof navItems = [
+  { view: "archives", label: "数据归档", icon: ArchiveIcon },
+  { view: "curves", label: "曲线分析", icon: ChartNoAxesCombined }
 ];
 
 function initialTheme(): "day" | "night" {
@@ -69,7 +77,7 @@ function initialTheme(): "day" | "night" {
 }
 
 export default function App() {
-  const { status, session, logout } = useAuth();
+  const { status, session, logout, logoutPending } = useAuth();
   const [location, setLocation] = useState<LocationState>(() => readLocation());
   const [theme, setTheme] = useState<"day" | "night">(initialTheme);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
@@ -161,9 +169,10 @@ export default function App() {
     }
   }
 
-  const navView = location.view === "asset" ? "assets" : ["archive", "curves"].includes(location.view) ? "archives" : location.view;
+  const navView = location.view === "asset" ? "assets" : ["archive", "import"].includes(location.view) ? "archives" : location.view;
 
   if (status === "booting") return <AuthLoading />;
+  if (status === "unavailable") return <AuthUnavailable />;
   if (status === "anonymous") return <LoginScreen />;
   if (session?.user.must_change_password) return <PasswordChangeScreen />;
 
@@ -180,11 +189,21 @@ export default function App() {
           <button type="button" className={location.kind === "MODULE" ? "active" : ""} aria-pressed={location.kind === "MODULE"} onClick={() => switchKind("MODULE")}>模块</button>
         </div>
         <nav className="primary-nav" aria-label="主要页面">
+          <div className="primary-nav-scroll" role="group" aria-label="其他主要页面，可横向滚动" tabIndex={0}>
           {[...navItems, ...(session?.user.role !== "VIEWER" ? [{ view: "submissions" as View, label: "测试数据审批", icon: ShieldCheck }] : [])].map((item) => {
             const Icon = item.icon;
             const active = navView === item.view;
             return <button key={item.view} type="button" className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => go(item.view)}><Icon aria-hidden="true" />{item.label}</button>;
           })}
+          </div>
+          <span className="primary-nav-scroll-hint" title="横向滚动查看更多页面" aria-hidden="true">↔</span>
+          <div className="primary-nav-data">
+            {dataNavItems.map((item) => {
+              const Icon = item.icon;
+              const active = navView === item.view;
+              return <button key={item.view} type="button" className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => go(item.view)}><Icon aria-hidden="true" />{item.label}</button>;
+            })}
+          </div>
         </nav>
         <div className="header-actions">
           {session?.user.role === "SYSTEM_ADMIN" && (
@@ -245,13 +264,14 @@ export default function App() {
                 <div role="presentation"><strong>{session?.user.display_name}</strong><span>@{session?.user.username}</span><small>{roleLabels[session!.user.role]}</small></div>
                 <button role="menuitem" type="button" onClick={() => go("account")}>账户设置</button>
                 <button role="menuitem" type="button" onClick={() => go("access-request")}>权限申请</button>
-                <button role="menuitem" type="button" onClick={() => void logout()}><LogOut aria-hidden="true" />退出</button>
+                <button role="menuitem" type="button" disabled={logoutPending} onClick={() => void logout()}><LogOut aria-hidden="true" />{logoutPending ? "正在退出…" : "退出"}</button>
               </div>
             )}
           </div>
         </div>
       </header>
       <main id="main-content" tabIndex={-1}>
+        <LogoutNotice />
         <Suspense fallback={<LoadingState label="正在加载页面" />}>
         {location.view === "catalog" && <CatalogPage assetKind={location.kind} navigate={(id) => go("test-case", id)} />}
         {location.view === "planning" && <PlanningPage key={location.kind} assetKind={location.kind} />}
@@ -265,13 +285,16 @@ export default function App() {
         {location.view === "account" && <AccountPage />}
         {location.view === "live" && <LiveRunsPage navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "stations" && <HmiStationsPage />}
+        {location.view === "benches" && <BenchOverviewPage navigate={(view) => go(view)} />}
         {location.view === "submissions" && <SubmissionsPage navigate={(id) => go("execution", id)} navigateArchive={(id) => go("archive", id)} />}
         {location.view === "archives" && <ArchivesPage navigate={(view, id) => go(view, id ?? null)} />}
+        {location.view === "import" && <CsvImportPage navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "archive" && location.id && <ArchiveDetailPage id={location.id} navigate={(view, id) => go(view, id ?? null)} />}
+        {location.view === "curves" && !location.id && <ArchivesPage mode="curves" navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "curves" && location.id && <CurveAnalysisPage id={location.id} navigate={(view, id) => go(view, id)} />}
         {location.view === "access-request" && <AccessRequestPage />}
         {location.view === "admin" && <AdminWorkspace />}
-        {["asset", "test-case", "execution", "archive", "curves"].includes(location.view) && !location.id && (
+        {["asset", "test-case", "execution", "archive"].includes(location.view) && !location.id && (
           <EmptyState title="页面地址缺少业务标识" description="请通过样品、Test Case 或 Execution 列表重新进入详情。" />
         )}
         </Suspense>

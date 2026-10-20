@@ -26,6 +26,7 @@ export type HmiStation = {
   last_seen_at: string;
   snapshot_at: string;
   runs: HmiRun[];
+  runtime_conflicts?: Array<{ id: string; execution_code: string; asset_code: string; detected_at: string }>;
   plc: { driver: string; communication_state: string; phase: string; powered_channels: number[]; stale: boolean };
 };
 

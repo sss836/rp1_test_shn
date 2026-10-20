@@ -7,4 +7,9 @@ unset_args=(-u COMPOSE_FILE -u COMPOSE_PROJECT_NAME -u COMPOSE_PROFILES)
 while IFS='=' read -r key ignored; do
   [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && unset_args+=(-u "$key")
 done < .env
-exec env "${unset_args[@]}" docker compose --env-file .env -f compose.yml "$@"
+compose_files=(-f compose.yml)
+# Preserve site-specific bindings and mounts during upgrades and maintenance.
+if [[ -f compose.override.yml ]]; then
+  compose_files+=(-f compose.override.yml)
+fi
+exec env "${unset_args[@]}" docker compose --env-file .env "${compose_files[@]}" "$@"

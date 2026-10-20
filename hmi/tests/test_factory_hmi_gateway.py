@@ -126,6 +126,28 @@ class ControlLeaseTests(unittest.TestCase):
 
 
 class GatewayApiTests(unittest.TestCase):
+    def test_heartbeat_does_not_wait_for_motor_can_or_platform_snapshot(self) -> None:
+        controller = StubController()
+        with tempfile.TemporaryDirectory() as directory, TestClient(
+            create_app(controller, data_root=Path(directory))
+        ) as client:
+            runtime = client.app.state.runtime.session("operator-a")
+            controller.state = "running"
+            runtime.lease.claim("operator-a")
+            with mock.patch.object(
+                controller, "snapshot", side_effect=RuntimeError("status read blocked")
+            ) as status_read:
+                response = client.post(
+                    "/api/v1/lease/heartbeat",
+                    headers={"X-RP1-Client-ID": "operator-a"},
+                )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["lease"]["owner"], "operator-a")
+                self.assertFalse(response.json()["lease"]["expired"])
+                self.assertEqual(response.json()["lease"]["timeout_s"], 2.0)
+                status_read.assert_not_called()
+            self.assertEqual(controller.state, "running")
+
     def test_new_client_session_sees_migrated_station_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

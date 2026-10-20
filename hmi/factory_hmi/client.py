@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import threading
 from copy import deepcopy
 import uuid
@@ -64,6 +66,7 @@ class GatewayClient:
         timeout: float = 10.0,
         client_id: str | None = None,
         operator_token: str | None = None,
+        trajectory_upload_timeout: float | None = None,
     ) -> None:
         base_url = base_url.strip().rstrip("/")
         parsed = parse.urlsplit(base_url)
@@ -71,6 +74,13 @@ class GatewayClient:
             raise ValueError("gateway URL must be an absolute http(s) URL")
         self.base_url = base_url
         self.timeout = timeout
+        upload_timeout = (
+            trajectory_upload_timeout if trajectory_upload_timeout is not None
+            else float(os.environ.get("RP1_FACTORY_TRAJECTORY_UPLOAD_TIMEOUT_S", "120"))
+        )
+        if not math.isfinite(upload_timeout) or upload_timeout <= 0:
+            raise ValueError("trajectory upload timeout must be a positive finite number")
+        self.trajectory_upload_timeout = max(timeout, upload_timeout)
         self.client_id = (client_id or f"hmi-{uuid.uuid4()}").strip()
         self.operator_token = (operator_token or "").strip()
         self._plc_lock = threading.RLock()
@@ -134,6 +144,7 @@ class GatewayClient:
         method: str,
         path: str,
         payload: Mapping[str, Any] | None = None,
+        *, timeout: float | None = None,
     ) -> JsonValue:
         url = self._url(path)
         headers = {
@@ -151,7 +162,7 @@ class GatewayClient:
 
         req = request.Request(url, data=data, headers=headers, method=method)
         try:
-            with request.urlopen(req, timeout=self.timeout) as response:
+            with request.urlopen(req, timeout=self.timeout if timeout is None else timeout) as response:
                 return self._decode_response(
                     response.read(),
                     method=method,
@@ -220,6 +231,24 @@ class GatewayClient:
 
     def snapshot(self) -> JsonValue:
         return self.get("/api/v1/snapshot")
+
+    def quick_profiles(self) -> JsonValue:
+        return self.get("/api/v1/quick/profiles")
+
+    def quick_status(self) -> JsonValue:
+        return self.get("/api/v1/quick/status")
+
+    def quick_prepare(self, profile: str, interfaces: list[str], backend: str = "motors_py") -> JsonValue:
+        return self.post("/api/v1/quick/prepare", dict(profile=profile, interfaces=interfaces, backend=backend))
+
+    def quick_start(self, hours: float, sample_id: str, *, physical_estop_confirmed: bool,
+                    power_source: str = "plc") -> JsonValue:
+        return self._request("POST", "/api/v1/quick/start", dict(duration_hours=hours,
+            sample_id=sample_id, physical_estop_confirmed=physical_estop_confirmed,
+            power_source=power_source), timeout=120.0)
+
+    def quick_end(self) -> JsonValue:
+        return self._request("POST", "/api/v1/quick/end", timeout=15.0)
 
     def configs(self) -> JsonValue:
         return self.get("/api/v1/configs")
@@ -337,7 +366,6 @@ class GatewayClient:
 
     def trajectory_upload(self, path: str | Path) -> JsonValue:
         source = Path(path)
-        body = source.read_bytes()
         url = self._url("/api/v1/trajectory/upload")
         headers = {
             "Accept": "application/json",
@@ -347,10 +375,12 @@ class GatewayClient:
         }
         if self.operator_token:
             headers["X-RP1-Operator-Token"] = self.operator_token
-        req = request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with request.urlopen(req, timeout=self.timeout) as response:
-                return self._decode_response(response.read(), method="POST", url=url)
+            with source.open("rb") as stream:
+                headers["Content-Length"] = str(os.fstat(stream.fileno()).st_size)
+                req = request.Request(url, data=stream, headers=headers, method="POST")
+                with request.urlopen(req, timeout=self.trajectory_upload_timeout) as response:
+                    return self._decode_response(response.read(), method="POST", url=url)
         except error.HTTPError as exc:
             detail = self._decode_error_detail(exc.read())
             raise GatewayHTTPError(
@@ -561,11 +591,17 @@ class GatewayClient:
     def execution_sync_status(self, test_id: str) -> JsonValue:
         return self.get(f"/api/v1/executions/{parse.quote(test_id, safe='')}/sync")
 
+    def platform_samples(self) -> JsonValue:
+        return self.get("/api/v1/platform/samples")
+
     def platform_options(self) -> JsonValue:
         return self.get("/api/v1/platform/options")
 
-    def rebuild_execution(self, test_id: str) -> JsonValue:
-        return self.post("/api/v1/executions/rebuild", {"test_id": test_id})
+    def rebuild_execution(self, test_id: str, reason: str) -> JsonValue:
+        return self.post("/api/v1/executions/rebuild", {"test_id": test_id, "reason": reason})
+
+    def execution_analysis_versions(self, test_id: str) -> JsonValue:
+        return self.get(f"/api/v1/executions/{parse.quote(test_id, safe='')}/analysis-revisions")
 
     def retry_execution(self, test_id: str) -> JsonValue:
         return self.post("/api/v1/executions/retry", {"test_id": test_id})

@@ -72,7 +72,7 @@ def test_recording_without_bench_or_platform_login_finishes_csv_and_local_report
     assert service.report_manager.report_path(manifest['test_id']).is_file()
     schema=json.loads((HMI/'factory_hmi/contracts/execution-bundle-v1.schema.json').read_text())
     Draft202012Validator(schema,format_checker=FormatChecker()).validate(manifest)
-    rebuilt=service.report_manager.rebuild(manifest['test_id'])
+    rebuilt=service.report_manager.rebuild(manifest['test_id'], actor='synthetic-account', reason='隔离采集复验')
     assert rebuilt.manifest['recording_scope']=='local'
     assert service.execution_history()[0]['recording_scope']=='local'
     with pytest.raises(ValueError,match='必须核实'):
@@ -127,7 +127,7 @@ def test_complete_platform_context_preserves_canonical_identity_and_independent_
     assert manifest['test_id'].startswith('LOCAL_REL-SARM-001_')
     assert manifest['execution_code'] == official
     assert service.execution_history()[0]['execution_code'] == official
-    rebuilt = service.report_manager.rebuild(manifest['test_id'])
+    rebuilt = service.report_manager.rebuild(manifest['test_id'], actor='synthetic-account', reason='隔离采集复验')
     assert rebuilt.manifest['execution_code'] == official
     assert manifest['recording_scope']=='platform'
     from factory_hmi.sync.presence import build_presence_snapshot

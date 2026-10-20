@@ -15,10 +15,15 @@ import sys
 import time
 from urllib.request import urlopen
 
-import yaml
-
 PROGRAM_ROOT = Path(__file__).resolve().parent
 SOURCE_ROOT = PROGRAM_ROOT / "hmi" if (PROGRAM_ROOT / "hmi").is_dir() else PROGRAM_ROOT
+# The launcher itself needs YAML before gateway_environment() can set PYTHONPATH.
+# A clean 22.04 machine has no Python 3.12 site packages outside this bundle.
+if (PROGRAM_ROOT / "runtime").is_dir():
+    sys.path.insert(0, str(PROGRAM_ROOT / "runtime"))
+
+import yaml
+
 stopping = False
 
 
@@ -43,6 +48,21 @@ def running(state: Path) -> dict:
 def request_stop(_signum=None, _frame=None):
     global stopping
     stopping = True
+
+
+def raise_existing(root: Path, data: dict) -> bool:
+    """Only send a window request to this verified launcher's private socket."""
+    address = data.get("activation_socket")
+    if not address or address != str(root / f"run/desktop-{data['pid']}.sock"):
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1.0)
+            client.connect(address)
+            client.sendall(b"raise\n")
+        return True
+    except OSError:
+        return False
 
 
 def seed_configs(root: Path, *, offline: bool, offline_access: str) -> None:
@@ -73,6 +93,12 @@ def gateway_environment(root: Path, runtime: Path | None, *, offline: bool, driv
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("RP1_FACTORY_", "RP1_RELIABILITY_"))}
     env.pop("PYTHONPATH", None)
+    for setting in (
+        "RP1_FACTORY_TRAJECTORY_MAX_BYTES",
+        "RP1_FACTORY_TRAJECTORY_UPLOAD_TIMEOUT_S",
+    ):
+        if setting in os.environ:
+            env[setting] = os.environ[setting]
     env.update({
         "RP1_FACTORY_DATA_ROOT": "data",
         "RP1_FACTORY_ALLOWED_CONFIG_ROOT": "config/stations",
@@ -182,7 +208,8 @@ def main() -> int:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print("HMI is already running.")
+            print("HMI 窗口恢复请求已发送。" if raise_existing(root, running(state))
+                  else "HMI 已在运行，窗口尚未就绪或该旧实例不支持窗口恢复。")
             return 0
         seed_configs(root, offline=args.offline_check, offline_access=args.offline_access)
         config = yaml.safe_load((root / "config/plc_cabinet.yaml").read_text())
@@ -199,13 +226,14 @@ def main() -> int:
         signal.signal(signal.SIGINT, request_stop)
         gateway = desktop = None
         url = f"http://127.0.0.1:{args.port}"
+        activation_socket = str(root / f"run/desktop-{os.getpid()}.sock")
         with (root / "logs/gateway.log").open("a") as glog, (root / "logs/desktop.log").open("a") as dlog:
             try:
                 gateway = subprocess.Popen([sys.executable, "-m", "factory_hmi.gateway", "--host", "127.0.0.1", "--port", str(args.port), "--data-root", "data"], cwd=root, env=env, stdout=glog, stderr=subprocess.STDOUT)
-                state.write_text(json.dumps({"pid": os.getpid(), "start": process_start(os.getpid()), "gateway_pid": gateway.pid, "gateway": url, "driver": driver, "access_mode": mode, "read_only": mode == "monitor"}))
+                state.write_text(json.dumps({"pid": os.getpid(), "start": process_start(os.getpid()), "gateway_pid": gateway.pid, "gateway": url, "driver": driver, "access_mode": mode, "read_only": mode == "monitor", "activation_socket": activation_socket}))
                 wait_health(gateway, url, driver, mode)
                 if not args.gateway_only:
-                    desktop = subprocess.Popen([sys.executable, "-m", "factory_hmi.desktop", "--gateway-url", url], cwd=root, env=env, stdout=dlog, stderr=subprocess.STDOUT)
+                    desktop = subprocess.Popen([sys.executable, "-m", "factory_hmi.desktop", "--gateway-url", url], cwd=root, env=dict(env, RP1_HMI_ACTIVATION_SOCKET=activation_socket, RP1_HMI_STATION_CONFIG_DIR=str(root / "config/stations")), stdout=dlog, stderr=subprocess.STDOUT)
                 print(f"HMI ready: PLC {driver}, {mode}, {url}", flush=True)
                 deadline = time.monotonic() + args.duration if args.duration > 0 else None
                 while not stopping:

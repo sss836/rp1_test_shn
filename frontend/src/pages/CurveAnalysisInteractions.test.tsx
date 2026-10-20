@@ -7,6 +7,8 @@ import { getInstanceByDom } from "echarts/core";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { archivesApi, type Archive, type ArchiveCatalogItem, type ArchiveCurves } from "../archiveApi";
 import CurveAnalysisPage from "./CurveAnalysisPage";
+import { workspaceApi } from "./workspace/api";
+import { defaultConfig, shareUrl } from "./workspace/config";
 
 vi.mock("../auth", () => ({ useAuth: () => ({ session: { user: { role: "TEST_EXECUTOR" } } }) }));
 // Keep the real ECharts model, dataZoom events, component controls, and React
@@ -66,6 +68,8 @@ const clients: QueryClient[] = [];
 let records: Record<string, Archive>;
 
 beforeEach(() => {
+  // Preserve every single-chart regression assertion on its explicit route.
+  window.history.replaceState({}, "", "?curve_mode=single");
   vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
   vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Independent fixtures prohibit network access")));
   const other = syntheticArchive("SYN-002", syntheticCatalog.map((column) => ({ ...column, key: column.key.replace("j1", "axisA").replace("j2", "axisB"), subject: column.subject.replace("j1", "axisA").replace("j2", "axisB") })));
@@ -338,4 +342,32 @@ it("rejects reversed X ranges locally and never sends an invalid viewport", asyn
   applyXRange("30", "10");
   await screen.findByRole("alert");
   expect(archivesApi.curves).toHaveBeenCalledTimes(calls);
+});
+
+
+it("preserves absolute viewport coordinates across real single/workbench transitions and overrides the initial shared URL range", async () => {
+  const epoch = new Date(String(records["synthetic-main"].facts.started_at)).getTime();
+  const config = defaultConfig(records["synthetic-main"]);
+  config.alignment = "absolute";
+  config.viewport = { start: epoch + 10000, end: epoch + 20000 };
+  window.history.replaceState({}, "", shareUrl(config));
+  vi.spyOn(workspaceApi, "statistics").mockImplementation(async (id, filters) => ({ archive_id: id, execution_uuid: records[id].execution_uuid, archive_code: records[id].archive_code, range: { start: filters.start, end: filters.end }, time_range: { start: 0, end: 100 }, catalog: [], resolution: "raw", total_rows: 0, series: [] }));
+  mount();
+  await screen.findByRole("button", { name: "单图对比" });
+  await waitFor(() => expect((screen.getByLabelText("全局时间起点") as HTMLInputElement).value).toBe(String(epoch + 10000)));
+  vi.mocked(archivesApi.curves).mockClear();
+  fireEvent.click(screen.getByRole("button", { name: "单图对比" }));
+  await ready();
+  expect((screen.getByLabelText("时间对齐") as HTMLSelectElement).value).toBe("absolute");
+  await waitFor(() => expect(archivesApi.curves).toHaveBeenCalledWith("synthetic-main", expect.objectContaining({ metrics: "j1_torque_nm", start: 10, end: 20 }), expect.any(AbortSignal)));
+  applyXRange(String(epoch + 30000), String(epoch + 40000));
+  await waitFor(() => expect(archivesApi.curves).toHaveBeenCalledWith("synthetic-main", expect.objectContaining({ start: 30, end: 40 }), expect.any(AbortSignal)));
+  fireEvent.click(screen.getByRole("button", { name: "多面板工作台" }));
+  await waitFor(() => expect((screen.getByLabelText("全局时间起点") as HTMLInputElement).value).toBe(String(epoch + 30000)));
+  expect((screen.getByLabelText("工作台时间对齐") as HTMLSelectElement).value).toBe("absolute");
+  expect((screen.getByLabelText("全局时间终点") as HTMLInputElement).value).toBe(String(epoch + 40000));
+  fireEvent.click(screen.getByRole("button", { name: "单图对比" }));
+  await ready();
+  expect((screen.getByLabelText("时间对齐") as HTMLSelectElement).value).toBe("absolute");
+  expect(vi.mocked(archivesApi.curves).mock.calls.every(([, filters]) => filters.start! < 101 && filters.end! <= 100)).toBe(true);
 });

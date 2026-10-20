@@ -303,6 +303,20 @@ def test_pyroute2_can_fd_configuration_includes_data_phase() -> None:
     }
 
 
+@pytest.mark.parametrize("bitrate,dbitrate,fd", [
+    (125_000, None, False), (500_000, None, False),
+    (250_000, 2_000_000, True), (1_000_000, 5_000_000, True),
+])
+def test_every_supported_connection_sets_queue_before_up(bitrate, dbitrate, fd) -> None:
+    iproute = FakeIPRoute()
+    Pyroute2NetlinkAdapter(iproute=iproute).connect(
+        "can2", bitrate=bitrate, dbitrate=dbitrate, fd=fd)
+    queue = iproute.link_calls[-2][1]
+    assert queue["txqlen"] == 10_000
+    assert ("mtu" in queue) is fd
+    assert iproute.link_calls[-1] == ("set", {"index": 2, "state": "up"})
+
+
 @pytest.mark.parametrize(
     "interface",
     [

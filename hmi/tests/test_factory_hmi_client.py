@@ -260,7 +260,13 @@ class GatewayClientTest(unittest.TestCase):
     def test_client_identity_token_and_binary_upload(
         self, urlopen: mock.Mock
     ) -> None:
-        urlopen.return_value = FakeResponse(b'{"ok":true}')
+        received = []
+
+        def consume_upload(req, **_kwargs):
+            received.append(req.data.read(8192))
+            return FakeResponse(b'{"ok":true}')
+
+        urlopen.side_effect = consume_upload
         client = GatewayClient(
             "http://127.0.0.1:8765",
             client_id="station-operator",
@@ -273,7 +279,10 @@ class GatewayClientTest(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         sent = urlopen.call_args.args[0]
-        self.assertEqual(sent.data, b"npz")
+        self.assertEqual(received, [b"npz"])
+        self.assertTrue(sent.data.closed)
+        self.assertEqual(sent.get_header("Content-length"), "3")
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 120.0)
         self.assertEqual(sent.get_header("X-rp1-client-id"), "station-operator")
         self.assertEqual(sent.get_header("X-rp1-operator-token"), "secret")
         self.assertEqual(sent.get_header("X-filename"), "aging.npz")

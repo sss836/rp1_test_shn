@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 
 _CASE_ID = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)*$")
-_SAMPLE_ID = re.compile(r"^RP[0-9]+\.[0-9]+-(?:ARM|SARM|LEG|SLEG|SYS|UPPER|LOWER|CHEST|HEAD|BAT)-[0-9]{3}$")
+_SAMPLE_ID = re.compile(r"^RP[0-9]+\.[0-9]+-(?:ARM|SARM|LEG|SLEG|SYS|UPPER|LOWER|WAISTHIP|CHEST|HEAD|BAT)-[0-9]{3}$")
 _BENCH_ID = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)*$")
 
 

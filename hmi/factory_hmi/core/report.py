@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import gzip
 import hashlib
 import io
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -47,6 +49,60 @@ class ReportResult:
     bundle_path: Path
     manifest: dict[str, Any]
     summary: dict[str, Any]
+    analysis_revision: dict[str, Any] | None = None
+
+
+def validate_baseline(execution: Path, bundle: Path, *, expected: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Validate the original seal, including tar members, without refreshing hashes.
+
+    Local analysis revisions and human reviews are deliberately outside this seal.
+    The returned reference is stored in each verification and checked before upload.
+    """
+    manifest_path = execution / "manifest.json"
+    if manifest_path.is_symlink() or bundle.is_symlink():
+        raise ValueError("基线证据不允许符号链接")
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    entries = {entry["path"]: entry for entry in manifest["files"]}
+    required = {TELEMETRY_PATH, SUMMARY_PATH, "config/execution.json", "config/station.yaml"}
+    if len(entries) != len(manifest["files"]) or not required <= entries.keys():
+        raise ValueError("基线证据清单缺失或重复，不能重新分析或核实")
+    for name, entry in entries.items():
+        path = execution / name
+        if Path(name).is_absolute() or ".." in Path(name).parts or not path.resolve().is_relative_to(execution.resolve()):
+            raise ValueError("基线证据路径无效")
+        if any(part.is_symlink() for part in [path, *path.parents] if part != execution.parent):
+            raise ValueError("基线证据不允许符号链接")
+        if not path.is_file() or path.stat().st_size != entry["size_bytes"] or _sha256(path) != entry["sha256"]:
+            raise ValueError(f"已冻结证据不一致：{name}；不能重新分析、核实或归档")
+    try:
+        with tarfile.open(bundle, "r:gz") as archive:
+            members = archive.getmembers()
+            by_name = {member.name: member for member in members}
+            if len(by_name) != len(members) or set(by_name) != {*entries, "manifest.json"}:
+                raise ValueError("原执行包成员与基线清单不一致")
+            for name, member in by_name.items():
+                if not member.isfile():
+                    raise ValueError("原执行包包含非普通文件")
+                handle = archive.extractfile(member)
+                digest = hashlib.sha256()
+                with handle:
+                    while chunk := handle.read(1024 * 1024):
+                        digest.update(chunk)
+                expected_hash = hashlib.sha256(manifest_bytes).hexdigest() if name == "manifest.json" else entries[name]["sha256"]
+                expected_size = len(manifest_bytes) if name == "manifest.json" else entries[name]["size_bytes"]
+                if digest.hexdigest() != expected_hash or member.size != expected_size:
+                    raise ValueError(f"原执行包成员与基线证据不一致：{name}")
+    except (tarfile.TarError, EOFError) as exc:
+        raise ValueError("原执行包无法校验") from exc
+    reference = {
+        "version": "baseline-v1", "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "bundle_sha256": _sha256(bundle),
+        "files": {name: {key: entry[key] for key in ("sha256", "size_bytes")} for name, entry in entries.items()},
+    }
+    if expected is not None and reference != expected:
+        raise ValueError("基线摘要、上下文或执行包与核实版本不一致，不能归档")
+    return reference
 
 
 def _utc_iso(value: Any = None) -> str:
@@ -378,9 +434,9 @@ def _build_verdict(
     blocked_names: set[str] = set()
     failed_names: set[str] = set()
 
-    def minimum(name: str, actual: float | int, key: str, unit: str) -> None:
+    def minimum(name: str, actual: float | int | None, key: str, unit: str) -> None:
         limit = _finite(acceptance.get(key))
-        passed = None if limit is None else float(actual) >= limit
+        passed = None if limit is None or actual is None else float(actual) >= limit
         rules.append(_metric_rule(name, actual, limit, unit, passed=passed))
         if passed is False:
             blocked_names.add(name)
@@ -401,19 +457,19 @@ def _build_verdict(
 
     minimum(
         "required_active_seconds",
-        float(context.get("active_seconds") or 0.0),
+        _finite(context.get("active_seconds")),
         "required_active_seconds",
         "s",
     )
     minimum(
         "required_cycles",
-        int(context.get("completed_cycles") or 0),
+        _finite(context.get("completed_cycles")),
         "required_cycles",
         "cycles",
     )
     minimum(
         "sample_completeness",
-        float(quality["sample_completeness"]),
+        _finite(quality["sample_completeness"]),
         "min_sample_completeness",
         "ratio",
     )
@@ -618,7 +674,7 @@ def _build_summary(
     )
     verdict = _build_verdict(
         context,
-        quality,
+        {**quality, "sample_completeness": completeness if context.get("active_seconds") is not None and record_rate_hz > 0 else None},
         joints,
         non_monotonic=non_monotonic or not times,
     )
@@ -638,7 +694,7 @@ def _build_summary(
     started_at = _utc_iso(context.get("started_at"))
     ended_at = _utc_iso(context.get("ended_at"))
     wall_seconds = _seconds_between(started_at, ended_at)
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "execution_uuid": str(context["execution_uuid"]),
         "test_id": str(context["test_id"]),
@@ -662,12 +718,29 @@ def _build_summary(
         "joint_metrics": joints,
     }
 
+    if context.get("active_seconds") is None:
+        result["timing"]["active_seconds"] = None
+        result["timing"]["paused_seconds"] = None
+        for module in result["module_metrics"]:
+            module["active_seconds"] = None
+            module["effective_aging_hours"] = None
+    if context.get("completed_cycles") is None:
+        result["timing"]["completed_cycles"] = None
+    if context.get("active_seconds") is None or record_rate_hz <= 0:
+        result["quality"]["expected_sample_count"] = None
+        result["quality"]["sample_completeness"] = None
+        for joint in result["joint_metrics"]:
+            joint["sample_completeness"] = None
+    return result
+
 
 def _render_report(summary: Mapping[str, Any], manifest_identity: Mapping[str, Any]) -> str:
     timing = summary["timing"]
     quality = summary["quality"]
     verdict = summary["verdict"]
     clock_missing = manifest_identity.get("timestamp_provenance") == "missing"
+    def number(value: Any, digits: int = 3) -> str:
+        return "未记录" if value is None else f"{value:.{digits}f}"
     lines = [
         f"# Factory aging report: {manifest_identity.get('execution_code') or summary['test_id']}",
         "",
@@ -679,9 +752,9 @@ def _render_report(summary: Mapping[str, Any], manifest_identity: Mapping[str, A
         f"- Operator: `{manifest_identity.get('operator_id', '')}`",
         f"- Started: {'未记录（历史 CSV 缺少绝对时间）' if clock_missing else timing['started_at']}",
         f"- Ended: {'未记录' if clock_missing else timing['ended_at']}",
-        (f"- Active seconds: {timing['active_seconds']:.3f}; wall / paused seconds: 未记录" if clock_missing else
-         f"- Active / wall / paused seconds: {timing['active_seconds']:.3f} / {timing['wall_seconds']:.3f} / {timing['paused_seconds']:.3f}"),
-        f"- Completed cycles: {timing['completed_cycles']}",
+        (f"- Active seconds: {number(timing['active_seconds'])}; wall / paused seconds: 未记录" if clock_missing else
+         f"- Active / wall / paused seconds: {number(timing['active_seconds'])} / {number(timing['wall_seconds'])} / {number(timing['paused_seconds'])}"),
+        f"- Completed cycles: {number(timing['completed_cycles'], 0)}",
         "",
         f"## Verdict: {'UNCONFIGURED / 未配置判据' if verdict['criteria_version'] == 'UNCONFIGURED' else str(verdict['status']).upper()}",
         "",
@@ -700,7 +773,7 @@ def _render_report(summary: Mapping[str, Any], manifest_identity: Mapping[str, A
             "## Sampling quality",
             "",
             f"- Samples: {quality['sample_count']} / {quality['expected_sample_count']}",
-            f"- Completeness: {quality['sample_completeness']:.6f}",
+            f"- Completeness: {number(quality['sample_completeness'], 6)}",
             f"- Maximum gap: {quality['max_gap_seconds']:.6f} s",
             "",
             "## Joint metrics",
@@ -766,19 +839,42 @@ class ReportManager:
         self.exports_root.mkdir(parents=True, exist_ok=True)
         self._review_lock = threading.RLock()
 
-    def finalize(
+    @contextmanager
+    def evidence_lock(self):
+        # Separate lock descriptions serialize threads and gateway/uploader processes.
+        with self._review_lock, (self.data_root / ".evidence.lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def validate(self, test_id: str) -> dict[str, Any]:
+        return validate_baseline(self.execution_dir(test_id), self.bundle_path(test_id))
+
+    def finalize(self, csv_path: Path | str, context: Mapping[str, Any], *, native_log: Path | str | None = None) -> ReportResult:
+        with self.evidence_lock():
+            return self._finalize(csv_path, context, native_log=native_log)
+
+    def _finalize(
         self,
         csv_path: Path | str,
         context: Mapping[str, Any],
         *,
         native_log: Path | str | None = None,
     ) -> ReportResult:
-        source = Path(csv_path).expanduser().resolve(strict=True)
-        if not source.is_file() or source.is_symlink():
+        source = Path(csv_path).expanduser()
+        if source.is_symlink():
+            raise ValueError("telemetry source must be a regular file")
+        source = source.resolve(strict=True)
+        if not source.is_file():
             raise ValueError("telemetry source must be a regular file")
         normalized = self._normalize_context(context)
         test_id = _safe_test_id(str(normalized["test_id"]))
         destination = self.executions_root / test_id
+        bundle_path = self.exports_root / f"{test_id}.tar.gz"
+        if destination.exists() or bundle_path.exists():
+            raise ValueError("执行证据已封存，禁止覆盖；重新分析只能追加本地版本")
         temporary = Path(
             tempfile.mkdtemp(prefix=f".{test_id}.", dir=self.executions_root)
         )
@@ -857,18 +953,12 @@ class ReportManager:
             _write_fsynced(temporary / "manifest.json", _json_bytes(manifest))
             _fsync_directory(temporary)
 
-            backup = destination.with_name(f".{destination.name}.previous")
-            if backup.exists():
-                shutil.rmtree(backup)
-            if destination.exists():
-                os.replace(destination, backup)
-            os.replace(temporary, destination)
+            # Build before publication; an existing execution is never replaced.
+            temporary_bundle = temporary.with_suffix(".tar.gz")
+            _deterministic_tar_gz(temporary, temporary_bundle)
+            os.rename(temporary, destination)
+            os.rename(temporary_bundle, bundle_path)
             _fsync_directory(self.executions_root)
-            if backup.exists():
-                shutil.rmtree(backup)
-
-            bundle_path = self.exports_root / f"{test_id}.tar.gz"
-            _deterministic_tar_gz(destination, bundle_path)
             _fsync_directory(self.exports_root)
             return ReportResult(
                 execution_dir=destination,
@@ -882,57 +972,66 @@ class ReportManager:
         except Exception:
             if temporary.exists():
                 shutil.rmtree(temporary, ignore_errors=True)
+            temporary.with_suffix(".tar.gz").unlink(missing_ok=True)
             raise
 
-    def rebuild(self, test_id: str) -> ReportResult:
-        execution = self.execution_dir(test_id)
-        # Rebuilding derived analysis must retain append-only human history.
-        reviews = {
-            path.name: path.read_bytes()
-            for path in (execution / "analysis").glob("operator_review*.json")
-        }
-        context_path = execution / "config/execution.json"
-        if context_path.is_file():
-            context = json.loads(context_path.read_text(encoding="utf-8"))
-        else:
+    def rebuild(self, test_id: str, *, actor: str, reason: str) -> ReportResult:
+        """Append a local, view-only analysis. Submission always uses baseline-v1."""
+        if not actor.strip() or not reason.strip() or len(reason.strip()) > 300:
+            raise ValueError("追加分析必须记录当前账号和 1 至 300 字原因")
+        with self.evidence_lock():
+            reference = self.validate(test_id)
+            execution = self.execution_dir(test_id)
+            context = json.loads((execution / "config/execution.json").read_text(encoding="utf-8"))
+            context["config"] = yaml.safe_load((execution / "config/station.yaml").read_text(encoding="utf-8")) or {}
+            context["acceptance"] = context.get("acceptance", context["config"].get("factory_hmi_acceptance", {}))
+            context["trajectory"] = json.loads((execution / "trajectory/metadata.json").read_text(encoding="utf-8"))
+            summary = _build_summary(execution / TELEMETRY_PATH, context)
             manifest = self.manifest(test_id)
-            summary = json.loads(
-                (execution / SUMMARY_PATH).read_text(encoding="utf-8")
-            )
-            context = {
-                **manifest,
-                "active_seconds": summary["timing"]["active_seconds"],
-                "completed_cycles": summary["timing"]["completed_cycles"],
-                "record_rate_hz": (
-                    summary["quality"]["expected_sample_count"] - 1
-                )
-                / max(1.0, summary["timing"]["active_seconds"]),
-                "outcome": "completed",
+            summary_bytes = _json_bytes(summary)
+            report_bytes = _render_report(summary, manifest).encode("utf-8")
+            previous = self.analysis_revisions(test_id)
+            number = max((item["revision"] for item in previous), default=0) + 1
+            revision = {
+                "revision": number, "created_at": _utc_iso(), "actor": actor.strip(), "reason": reason.strip(),
+                "usage": "local_view_only", "baseline": reference,
+                "analyzer_sha256": _sha256(Path(__file__)),
+                "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
+                "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+                "previous_version_sha256": previous[-1]["version_sha256"] if previous else None,
             }
-        config_path = execution / "config/station.yaml"
-        context["config"] = (
-            yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-            if config_path.is_file()
-            else {}
-        )
-        context["acceptance"] = context["config"].get(
-            "factory_hmi_acceptance", {}
-        )
-        metadata_path = execution / "trajectory/metadata.json"
-        context["trajectory"] = (
-            json.loads(metadata_path.read_text(encoding="utf-8"))
-            if metadata_path.is_file()
-            else {}
-        )
-        log_path = execution / "logs/native.log"
-        result = self.finalize(
-            execution / TELEMETRY_PATH,
-            context,
-            native_log=log_path if log_path.is_file() else None,
-        )
-        for name, payload in reviews.items():
-            _write_fsynced(result.execution_dir / "analysis" / name, payload)
-        return result
+            revision["version_sha256"] = hashlib.sha256(_json_bytes(revision)).hexdigest()
+            # Validate again after analysis and before the first version write.
+            validate_baseline(execution, self.bundle_path(test_id), expected=reference)
+            temporary = Path(tempfile.mkdtemp(prefix=".analysis-", dir=self.data_root))
+            destination = execution / "analysis/revisions" / f"v{number:06d}"
+            try:
+                _write_fsynced(temporary / "summary.json", summary_bytes)
+                _write_fsynced(temporary / "report.md", report_bytes)
+                _write_fsynced(temporary / "revision.json", _json_bytes(revision))
+                destination.parent.mkdir(exist_ok=True)
+                os.rename(temporary, destination)
+                _fsync_directory(destination.parent)
+            except Exception:
+                shutil.rmtree(temporary, ignore_errors=True)
+                raise
+            return ReportResult(execution, execution / "manifest.json", destination / "summary.json",
+                destination / "report.md", self.bundle_path(test_id), manifest, summary, revision)
+
+    def analysis_revisions(self, test_id: str) -> list[dict[str, Any]]:
+        values = []
+        for path in sorted((self.execution_dir(test_id) / "analysis/revisions").glob("v*/revision.json")):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            expected_hash = value.pop("version_sha256")
+            if hashlib.sha256(_json_bytes(value)).hexdigest() != expected_hash:
+                raise ValueError("本地追加分析版本哈希不一致")
+            value["version_sha256"] = expected_hash
+            if value["revision"] != len(values) + 1 or path.parent.name != f"v{value['revision']:06d}" or value["previous_version_sha256"] != (values[-1]["version_sha256"] if values else None):
+                raise ValueError("本地追加分析版本链不连续")
+            if _sha256(path.parent / "summary.json") != value["summary_sha256"] or _sha256(path.parent / "report.md") != value["report_sha256"]:
+                raise ValueError("本地追加分析内容哈希不一致")
+            values.append(value)
+        return values
 
     def recover_orphans(self, record_root: Path | str) -> list[ReportResult]:
         results: list[ReportResult] = []
@@ -943,9 +1042,14 @@ class ReportManager:
             sidecar = csv_path.with_suffix(".context.json")
             if sidecar.is_file():
                 context = json.loads(sidecar.read_text(encoding="utf-8"))
+                if not isinstance(context, dict):
+                    raise ValueError("历史上下文文件格式无效")
+                declared = dict(context)
+                context.update(test_id=test_id, origin="HISTORY", timestamp_provenance="missing", machine_status="unknown",
+                    started_at="1970-01-01T00:00:00Z", ended_at="1970-01-01T00:00:00Z", active_seconds=None,
+                    completed_cycles=None, record_rate_hz=None, outcome="unknown",
+                    history_declared_context=declared, history_context_sha256=_sha256(sidecar))
             else:
-                _, _, times, _ = _read_csv(csv_path)
-                active = max(times, default=0.0)
                 context = {
                     "execution_uuid": str(
                         uuid.uuid5(
@@ -966,13 +1070,9 @@ class ReportManager:
                     "actual_object": "",
                     "started_at": "1970-01-01T00:00:00Z",
                     "ended_at": "1970-01-01T00:00:00Z",
-                    "active_seconds": active,
-                    "completed_cycles": 0,
-                    "record_rate_hz": (
-                        (len(times) - 1) / active
-                        if len(times) > 1 and active > 0.0
-                        else 0.0
-                    ),
+                    "active_seconds": None,
+                    "completed_cycles": None,
+                    "record_rate_hz": None,
                     "outcome": "interrupted",
                     "manual_stop": True,
                     "config": {},
@@ -996,10 +1096,15 @@ class ReportManager:
         )
 
     def write_operator_review(self, test_id: str, review: Mapping[str, Any], *, central_analysis: Mapping[str, Any] | None = None) -> Path:
+        with self.evidence_lock():
+            return self._write_operator_review(test_id, review, central_analysis=central_analysis)
+
+    def _write_operator_review(self, test_id: str, review: Mapping[str, Any], *, central_analysis: Mapping[str, Any] | None = None) -> Path:
         from factory_hmi.desktop.operator_review import review_package
         unknown = set(review) - {"tester", "bench", "station_id", "outcome", "notes", "analysis", "verified_status", "operator_summary", "submission_reason", "discrepancy_reason", "test_name", "actual_object"}
         if unknown:
             raise ValueError("核实只能修改人员、工位、人工结论和备注，禁止修改采集事实：" + "、".join(sorted(unknown)))
+        reference = self.validate(test_id)
         summary = self.summary(test_id)
         if central_analysis:
             summary["central_analysis"] = dict(central_analysis)
@@ -1010,12 +1115,12 @@ class ReportManager:
             test_name=str(review.get("test_name") or ""), actual_object=str(review.get("actual_object") or ""),
             summary=summary,
         )
+        body["baseline_evidence"] = reference
         directory = self.execution_dir(test_id) / "analysis"
         directory.mkdir(exist_ok=True)
         path = directory / "operator_review.json"
         with self._review_lock:
-            previous = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-            body["revision"] = int(previous.get("revision") or 0) + 1
+            body["revision"] = max((int(item.stem.split(".v")[-1]) for item in directory.glob("operator_review.v*.json")), default=0) + 1
             body["verified_at"] = _utc_iso()
             _write_fsynced(directory / f"operator_review.v{body['revision']}.json", _json_bytes(body))
             _write_fsynced(path, _json_bytes(body))
@@ -1152,6 +1257,7 @@ class ReportManager:
             "software",
             "calibration_version",
             "test_name", "actual_object", "origin", "machine_status", "timestamp_provenance",
+            "acceptance", "history_declared_context", "history_context_sha256",
         }
         return {
             key: value

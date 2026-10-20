@@ -1,0 +1,24 @@
+.bench-overview-page { display: grid; gap: 18px; }
+.bench-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.bench-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.bench-summary > div { display: grid; gap: 12px; padding: 20px; border: 1px solid var(--line); border-radius: var(--radius-panel); background: var(--surface); }
+.bench-summary span { font-size: 13px; color: var(--muted); }
+.bench-summary strong { font-size: 30px; font-variant-numeric: tabular-nums; }
+.bench-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 16px; }
+.bench-filters > label:not(.hmi-auto-refresh) { display: grid; gap: 8px; font-size: 13px; }
+.bench-filters input[type=search] { width: min(320px, 100%); }
+.bench-filters input[type=search], .bench-filters select { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
+.bench-read-time { color: var(--muted); font-size: 12px; }
+.bench-table { min-width: 1120px; }
+.bench-table td { vertical-align: top; }
+.bench-table td:first-child { min-width: 140px; }
+.bench-availability { font-size: 12px; }
+.bench-availability.enabled { color: var(--success, var(--text)); }
+.bench-availability.disabled { color: var(--warning); }
+.bench-table details { margin-top: 8px; }
+.bench-table summary { color: var(--brand); cursor: pointer; white-space: nowrap; }
+.bench-hmi-details { display: grid; gap: 12px; min-width: 340px; max-width: 500px; margin-top: 12px; }
+.bench-current-run + .bench-current-run { margin-top: 12px; }
+.bench-current-run strong { overflow-wrap: anywhere; }
+@media (max-width: 800px) { .bench-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .bench-summary { grid-template-columns: 1fr; } .bench-filters { align-items: stretch; flex-direction: column; } }

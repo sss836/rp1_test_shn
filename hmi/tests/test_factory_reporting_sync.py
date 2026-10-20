@@ -136,7 +136,7 @@ class ReportingAndSyncTests(unittest.TestCase):
         self.assertEqual(result.summary["verdict"]["status"], "passed")
 
         first_digest = hashlib.sha256(result.bundle_path.read_bytes()).hexdigest()
-        rebuilt = manager.rebuild(self.test_id)
+        rebuilt = manager.rebuild(self.test_id, actor="synthetic-account", reason="回归验证")
         second_digest = hashlib.sha256(rebuilt.bundle_path.read_bytes()).hexdigest()
         self.assertEqual(first_digest, second_digest)
 

@@ -48,3 +48,14 @@ data/
 *.pem
 *.p12
 *.pfx
+
+# User-approved, hash-verified factory verification trajectories (source assets).
+!hmi/factory_hmi/resources/quick/*.npz
+
+# Local reports, review snapshots and handoff notes are not source releases.
+/deliverables/
+/review/
+/docs/reviews/
+/hmi/docs/reports/
+/HANDOFF-*.md
+/design-qa.md

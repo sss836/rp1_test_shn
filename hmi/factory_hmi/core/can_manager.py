@@ -423,13 +423,10 @@ class Pyroute2NetlinkAdapter(NetlinkAdapter):
                     }
                 )
             iproute.link("set", index=index, **timing_options)
-            if fd and bitrate == ARBITRATION_BITRATE and dbitrate == DATA_BITRATE:
-                iproute.link(
-                    "set",
-                    index=index,
-                    mtu=_FACTORY_CAN_FD_MTU,
-                    txqlen=_FACTORY_TX_QUEUE_LENGTH,
-                )
+            queue_options: dict[str, Any] = {"txqlen": _FACTORY_TX_QUEUE_LENGTH}
+            if fd:
+                queue_options["mtu"] = _FACTORY_CAN_FD_MTU
+            iproute.link("set", index=index, **queue_options)
             iproute.link("set", index=index, state="up")
         except Exception as exc:
             raise CanOperationError(

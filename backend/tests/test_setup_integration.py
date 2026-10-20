@@ -33,7 +33,7 @@ def test_empty_catalog_home_and_complete_setup_with_permission_isolation(environ
         assert len(catalog) == 68
         home = data(admin, "dashboard/home")
         scopes = [item for group in home["groups"] for item in group["objects"]]
-        assert len(scopes) == 10
+        assert len(scopes) == 11
         assert all(s["part_asset_count"] == s["active_execution_count"] == 0 for s in scopes)
         assert sum(len(s["test_cases"]) for s in scopes) == 67
         assert all(c["execution_count"] == 0 and c["effective_exposure_seconds"] == 0 for s in scopes for c in s["test_cases"])

@@ -1422,6 +1422,8 @@ class ReadModelRepository:
                   ) facts
                 )
                 SELECT a.public_id, a.asset_code, a.asset_kind,
+                       CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN 'SYS' ELSE mp.target_part_code END AS target_part_code,
+                       target_part.name AS target_part_name,
                        coalesce(nullif(a.display_name, ''), a.asset_code) AS display_name,
                        a.product_family, b.batch_code, a.serial_number, a.lifecycle_status,
                        current_execution.public_id AS execution_public_id,
@@ -1435,6 +1437,9 @@ class ReadModelRepository:
                        ld.last_received_at
                 FROM test.asset a
                 LEFT JOIN test.manufacturing_batch b ON b.id = a.batch_id
+                LEFT JOIN test.module_profile mp ON mp.asset_id=a.id AND a.asset_kind='MODULE'
+                LEFT JOIN catalog.test_target_part target_part
+                  ON target_part.part_code=CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN 'SYS' ELSE mp.target_part_code END
                 LEFT JOIN durations d ON d.asset_id = a.id
                 CROSS JOIN last_data ld
                 LEFT JOIN LATERAL (

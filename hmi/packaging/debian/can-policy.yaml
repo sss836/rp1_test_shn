@@ -5,6 +5,7 @@ allowed_interfaces:
   - can2
   - can3
   - can4
+  - can5
 timing:
   allowed_bitrates:
     - 125000

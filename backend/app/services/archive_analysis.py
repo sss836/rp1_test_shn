@@ -62,7 +62,8 @@ def retrospective_analysis(archive: dict, source: dict) -> dict:
             minimum=metric.get("min"),maximum=metric.get("max"),first=metric.get("first"),last=metric.get("last"),
             faults=metric.get("fault_count") or 0)
     rate = acceptance.get("record_rate_hz")
-    expected = math.floor(archive["facts"]["active_seconds"]*rate)+1 if rate else None
+    active = archive["facts"].get("active_seconds")
+    expected = math.floor(active*rate)+1 if rate and active is not None else None
     quality["expected_sample_count"] = expected
     quality["sample_completeness"] = min(1.0,quality["valid_time_rows"]/expected) if expected else None
     report = CurveProcessor.analyze(archive["facts"],acceptance,quality,stats,honor_recorded_verdict=False)

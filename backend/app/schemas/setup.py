@@ -8,7 +8,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstrai
 
 Code = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")]
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
-Part = Literal["SYS", "ARM", "SARM", "LEG", "SLEG", "UPPER", "LOWER", "CHEST", "HEAD", "BAT"]
+Part = Literal["SYS", "ARM", "SARM", "LEG", "SLEG", "UPPER", "LOWER", "WAISTHIP", "CHEST", "HEAD", "BAT"]
 Kind = Literal["WHOLE_MACHINE", "MODULE"]
 
 
@@ -18,7 +18,7 @@ class Change(BaseModel):
 
 
 class AssetCreate(Change):
-    asset_code: str = Field(pattern=r"^RP[0-9]+\.[0-9]+-(SYS|ARM|SARM|LEG|SLEG|UPPER|LOWER|CHEST|HEAD|BAT)-[0-9]{3}$")
+    asset_code: str = Field(pattern=r"^RP[0-9]+\.[0-9]+-(SYS|ARM|SARM|LEG|SLEG|UPPER|LOWER|WAISTHIP|CHEST|HEAD|BAT)-[0-9]{3}$")
     asset_kind: Kind
     target_part_code: Part
     product_family: Name

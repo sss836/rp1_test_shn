@@ -3,14 +3,16 @@ import { apiRequest } from "./client";
 export type ArchiveOrigin = "HMI" | "HISTORY" | "OTHER";
 export type ArchiveVerdict = "passed" | "failed" | "blocked";
 export type ArchiveCatalogItem = { key: string; subject: string; metric: string; unit: string };
-export type ArchiveVerification = { revision: number; tester: string; station_id: string; station_code?: string; station_name?: string; verdict: ArchiveVerdict; notes: string; discrepancy_reason: string; declared_started_at?: string | null; declared_ended_at?: string | null; created_at: string };
+export type ArchiveDetectedTiming = { version: string; filename: string; evidence_sha256: string; timezone: "UTC"; end_basis: "last_sample"; started_at: string; first_sample_at: string; ended_at: string; recorded_seconds: number; first_offset_seconds: number; last_offset_seconds: number };
+export type ArchiveVerification = { revision: number; tester: string; station_id: string; station_code?: string; station_name?: string; verdict: ArchiveVerdict; notes: string; discrepancy_reason: string; declared_started_at?: string | null; declared_ended_at?: string | null; declared_active_seconds?: number | null; declared_completed_cycles?: number | null; declared_exception_count?: number | null; timing_evidence?: ArchiveDetectedTiming; created_at: string };
 export type ArchiveContext = { campaign_id: string; cycle_id: string; segment_id: string; asset_id: string; configuration_id: string; test_case_version_id: string; station_id: string };
+export type ArchiveIntakeSubmit = { verification: { expected_revision: number; tester: string; station_id: string; verdict: ArchiveVerdict; notes?: string; declared_started_at?: string; declared_ended_at?: string; declared_active_seconds?: number; declared_completed_cycles?: number; declared_exception_count?: number }; context: ArchiveContext; expected_submission_revision: number };
 export type Archive = {
   id: string; execution_uuid: string; archive_code: string; owner_public_id: string; is_owner: boolean; can_edit: boolean; can_analyze?: boolean;
   origin: ArchiveOrigin; test_name: string; actual_object: string; station_label: string; filename: string; size_bytes: number; sha256: string; received_bytes: number;
   upload_state: "UPLOADING" | "COMPLETE" | "CORRUPT"; processing_state: "WAITING" | "QUEUED" | "PROCESSING" | "READY" | "FAILED";
   processing_error: string | null; classification_state: "UNCLASSIFIED" | "CLASSIFIED"; revision: number;
-  facts: Record<string, unknown>; acceptance: Record<string, unknown>;
+  facts: Record<string, unknown>; acceptance: Record<string, unknown>; detected_timing?: ArchiveDetectedTiming | null;
   manifest: { analysis?: Record<string, unknown>; catalog?: ArchiveCatalogItem[]; time_range?: { start: number; end: number }; stages?: unknown[]; cycles?: unknown[]; row_count?: number; [key: string]: unknown } | null;
   current_verification: ArchiveVerification | null; classification: (ArchiveContext & { revision: number }) | null;
   submission_id: string | null; submission_revision: number | null; submission_status: "PENDING" | "APPROVED" | "REJECTED" | null;
@@ -40,7 +42,8 @@ export const archivesApi = {
   analyses: (id: string, signal?: AbortSignal) => apiRequest<{ items: ArchiveAnalysis[]; original_analysis: Record<string, unknown> }>(`/api/v1/archives/${encodeURIComponent(id)}/analyses`, { signal }),
   analyze: (id: string, payload: { test_case_version_id: string; reason: string }, key: string) => apiRequest<ArchiveAnalysis>(`/api/v1/archives/${encodeURIComponent(id)}/analyses`, { method: "POST", headers: { "Idempotency-Key": key, "X-Change-Reason": payload.reason }, body: JSON.stringify(payload) }),
   curves: (id: string, filters: { metrics: string; subjects?: string; start?: number; end?: number; max_points?: number; stage?: string; cycle?: string }, signal?: AbortSignal) => apiRequest<ArchiveCurves>(`/api/v1/archives/${encodeURIComponent(id)}/curves?${queryString(filters)}`, { signal }),
-  verify: (id: string, payload: { expected_revision: number; tester: string; station_id: string; verdict: ArchiveVerdict; notes: string; discrepancy_reason: string; reason: string; declared_started_at?: string; declared_ended_at?: string }, key: string) => mutate(id, "verification", payload, payload.reason, key),
+  verify: (id: string, payload: { expected_revision: number; tester: string; station_id: string; verdict: ArchiveVerdict; notes: string; discrepancy_reason: string; reason: string; declared_started_at?: string; declared_ended_at?: string; declared_active_seconds?: number; declared_completed_cycles?: number; declared_exception_count?: number }, key: string) => mutate(id, "verification", payload, payload.reason, key),
+  intakeSubmit: (id: string, payload: ArchiveIntakeSubmit, key: string) => mutate(id, "verify-and-submit", payload, "历史CSV补录送审", key),
   classify: (id: string, payload: { expected_revision: number; context: ArchiveContext; reason: string }, key: string) => mutate(id, "classification", payload, payload.reason, key),
   submit: (id: string, payload: { expected_revision: number; expected_submission_revision: number; reason: string }, key: string) => mutate(id, "submit", payload, payload.reason, key)
 };
@@ -49,8 +52,32 @@ export function archiveTitle(item: Pick<Archive, "execution_code" | "archive_cod
   return item.execution_code || item.archive_code || item.test_name;
 }
 
+export function formatArchiveTimestamp(value: string) {
+  const clock = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(new Date(value));
+  const fraction = value.match(/\.(\d+)(?:Z|[+-])/i)?.[1] ?? "";
+  return `${clock}.${fraction.padEnd(6, "0").slice(0, 6)}`;
+}
+
 export function archiveStation(item: Archive) {
   const code = item.current_verification?.station_code ?? item.verified_station_code;
   const name = item.current_verification?.station_name ?? item.verified_station_name;
   return code ? `${code}${name ? ` · ${name}` : ""}` : item.station_label;
+}
+
+export function missingArchiveAcquisitionFacts(item: Archive) {
+  const missing = ["active_seconds", "completed_cycles", "exception_count"].filter((key) => typeof item.facts[key] !== "number" || !Number.isFinite(item.facts[key]));
+  if (!item.facts.machine_status || item.facts.machine_status === "unknown") missing.push("machine_status");
+  return missing;
+}
+
+export function missingArchiveSubmissionInfo(item: Archive) {
+  const verification = item.current_verification;
+  const missing = ["active_seconds", "completed_cycles", "exception_count"].filter((key) => {
+    const value = item.facts[key] ?? verification?.[`declared_${key}` as keyof ArchiveVerification];
+    return typeof value !== "number" || !Number.isFinite(value);
+  });
+  if (!item.facts.started_at && !verification?.declared_started_at) missing.push("started_at");
+  if (!item.facts.ended_at && !verification?.declared_ended_at) missing.push("ended_at");
+  if ((!item.facts.machine_status || item.facts.machine_status === "unknown") && !verification?.verdict) missing.push("verdict");
+  return missing;
 }

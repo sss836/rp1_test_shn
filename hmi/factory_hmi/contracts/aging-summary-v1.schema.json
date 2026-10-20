@@ -23,9 +23,9 @@
         "started_at": {"type": "string", "format": "date-time"},
         "ended_at": {"type": "string", "format": "date-time"},
         "wall_seconds": {"type": "number", "minimum": 0},
-        "active_seconds": {"type": "number", "minimum": 0},
-        "paused_seconds": {"type": "number", "minimum": 0},
-        "completed_cycles": {"type": "integer", "minimum": 0}
+        "active_seconds": {"type": ["number", "null"], "minimum": 0},
+        "paused_seconds": {"type": ["number", "null"], "minimum": 0},
+        "completed_cycles": {"type": ["integer", "null"], "minimum": 0}
       }
     },
     "quality": {
@@ -37,8 +37,8 @@
       ],
       "properties": {
         "sample_count": {"type": "integer", "minimum": 0},
-        "expected_sample_count": {"type": "integer", "minimum": 0},
-        "sample_completeness": {"type": "number", "minimum": 0, "maximum": 1},
+        "expected_sample_count": {"type": ["integer", "null"], "minimum": 0},
+        "sample_completeness": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_gap_seconds": {"type": "number", "minimum": 0}
       }
     },
@@ -94,8 +94,8 @@
       ],
       "properties": {
         "module_name": {"type": "string", "minLength": 1, "maxLength": 255},
-        "active_seconds": {"type": "number", "minimum": 0},
-        "effective_aging_hours": {"type": "number", "minimum": 0},
+        "active_seconds": {"type": ["number", "null"], "minimum": 0},
+        "effective_aging_hours": {"type": ["number", "null"], "minimum": 0},
         "worst_joint": {"type": "string", "maxLength": 255},
         "max_temperature_rise_c": {"$ref": "#/$defs/nullableMetric"},
         "max_torque_utilization": {"$ref": "#/$defs/nullableMetric"},
@@ -120,7 +120,7 @@
         "joint_name": {"type": "string", "minLength": 1, "maxLength": 255},
         "motor_id": {"type": "integer", "minimum": 0},
         "sample_count": {"type": "integer", "minimum": 0},
-        "sample_completeness": {"type": "number", "minimum": 0, "maximum": 1},
+        "sample_completeness": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         "max_gap_seconds": {"type": "number", "minimum": 0},
         "temperature_start_c": {"$ref": "#/$defs/nullableMetric"},
         "temperature_end_c": {"$ref": "#/$defs/nullableMetric"},

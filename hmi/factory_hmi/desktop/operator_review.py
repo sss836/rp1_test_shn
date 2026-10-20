@@ -47,25 +47,26 @@ def _number(value: object, digits: int = 2) -> str:
     try:
         number = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        return "—"
+        return "未记录"
     if number != number or number in {float("inf"), float("-inf")}:
-        return "—"
+        return "未记录"
     return f"{number:.{digits}f}"
 
 
 def measured_lines(summary: Mapping[str, object] | None) -> str:
     """Read-only lines for the verification dialog."""
     if not isinstance(summary, Mapping):
-        return "本机没有可读取的关节汇总，不能提交。请先重建本机报告；采集事实不能手工补写。"
+        return "本机没有可读取的关节汇总，不能提交。请检查原始封存报告；追加分析不能替换基线，采集事实不能手工补写。"
     if not summary.get("joint_metrics"):
-        return _analysis_verdict_lines(summary) + "本机未识别关节参数，采集事实仍只读；核实归档后由中央分析可识别参数。"
+        return "核实与上传版本：原始封存基线 baseline-v1；追加分析仅供本地查看。" + _analysis_verdict_lines(summary) + "本机未识别关节参数，采集事实仍只读；核实归档后由中央分析可识别参数。"
     timing = summary.get("timing") if isinstance(summary.get("timing"), Mapping) else {}
     quality = summary.get("quality") if isinstance(summary.get("quality"), Mapping) else {}
     lines = [
+        "核实与上传版本：原始封存基线 baseline-v1；追加分析仅供本地查看。",
         _analysis_verdict_lines(summary),
         f"已运行 {_number(timing.get('active_seconds'), 1)} 秒",
-        f"完成循环 {int(timing.get('completed_cycles') or 0)}",
-        f"样本完整度 {_number(float(quality.get('sample_completeness') or 0) * 100, 1)}%",
+        f"完成循环 {_number(timing.get('completed_cycles'), 0)}",
+        f"样本完整度 {_number(float(quality['sample_completeness']) * 100 if quality.get('sample_completeness') is not None else None, 1)}%",
         "关节汇总（只读）：",
     ]
     joints = summary.get("joint_metrics")
@@ -102,8 +103,8 @@ def analysis_text(summary: Mapping[str, object] | None) -> str:
     tracking = max(float(item.get("tracking_rms_rad") or 0) for item in joints)
     return (
         _analysis_verdict_lines(summary)
-        + f"运行 {_number(timing.get('active_seconds'), 1)} 秒，完成 {int(timing.get('completed_cycles') or 0)} 循环，"
-        f"样本完整度 {_number(float(quality.get('sample_completeness') or 0) * 100, 1)}%。共 {len(joints)} 个关节。"
+        + f"运行 {_number(timing.get('active_seconds'), 1)} 秒，完成 {_number(timing.get('completed_cycles'), 0)} 循环，"
+        f"样本完整度 {_number(float(quality['sample_completeness']) * 100 if quality.get('sample_completeness') is not None else None, 1)}%。共 {len(joints)} 个关节。"
         f"峰值力矩最高为 {_number(peak.get('torque_peak_abs_nm'))} N·m（{peak.get('joint_name')}）。"
         f"峰值温升最高为 {_number(rise.get('temperature_peak_rise_c'), 1)} °C（{rise.get('joint_name')}，"
         f"该关节结束温升 {_number(rise.get('temperature_rise_c'), 1)} °C）。"
@@ -140,7 +141,7 @@ def review_package(
     if len(remark) > 300:
         raise ValueError("测试员记录最多 300 字")
     if not isinstance(summary, Mapping) or not isinstance(summary.get("timing"), Mapping):
-        raise ValueError("本机摘要未读取，不能提交；请先重建报告")
+        raise ValueError("本机摘要未读取，不能提交；请检查原始封存基线")
     try:
         valid_station_id = str(UUID(station_id.strip()))
     except ValueError as exc:

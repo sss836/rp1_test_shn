@@ -17,7 +17,7 @@ const limbLabels: Record<string, string> = {
   right_short_leg: "右腿（5自由度）",
   upper_body: "上肢",
   lower_body: "下肢",
-  waist_hip: "腰髋",
+  waist_hip: "腰胯（腰髋）",
   biped_waist: "双足腰"
 };
 
@@ -40,6 +40,11 @@ export function HmiStationCard({ station, live = true }: { station: HmiStation; 
         <div><dt>PLC 通信</dt><dd>{current ? station.plc.communication_state : "当前状态未知"}{station.plc.driver === "mock" && <span className="hmi-mock-label">模拟 PLC</span>}</dd></div>
         <div><dt>电柜状态</dt><dd>{current && !station.plc.stale ? station.plc.phase : "当前状态未知"}</dd></div>
       </dl>
+      {!!station.runtime_conflicts?.length && <div className="hmi-snapshot-note" role="alert">
+        <strong>测试记录待核实</strong>
+        <p>运行时长与同一样品其他记录重叠。在线监控不受此冲突影响，冲突时长尚未入账。</p>
+        <ul>{station.runtime_conflicts.map((issue) => <li key={issue.id}>{issue.asset_code} · {issue.execution_code} · {formatDate(issue.detected_at)}</li>)}</ul>
+      </div>}
       {!current && <p className="hmi-snapshot-note">以下为最后上报信息，不能据此判断设备当前是否仍在运行。</p>}
       <div className="hmi-runs">
         {station.runs.length ? station.runs.map((run) => {

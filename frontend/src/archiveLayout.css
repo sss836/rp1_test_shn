@@ -18,6 +18,12 @@
 .archive-curve-link:disabled, .archives-page button:disabled, .curve-analysis-page button:disabled { opacity: .5; cursor: not-allowed; }
 .archive-evidence { display: grid; gap: 16px; }
 .archive-evidence > .panel + .panel { margin-top: 0; }
+.archive-analysis-toggle { cursor: pointer; list-style: none; margin-bottom: 0; }
+.archive-analysis-toggle::-webkit-details-marker { display: none; }
+.archive-analysis-toggle > svg { flex: 0 0 auto; width: 20px; height: 20px; color: var(--brand-strong); }
+.archive-analysis-toggle:focus-visible { outline: 2px solid var(--brand-strong); outline-offset: 6px; }
+.archive-analysis[open] > .archive-analysis-toggle { margin-bottom: 14px; }
+.archive-analysis[open] > .archive-analysis-toggle > svg { transform: rotate(180deg); }
 .archive-form, .curve-reference-form { display: grid; gap: 14px; }
 .archive-form-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .archive-form-wide { grid-column: 1 / -1; }
@@ -27,6 +33,11 @@
 }
 .archive-form textarea { min-height: 90px; resize: vertical; }
 .archive-form > button { justify-self: start; }
+.archive-intake-context { grid-column: span 2; }
+.archive-intake-time { margin: 0; padding: 10px 12px; background: var(--surface-subtle); border: 1px solid var(--line); border-radius: 5px; font-size: 12px; line-height: 1.7; }
+.archive-intake-time small { display: block; color: var(--muted); }
+.archive-more > summary { cursor: pointer; color: var(--brand-strong); font-size: 13px; font-weight: 600; }
+.archive-more[open] > summary { margin-bottom: 16px; }
 .archive-submit-row { display: flex; gap: 12px; align-items: end; }
 .archive-submit-row label { flex: 1; }
 .archive-notes { white-space: pre-wrap; overflow-wrap: anywhere; margin: 14px 0 0; padding: 14px 16px; border-left: 3px solid var(--brand); background: var(--surface-subtle); font-size: 13px; line-height: 1.8; }
@@ -100,6 +111,7 @@
   .curve-range-bar { grid-template-columns: repeat(4, minmax(70px, 1fr)) auto auto; }
 }
 @media (max-width: 700px) {
+  .archive-intake-context { grid-column: auto; }
   .archive-form-grid { grid-template-columns: 1fr; }
   .curve-sidebar { grid-template-columns: 1fr; }
   .curve-query-controls { grid-template-columns: 1fr; }

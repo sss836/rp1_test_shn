@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiError, apiRequest, setUnauthorizedHandler } from "./client";
+import { ApiError, apiRequest, invalidateAuthenticationRequests, setUnauthorizedHandler } from "./client";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -113,5 +113,33 @@ describe("authenticated API client", () => {
       status: 502,
       code: "invalid_response"
     });
+  });
+});
+
+
+describe("authentication response ordering", () => {
+  it("does not deliver an old 401 to a newer identity", async () => {
+    let complete!: (response: Response) => void;
+    const onUnauthorized = vi.fn();
+    setUnauthorizedHandler(onUnauthorized);
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { complete = resolve; })));
+    const previous = apiRequest("/api/v1/previous-user-data").catch((error: unknown) => error);
+    invalidateAuthenticationRequests();
+    complete(new Response(JSON.stringify({ error: { code: "session_revoked", message: "revoked" } }), { status: 401 }));
+    expect(await previous).toMatchObject({ status: 401 });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("does not invalidate auth from an aborted request even if its transport still returns 401", async () => {
+    let complete!: (response: Response) => void;
+    const controller = new AbortController();
+    const onUnauthorized = vi.fn();
+    setUnauthorizedHandler(onUnauthorized);
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { complete = resolve; })));
+    const previous = apiRequest("/api/v1/auth/me", { signal: controller.signal }).catch((error: unknown) => error);
+    controller.abort();
+    complete(new Response(JSON.stringify({ error: { code: "authentication_required", message: "login" } }), { status: 401 }));
+    expect(await previous).toMatchObject({ status: 401 });
+    expect(onUnauthorized).not.toHaveBeenCalled();
   });
 });

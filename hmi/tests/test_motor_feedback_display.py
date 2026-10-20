@@ -86,3 +86,12 @@ def test_existing_software_alarm_is_not_replaced(window):
     receive(window, timestamp_s=0.0, software_diagnosis="位置跟踪超限")
     assert cell(window, 12) == "位置跟踪超限"
     assert cell(window, 13) == "—"
+
+
+def test_fresh_driver_fault_warns_temperature_can_freeze_without_rewriting_value(window):
+    receive(window, error_id=7, temperature_c=32.0)
+    assert cell(window, 8) == "32.000"
+    assert "DRV_ERROR" in cell(window, 12)
+    assert "温度为上报值" in cell(window, 12)
+    assert "可能冻结" in cell(window, 12)
+    assert cell(window, 11) == "7"

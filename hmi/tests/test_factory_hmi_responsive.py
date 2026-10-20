@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import os
+import gc
+import time
 import unittest
+import weakref
 from unittest import mock
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QTimer
 from PySide6.QtWebSockets import QWebSocket
 from PySide6.QtWidgets import QApplication, QComboBox, QDialog, QLineEdit, QTextEdit
+from shiboken6 import isValid
 
-from factory_hmi.desktop.app import FactoryMainWindow
+from factory_hmi.desktop.app import FactoryMainWindow, RestWorker
 
 
 def _setup_network_without_io(window: FactoryMainWindow) -> None:
@@ -36,9 +40,52 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
         patcher.start()
         with mock.patch.object(FactoryMainWindow, "_run_rest"):
             self.window = FactoryMainWindow("http://127.0.0.1:65534")
+        self.window._platform_stations = [{"code": "MP-02", "id": "11111111-1111-4111-8111-111111111111"}]
+
+    def _online_upper_sample(self) -> None:
+        self.window._platform_operator = "qa-operator"
+        self.window.limb.setCurrentIndex(self.window.limb.findData("upper_body"))
+        self.window._platform_samples_received({"online": True, "samples": [{"code": "RP1.3-UPPER-001", "target_part_code": "UPPER", "running": False}]})
+        self.window.robot_id.setText("RP1.3-UPPER-001")
 
     def tearDown(self) -> None:
         self.window.deleteLater()
+
+    def test_completed_requests_release_workers_and_still_finish_callbacks(self) -> None:
+        self.window.plc_page.stop()
+        with mock.patch.object(self.window, "_run_rest"):
+            self.app.processEvents()
+        references = []
+        replies = []
+        finished = []
+
+        def make_worker(operation):
+            worker = RestWorker(operation)
+            references.append(weakref.ref(worker))
+            return worker
+
+        with mock.patch("factory_hmi.desktop.app.RestWorker", side_effect=make_worker):
+            for index in range(50):
+                self.window._run_rest(
+                    "模拟请求", lambda value=index: value, replies.append,
+                    quiet=True, on_finished=lambda: finished.append(True),
+                )
+        self.window.pool.waitForDone(2000)
+        deadline = time.monotonic() + 2
+        while len(finished) < 50 and time.monotonic() < deadline:
+            self.app.processEvents()
+        self.app.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        gc.collect()
+        self.assertEqual(sorted(replies), list(range(50)))
+        self.assertEqual(len(finished), 50)
+        self.assertFalse(self.window._workers)
+        # QThreadPool may retain Python runnable wrappers; their QObject signal
+        # resources and callback connections must nevertheless be destroyed.
+        self.assertFalse(any(
+            reference() is not None and isValid(reference().signals)
+            for reference in references
+        ))
 
     def test_default_return_failure_replaces_the_moving_notice(self) -> None:
         from factory_hmi.client import GatewayHTTPError
@@ -56,6 +103,7 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
         self.assertNotIn("正在", self.window.preflight_result.text())
 
     def test_logged_in_operator_can_start_local_test_without_upload_profile(self) -> None:
+        self._online_upper_sample()
         self.window._platform_operator = "qa-operator"
         self.window.robot_id.setText("RP1.3-UPPER-01")
         self.window.platform_station_id.setText("A10")
@@ -126,6 +174,7 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
         self.assertTrue(self.window.reset_button.isEnabled())
 
     def test_selected_platform_profile_passes_its_bench_code_to_start(self) -> None:
+        self._online_upper_sample()
         self.window.robot_id.setText("RP1.3-UPPER-01")
         self.window.platform_station_id.setText("MP-02")
         self.window.platform_case_code.addItem("REL-UPPER-001", "REL-UPPER-001")
@@ -137,8 +186,92 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
             run.call_args.args[1]()
             self.assertEqual(start.call_args.kwargs["recording_scope"], "platform")
             self.assertEqual(start.call_args.kwargs["bench_id"], "MP-02")
+            self.assertEqual(start.call_args.kwargs["station_id"], "11111111-1111-4111-8111-111111111111")
             self.assertEqual(start.call_args.kwargs["test_case_id"], "REL-UPPER-001")
             self.assertEqual(start.call_args.kwargs["robot_id"], "RP1.3-UPPER-001")
+
+    def test_selected_case_uses_actual_bench_and_uuid_instead_of_planned_station(self) -> None:
+        self._online_upper_sample()
+        self.window.platform_station_id.setText("mp-02")
+        self.window.platform_case_code.addItem("REL-UPPER-001", "REL-UPPER-001")
+        self.window.platform_case_code.setCurrentIndex(self.window.platform_case_code.count() - 1)
+        planned = {"ready": True, "bench_id": "RD-01", "station_id": "planned-station",
+            "test_case_id": "REL-UPPER-001", "sample_id": "RP1.3-UPPER-001"}
+        self.window.platform_test_profile.addItem("Ready", planned)
+        self.window.platform_test_profile.setCurrentIndex(1)
+        with mock.patch.object(self.window, "_save_local_bench"), mock.patch.object(self.window, "_run_rest") as run, mock.patch.object(self.window.client, "playback_start") as start:
+            self.window._start_playback()
+            run.call_args.args[1]()
+        self.assertEqual(start.call_args.kwargs["bench_id"], "MP-02")
+        self.assertEqual(start.call_args.kwargs["station_id"], self.window._platform_stations[0]["id"])
+        self.assertEqual(start.call_args.kwargs["test_case_id"], "REL-UPPER-001")
+        self.assertEqual(self.window.platform_test_profile.currentData(), planned)
+
+    def test_unknown_actual_bench_never_starts_using_planned_station(self) -> None:
+        self._online_upper_sample()
+        self.window.platform_station_id.setText("UNKNOWN")
+        self.window.platform_case_code.addItem("REL-UPPER-001", "REL-UPPER-001")
+        self.window.platform_case_code.setCurrentIndex(self.window.platform_case_code.count() - 1)
+        self.window.platform_test_profile.addItem("Ready", {"ready": True, "bench_id": "RD-01", "sample_id": "RP1.3-UPPER-001"})
+        self.window.platform_test_profile.setCurrentIndex(1)
+        with mock.patch.object(self.window, "_run_rest") as run, mock.patch("factory_hmi.desktop.app.QMessageBox.warning") as warning:
+            self.window._start_playback()
+        run.assert_not_called()
+        self.assertIn("有效工位", warning.call_args.args[2])
+
+    def test_finished_csv_can_be_submitted_after_motor_disable_and_save(self) -> None:
+        self.window.test_id.setProperty("record_id", "finished-record")
+        snapshot = {"station": {"state": "connected", "motors_enabled": False}, "playback": {
+            "test_id": "finished-record", "recording": {"finished": True, "filename": "finished.csv"}}}
+        self.window._last_snapshot = snapshot
+        self.window._render_aging_status(snapshot)
+        self.assertTrue(self.window.submit_review_button.isEnabled())
+        self.assertTrue(self.window.export_bundle_button.isEnabled())
+        with mock.patch("factory_hmi.desktop.app.QFileDialog.getSaveFileName", return_value=("/tmp/mock-record.csv", "CSV")), mock.patch.object(self.window.client, "download_current_record", return_value="/tmp/mock-record.csv"), mock.patch.object(self.window, "_run_rest") as run:
+            self.window._save_current_csv()
+            run.call_args.args[2](run.call_args.args[1]())
+            run.call_args.kwargs["on_finished"]()
+        self.window._render_aging_status(snapshot)
+        self.assertTrue(self.window.submit_review_button.isEnabled())
+
+    def test_selected_history_can_be_submitted_without_current_playback_or_during_next_run(self) -> None:
+        self.window._execution_history_received({"items": [{"test_id": "old-record", "sync_state": "local_completed"}]})
+        self.window.execution_history_table.selectRow(0)
+        for snapshot in ({"station": {"state": "disconnected"}},
+                {"station": {"state": "running"}, "playback": {"test_id": "new-record", "recording": {"active": True, "finished": False}}}):
+            with self.subTest(snapshot=snapshot):
+                self.window._last_snapshot = snapshot
+                self.window._render_aging_status(snapshot)
+                self.assertTrue(self.window.submit_review_button.isEnabled())
+        with mock.patch.object(self.window, "_run_rest") as run, mock.patch.object(self.window.client, "execution_summary") as summary:
+            self.window._submit_execution()
+            run.call_args.args[1]()
+            summary.assert_called_once_with("old-record")
+            self.window._update_execution_actions()
+            self.assertFalse(self.window.submit_review_button.isEnabled())
+            run.call_args.kwargs["on_finished"]()
+            self.assertTrue(self.window.submit_review_button.isEnabled())
+
+    def test_history_refresh_preserves_identity_and_does_not_resubmit_pending_record(self) -> None:
+        rejected = {"test_id": "rejected-record", "sync_state": "rejected"}
+        pending = {"test_id": "pending-record", "sync_state": "pending_review"}
+        self.window._execution_history_received({"items": [rejected, pending]})
+        self.window.execution_history_table.selectRow(0)
+        self.assertTrue(self.window.submit_review_button.isEnabled())
+        self.window._execution_history_received({"items": [pending, rejected]})
+        self.assertEqual(self.window._selected_test_id(), "rejected-record")
+        self.assertTrue(self.window.submit_review_button.isEnabled())
+        self.window.execution_history_table.selectRow(0)
+        self.assertFalse(self.window.submit_review_button.isEnabled())
+        self.window._submission_review_finished()
+        self.assertFalse(self.window.submit_review_button.isEnabled())
+
+    def test_unfinished_current_record_has_no_submission_or_bundle_action(self) -> None:
+        self.window.test_id.setProperty("record_id", "new-record")
+        self.window._render_aging_status({"station": {"state": "running"}, "playback": {
+            "test_id": "new-record", "recording": {"active": True, "finished": False}}})
+        self.assertFalse(self.window.submit_review_button.isEnabled())
+        self.assertFalse(self.window.export_bundle_button.isEnabled())
 
     def test_remote_code_is_displayed_but_actions_keep_local_record_id(self) -> None:
         local = "REL-SARM-001_2610101800_RP1.3-SARM-001_MP-01_" + "1" * 32
@@ -162,17 +295,18 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
         self.window.execution_history_table.setCurrentCell(-1, -1)
         self.assertEqual(self.window._selected_test_id(), local)
 
-    def test_incomplete_selected_profile_blocks_even_without_platform_login(self) -> None:
+    def test_offline_ignores_stale_platform_profile_and_starts_locally(self) -> None:
         self.window._platform_operator = ""
         self.window.robot_id.setText("local-arm")
         self.window.platform_test_profile.addItem("Incomplete", {"ready": False, "missing": ["campaign_id"]})
         self.window.platform_test_profile.setCurrentIndex(1)
-        with mock.patch.object(self.window, "_run_rest") as run, mock.patch("factory_hmi.desktop.app.QMessageBox.warning") as warning:
+        with mock.patch.object(self.window, "_save_local_bench"), mock.patch.object(self.window, "_run_rest") as run, mock.patch("factory_hmi.desktop.app.QMessageBox.warning") as warning:
             self.window._start_playback()
-            run.assert_not_called()
-            warning.assert_called_once()
+            run.assert_called_once()
+            warning.assert_not_called()
 
     def test_incomplete_selected_upload_profile_still_blocks_start(self) -> None:
+        self._online_upper_sample()
         self.window._platform_operator = "qa-operator"
         self.window.robot_id.setText("RP1.3-UPPER-01")
         self.window.platform_test_profile.addItem("Incomplete", {"ready": False, "missing": ["campaign_id"]})

@@ -1,5 +1,11 @@
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 let unauthorizedHandler: (() => void) | null = null;
+let authenticationEpoch = 0;
+
+// Invalidates callbacks from requests started under a previous identity.
+export function invalidateAuthenticationRequests() {
+  authenticationEpoch += 1;
+}
 
 const SESSION_INVALIDATION_CODES = new Set([
   "authentication_required",
@@ -20,6 +26,10 @@ export class ApiError extends Error {
     this.code = code;
     this.details = details;
   }
+}
+
+export function isSessionInvalidationError(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.status === 401 && SESSION_INVALIDATION_CODES.has(error.code);
 }
 
 export function setUnauthorizedHandler(handler: (() => void) | null) {
@@ -84,6 +94,8 @@ export async function apiRequest<T>(
   init: RequestInit = {},
   parse?: (data: unknown) => T
 ): Promise<T> {
+  const requestEpoch = authenticationEpoch;
+  const requestUnauthorizedHandler = unauthorizedHandler;
   const headers = buildHeaders(init.headers);
   const method = (init.method ?? "GET").toUpperCase();
   if (init.body != null && !headers.has("Content-Type")) {
@@ -126,9 +138,12 @@ export async function apiRequest<T>(
     if (
       response.status === 401 &&
       failure?.code &&
-      SESSION_INVALIDATION_CODES.has(failure.code)
+      SESSION_INVALIDATION_CODES.has(failure.code) &&
+      !init.signal?.aborted &&
+      requestEpoch === authenticationEpoch &&
+      requestUnauthorizedHandler === unauthorizedHandler
     ) {
-      unauthorizedHandler?.();
+      requestUnauthorizedHandler?.();
     }
     throw new ApiError(
       failure?.message ?? (invalidSuccessResponse

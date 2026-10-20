@@ -29,6 +29,15 @@ describe("workstation status", () => {
     expect(screen.getByText("模拟 PLC")).toBeTruthy();
   });
 
+  it("keeps monitoring visible while separately exposing a retained runtime conflict", () => {
+    render(<HmiStationCard station={{...station, runtime_conflicts: [{id: "issue", execution_code: "QA-CONFLICT", asset_code: "RP1.3-ARM-001", detected_at: station.last_seen_at}]}} />);
+    expect(screen.getByText("测试运行中")).toBeTruthy();
+    const alert = within(screen.getByRole("alert"));
+    expect(alert.getByText("测试记录待核实")).toBeTruthy();
+    expect(alert.getByText(/冲突时长尚未入账/)).toBeTruthy();
+    expect(alert.getByText(/QA-CONFLICT/)).toBeTruthy();
+  });
+
   it("does not claim last reported running state is live after disconnect", () => {
     render(<HmiStationCard station={{...station, online: false, snapshot_fresh: false, state: "offline"}} />);
     expect(screen.getByText("离线")).toBeTruthy();

@@ -290,6 +290,9 @@ class ReliabilityPlatformClient:
     def create_archive(self, payload: Mapping[str, Any], key: str) -> dict[str, Any]:
         return self._call("POST", "/api/v1/archives", payload=payload, idempotency_key=key, service_auth=False)
 
+    def import_archive(self, payload: Mapping[str, Any], key: str) -> dict[str, Any]:
+        return self._call("POST", "/api/v1/archive-imports", payload=payload, idempotency_key=key, service_auth=False)
+
     def archive(self, archive_id: str) -> dict[str, Any]:
         return self._call("GET", f"/api/v1/archives/{archive_id}", service_auth=False)
 
@@ -303,6 +306,34 @@ class ReliabilityPlatformClient:
 
     def submission(self, submission_id: str) -> dict[str, Any]:
         return self._call("GET", f"/api/v1/submissions/{submission_id}", service_auth=False)
+
+    def find_submission(self, execution_uuid: str) -> dict[str, Any] | None:
+        """Read visible receipts, including lost legacy replies, before recovery."""
+        from uuid import UUID
+        expected = str(UUID(execution_uuid))
+        before = None
+        seen = set()
+        for _ in range(10):
+            path = "/api/v1/submissions?limit=100" + (f"&before={before}" if before is not None else "")
+            page = self._call("GET", path, service_auth=False)
+            if not isinstance(page, Mapping) or not isinstance(page.get("items"), list):
+                raise ValueError("平台审批列表不可用，不能确认旧请求状态")
+            for item in page["items"]:
+                if not isinstance(item, Mapping) or not item.get("id"):
+                    raise ValueError("平台审批列表缺少记录身份")
+                receipt = self.submission(str(UUID(str(item["id"]))))
+                if not isinstance(receipt, Mapping) or not receipt.get("execution_uuid"):
+                    raise ValueError("平台审批回执缺少执行身份")
+                if str(UUID(str(receipt["execution_uuid"]))) == expected:
+                    return dict(receipt)
+            cursor = page.get("next_cursor")
+            if cursor is None:
+                return None
+            if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor <= 0 or cursor in seen:
+                raise ValueError("平台审批列表分页无效，不能确认旧请求状态")
+            seen.add(cursor)
+            before = cursor
+        raise ValueError("平台审批记录较多，尚未完成旧请求回执核对；请联系维护员")
 
     def register_execution(
         self, payload: Mapping[str, Any], idempotency_key: str
@@ -436,6 +467,10 @@ class ReliabilityUploaderWorker:
             stations = options.get("stations") if isinstance(options.get("stations"), list) else []
             return profiles_from_setup(campaigns, contexts, stations)
 
+    def sample_options(self) -> list[dict[str, Any]]:
+        # The client already serializes its cookie opener. No metadata/approval write.
+        return self.client._call("GET", "/api/v1/hmi/samples", service_auth=False, expect="list", timeout=3)
+
     def station_options(self) -> list[dict[str, Any]]:
         with self._submission_lock:
             if not self._identity:
@@ -524,6 +559,11 @@ class ReliabilityUploaderWorker:
             try:
                 self._process(item)
             except (PlatformError, OSError, ValueError, KeyError, tarfile.TarError) as exc:
+                if item.state == "awaiting_classification":
+                    # Reconciliation failures must never turn into a mutating retry.
+                    self.outbox.update(item.execution_uuid, last_error=str(exc), next_attempt_at=time.time() + 30)
+                    count += 1
+                    continue
                 if item.manifest.get("archive_protocol") == "reliability_v1_csv" and isinstance(exc, PlatformError) and exc.status in {400, 409, 422}:
                     self.outbox.update(item.execution_uuid, state="needs_verification", last_error=str(exc), review_reason="平台校验未通过，请核实后重新提交", next_attempt_at=0)
                 else:
@@ -588,7 +628,34 @@ class ReliabilityUploaderWorker:
                 # Freeze the exact request BEFORE sending. A lost response or a
                 # local report rebuild must not change an idempotent retry.
                 self.outbox.update(producer, submission_payload=json.dumps(request_payload, ensure_ascii=False, sort_keys=True))
-            receipt = self.client.submit_summary(request_payload, f"{producer}:summary:{item.submission_revision + 1}")
+            try:
+                receipt = self.client.submit_summary(request_payload, f"{producer}:summary:{item.submission_revision + 1}")
+            except PlatformError as exc:
+                # A transport failure or conflict is ambiguous: retain and retry
+                # the exact request. Only a definitive 422 plus successful
+                # receipt lookups can unlock a new human verification.
+                if exc.status != 422 or item.submission_id or item.upload_id or item.remote_state:
+                    raise
+                frozen = self.outbox.get(producer)
+                if frozen is None:
+                    raise ValueError("本地旧请求不存在，不能恢复") from exc
+                receipt = self.client.find_submission(producer)
+                if receipt is None:
+                    try:
+                        archive = self.client.archive(producer)
+                    except PlatformError as lookup_error:
+                        if lookup_error.status != 404:
+                            raise
+                        archive = None
+                    if archive is not None:
+                        if str(archive.get("execution_uuid")) != producer:
+                            raise ValueError("中央归档执行身份不一致")
+                        if not archive.get("submission_id"):
+                            raise ValueError("平台已有该执行的归档，请先在平台核对核实与送审状态；保留旧请求")
+                        receipt = self.client.submission(str(archive["submission_id"]))
+                    else:
+                        self.outbox.recover_rejected_legacy_summary(frozen, str(exc))
+                        return
         if not isinstance(receipt, Mapping):
             raise ValueError("审批回执格式无效")
         from uuid import UUID
@@ -613,25 +680,70 @@ class ReliabilityUploaderWorker:
             review_reason=str(latest.get("review_reason") or "等待审批；尚未进入正式查询和统计"),
             next_attempt_at=time.time() + 10 if status == "PENDING" else 0, last_error="")
 
+    def _reconcile_archive(self, item: OutboxItem, detail: Mapping[str, Any], *, reason: str = "") -> None:
+        """GET receipt reconciliation only; classification changes never auto-submit."""
+        status = str(detail.get("submission_status") or "")
+        if status not in {"", "PENDING", "APPROVED", "REJECTED"}:
+            raise ValueError("未知审批状态")
+        if int(detail.get("submission_revision") or item.submission_revision) < item.submission_revision:
+            raise ValueError("审批回执版本过期")
+        state = {"PENDING": "pending_review", "APPROVED": "approved", "REJECTED": "rejected"}.get(status, "awaiting_classification")
+        classified = detail.get("classification_state") == "CLASSIFIED"
+        self.outbox.update(item.execution_uuid, state=state, remote_state=status or ("CLASSIFIED" if classified else "UNCLASSIFIED"),
+            submission_id=str(detail.get("submission_id") or item.submission_id),
+            submission_revision=int(detail.get("submission_revision") or item.submission_revision),
+            execution_code=str(detail.get("execution_code") or ""), last_error="",
+            review_reason=reason or ("中央已归类；请在平台核实并显式送审" if classified and not status else "中央状态：" + (status or "待归类")),
+            next_attempt_at=time.time() + 30 if state in {"awaiting_classification", "pending_review"} else 0)
+
+    @staticmethod
+    def _archive_identity(item: OutboxItem, frozen: Mapping[str, Any], detail: Mapping[str, Any]) -> str:
+        binding = frozen.get("archive_binding") or {}
+        expected_uuid = binding.get("server_execution_uuid") or item.execution_uuid
+        if str(detail.get("execution_uuid")) != expected_uuid:
+            raise ValueError("归档回执执行身份不一致")
+        if binding:
+            if str(detail.get("id")) != binding["archive_id"] or detail.get("sha256") != binding["sha256"] or detail.get("size_bytes") != binding["size_bytes"]:
+                raise ValueError("历史归档身份或文件哈希回执不一致")
+        return str(expected_uuid)
+
     def _process_archive(self, item: OutboxItem) -> None:
         """Resume only an explicitly verified, account-bound CSV; never send a bundle."""
         from uuid import UUID
         producer = str(UUID(item.execution_uuid))
         manifest = item.manifest
-        csv_path = Path(str(manifest["csv_path"])).expanduser().resolve(strict=True)
-        evidence = next((entry for entry in manifest.get("files", []) if entry.get("path") == "telemetry/raw.csv"), None)
-        if not evidence or not isinstance(evidence.get("size_bytes"), int) or not re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("sha256") or "")):
-            raise ValueError("缺少已核实原始 CSV 的冻结证据，不能归档")
-        verified_size = evidence["size_bytes"]
-        verified_sha256 = evidence["sha256"]
-        # The enqueue-time manifest binds the human verification to these bytes.
-        # The first worker attempt must not accept a fresh hash of a changed file.
-        if csv_path.stat().st_size != verified_size or _sha256(csv_path) != verified_sha256:
-            raise ValueError("原始 CSV 与已核实冻结证据不一致，不能归档")
         frozen = json.loads(item.submission_payload) if item.submission_payload else {}
+        # Existing approval/reconciliation reads are independent of local files and
+        # preserve old pending payloads byte-for-byte, including pre-upgrade queues.
+        if item.state == "awaiting_classification" and item.upload_id:
+            detail = self.client.archive(item.upload_id)
+            self._archive_identity(item, frozen, detail)
+            self._reconcile_archive(item, detail)
+            return
+        if item.submission_id and item.remote_state == "PENDING":
+            detail = self.client.archive(item.upload_id)
+            canonical = self._archive_identity(item, frozen, detail)
+            receipt = self.client.submission(item.submission_id)
+            if str(receipt.get("execution_uuid")) != canonical:
+                raise ValueError("审批回执与执行身份不一致")
+            if frozen.get("transport") != "history_import" and receipt.get("submitter") != self._identity:
+                raise ValueError("审批回执与提交账号不一致")
+            self._reconcile_archive(item, {**detail, "submission_status": receipt["status"],
+                "submission_revision": receipt["revision"], "execution_code": receipt.get("execution_code")})
+            return
+        if manifest.get("origin") == "HISTORY" and frozen and frozen.get("transport") != "history_import":
+            raise ValueError("旧历史记录已有冻结归档请求，必须先核对平台回执，不能按严格实测事实续传")
+        csv_path = Path(str(manifest["csv_path"])).expanduser().resolve(strict=True)
+        from factory_hmi.core.report import validate_baseline
+        reference = manifest.get("baseline_evidence")
+        if not reference or reference != manifest.get("operator_review", {}).get("baseline_evidence"):
+            raise ValueError("缺少摘要与执行包的核实绑定，请重新核实原始封存基线")
+        validate_baseline(csv_path.parent.parent, Path(item.bundle_path), expected=reference)
+        evidence = reference["files"]["telemetry/raw.csv"]
+        verified_size, verified_sha256 = evidence["size_bytes"], evidence["sha256"]
         if not frozen:
             from factory_hmi.desktop.operator_review import analysis_text
-            summary = _extract_summary(Path(item.bundle_path))
+            summary = json.loads((csv_path.parent.parent / "analysis/summary.json").read_text(encoding="utf-8"))
             timing, quality, verdict = (summary.get(key) or {} for key in ("timing", "quality", "verdict"))
             config_path = csv_path.parent.parent / "config/execution.json"
             context = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
@@ -645,7 +757,7 @@ class ReliabilityUploaderWorker:
                 criteria["record_rate_hz"] = context["record_rate_hz"]
             clock_missing = manifest.get("timestamp_provenance") == "missing"
             machine = str(manifest.get("machine_status") or "unknown")
-            machine = {"fault": "failed", "passed": "completed", "blocked": "interrupted"}.get(machine, machine)
+            machine = {"fault": "failed", "passed": "completed", "blocked": "interrupted", "duration_complete": "completed", "cycles_complete": "completed"}.get(machine, machine)
             if machine not in {"completed", "failed", "stopped", "interrupted", "unknown"}:
                 machine = "unknown"
             auto = "unconfigured" if criteria["criteria_version"] == "UNCONFIGURED" else str(verdict.get("status") or "blocked")
@@ -663,27 +775,45 @@ class ReliabilityUploaderWorker:
             }
             if manifest.get("recording_scope") == "platform" and all(manifest.get(key) for key in _PROFILE_REQUIRED):
                 create["classification"] = {key: manifest[key] for key in _PROFILE_REQUIRED}
-            frozen = {"create": create, "review": dict(manifest["operator_review"])}
+            history_import = manifest.get("origin") == "HISTORY"
+            if not history_import and (timing.get("active_seconds") is None or timing.get("completed_cycles") is None):
+                raise ValueError("实测记录缺少运行事实，不能填零上传")
+            if history_import:
+                # Exactly the existing seven-field import contract; facts are
+                # server-owned unknowns, never CSV span/zero placeholders.
+                create = {"filename": csv_path.name, "size_bytes": verified_size, "sha256": verified_sha256,
+                    "test_name": manifest["test_name"], "actual_object": manifest["actual_object"],
+                    "station_id": manifest["operator_review"]["station_id"], "classification": None}
+            frozen = {"create": create, "review": dict(manifest["operator_review"]),
+                "transport": "history_import" if history_import else "strict_archive"}
             self.outbox.update(producer, submission_payload=json.dumps(frozen, ensure_ascii=False, sort_keys=True))
         create = frozen["create"]
         # Any post-verification change to source CSV fails closed, including retries.
         if csv_path.stat().st_size != create["size_bytes"] or _sha256(csv_path) != create["sha256"]:
             raise ValueError("原始 CSV 已变更，冻结归档不能继续")
-        detail = self.client.archive(item.upload_id) if item.upload_id else self.client.create_archive(create, producer + ":archive")
+        history_import = frozen.get("transport") == "history_import"
+        if item.upload_id:
+            detail = self.client.archive(item.upload_id)
+        elif history_import:
+            response = self.client.import_archive(create, producer + ":history-import")
+            detail = response["archive"]
+            # Persist canonical identity before any CSV transfer. Replay the same
+            # create key after a lost receipt; never guess it from the local UUID.
+            if detail.get("sha256") != verified_sha256 or detail.get("size_bytes") != verified_size:
+                raise ValueError("历史导入回执文件哈希或长度不一致")
+            frozen["archive_binding"] = {"local_execution_uuid": producer,
+                "server_execution_uuid": str(UUID(str(detail["execution_uuid"]))),
+                "archive_id": str(UUID(str(detail["id"]))), "sha256": verified_sha256, "size_bytes": verified_size,
+                "reused": bool(response.get("reused"))}
+            self.outbox.update(producer, upload_id=frozen["archive_binding"]["archive_id"],
+                submission_payload=json.dumps(frozen, ensure_ascii=False, sort_keys=True))
+        else:
+            detail = self.client.create_archive(create, producer + ":archive")
         archive_id = str(UUID(str(detail["id"])))
-        if str(detail.get("execution_uuid")) != producer:
-            raise ValueError("归档回执执行身份不一致")
-        if item.submission_id and item.remote_state == "PENDING":
-            receipt = self.client.submission(item.submission_id)
-            if str(receipt.get("execution_uuid")) != producer or receipt.get("submitter") != self._identity:
-                raise ValueError("审批回执与执行身份或提交账号不一致")
-            status = str(receipt["status"])
-            if status not in {"PENDING", "APPROVED", "REJECTED"}:
-                raise ValueError("未知审批状态")
-            self.outbox.update(producer, state={"PENDING": "pending_review", "APPROVED": "approved", "REJECTED": "rejected"}[status],
-                remote_state=status, submission_revision=int(receipt["revision"]), execution_code=str(receipt.get("execution_code") or ""),
-                review_reason=str((receipt.get("revisions") or [{}])[-1].get("review_reason") or "等待审批"),
-                next_attempt_at=time.time() + 10 if status == "PENDING" else 0, last_error="")
+        self._archive_identity(item, frozen, detail)
+        if history_import and (detail.get("submission_status") in {"PENDING", "APPROVED"}
+                or detail.get("current_verification") or detail.get("is_owner") is not True or detail.get("can_edit") is not True):
+            self._reconcile_archive(item, detail, reason="复用已有中央归档；仅对账，不覆盖其核实或送审")
             return
         self.outbox.update(producer, upload_id=archive_id, state="uploading")
         processing_error = str(detail.get("processing_error") or "中央 CSV 解析失败")
@@ -732,8 +862,11 @@ class ReliabilityUploaderWorker:
         verification = frozen["verification"]
         detail = self.client.archive_action(archive_id, "verification", verification,
             f"{producer}:verification:{frozen['review'].get('revision', 1)}")
+        if history_import:
+            self._reconcile_archive(item, detail, reason="历史 CSV 已核实归档，可查看曲线；缺少运行事实，不能送审或进入正式统计")
+            return
         if detail.get("classification_state") != "CLASSIFIED":
-            self.outbox.update(producer, state="awaiting_classification", remote_state="UNCLASSIFIED", review_reason="中央归档已完成，等待补齐正式用例关联", last_error="", next_attempt_at=0)
+            self.outbox.update(producer, state="awaiting_classification", remote_state="UNCLASSIFIED", review_reason="中央归档已完成，等待补齐正式用例关联；后续仅对账，不自动送审", last_error="", next_attempt_at=time.time() + 30)
             return
         # Preserve the planned station in the first classification. A corrected
         # actual station is a new auditable classification after verification.

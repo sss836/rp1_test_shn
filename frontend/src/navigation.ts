@@ -9,8 +9,10 @@ export type View =
   | "assets"
   | "live"
   | "stations"
+  | "benches"
   | "submissions"
   | "archives"
+  | "import"
   | "archive"
   | "curves"
   | "asset"
@@ -36,8 +38,10 @@ const views = new Set<View>([
   "assets",
   "live",
   "stations",
+  "benches",
   "submissions",
   "archives",
+  "import",
   "archive",
   "curves",
   "asset",
@@ -48,7 +52,7 @@ const views = new Set<View>([
   "admin"
 ]);
 const targetParts = new Set<TargetPartCode>([
-  "ARM", "SARM", "LEG", "SLEG", "SYS", "UPPER", "LOWER", "CHEST", "HEAD", "BAT"
+  "ARM", "SARM", "LEG", "SLEG", "SYS", "UPPER", "LOWER", "WAISTHIP", "CHEST", "HEAD", "BAT"
 ]);
 
 export function readLocation(search = window.location.search): LocationState {

@@ -12,8 +12,27 @@ export function AuthLoading() {
   );
 }
 
+export function AuthUnavailable() {
+  const { bootError, refetchMe } = useAuth();
+  return <main className="auth-stage">
+    <section className="state-panel error-state" role="alert">
+      <h1>暂时无法验证登录</h1>
+      <p>{bootError || "无法连接认证服务。"}</p>
+      <p>尚未确认登录状态。连接恢复后可重试验证现有会话。</p>
+      <button type="button" onClick={() => void refetchMe()}>重试验证登录</button>
+    </section>
+    <LogoutNotice />
+  </main>;
+}
+
+export function LogoutNotice() {
+  const { logoutError, logoutPending, logout } = useAuth();
+  if (!logoutError) return null;
+  return <div className="form-error" role="alert"><p>{logoutError}</p><button type="button" className="text-button" disabled={logoutPending} onClick={() => void logout()}>重试退出</button></div>;
+}
+
 export function LoginScreen() {
-  const { login, bootError } = useAuth();
+  const { login, bootError, logoutPending } = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState(bootError);
@@ -58,7 +77,7 @@ export function LoginScreen() {
           <label>用户名<input autoFocus autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} required /></label>
           <label>密码<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
           {error && <p className="form-error" role="alert">{error}</p>}
-          <button className="primary-button login-submit" type="submit" disabled={busy || !username || !password}>
+          <button className="primary-button login-submit" type="submit" disabled={busy || logoutPending || !username || !password}>
             {busy ? "正在验证…" : <>进入可靠性工作台 <ArrowRight aria-hidden="true" /></>}
           </button>
         </form>
@@ -68,7 +87,7 @@ export function LoginScreen() {
 }
 
 export function PasswordChangeScreen() {
-  const { session, changePassword, logout } = useAuth();
+  const { session, changePassword, logout, logoutPending } = useAuth();
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -107,7 +126,8 @@ export function PasswordChangeScreen() {
           {error && <p className="form-error" role="alert">{error}</p>}
           <button className="primary-button" type="submit" disabled={busy}>{busy ? "正在更新…" : "更新密码并进入平台"}</button>
         </form>
-        <button className="text-button" type="button" onClick={() => void logout()}><LogOut aria-hidden="true" />退出当前账户</button>
+        <LogoutNotice />
+        <button className="text-button" type="button" disabled={logoutPending} onClick={() => void logout()}><LogOut aria-hidden="true" />{logoutPending ? "正在退出…" : "退出当前账户"}</button>
       </section>
     </main>
   );

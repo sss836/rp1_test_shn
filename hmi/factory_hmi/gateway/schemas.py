@@ -252,3 +252,26 @@ class PlcChannelRequest(PlcOperatorRequest):
 class PlcSetpointRequest(PlcOperatorRequest):
     voltage: float = Field(ge=0.0, le=1000.0)
     current: float = Field(ge=0.0, le=1000.0)
+
+
+class QuickPrepareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    profile: str = Field(min_length=1, max_length=40)
+    interfaces: list[str] = Field(default_factory=list, max_length=4)
+    backend: Literal["motors_py", "fake"] = "motors_py"
+
+    @field_validator("interfaces")
+    @classmethod
+    def validate_interfaces(cls, value: list[str]) -> list[str]:
+        import re
+        if any(not re.fullmatch(r"can[0-9]+", name) for name in value):
+            raise ValueError("CAN 接口名称无效")
+        return value
+
+
+class QuickStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    power_source: Literal["external", "plc"] = "plc"
+    duration_hours: float = Field(gt=0.0)
+    physical_estop_confirmed: bool
+    sample_id: str = Field(min_length=1, max_length=200)

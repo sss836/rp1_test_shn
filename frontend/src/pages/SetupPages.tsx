@@ -65,6 +65,12 @@ export function AssetCreateForm({ assetKind }: { assetKind: AssetKind }) {
   </section>;
 }
 
+export function StationCreateForm({ after }: { after?: () => void }) {
+  return <Panel title="新建台架"><CreateForm title="填写现场台架信息；同一站点或实验室编号须使用已有名称。保存后刷新台架清单。" path="stations" after={after} fields={[
+    text("site_code", "站点编号"), text("site_name", "站点名称"), text("lab_code", "实验室编号"), text("lab_name", "实验室名称"), text("station_code", "台架编号"), text("name", "台架名称"), { name: "station_type", label: "台架类型", options: [{ value: "WHOLE_MACHINE", label: "整机" }, { value: "MODULE", label: "模块" }, { value: "SHARED", label: "共享" }] }, reason
+  ]} /></Panel>;
+}
+
 export function CatalogPage({ assetKind, navigate }: { assetKind: AssetKind; navigate: (id: string) => void }) {
   const [search, setSearch] = useState("");
   const catalog = useQuery({ queryKey: ["setup-catalog"], queryFn: ({ signal }) => setupApi.catalog(signal) });
@@ -105,9 +111,7 @@ export function PlanningPage({ assetKind }: { assetKind: AssetKind }) {
         { name: "planned_start", label: "计划开始时间", type: "datetime-local", optional: true }, { name: "planned_end", label: "计划结束时间", type: "datetime-local", optional: true }, reason
       ]} /></Panel>
     </div>}
-    {tab === "stations" && admin && <Panel title="台架与组织信息"><CreateForm title="同一站点或实验室编号须使用相同名称" path="stations" fields={[
-      text("site_code", "站点编号"), text("site_name", "站点名称"), text("lab_code", "实验室编号"), text("lab_name", "实验室名称"), text("station_code", "台架编号"), text("name", "台架名称"), { name: "station_type", label: "台架类型", options: [{ value: "WHOLE_MACHINE", label: "整机" }, { value: "MODULE", label: "模块" }, { value: "SHARED", label: "共享" }] }, reason
-    ]} /></Panel>}
+    {tab === "stations" && admin && <StationCreateForm />}
     {tab === "plans" && <>
       <Panel title="可访问的计划">
         {plans.isLoading ? <LoadingState /> : !(plans.data ?? []).some((p) => p.asset_kind === assetKind) ? <EmptyState title="暂无可访问计划" description={admin ? "请使用“创建项目和计划”建立真实测试计划。" : "请联系管理员创建计划并授权。"} /> : <div className="setup-plan-list">{plans.data?.filter((p) => p.asset_kind === assetKind).map((p) => <button key={p.id} type="button" aria-pressed={selected === p.id} onClick={() => { setSelected(p.id); setAssetId(""); setCaseId(""); }}><strong>{p.code} · {p.name}</strong><span>{p.program_code ?? "项目详情不可见"} · {p.status} · {(p.stages ?? []).map((stage) => stage.stage_name).join("、") || "测试阶段1"} · {p.asset_count} 个样品 · {p.case_count} 个配置项</span><small>{formatDate(p.planned_start)} 至 {formatDate(p.planned_end)}</small></button>)}</div>}

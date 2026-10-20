@@ -94,6 +94,9 @@ class ArchiveVerification(ArchiveModel):
     discrepancy_reason: str = Field(default="", max_length=1000)
     declared_started_at: AwareDatetime | None = None
     declared_ended_at: AwareDatetime | None = None
+    declared_active_seconds: float | None = Field(default=None, ge=0, le=315360000)
+    declared_completed_cycles: int | None = Field(default=None, ge=0, le=2147483647)
+    declared_exception_count: int | None = Field(default=None, ge=0, le=2147483647)
     reason: str = Field(min_length=1, max_length=300)
 
     @model_validator(mode="after")
@@ -105,6 +108,8 @@ class ArchiveVerification(ArchiveModel):
                 raise ValueError("人工补录结束时间必须不早于开始时间")
             if self.declared_ended_at > datetime.now(self.declared_ended_at.tzinfo) + timedelta(minutes=5):
                 raise ValueError("人工补录结束时间不能在未来")
+            if self.declared_active_seconds is not None and self.declared_active_seconds > (self.declared_ended_at - self.declared_started_at).total_seconds() + .001:
+                raise ValueError("人工申报运行时长不得超过开始至结束的区间")
         return self
 
 
@@ -120,6 +125,39 @@ class ArchiveSubmit(ArchiveModel):
     reason: str = Field(min_length=1, max_length=300)
 
 
+class ArchiveIntakeVerification(ArchiveVerification):
+    notes: str = Field(default="", max_length=1000)
+    reason: str = Field(default="历史CSV补录送审", min_length=1, max_length=300)
+
+
+class ArchiveIntakeSubmit(ArchiveModel):
+    verification: ArchiveIntakeVerification
+    context: ArchiveContext
+    expected_submission_revision: int = Field(default=0, ge=0)
+
+
 class ArchiveAnalysisCreate(ArchiveModel):
     test_case_version_id: UUID
     reason: str = Field(min_length=1,max_length=300)
+
+
+class ArchiveImportCreate(ArchiveModel):
+    """Historical CSV import metadata. Acquisition facts are server-owned unknowns."""
+    filename: str = Field(min_length=5, max_length=200)
+    size_bytes: int = Field(ge=1, le=50 * 1024**3)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    test_name: str = Field(min_length=1, max_length=200)
+    actual_object: str = Field(min_length=1, max_length=200)
+    station_id: UUID
+    classification: ArchiveContext | None = None
+
+    @model_validator(mode="after")
+    def metadata(self):
+        if (PurePosixPath(self.filename).name != self.filename
+                or PureWindowsPath(self.filename).name != self.filename
+                or not self.filename.lower().endswith(".csv")
+                or "\x00" in self.filename):
+            raise ValueError("文件名必须是无目录的 CSV 文件名")
+        if self.classification and self.classification.station_id != self.station_id:
+            raise ValueError("正式关联工位必须与补录工位一致")
+        return self

@@ -36,6 +36,8 @@ include = ["factory_hmi*", "scripts"]
 factory_hmi = [
   "config/*.yaml",
   "contracts/*.json",
+  "resources/quick/*.json",
+  "resources/quick/*.npz",
   "desktop/assets/*.png",
   "desktop/assets/*.qss",
 ]

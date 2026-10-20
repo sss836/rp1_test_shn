@@ -71,6 +71,8 @@ class GridTableModel(QAbstractTableModel):
         tone = self._tones.get((row, column))
         if role == Qt.ItemDataRole.DisplayRole:
             return str(value)
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return str(value)
         if role == Qt.ItemDataRole.TextAlignmentRole:
             return (
                 int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)

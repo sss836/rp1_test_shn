@@ -707,7 +707,7 @@ class FactoryService:
         if report_context is not None and record_path is not None:
             thread = threading.Thread(
                 target=self._finalize_after_run,
-                args=(controller, record_path, report_context),
+                args=(controller, record_path, report_context, controller.playback),
                 name=f"factory-report-{report_context['test_id']}",
                 daemon=True,
             )
@@ -794,15 +794,23 @@ class FactoryService:
             summary["central_analysis"] = dict(queued.manifest["central_analysis"])
         return summary
 
+    def execution_analysis_versions(self, test_id: str) -> dict[str, Any]:
+        revisions = self.report_manager.analysis_revisions(test_id)
+        execution = self.report_manager.execution_dir(test_id)
+        return {"test_id": test_id, "submission_baseline": "baseline-v1", "items": [
+            {**revision, "report_text": (execution / "analysis/revisions" / f"v{revision['revision']:06d}" / "report.md").read_text(encoding="utf-8")}
+            for revision in revisions]}
+
     def execution_report_file(self, test_id: str) -> Path:
         return self.report_manager.report_path(test_id)
 
     def execution_bundle_file(self, test_id: str) -> Path:
         return self.report_manager.bundle_path(test_id)
 
-    def rebuild_report(self, test_id: str) -> dict[str, Any]:
-        result = self.report_manager.rebuild(test_id)
-        return self._report_result(result)
+    def rebuild_report(self, test_id: str, *, actor: str, reason: str) -> dict[str, Any]:
+        result = self.report_manager.rebuild(test_id, actor=actor, reason=reason)
+        return {**self._report_result(result), "analysis_revision": result.analysis_revision,
+            "report_text": result.report_path.read_text(encoding="utf-8"), "submission_baseline": "baseline-v1"}
 
     def submit_execution(
         self,
@@ -818,26 +826,27 @@ class FactoryService:
         if not review:
             raise ValueError("必须核实测试人、有效工位、人工结论和测试员记录后才能提交")
         if queued and queued.submission_payload and queued.state not in {"rejected", "needs_verification"}:
-            raise ValueError("已有上传或送审请求等待确认，请先重试归档恢复回执后再修改核实信息")
+            raise ValueError("已有冻结请求尚未完成回执核对。请点“重试归档”；旧摘要若已拒收，将先核对平台记录，再转为“需要重新核实”。")
+        if queued and queued.submission_payload and queued.manifest.get("archive_protocol") != "reliability_v1_csv":
+            if queued.state != "needs_verification" or not self.outbox.legacy_summary_recovery_verified(queued):
+                raise ValueError("旧摘要必须先重试并核对平台回执，不能覆盖原请求")
+        if queued and queued.submission_payload and queued.manifest.get("origin") == "HISTORY":
+            previous = json.loads(queued.submission_payload)
+            if previous.get("transport") != "history_import":
+                raise ValueError("旧历史记录已有冻结归档请求，请先在平台核对回执；不能改写旧请求或把缺失运行事实重新送审")
+        # Evidence validation precedes all review/version writes.
+        self.report_manager.validate(test_id)
         central_analysis = queued.manifest.get("central_analysis") if queued else None
         review_path = self.report_manager.write_operator_review(test_id, review, central_analysis=central_analysis)
         verified = json.loads(review_path.read_text(encoding="utf-8"))
         manifest = dict(self.report_manager.manifest(test_id))
         raw_path = self.report_manager.execution_dir(test_id) / "telemetry/raw.csv"
-        expected = next((entry for entry in manifest.get("files", []) if entry.get("path") == "telemetry/raw.csv"), None)
-        import hashlib
-        digest = hashlib.sha256()
-        with raw_path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-        if not expected or expected["sha256"] != digest.hexdigest() or expected["size_bytes"] != raw_path.stat().st_size:
-            raise ValueError("原始采集文件与已冻结证据不一致，不能提交")
         actual_object = verified.get("actual_object") or manifest.get("actual_object") or manifest.get("sample_id")
         test_name = verified.get("test_name") or manifest.get("test_name")
         if not actual_object or actual_object == "unknown" or not test_name:
             raise ValueError("请补齐测试名称和实际测试对象")
         manifest.update(archive_protocol="reliability_v1_csv", csv_path=str(raw_path),
-            operator_review=verified, test_name=test_name, actual_object=actual_object,
+            operator_review=verified, baseline_evidence=verified["baseline_evidence"], test_name=test_name, actual_object=actual_object,
             submission_reason=str(reason or verified["submission_reason"]).strip()[:300])
         if central_analysis:
             manifest["central_analysis"] = central_analysis
@@ -847,9 +856,9 @@ class FactoryService:
         )
         if queued and queued.submission_payload:
             frozen = json.loads(queued.submission_payload)
-            if "create" in frozen:
+            if "create" in frozen and queued.manifest.get("archive_protocol") == "reliability_v1_csv":
                 item = self.outbox.update(item.execution_uuid, submission_payload=json.dumps(
-                    {"create": frozen["create"], "review": verified}, ensure_ascii=False, sort_keys=True))
+                    {**{key: frozen[key] for key in ("create", "transport", "archive_binding") if key in frozen}, "review": verified}, ensure_ascii=False, sort_keys=True))
         return item.to_dict()
 
     def retry_submission(self, test_id: str) -> dict[str, Any]:
@@ -862,7 +871,7 @@ class FactoryService:
 
     def import_history(self, paths: Sequence[str], metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Explicit local selection only; never uploads or starts hardware."""
-        from factory_hmi.core.report import _read_csv, _sha256
+        from factory_hmi.core.report import _sha256
         if not paths or len(paths) > 100:
             raise ValueError("请选择 1 至 100 个历史 CSV")
         results = []
@@ -876,6 +885,9 @@ class FactoryService:
             context = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.is_file() else {}
             if not isinstance(context, dict):
                 raise ValueError("历史上下文文件格式无效")
+            declared_context = dict(context)
+            context["history_declared_context"] = declared_context
+            context["history_context_sha256"] = _sha256(sidecar) if sidecar.is_file() else None
             context.setdefault("actual_object", context.get("sample_id") or context.get("robot_id") or "")
             context.setdefault("test_name", context.get("test_case_id") or "")
             identity = str(context.get("execution_uuid") or uuid.uuid5(uuid.NAMESPACE_URL, "rp1-history-sha256:" + digest))
@@ -895,10 +907,8 @@ class FactoryService:
                 if not explicit:
                     raise ValueError("历史补录必须填写测试名称、实际对象、工位和测试人")
                 context[field] = explicit
-            _, _, times, _ = _read_csv(source)
-            # Relative duration is measured from CSV; unknown absolute clocks stay
-            # explicitly MISSING on the wire (epoch is only a local report placeholder).
-            has_clock = bool(context.get("started_at") and context.get("ended_at"))
+            # CSV coordinate span does not measure active runtime or completed cycles.
+            # Missing acquisition facts stay unknown; imports use the historical intake.
             formal_keys = ("campaign_id", "cycle_id", "segment_id", "asset_id", "configuration_id", "test_case_version_id", "station_id")
             formal_context = all(context.get(key) for key in formal_keys) and context.get("test_case_id") not in {None, "", "OTHER"}
             if formal_context:
@@ -909,12 +919,10 @@ class FactoryService:
                     formal_context = False
             context.update(execution_uuid=identity, test_id="HISTORY_" + identity.replace("-", ""),
                 origin="HISTORY", recording_scope="platform" if formal_context else "local", test_case_id=context.get("test_case_id") or "OTHER",
-                sample_id=context["actual_object"], machine_status=context.get("machine_status") or "unknown",
-                timestamp_provenance="recorded" if has_clock else "missing",
-                started_at=context.get("started_at") or "1970-01-01T00:00:00Z",
-                ended_at=context.get("ended_at") or "1970-01-01T00:00:00Z",
-                active_seconds=context.get("active_seconds", max(times, default=0.0) - min(times, default=0.0)),
-                completed_cycles=context.get("completed_cycles", 0), outcome=context.get("outcome") or "interrupted")
+                sample_id=context["actual_object"], machine_status="unknown",
+                timestamp_provenance="missing",
+                started_at="1970-01-01T00:00:00Z", ended_at="1970-01-01T00:00:00Z",
+                active_seconds=None, completed_cycles=None, record_rate_hz=None, outcome="unknown")
             result = self.report_manager.finalize(source, context)
             results.append(self._report_result(result))
         return results
@@ -949,13 +957,21 @@ class FactoryService:
         controller: FactoryController,
         record_path: Path,
         context: dict[str, Any],
+        playback_session: Any = None,
     ) -> None:
         current = threading.current_thread()
         test_id = str(context["test_id"])
         try:
-            controller.wait()
+            # Hold the execution's playback identity across quick disconnects.
+            # A new configuration or disconnect may clear controller.playback
+            # before this background finalizer gets CPU time.
+            if playback_session is not None:
+                playback_session.wait()
+                playback = playback_session.snapshot()
+            else:
+                controller.wait()
+                playback = controller.snapshot().get("playback")
             snapshot = controller.snapshot()
-            playback = snapshot.get("playback")
             progress = (
                 playback.get("progress", {})
                 if isinstance(playback, Mapping)

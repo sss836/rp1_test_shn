@@ -1,7 +1,9 @@
 from typing import Annotated, Literal
 from uuid import UUID
 
+import anyio
 from fastapi import APIRouter, Depends, Header, Query, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import DBAPIError
 from starlette.concurrency import run_in_threadpool
 
@@ -10,9 +12,10 @@ from app.core.config import get_settings
 from app.core.db import DbSession
 from app.core.errors import ApiError
 from app.repositories.archives import ArchiveRepository
-from app.schemas.archives import ArchiveAnalysisCreate, ArchiveClassification, ArchiveCreate, ArchiveSubmit, ArchiveVerification
+from app.schemas.archives import ArchiveAnalysisCreate, ArchiveClassification, ArchiveCreate, ArchiveIntakeSubmit, ArchiveSubmit, ArchiveVerification
 from app.schemas.common import DataEnvelope
 from app.services.archive_storage import ArchiveStorage
+from app.services.curve_analysis import CurveAnalysisService, MAX_TIME_SECONDS
 from app.services.curve_query import CurveQueryService
 
 
@@ -110,6 +113,11 @@ def submit(reference: str,payload: ArchiveSubmit, _: Operator,session: DbSession
     return operation(lambda: ArchiveRepository(session).submit(reference,payload,idempotency_key))
 
 
+@router.post("/{reference}/verify-and-submit")
+def intake_submit(reference: str, payload: ArchiveIntakeSubmit, _: Operator, session: DbSession, idempotency_key: Key):
+    return operation(lambda: ArchiveRepository(session).intake_submit(reference, payload, idempotency_key))
+
+
 @router.get("/{reference}/analyses")
 def analyses(reference: str, _: Reader,session: DbSession):
     return DataEnvelope(data=ArchiveRepository(session).analyses(reference))
@@ -132,3 +140,63 @@ def curves(reference: str, _: Reader,session: DbSession,
     query = CurveQueryService(ArchiveStorage(settings.archive_root),settings.archive_query_memory_mb)
     return DataEnvelope(data=query.query(archive,[m.strip() for m in metrics.split(",") if m.strip()],
         [s.strip() for s in subjects.split(",") if s.strip()],start,end,max_points,stage,cycle))
+
+
+def raw_request(reference: str, _: Reader, session: DbSession,
+                metrics: Annotated[str, Query(max_length=4000)]="",
+                subjects: Annotated[str, Query(max_length=4000)]="",
+                start: Annotated[float | None, Query(ge=0, le=MAX_TIME_SECONDS, allow_inf_nan=False)]=None,
+                end: Annotated[float | None, Query(ge=0, le=MAX_TIME_SECONDS, allow_inf_nan=False)]=None,
+                stage: Annotated[str | None, Query(max_length=100)]=None,
+                cycle: Annotated[str | None, Query(max_length=100)]=None):
+    # Use the same per-archive RLS gate as /curves on every request, including
+    # paginated reads and downloads; a shared URL confers no new permission.
+    archive = ArchiveRepository(session).get(reference)
+    settings = get_settings()
+    service = CurveAnalysisService(ArchiveStorage(settings.archive_root), settings.archive_query_memory_mb)
+    selection = service.select(archive, [m.strip() for m in metrics.split(",") if m.strip()],
+                               [s.strip() for s in subjects.split(",") if s.strip()], start, end, stage, cycle)
+    return service, selection
+
+
+RawRequest = Annotated[tuple, Depends(raw_request)]
+
+
+@router.get("/{reference}/statistics")
+def raw_statistics(query: RawRequest):
+    service, selection = query
+    return DataEnvelope(data=service.statistics(selection))
+
+
+@router.get("/{reference}/samples")
+def raw_samples(query: RawRequest,
+                offset: Annotated[int, Query(ge=0, le=9223372036854775807)]=0,
+                limit: Annotated[int, Query(ge=1, le=500)]=100):
+    service, selection = query
+    return DataEnvelope(data=service.samples(selection, offset, limit))
+
+
+class ArchiveCsvResponse(StreamingResponse):
+    def __init__(self, export):
+        self.export = export
+        super().__init__(export.chunks(), media_type="text/csv; charset=utf-8", headers={
+            "Content-Disposition": f'attachment; filename="{export.filename}"',
+            "Cache-Control": "no-store", "X-Archive-Resolution": "raw",
+            "X-Archive-Row-Count": str(export.count),
+        })
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # A generator's finally is insufficient if streaming never begins or
+            # the client disconnects while sending a chunk. Always release the
+            # DuckDB connection and its bounded spill directory, even on cancel.
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(self.export.close)
+
+
+@router.get("/{reference}/export.csv")
+def raw_export_csv(query: RawRequest):
+    service, selection = query
+    return ArchiveCsvResponse(service.export_csv(selection))

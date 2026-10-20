@@ -77,8 +77,8 @@ class CanTests(unittest.TestCase):
             run.assert_not_called()
 
     def test_helper_policy_only_allows_adapter_can_channels(self):
-        self.assertEqual(self.policy.allowed_interfaces, frozenset(['can0', 'can1', 'can2', 'can3']))
-        for interface in ['can4', 'can99', 'lin0']:
+        self.assertEqual(self.policy.allowed_interfaces, frozenset(f'can{i}' for i in range(6)))
+        for interface in ['can6', 'can99', 'lin0']:
             adapter = FakeAdapter()
             with self.assertRaises((CanPermissionError, ValueError)):
                 execute_request(dict(self.request, interfaces=[interface]), policy=self.policy, adapter=adapter)

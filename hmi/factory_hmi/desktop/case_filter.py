@@ -17,7 +17,7 @@ LIMB_PARTS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     "right_short_leg": (frozenset({"LEG", "SLEG"}), frozenset({"SLEG"})),
     "upper_body": (frozenset({"UPPER"}), frozenset({"UPPER"})),
     "biped_waist": (frozenset({"LOWER"}), frozenset({"LOWER"})),
-    "waist_hip": (frozenset({"LOWER"}), frozenset({"LOWER"})),
+    "waist_hip": (frozenset({"WAISTHIP", "LOWER"}), frozenset({"WAISTHIP", "LOWER"})),
     "lower_body": (frozenset({"LOWER"}), frozenset({"LOWER"})),
 }
 
@@ -64,11 +64,10 @@ OTHER_CASE = "OTHER"
 def start_decision(
     *,
     saved_bench: str,
-    context_bench: str,
     case_code: str | None,
     has_context: bool,
 ) -> str:
-    """Decide whether a start has a case and a matching bench."""
+    """Require a case, sample context and an independently chosen actual bench."""
     code = str(case_code or "").strip()
     if not code:
         return "need_case"
@@ -78,13 +77,29 @@ def start_decision(
         return "local_other"
     if not has_context:
         return "need_sample"
-    bench = saved_bench.strip().upper()
-    expected = context_bench.strip().upper()
-    if not bench:
+    if not saved_bench.strip():
         return "need_bench"
-    if not expected or bench != expected:
-        return "bench_mismatch"
     return "ready"
+
+
+def profile_at_bench(
+    profile: Mapping[str, object], bench: str, stations: list[dict[str, object]],
+) -> dict[str, object]:
+    """Copy the selected context with the actual station's code and UUID together."""
+    code = bench.strip().upper()
+    matches = [station for station in stations
+        if str(station.get("code") or "").strip().upper() == code
+        and station.get("active", True) and station.get("enabled", True)]
+    if len(matches) != 1 or not matches[0].get("id"):
+        raise ValueError("本机台架不是平台有效工位，请选择已启用的工位编号或刷新平台选项。")
+    result = dict(profile)
+    # A planned station is a default in the campaign, not a constraint on the case.
+    # Missing non-station context and conflicting case/sample codes still block.
+    station_fields = {"station_id", "station_code", "bench_id", "station_code/bench_id 编号不一致"}
+    missing = [str(field) for field in profile.get("missing", []) if field not in station_fields]
+    result.update(bench_id=code, station_code=code, station_id=str(matches[0]["id"]), missing=missing)
+    result["ready"] = not missing and (bool(profile.get("ready")) or bool(profile.get("missing")))
+    return result
 
 
 def profile_matches_limb(profile: Mapping[str, object], limb: str) -> bool:
@@ -96,4 +111,6 @@ def profile_matches_limb(profile: Mapping[str, object], limb: str) -> bool:
     if case not in case_parts:
         return False
     sample = sample_part(str(profile.get("sample_id") or profile.get("asset_code") or ""))
+    if limb == "waist_hip" and sample and sample != case:
+        return False
     return not sample or sample in sample_parts

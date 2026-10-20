@@ -10,6 +10,10 @@ from factory_hmi.sync.outbox import Outbox
 from factory_hmi.sync.reliability_platform import load_test_profiles, profiles_from_setup
 
 
+def test_waist_hip_has_an_independent_canonical_sample_segment():
+    assert build_execution_code('REL-WAISTHIP-001', datetime(2026, 10, 19, tzinfo=timezone.utc), 'RP1.3-WAISTHIP-001', 'A10') == 'REL-WAISTHIP-001_2610190800_RP1.3-WAISTHIP-001_A10'
+
+
 @pytest.mark.parametrize('started', [
     datetime(2026, 10, 10, 17, 30, tzinfo=timezone.utc),
     datetime(2026, 10, 11, 1, 30, tzinfo=timezone(timedelta(hours=8))),

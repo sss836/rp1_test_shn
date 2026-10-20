@@ -28,7 +28,11 @@ describe("read-model navigation", () => {
     expect(href).toContain("part=SLEG");
   });
 
-  it.each(["account", "access-request", "admin"] as const)(
+  it("preserves the independent waist/hip asset route", () => {
+    expect(readLocation(locationHref({ view: "assets", kind: "MODULE", id: null, part: "WAISTHIP" })).part).toBe("WAISTHIP");
+  });
+
+  it.each(["account", "access-request", "admin", "benches"] as const)(
     "round-trips the %s security route",
     (view) => {
       const href = locationHref({ view, kind: "WHOLE_MACHINE", id: null, part: null });

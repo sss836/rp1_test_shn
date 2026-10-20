@@ -13,9 +13,9 @@ import json
 import os
 from pathlib import Path
 import socket
-import tarfile
 import threading
 import time
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -116,6 +116,7 @@ def classified_profile(engine, users, worker):
 
 def local_record(tmp_path, profile, *, origin="HMI", old_passed_summary=False):
     from factory_hmi.core.service import FactoryService
+    import factory_hmi.core.report as report_module
     import factory_hmi
     import yaml
 
@@ -137,19 +138,19 @@ def local_record(tmp_path, profile, *, origin="HMI", old_passed_summary=False):
         "active_seconds": 2, "completed_cycles": 1, "record_rate_hz": 10,
         "outcome": "completed", "origin": origin, "config": configuration,
     }
-    report = service.report_manager.finalize(source, initial)
+    build_summary = report_module._build_summary
+
+    def historical_summary(*args, **kwargs):
+        summary = build_summary(*args, **kwargs)
+        assert summary["verdict"]["status"] == "unconfigured", "default missing rated torque must not automatically pass"
+        if old_passed_summary:
+            # Model the old analyzer before the original evidence is sealed.
+            summary["verdict"]["status"] = "passed"
+        return summary
+
+    with patch.object(report_module, "_build_summary", side_effect=historical_summary):
+        report = service.report_manager.finalize(source, initial)
     assert report.summary["verdict"]["criteria_version"] == "generic-v1"
-    assert report.summary["verdict"]["status"] == "unconfigured", "default missing rated torque must not automatically pass"
-    if old_passed_summary:
-        # A pre-upgrade local report could say passed while current central rules
-        # say unconfigured. Preserve all raw bytes and model only that old report.
-        legacy = deepcopy(report.summary)
-        legacy["verdict"]["status"] = "passed"
-        report.summary_path.write_text(json.dumps(legacy), encoding="utf-8")
-        with tarfile.open(report.bundle_path, "w:gz") as bundle:
-            for path in sorted(report.execution_dir.rglob("*")):
-                if path.is_file():
-                    bundle.add(path, arcname=path.relative_to(report.execution_dir).as_posix())
     review = {"tester": "Synthetic actual tester", "bench": profile["bench_id"], "station_id": profile["station_id"],
               "outcome": "成功", "notes": "Synthetic operator notes", "test_name": initial["test_name"],
               "actual_object": initial["actual_object"],

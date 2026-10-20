@@ -47,6 +47,7 @@ export const MODULE_DIRECTORY = [
   { code: "LEG", members: ["LEG", "SLEG"] },
   { code: "UPPER", members: ["UPPER"] },
   { code: "LOWER", members: ["LOWER"] },
+  { code: "WAISTHIP", members: ["WAISTHIP"] },
   { code: "CHEST", members: ["CHEST"] },
   { code: "HEAD", members: ["HEAD"] },
   { code: "BAT", members: ["BAT"] }

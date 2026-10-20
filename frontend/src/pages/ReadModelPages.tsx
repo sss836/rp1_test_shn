@@ -350,6 +350,7 @@ const targetPartNames: Record<TargetPartCode, string> = {
   SYS: "整机系统",
   UPPER: "上肢",
   LOWER: "下肢",
+  WAISTHIP: "腰胯",
   CHEST: "胸腔",
   HEAD: "头部",
   BAT: "动力电池"

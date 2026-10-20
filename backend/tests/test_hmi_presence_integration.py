@@ -198,3 +198,24 @@ def test_only_a_complete_running_heartbeat_opens_one_official_execution(environm
         assert row.status == "COMPLETED"
         assert float(row.reported_active_seconds) == 55
         assert float(row.active_seconds) == 55
+
+
+def test_one_account_can_use_two_benches_and_a_bench_can_switch_accounts(environment):
+    engine, users = environment
+    installation = str(uuid4())
+    first_payload = {**heartbeat_payload(installation), 'bench_id': 'QA-ACCOUNT-A', 'runs': []}
+    second_payload = {**heartbeat_payload(), 'bench_id': 'QA-ACCOUNT-B', 'runs': []}
+    with signed_in(users['first']) as first, signed_in(users['first']) as parallel, signed_in(users['admin']) as admin:
+        assert first.put('/api/v1/hmi/presence/' + str(uuid4()), json=first_payload).status_code == 200
+        assert parallel.put('/api/v1/hmi/presence/' + str(uuid4()), json=second_payload).status_code == 200
+        assert find_station(admin, installation)['online']
+        assert find_station(admin, second_payload['installation_id'])['online']
+        assert first.post('/api/v1/auth/logout').status_code == 204
+        assert parallel.get('/api/v1/auth/me').status_code == 200
+        assert find_station(admin, second_payload['installation_id'])['online']
+        with signed_in(users['second']) as replacement:
+            assert replacement.put('/api/v1/hmi/presence/' + str(uuid4()), json=first_payload).status_code == 200
+            assert find_station(admin, installation)['operator_name'] == users['second']
+            assert find_station(replacement, installation)['online']
+    with engine.connect() as db:
+        assert db.execute(text('SELECT count(DISTINCT user_id) FROM integration.hmi_presence WHERE installation_id=CAST(:id AS uuid)'), {'id': installation}).scalar_one() == 2

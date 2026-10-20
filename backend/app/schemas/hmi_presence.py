@@ -45,6 +45,13 @@ class HmiHeartbeat(BaseModel):
     plc: HmiPlcStatus = Field(default_factory=HmiPlcStatus)
 
 
+class HmiRuntimeConflict(BaseModel):
+    id: UUID
+    execution_code: str
+    asset_code: str
+    detected_at: datetime
+
+
 class HmiStationView(BaseModel):
     connection_id: UUID
     installation_id: UUID
@@ -59,6 +66,7 @@ class HmiStationView(BaseModel):
     last_seen_at: datetime
     snapshot_at: datetime
     runs: list[HmiRun]
+    runtime_conflicts: list[HmiRuntimeConflict] = Field(default_factory=list)
     plc: HmiPlcStatus
 
 

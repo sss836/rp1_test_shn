@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import sqlite3
@@ -97,6 +98,17 @@ class Outbox:
                 );
                 CREATE INDEX IF NOT EXISTS execution_outbox_due
                 ON execution_outbox(state, next_attempt_at);
+                CREATE TABLE IF NOT EXISTS legacy_summary_recovery (
+                    execution_uuid TEXT NOT NULL REFERENCES execution_outbox(execution_uuid),
+                    payload_sha256 TEXT NOT NULL,
+                    frozen_payload TEXT NOT NULL,
+                    submission_owner TEXT NOT NULL,
+                    submission_revision INTEGER NOT NULL,
+                    rejection_status INTEGER NOT NULL CHECK(rejection_status = 422),
+                    rejection_error TEXT NOT NULL,
+                    reconciled_at REAL NOT NULL,
+                    PRIMARY KEY(execution_uuid, payload_sha256)
+                );
                 """
             )
             connection.execute("BEGIN IMMEDIATE")
@@ -317,6 +329,49 @@ class Outbox:
         assert item is not None
         return item
 
+    def recover_rejected_legacy_summary(self, expected: OutboxItem, error: str) -> OutboxItem:
+        """Keep the exact old request after a 422 and successful read-only receipt lookup.
+
+        This only unlocks human verification. It never uploads a CSV or removes
+        the old request; enqueue replaces the active payload after confirmation.
+        """
+        encoded = expected.submission_payload
+        payload = json.loads(encoded or "{}")
+        if (set(payload) != {"summary", "expected_revision", "reason"}
+                or not isinstance(payload["summary"], dict)
+                or payload["summary"].get("execution_uuid") != expected.execution_uuid):
+            raise ValueError("旧摘要请求身份或格式不一致，不能恢复")
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM execution_outbox WHERE execution_uuid=?", (expected.execution_uuid,)).fetchone()
+            if row is None:
+                raise KeyError(expected.execution_uuid)
+            if (row["submission_payload"] != encoded or row["submission_owner"] != expected.submission_owner
+                    or row["submission_revision"] != expected.submission_revision
+                    or row["state"] not in {"local_completed", "sync_failed"}
+                    or row["submission_id"] or row["upload_id"] or row["remote_state"]
+                    or json.loads(row["manifest_json"]).get("archive_protocol")):
+                raise ValueError("旧请求状态已变化或已有平台回执，请刷新核对")
+            connection.execute("""INSERT OR IGNORE INTO legacy_summary_recovery
+                (execution_uuid,payload_sha256,frozen_payload,submission_owner,submission_revision,
+                 rejection_status,rejection_error,reconciled_at) VALUES(?,?,?,?,?,422,?,?)""",
+                (expected.execution_uuid,digest,encoded,expected.submission_owner,expected.submission_revision,str(error)[:4096],time.time()))
+            connection.execute("""UPDATE execution_outbox SET state='needs_verification',next_attempt_at=0,
+                last_error=?,review_reason=?,updated_at=? WHERE execution_uuid=?""",
+                (str(error)[:4096],"旧摘要已拒收且未查到平台记录；请重新核实后归档原始 CSV",time.time(),expected.execution_uuid))
+        item = self.get(expected.execution_uuid)
+        assert item is not None
+        return item
+
+    def legacy_summary_recovery_verified(self, item: OutboxItem) -> bool:
+        digest = hashlib.sha256(item.submission_payload.encode("utf-8")).hexdigest()
+        with self._connect() as connection:
+            return connection.execute("""SELECT 1 FROM legacy_summary_recovery
+                WHERE execution_uuid=? AND payload_sha256=? AND frozen_payload=?
+                  AND submission_owner=? AND submission_revision=? AND rejection_status=422""",
+                (item.execution_uuid,digest,item.submission_payload,item.submission_owner,item.submission_revision)).fetchone() is not None
+
     def list(self, *, limit: int = 100) -> list[OutboxItem]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -336,7 +391,7 @@ class Outbox:
                 """
                 SELECT * FROM execution_outbox
                 WHERE state IN ('local_completed', 'sync_failed', 'validating',
-                                'pending_review')
+                                'pending_review', 'awaiting_classification')
                   AND next_attempt_at <= ?
                   AND (? IS NULL OR submission_owner = ?)
                 ORDER BY updated_at ASC
@@ -416,6 +471,8 @@ class Outbox:
             raise KeyError(execution_uuid)
         if item.state in {"approved", "uploaded"}:
             return item
+        if item.state == "awaiting_classification":
+            return self.update(execution_uuid, next_attempt_at=0, last_error="")
         if item.state in {"rejected", "needs_verification"} and item.manifest.get("archive_protocol") == "reliability_v1_csv":
             raise ValueError("驳回后请重新核实并提交")
         return self.update(

@@ -7,6 +7,7 @@ export type TargetPartCode =
   | "SYS"
   | "UPPER"
   | "LOWER"
+  | "WAISTHIP"
   | "CHEST"
   | "HEAD"
   | "BAT";

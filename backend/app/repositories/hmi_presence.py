@@ -34,6 +34,33 @@ class HmiPresenceRepository:
     def __init__(self, session: Session):
         self.session = session
 
+    def sample_options(self) -> list[dict]:
+        return [dict(row) for row in self.session.execute(
+            text("SELECT * FROM integration.hmi_sample_options()")
+        ).mappings()]
+
+    def _runtime_conflicts(self, installations: list[UUID]) -> dict[str, list[dict]]:
+        if not installations:
+            return {}
+        rows = self.session.execute(text("""
+            SELECT DISTINCT ON (c.installation_id, c.execution_id)
+                c.installation_id,c.public_id AS id,e.execution_code,a.asset_code,c.detected_at
+            FROM integration.hmi_runtime_conflict c
+            JOIN test.test_execution e ON e.id=c.execution_id
+            JOIN test.asset a ON a.id=e.asset_id
+            WHERE c.installation_id=ANY(CAST(:ids AS uuid[]))
+              AND e.approved_submission_id IS NULL AND e.status IN ('RUNNING','PAUSED')
+              AND NOT EXISTS (SELECT 1 FROM test.runtime_interval ri
+                              WHERE ri.execution_id=e.id AND NOT ri.voided)
+            ORDER BY c.installation_id,c.execution_id,c.detected_at DESC,c.id DESC
+        """), {"ids": [str(value) for value in installations]}).mappings().all()
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            value = dict(row)
+            key = str(value.pop("installation_id"))
+            grouped.setdefault(key, []).append(value)
+        return grouped
+
     def heartbeat(self, connection_id: UUID, payload: HmiHeartbeat, actor: RequestActor) -> dict:
         values = payload.model_dump(mode="json")
         result = self.session.execute(
@@ -52,6 +79,7 @@ class HmiPresenceRepository:
             "heartbeat_interval_seconds": 10,
             "offline_after_seconds": 45,
             "executions": executions or [],
+            "runtime_conflicts": self._runtime_conflicts([payload.installation_id]).get(str(payload.installation_id), []),
         }
 
     def disconnect(self, connection_id: UUID, actor: RequestActor) -> dict:
@@ -73,8 +101,9 @@ class HmiPresenceRepository:
             {"cursor": str(cursor) if cursor else None, "limit": limit + 1},
         ).mappings().all()
         now = datetime.now(timezone.utc)
+        conflicts = self._runtime_conflicts([row["installation_id"] for row in rows[:limit]])
         return HmiStationList(
-            items=[station_view(dict(row), now) for row in rows[:limit]],
+            items=[station_view({**dict(row), "runtime_conflicts": conflicts.get(str(row["installation_id"]), [])}, now) for row in rows[:limit]],
             next_cursor=rows[limit - 1]["installation_id"] if len(rows) > limit else None,
             as_of_at=now,
         )

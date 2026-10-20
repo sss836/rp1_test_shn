@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 AssetKind = Literal["WHOLE_MACHINE", "MODULE"]
-TargetPartCode = Literal["ARM", "SARM", "LEG", "SLEG", "SYS", "UPPER", "LOWER", "CHEST", "HEAD", "BAT"]
+TargetPartCode = Literal["ARM", "SARM", "LEG", "SLEG", "SYS", "UPPER", "LOWER", "WAISTHIP", "CHEST", "HEAD", "BAT"]
 MetricQualityStatus = Literal["VALID", "PARTIAL", "INVALID", "MISSING"]
 
 

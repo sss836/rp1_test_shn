@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -22,12 +23,14 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from factory_hmi.plc.service import PlcCabinetService, PlcControlDisabledError
 from factory_hmi.plc.coordination import PlcRequestConflict
 from factory_hmi.sync.outbox import Outbox
 
 from .lease import ControlLease, LeaseConflict
+from .trajectory_upload import configured_trajectory_limit, receive_trajectory
 from .schemas import (
     BenchCodeRequest,
     CanConnectRequest,
@@ -48,6 +51,8 @@ from .schemas import (
     ZeroMotorRequest,
     ZeroPrepareRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _default_controller(
@@ -121,6 +126,23 @@ class _PlatformCoordinator:
                 result = self.outbox.get(result["execution_uuid"]).to_dict()
             self.wake()
             return result
+
+    def analyze(self, operation: Callable[[str], Any]) -> Any:
+        with self._lock:
+            if self._mode != "reliability_v1" or not self._identity:
+                raise ValueError("请先登录当前平台账号再追加本地分析。")
+            return operation(self._identity)
+
+    def samples(self) -> dict[str, Any]:
+        from factory_hmi.sync.uploader import PlatformError
+        with self._lock:
+            uploader, identity = self._uploader, self._identity
+        if self._mode != "reliability_v1" or uploader is None or not identity:
+            return {"online": False, "samples": []}
+        try:
+            return {"online": True, "samples": uploader.sample_options()}
+        except (PlatformError, TimeoutError, OSError) as exc:
+            return {"online": False, "samples": [], "error": str(exc)}
 
     def options(self) -> dict[str, Any]:
         from factory_hmi.sync.reliability_platform import load_test_profiles
@@ -272,6 +294,11 @@ class _PlatformCoordinator:
             uploader.clear_credentials()
 
 
+from factory_hmi.gateway.quick_run import QuickRun
+from factory_hmi.gateway.schemas import QuickPrepareRequest, QuickStartRequest
+from factory_hmi.quick_profiles import catalog as quick_catalog
+
+
 class GatewayRuntime:
     def __init__(
         self,
@@ -310,6 +337,7 @@ class GatewayRuntime:
         self._motion_epoch_guard = threading.Lock()
         self._motion_epoch = 0
         self._motion_interrupts_pending = 0
+        self.quick = None
         self.outbox = outbox
         self._platform = platform
 
@@ -325,6 +353,8 @@ class GatewayRuntime:
         self._lease_thread.start()
 
     def close(self) -> None:
+        if self.quick is not None:
+            self.quick.cancel()
         self._stop.set()
         if self._lease_thread is not None:
             self._lease_thread.join(timeout=2.0)
@@ -336,13 +366,22 @@ class GatewayRuntime:
         except Exception:
             pass
 
+    def lease_snapshot(self) -> dict[str, Any]:
+        """Read liveness without polling hardware, reports, or the platform."""
+        lease = self.lease.snapshot()
+        return {
+            "owner": lease.owner,
+            "age_s": lease.age_s,
+            "timeout_s": lease.timeout_s,
+            "expired": lease.expired,
+        }
+
     def snapshot(self) -> dict[str, Any]:
         result = self._invoke(("snapshot", "get_snapshot"))
         if hasattr(result, "to_dict"):
             result = result.to_dict()
         if not isinstance(result, dict):
             raise RuntimeError("controller snapshot must be a mapping")
-        lease = self.lease.snapshot()
         value = dict(result)
         if value.get("config_path"):
             value["config_path"] = self._config_reference(Path(value["config_path"]))
@@ -351,12 +390,7 @@ class GatewayRuntime:
             value["state"] = station.get("state")
         if "connected" not in value and isinstance(station, dict):
             value["connected"] = bool(station.get("backend_connected", False))
-        value["lease"] = {
-            "owner": lease.owner,
-            "age_s": lease.age_s,
-            "timeout_s": lease.timeout_s,
-            "expired": lease.expired,
-        }
+        value["lease"] = self.lease_snapshot()
         platform = self._platform.snapshot()
         if platform["uploader_running"]:
             state = str(value.get("state") or "idle")
@@ -388,6 +422,7 @@ class GatewayRuntime:
                 }
             )
         value["platform"] = platform
+        value["quick"] = self.quick.snapshot() if self.quick else None
         return value
 
     def platform_login(self, request: PlatformLoginRequest) -> dict[str, Any]:
@@ -420,7 +455,13 @@ class GatewayRuntime:
             test_id,
         )
 
+    def rebuild_execution(self, test_id: str, reason: str) -> Any:
+        return self._platform.analyze(lambda actor: self._invoke(
+            ("rebuild_report",), test_id, actor=actor, reason=reason))
+
     def configure(self, request: ConfigureRequest) -> Any:
+        if self.quick is not None:
+            self.quick.invalidate()
         config_path = self._allowed_config_path(request.config_path)
         bus_bindings = (
             None
@@ -486,6 +527,8 @@ class GatewayRuntime:
         )
 
     def import_trajectory(self, path: str) -> Any:
+        if self.quick is not None:
+            self.quick.invalidate()
         uploaded = Path(path).expanduser()
         if uploaded.is_absolute():
             uploaded = uploaded.resolve(strict=True)
@@ -612,8 +655,13 @@ class GatewayRuntime:
     def _monitor_lease(self) -> None:
         while not self._stop.wait(0.1):
             with self._lease_guard:
-                if not self.lease.expired():
+                lease = self.lease.snapshot()
+                if not lease.expired:
                     continue
+                logger.warning(
+                    "operator lease expired: owner=%s age_s=%.3f timeout_s=%.3f",
+                    lease.owner, lease.age_s, lease.timeout_s,
+                )
                 try:
                     state = str(self.snapshot().get("state", ""))
                 except Exception:
@@ -904,7 +952,9 @@ def create_app(
     lease_timeout_s: float = 2.0,
     status_rate_hz: float = 10.0,
     data_root: Path | None = None,
+    trajectory_max_bytes: int | None = None,
 ) -> FastAPI:
+    trajectory_limit = configured_trajectory_limit(trajectory_max_bytes)
     resolved_data_root = (
         (
             data_root
@@ -939,6 +989,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.runtime = hub
+    app.state.trajectory_max_bytes = trajectory_limit
 
     def owner_id(request: Request, explicit: str | None) -> str:
         if explicit and explicit.strip():
@@ -1060,6 +1111,11 @@ def create_app(
     ) -> dict[str, Any]:
         require_token(x_rp1_operator_token)
         return {"ok": True, "result": hub._platform.options()}
+
+    @app.get("/api/v1/platform/samples")
+    def platform_samples(x_rp1_operator_token: str | None = Header(default=None)) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        return {"ok": True, "result": hub._platform.samples()}
 
     @app.exception_handler(PlcRequestConflict)
     async def plc_request_conflict(_request: Request, exc: PlcRequestConflict) -> JSONResponse:
@@ -1238,6 +1294,54 @@ def create_app(
         result["items"] = items
         return {"ok": True, "result": result}
 
+    def quick_for(runtime, owner):
+        if runtime.quick is None:
+            runtime.quick = QuickRun(runtime, hub, owner)
+        return runtime.quick
+
+    @app.get("/api/v1/quick/profiles")
+    def quick_profiles():
+        return {"items": quick_catalog()}
+
+    @app.get("/api/v1/quick/status")
+    def quick_status(request: Request, x_rp1_client_id: str | None = Header(default=None)):
+        owner = owner_id(request, x_rp1_client_id)
+        runtime = hub.session(owner)
+        return quick_for(runtime, owner).snapshot()
+
+    @app.post("/api/v1/quick/prepare")
+    def quick_prepare(body: QuickPrepareRequest, request: Request,
+                      x_rp1_client_id: str | None = Header(default=None),
+                      x_rp1_operator_token: str | None = Header(default=None)):
+        owner = owner_id(request, x_rp1_client_id)
+        def operation(runtime):
+            quick = quick_for(runtime, owner)
+            if quick.snapshot()['active']:
+                raise RuntimeError('请先结束当前快速验证')
+            try:
+                return quick.prepare(body.profile, body.interfaces, body.backend)
+            except Exception as exc:
+                quick._state('fault', str(exc), active=False)
+                raise
+        return mutate(request, x_rp1_client_id, x_rp1_operator_token, operation, claim=True)
+
+    @app.post("/api/v1/quick/start")
+    def quick_start(body: QuickStartRequest, request: Request,
+                    x_rp1_client_id: str | None = Header(default=None),
+                    x_rp1_operator_token: str | None = Header(default=None)):
+        owner = owner_id(request, x_rp1_client_id)
+        return mutate(request, x_rp1_client_id, x_rp1_operator_token,
+            lambda runtime: quick_for(runtime, owner).start(body.duration_hours, body.physical_estop_confirmed, body.sample_id, power_source=body.power_source),
+            motion_command=True)
+
+    @app.post("/api/v1/quick/end")
+    def quick_end(request: Request,
+                  x_rp1_client_id: str | None = Header(default=None),
+                  x_rp1_operator_token: str | None = Header(default=None)):
+        owner = owner_id(request, x_rp1_client_id)
+        return mutate(request, x_rp1_client_id, x_rp1_operator_token,
+            lambda runtime: quick_for(runtime, owner).end(), preempt_motion=True)
+
     @app.post("/api/v1/configure")
     def configure(
         body: ConfigureRequest,
@@ -1387,29 +1491,40 @@ def create_app(
             raise HTTPException(
                 status_code=400, detail="trajectory filename must end with .npz"
             )
-        body = await request.body()
-        if not body or len(body) > 128 * 1024 * 1024:
-            raise HTTPException(
-                status_code=413, detail="trajectory must be 1 byte to 128 MiB"
-            )
+        temporary, received_bytes = await receive_trajectory(
+            request, runtime.trajectory_root, trajectory_limit,
+        )
         target = runtime.trajectory_root / filename
-        temporary = target.with_suffix(target.suffix + ".part")
 
         def import_in_worker() -> tuple[Any, dict[str, Any]]:
             with runtime._lease_guard:
                 runtime.lease.refresh(owner)
-                temporary.write_bytes(body)
-                temporary.replace(target)
-                result = runtime.import_trajectory(str(target))
+                previous = temporary.with_suffix(".previous")
+                if target.exists():
+                    target.replace(previous)
+                try:
+                    temporary.replace(target)
+                    result = runtime.import_trajectory(str(target))
+                except BaseException:
+                    target.unlink(missing_ok=True)
+                    if previous.exists():
+                        previous.replace(target)
+                    raise
+                else:
+                    previous.unlink(missing_ok=True)
                 runtime.lease.refresh(owner)
                 return result, runtime.snapshot()
 
         try:
-            result, snapshot = await asyncio.to_thread(import_in_worker)
+            result, snapshot = await run_in_threadpool(import_in_worker)
         except (ValueError, RuntimeError) as exc:
-            target.unlink(missing_ok=True)
-            temporary.unlink(missing_ok=True)
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+        logger.info(
+            "trajectory upload completed: owner=%s filename=%s bytes=%d limit=%d",
+            owner, filename, received_bytes, trajectory_limit,
+        )
         return {
             "ok": True,
             "result": _json_result(result),
@@ -1542,6 +1657,19 @@ def create_app(
         except (ValueError, RuntimeError, FileNotFoundError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/v1/executions/{test_id}/analysis-revisions")
+    def execution_analysis_revisions(
+        test_id: str, request: Request,
+        x_rp1_client_id: str | None = Header(default=None),
+        x_rp1_operator_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        runtime = hub.session(owner_id(request, x_rp1_client_id))
+        try:
+            return runtime._invoke(("execution_analysis_versions",), test_id)
+        except (ValueError, RuntimeError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     def execution_file(
         test_id: str,
         request: Request,
@@ -1617,9 +1745,9 @@ def create_app(
         runtime = hub.session(owner_id(request, x_rp1_client_id))
         try:
             result = await asyncio.to_thread(
-                runtime._invoke,
-                ("rebuild_report",),
+                runtime.rebuild_execution,
                 body.test_id,
+                body.reason,
             )
         except (ValueError, RuntimeError, FileNotFoundError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1697,7 +1825,7 @@ def create_app(
             runtime.lease.refresh(owner)
         except LeaseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"ok": True, "lease": runtime.snapshot()["lease"]}
+        return {"ok": True, "lease": runtime.lease_snapshot()}
 
     @app.post("/api/v1/zero/prepare")
     def zero_prepare(

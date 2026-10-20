@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.errors import ApiError
 from app.repositories.submissions import SubmissionRepository
-from app.schemas.archives import ArchiveAnalysisCreate, ArchiveCreate, ArchiveClassification, ArchiveSubmit, ArchiveVerification
+from app.schemas.archives import ArchiveAnalysisCreate, ArchiveImportCreate, ArchiveCreate, ArchiveClassification, ArchiveIntakeSubmit, ArchiveSubmit, ArchiveVerification
 from app.schemas.submissions import SubmissionCreate, TestSummary
 from app.services.archive_analysis import retrospective_analysis
 
@@ -21,6 +21,7 @@ DETAIL = """SELECT a.id AS cursor,a.public_id AS id,a.execution_uuid,a.archive_c
         AND a.processing_state='READY' AS can_analyze,
     a.origin,a.test_name,a.actual_object,a.station_label,a.filename,a.size_bytes,a.sha256,
     a.received_bytes,a.upload_state,a.processing_state,a.processing_error,a.revision,a.facts,a.acceptance,a.manifest,
+    integration.archive_csv_timing(a.id) AS detected_timing,
     CASE WHEN a.classification_revision IS NULL THEN 'UNCLASSIFIED' ELSE 'CLASSIFIED' END AS classification_state,
     CASE WHEN v.revision IS NULL THEN NULL ELSE v.payload||jsonb_build_object('revision',v.revision,'created_at',v.created_at,'station_code',verified_station.station_code,'station_name',verified_station.name) END AS current_verification,
     CASE WHEN c.revision IS NULL THEN NULL ELSE c.payload||jsonb_build_object('revision',c.revision,'created_at',c.created_at) END AS classification,
@@ -86,6 +87,18 @@ class ArchiveRepository:
             {"payload": payload.model_dump_json(), "key": key}).scalar_one()
         return self.get(public_id)
 
+    def import_match(self, sha256: str, size_bytes: int):
+        # SELECT is subject to existing archive RLS; no hidden-record hint leaks.
+        archive_id = self.session.execute(text("""SELECT public_id FROM integration.execution_archive
+            WHERE sha256=:sha256 AND size_bytes=:size_bytes ORDER BY id LIMIT 1"""),
+            {"sha256": sha256, "size_bytes": size_bytes}).scalar_one_or_none()
+        return {"archive": self.get(archive_id) if archive_id else None}
+
+    def import_create(self, payload: ArchiveImportCreate, key: str):
+        result = self.session.execute(text("SELECT * FROM integration.archive_import(CAST(:payload AS jsonb),:key)"),
+            {"payload": payload.model_dump_json(), "key": key}).mappings().one()
+        return {"archive": self.get(result["archive_id"]), "reused": result["reused"]}
+
     def edit(self, reference, operation, payload: ArchiveVerification | ArchiveClassification, key):
         current = self.get(reference)
         public_id = self.session.execute(text("SELECT integration.archive_edit(:id,:operation,CAST(:payload AS jsonb),:key)"),
@@ -114,10 +127,18 @@ class ArchiveRepository:
             raise ApiError(409,"archive_revision_conflict","核实或归类版本已变化，请刷新。")
         if not current["is_owner"]:
             raise ApiError(403,"archive_owner_required","请由原提交人送审；管理员可以代为补齐归类和核实。")
+        # The database derives a frozen summary from acquisition evidence and
+        # append-only historical declarations; unknown raw facts stay unknown.
         canonical = self.session.execute(text("SELECT integration.archive_summary(id) FROM integration.execution_archive WHERE public_id=:id"), {"id": current["id"]}).scalar_one()
         summary = TestSummary.model_validate(canonical)
         SubmissionRepository(self.session).submit(SubmissionCreate(summary=summary,expected_revision=payload.expected_submission_revision,reason=payload.reason),key)
         return self.get(current["id"],history=True)
+
+    def intake_submit(self, reference, payload: ArchiveIntakeSubmit, key: str):
+        current = self.get(reference)
+        public_id = self.session.execute(text("SELECT integration.archive_intake_submit(:id,CAST(:payload AS jsonb),:key)"),
+            {"id": current["id"], "payload": payload.model_dump_json(), "key": key}).scalar_one()
+        return self.get(public_id, history=True)
 
     def analyses(self, reference):
         archive = self.get(reference)

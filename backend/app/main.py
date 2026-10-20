@@ -13,6 +13,7 @@ from app.api.routes import (
     access,
     admin,
     archives,
+    archive_imports,
     auth,
     dashboard,
     health,
@@ -147,3 +148,4 @@ app.include_router(mtbf.router)
 app.include_router(setup.router)
 app.include_router(submissions.router)
 app.include_router(archives.router)
+app.include_router(archive_imports.router)

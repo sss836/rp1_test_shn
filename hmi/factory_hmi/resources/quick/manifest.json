@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "trajectories": [
+    {
+      "limb": "left_arm",
+      "file": "left_arm_joint_inspect.npz",
+      "sha256": "984cf5a6764113800edf764d9f779a83e5bf29da90b9f9349e7b771b1719a746",
+      "source_name": "left_arm_joint_inspect.npz"
+    },
+    {
+      "limb": "right_arm",
+      "file": "right_arm_joint_inspect.npz",
+      "sha256": "b610359b4b2813900ac4293980ca832149200ed3d63fa44a7a4257e8dc5cdbba",
+      "source_name": "right_arm_joint_inspect.npz"
+    },
+    {
+      "limb": "left_short_arm",
+      "file": "left_short_arm_joint_1.npz",
+      "sha256": "85bd3dc12293f4d0ecb66971e1f3af37c315e1c412db54b37fe5c99f6ac566eb",
+      "source_name": "left_short_arm_joint_1.npz"
+    },
+    {
+      "limb": "right_short_arm",
+      "file": "right_short_arm_joint_inspect.npz",
+      "sha256": "6b5b447399d48233c5c27571c67cbc7c0ef6a984a954f34e27b1cd1434945a84",
+      "source_name": "right_short_arm_joint_inspect.npz"
+    },
+    {
+      "limb": "left_short_leg",
+      "file": "left_short_leg_flow.npz",
+      "sha256": "a3066437b09168955c4d5fa14c690772c14afcdc87ef2ce54c739e5f0da820e4",
+      "source_name": "left_short_leg_flow.npz"
+    },
+    {
+      "limb": "right_short_leg",
+      "file": "right_short_leg_flow.npz",
+      "sha256": "8a45ed836d1557fd149cf15b65b812d8d1cbd935189a5e1c88ef01a405d70d3b",
+      "source_name": "right_short_leg_flow.npz"
+    },
+    {
+      "limb": "waist_hip",
+      "file": "waist_hip_joint_inspect.npz",
+      "sha256": "cf68d2c8b21e65ea89d75b1017d81237a3ee09c15acf60a256cac2ab5d68aaf0",
+      "source_name": "waist_hip_joint_inspect.npz"
+    }
+  ]
+}

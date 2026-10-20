@@ -30,10 +30,11 @@ it("shows a published catalog without samples and preserves disabled catalog ent
   expect(navigate).toHaveBeenCalledWith("1");
 });
 
-it("keeps all seven module groups with zero counts in an empty sample database", async () => {
+it("keeps all eight module groups with zero counts in an empty sample database", async () => {
   view(<AssetsPage assetKind="MODULE" part={null} selectPart={vi.fn()} clearPart={vi.fn()} navigate={vi.fn()} />);
   await screen.findByText("ARM");
-  expect(screen.getAllByText("0 台")).toHaveLength(14);
+  expect(screen.getAllByText("0 台")).toHaveLength(16);
+  expect(screen.getByText("WAISTHIP")).toBeTruthy();
   expect(screen.getByText("HEAD")).toBeTruthy();
 });
 
