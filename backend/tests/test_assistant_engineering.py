@@ -56,6 +56,9 @@ def test_torque_absolute_peak_raw_range_and_approval(tmp_path,monkeypatch):
     assert result["largest_in_scanned_scope"]["peak_abs"]==12
     assert result["largest_in_scanned_scope"]["range"]=={"start":0,"end":1}
     assert result["complete"]
+    scoped=business.compare_torque(None,{"archives":["synthetic"]},{"archive_id":"synthetic","start":1,"end":1})["data"]
+    assert scoped["largest_in_scanned_scope"]["subject"]=="b" and scoped["largest_in_scanned_scope"]["peak_abs"]==9
+    with pytest.raises(ApiError):business.compare_torque(None,{"archives":["synthetic"]},{"archive_id":"synthetic","selection_empty":True})
     archive["submission_status"]="PENDING"
     assert not business.compare_torque(None,{"archives":["synthetic"]},{})["data"]["items"]
     assert business.compare_torque(None,{"archives":["synthetic"],"scope":"raw"},{})["data"]["items"]

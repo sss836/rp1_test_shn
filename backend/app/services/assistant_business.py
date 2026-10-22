@@ -79,9 +79,12 @@ def runtime_summary(session,args,context):
         "meaning":"累计总时长、有效暴露、排除、待确认和当前执行时长分别展示；部位多样品合计不是单台连续运行时间。"},"/api/v1/dashboard/home","原始秒；hours为小时")
 
 def compare_torque(session,args,context):
-    if context.get("selection_empty") and not args.get("archives"):
+    if context.get("selection_empty") and (not args.get("archives") or context.get("archive_id") in args["archives"]):
         raise ApiError(422,"archive_selection_empty","当前选择没有重叠数据，请明确比较对象或归档范围。")
     repo=ArchiveRepository(session); references=args.get("archives") or ([context["archive_id"]] if context.get("archive_id") else [])
+    selected=not args.get("archives") or references==[context.get("archive_id")]
+    range_start=args.get("start",context.get("start") if selected else None)
+    range_end=args.get("end",context.get("end") if selected else None)
     truncated=False;excluded=[];rows=[]
     if references:
         if len(references)>8:raise ApiError(422,"torque_scope_large","一次最多比较8份归档，可分批明确范围。")
@@ -96,9 +99,10 @@ def compare_torque(session,args,context):
           LEFT JOIN test.asset asset ON asset.id=e.asset_id
           LEFT JOIN test.module_profile mp ON mp.asset_id=asset.id
           WHERE a.processing_state='READY'
+          AND (:raw_scope OR info.submission_status='APPROVED')
           AND (:all_parts OR mp.target_part_code=ANY(CAST(:parts AS text[])))
           AND (:all_assets OR asset.public_id::text=:asset OR asset.asset_code=:asset)
-          ORDER BY a.id DESC LIMIT 9"""),{"all_parts":not codes,"parts":codes,"all_assets":not args.get("asset"),"asset":str(args.get("asset") or "")}).scalars().all()
+          ORDER BY a.id DESC LIMIT 9"""),{"raw_scope":args.get("scope")=="raw","all_parts":not codes,"parts":codes,"all_assets":not args.get("asset"),"asset":str(args.get("asset") or "")}).scalars().all()
         truncated=len(ids)>8;archives=[repo.get(x) for x in ids[:8]]
     settings=get_settings();service=CurveAnalysisService(ArchiveStorage(settings.archive_root),settings.archive_query_memory_mb)
     started=time.monotonic()
@@ -114,7 +118,7 @@ def compare_torque(session,args,context):
         for offset in range(0,len(torque),32):
             chosen=torque[offset:offset+32]
             metrics=list(dict.fromkeys(x["key"] for x in chosen))
-            selection=service.select(archive,metrics,[],args.get("start"),args.get("end"))
+            selection=service.select(archive,metrics,[],range_start,range_end)
             stat=service.statistics(selection)
             for item in stat["series"]:
                 values=[v for v in (item.get("min"),item.get("max")) if isinstance(v,(int,float))]
