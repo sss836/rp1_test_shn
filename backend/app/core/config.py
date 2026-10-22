@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     assistant_runtime_enabled: bool = False
     assistant_production_enabled: bool = False
     assistant_task_seconds: int = Field(default=120,ge=1,le=120)
+    assistant_attachment_root: str = ""
+    assistant_source_root: str = "/var/lib/rp1/assistant-source"
     # Verified official CNY peak rates per million tokens. Applying peak rates
     # at all times conservatively bounds spend without guessing holidays.
     assistant_price_valid_until: str = "2026-10-29T00:00:00+08:00"

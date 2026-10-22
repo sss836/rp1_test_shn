@@ -26,6 +26,8 @@ const server = createServer(async (req, res) => {
     tool_names: body.tools.map((item) => item.function.name),
     tool_parameters: body.tools.map((item) => item.function.parameters),
     roles: body.messages.map((item) => item.role),
+    image_count: body.messages.filter(item=>item.role==="user").flatMap(item=>Array.isArray(item.content)?item.content:[]).filter(item=>item.type==="image_url").length,
+    has_actual_question: body.messages.some(item=>item.role==="user"&&JSON.stringify(item.content).includes("当前用户问题")),
     contains_rp1_credentials: /tool_grant|rp1_session|rp1_csrf|X-RP1-Tool-Grant|X-RP1-Bridge-Secret/i.test(raw),
   });
   if (mode === "limited") { res.writeHead(429); res.end('{"error":{"message":"synthetic sensitive provider detail"}}'); return; }

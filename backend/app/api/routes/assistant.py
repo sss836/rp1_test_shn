@@ -25,7 +25,7 @@ class EmptyProbe(BaseModel):
 def capabilities(actor: RequestActorDep):
     require_pilot(get_settings(), actor.public_id, actor.role, actor.principal_kind)
     if get_settings().assistant_runtime_enabled:
-        return DataEnvelope(data={'mode':'assistant_runtime','tools':['get_curve_statistics','get_test_progress','list_hmi_stations','apply_setup_bundle'],'writes_enabled':True,'limits':{'daily_cny':100,'concurrency':2,'rounds':6,'seconds':120,'chat_days':30}})
+        return DataEnvelope(data={'mode':'assistant_runtime','tools':['get_curve_statistics','get_test_progress','list_hmi_stations','apply_setup_bundle',*__import__('app.services.assistant_business',fromlist=['TOOLS']).TOOLS],'writes_enabled':True,'limits':{'daily_cny':100,'concurrency':2,'rounds':6,'seconds':120,'chat_days':30}})
     return DataEnvelope(data={"mode": "isolation_probe", "tools": [TOOL_NAME], "writes_enabled": False})
 
 

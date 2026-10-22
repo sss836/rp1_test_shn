@@ -1,6 +1,8 @@
 from typing import Annotated
 from uuid import UUID
 from fastapi import APIRouter,Header,Request
+from fastapi.responses import Response
+from urllib.parse import unquote
 from sqlalchemy.exc import DBAPIError
 from app.core.auth import RequestActorDep
 from app.core.errors import ApiError
@@ -12,6 +14,35 @@ from app.core.config import get_settings
 
 router=APIRouter(prefix='/api/v1/assistant',tags=['assistant-runtime'])
 Grant=Annotated[str,Header(alias='X-RP1-Tool-Grant',min_length=32,max_length=128)]
+
+
+@router.post('/attachments',status_code=201)
+async def attachment_upload(request:Request,actor:RequestActorDep):
+    require_runtime(actor)
+    from app.services.assistant_attachments import upload,MAX_BYTES
+    from app.core.errors import ApiError
+    from starlette.concurrency import run_in_threadpool
+    raw=bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw)>MAX_BYTES:raise ApiError(413,'attachment_size','附件最大4MB。')
+    return DataEnvelope(data=await run_in_threadpool(upload,actor,bytes(raw),unquote(request.headers.get('x-filename','attachment')),request.headers.get('content-type','').split(';')[0]))
+
+
+@router.get('/attachments/{identifier}')
+def attachment_get(identifier:UUID,actor:RequestActorDep):
+    require_runtime(actor)
+    from app.services.assistant_attachments import read
+    meta,raw=read(actor,identifier)
+    return Response(raw,media_type=meta['mime'],headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Content-Disposition':'inline' if meta['kind']=='image' else 'attachment'})
+
+
+@router.delete('/attachments/{identifier}',status_code=204)
+def attachment_delete(identifier:UUID,actor:RequestActorDep):
+    require_runtime(actor)
+    from app.services.assistant_attachments import delete
+    delete(actor,identifier)
+    return Response(status_code=204)
 
 
 @router.get('/threads')

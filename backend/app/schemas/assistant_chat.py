@@ -16,6 +16,7 @@ class PageContext(BaseModel):
     end: float | None = Field(default=None,ge=0,le=1e12,allow_inf_nan=False)
     stage: str | None = Field(default=None,max_length=100)
     cycle: str | None = Field(default=None,max_length=100)
+    target_part_code: str | None = Field(default=None,max_length=30)
 
     @model_validator(mode="after")
     def valid_selection(self):
@@ -30,11 +31,12 @@ class ChatSubmit(BaseModel):
     thread_id: UUID | None = None
     message: str = Field(min_length=1,max_length=8000)
     context: PageContext = Field(default_factory=PageContext)
+    attachments: list[UUID] = Field(default_factory=list,max_length=3)
 
 
 class ReadTool(BaseModel):
     model_config=ConfigDict(extra="forbid")
-    tool: Literal["get_curve_statistics","get_test_progress","list_hmi_stations"]
+    tool: str = Field(pattern=r"^[a-z_]{1,50}$")
     arguments: dict = Field(default_factory=dict)
 
 

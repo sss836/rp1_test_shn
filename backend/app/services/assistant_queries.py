@@ -12,6 +12,9 @@ from app.services.curve_analysis import CurveAnalysisService
 
 
 def query(session,tool,arguments,context):
+    if tool not in {"get_curve_statistics","get_test_progress","list_hmi_stations"}:
+        from app.services.assistant_business import query as business_query
+        return business_query(session,tool,arguments,context)
     at=datetime.now(timezone.utc).isoformat()
     if tool=="get_curve_statistics":
         args=CurveArguments.model_validate(arguments)

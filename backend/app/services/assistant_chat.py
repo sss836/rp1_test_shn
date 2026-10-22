@@ -91,6 +91,8 @@ class ChatRuntime:
         while True:
             await asyncio.sleep(60)
             with SessionLocal.begin() as session:session.execute(text("SELECT integration.assistant_maintenance(false)"))
+            from app.services.assistant_attachments import cleanup_expired
+            await asyncio.to_thread(cleanup_expired)
             with setup_flow.lock:
                 now=time.monotonic()
                 for key in [k for k,v in setup_flow.proposals.items() if v.expires<=now]:setup_flow.proposals.pop(key,None)
@@ -103,6 +105,8 @@ class ChatRuntime:
 
     async def submit(self,payload,request,actor):
         require_runtime(actor)
+        from app.services.assistant_attachments import freeze
+        attachments=freeze(actor,payload.attachments)
         if re.search(r"sk-[a-zA-Z0-9]{20,}|Authorization\s*:\s*Bearer",payload.message):
             raise ApiError(422,"assistant_secret_rejected","请勿在助手对话中发送密钥或登录凭据。")
         if self.queue is None: raise ApiError(503,"assistant_worker_unavailable","助手任务执行器未就绪。")
@@ -127,6 +131,7 @@ class ChatRuntime:
             authority=setup_flow.command_messages([m['body'] for m in messages if m['role']=='user'][-12:])
             choices=setup_flow.matching_choices(session,authority)
             snapshot={'messages':messages,'authorization_messages':authority,'choices':choices,'context':payload.context.model_dump(mode='json',exclude_none=True)}
+            snapshot["attachments"]=attachments
             encoded=canonical(snapshot)
             session.execute(text("UPDATE integration.assistant_job SET input_message_id=:message,input_snapshot=CAST(:snapshot AS jsonb),input_hash=:hash WHERE id=:id"),{'id':payload.request_key,'message':message_id,'snapshot':encoded,'hash':hashlib.sha256(encoded.encode()).hexdigest()})
             session.execute(text("UPDATE integration.assistant_thread SET updated_at=now() WHERE id=:id"),{'id':thread})
@@ -168,7 +173,8 @@ class ChatRuntime:
             self.tokens[grants.key(token)]={'id':identifier,'actor':actor,'context':job['context'],'cards':cards,'write_count':0,'reads':0}
             async with asyncio.timeout(max(.001,settings.assistant_task_seconds-(time.monotonic()-started))):
                 async with httpx.AsyncClient(timeout=settings.assistant_task_seconds,trust_env=False,follow_redirects=False) as client:
-                    response=await client.post(settings.assistant_pi_url.rstrip('/')+'/internal/chat',json={'tool_grant':token,'messages':messages,'choices':choices,'context':job['context'],'timeout_ms':settings.assistant_task_seconds*1000},headers={'X-RP1-Bridge-Secret':service_secret(settings)})
+                    from app.services.assistant_attachments import model_content
+                    response=await client.post(settings.assistant_pi_url.rstrip('/')+'/internal/chat',json={'tool_grant':token,'messages':messages,'choices':choices,'context':job['context'],'attachments':model_content(actor,snapshot.get('attachments',[])),'timeout_ms':settings.assistant_task_seconds*1000},headers={'X-RP1-Bridge-Secret':service_secret(settings)})
             outcome=intent.outcome
             if response.status_code!=200:
                 state='TIMED_OUT' if response.status_code==504 else 'FAILED'
@@ -221,7 +227,16 @@ class ChatRuntime:
     def read(self,token,payload):
         item=self.authorize(token);item['reads']+=1
         if item['reads']>12:raise ApiError(409,"assistant_tool_limit","单任务工具调用过多。")
-        with actor_session(item['actor']) as session:card=query(session,payload.tool,payload.arguments,item['context'])
+        from app.services.assistant_privacy import public_evidence
+        try:
+            if payload.tool in {'search_project_source','read_project_source','search_web','read_web_page'}:
+                card=query(None,payload.tool,payload.arguments,item['context'])
+            else:
+                with actor_session(item['actor']) as session:card=query(session,payload.tool,payload.arguments,item['context'])
+        except (ApiError,ValueError,TypeError) as exc:
+            if isinstance(exc,ApiError) and exc.status_code in (401,403):raise
+            card={'type':'query_issue','title':'查询需要调整','source':payload.tool,'updated_at':datetime.now(timezone.utc).isoformat(),'data':{'status':'unavailable','code':getattr(exc,'code','invalid_arguments'),'message':getattr(exc,'message','查询参数不匹配，请根据真实目录调整。')}}
+        card=public_evidence(card)
         item['cards'].append(json.loads(canonical(card)))
         return card
 
@@ -250,7 +265,7 @@ def history(actor,thread):
     require_runtime(actor)
     with actor_session(actor) as session:
         if session.execute(text("SELECT id FROM integration.assistant_thread WHERE id=:id"),{'id':thread}).first() is None:raise ApiError(404,"assistant_thread_not_found","会话不存在或不可访问。")
-        rows=[dict(x) for x in session.execute(text("SELECT id,job_id,role,body,context,cards,created_at FROM integration.assistant_message WHERE thread_id=:id AND created_at>=now()-interval '30 days' ORDER BY id DESC LIMIT 200"),{'id':thread}).mappings()][::-1]
+        rows=[dict(x) for x in session.execute(text("SELECT m.id,m.job_id,m.role,m.body,m.context,m.cards,m.created_at,coalesce(j.input_snapshot->'attachments','[]'::jsonb) AS attachments FROM integration.assistant_message m LEFT JOIN integration.assistant_job j ON j.id=m.job_id WHERE m.thread_id=:id AND m.created_at>=now()-interval '30 days' ORDER BY m.id DESC LIMIT 200"),{'id':thread}).mappings()][::-1]
         jobs=[dict(x) for x in session.execute(text("SELECT id,state,created_at FROM integration.assistant_job WHERE thread_id=:id AND created_at>=now()-interval '30 days' ORDER BY created_at DESC LIMIT 10"),{'id':thread}).mappings()]
         return {'messages':rows,'jobs':jobs}
 

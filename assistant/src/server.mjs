@@ -37,15 +37,16 @@ export function buildServer(config, probe = runProbe) {
       let bytes = 0;
       for await (const chunk of request) {
         bytes += chunk.length;
-        if (bytes > (isChat?524288:isSetup ? 131072 : 1024)) return send(response, 413, { error: "body_too_large" });
+        if (bytes > (isChat?18000000:isSetup ? 131072 : 1024)) return send(response, 413, { error: "body_too_large" });
         chunks.push(chunk);
       }
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== (isChat?5:isSetup ? 3 : 1) || typeof body.tool_grant !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(body.tool_grant)) {
+      if (!body || typeof body !== "object" || Array.isArray(body) || (isChat?![5,6].includes(Object.keys(body).length):Object.keys(body).length !== (isSetup ? 3 : 1)) || typeof body.tool_grant !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(body.tool_grant)) {
         return send(response, 422, { error: "invalid_probe" });
       }
       if(isSetup && (!Array.isArray(body.messages)||body.messages.length>12||!body.messages.every((m)=>typeof m==="string"&&m.length<=8000)||!body.choices||typeof body.choices!=="object"))return send(response,422,{error:"invalid_setup"});
       if(isChat&&(!Array.isArray(body.messages)||body.messages.length>20||!body.context||!body.choices||!Number.isInteger(body.timeout_ms)||body.timeout_ms<1000||body.timeout_ms>120000))return send(response,422,{error:"invalid_chat"});
+      if(isChat&&body.attachments!==undefined&&(!Array.isArray(body.attachments)||body.attachments.length>3||body.attachments.some(a=>!a||!["text","image"].includes(a.type)||(a.type==="image"&&(!["image/png","image/jpeg"].includes(a.mimeType)||typeof a.data!=="string"||a.data.length>5700000))||(a.type==="text"&&(typeof a.text!=="string"||a.text.length>25000)))))return send(response,422,{error:"invalid_attachment"});
       send(response, 200, isChat?await runChat(config,body,controller.signal):isSetup ? await runSetup(config, body, controller.signal) : await probe(config, body.tool_grant, controller.signal));
     } catch {
       // Never return or log provider errors, prompts, tokens or raw payloads.

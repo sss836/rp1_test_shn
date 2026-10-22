@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, ArrowUp, ArrowUpRight, CheckCircle2, ChevronDown, Clock3, History, Layers, Link2, ListChecks, Plus, Radio, Sparkles, Square, X } from "lucide-react";
-import { assistantApi, type PageContext, type AssistantCard } from "../assistantApi";
+import { Activity, ArrowUp, ArrowUpRight, CheckCircle2, ChevronDown, Clock3, History, Layers, Link2, Paperclip, ListChecks, Plus, Radio, Sparkles, Square, X } from "lucide-react";
+import { assistantApi, type PageContext, type AssistantCard, type AssistantAttachment } from "../assistantApi";
 import { requestId } from "../client";
 import { locationHref, type View } from "../navigation";
 import "../assistant.css";
@@ -72,9 +72,11 @@ export function AssistantPanel({ accountKey, context, navigate }: { accountKey: 
   const cache = useQueryClient();
   const [open, setOpen] = useState(false), [thread, setThread] = useState(""), [jobId, setJob] = useState("");
   const [input, setInput] = useState(""), [error, setError] = useState(""), [sending, setSending] = useState(false), [approved, setApproved] = useState(false), [showHistory, setShowHistory] = useState(false), [canRetry, setCanRetry] = useState(false);
-  const pending = useRef<{ request_key: string; thread_id?: string; message: string; context: PageContext } | null>(null);
+  const [attachments,setAttachments]=useState<AssistantAttachment[]>([]),[uploading,setUploading]=useState(false);
+  const fileInput=useRef<HTMLInputElement|null>(null),uploadController=useRef<AbortController|null>(null);
+  const pending = useRef<{ request_key: string; thread_id?: string; message: string; context: PageContext; attachments?:string[] } | null>(null);
   const controller = useRef<AbortController | null>(null), textarea = useRef<HTMLTextAreaElement | null>(null), bottom = useRef<HTMLDivElement | null>(null);
-  useEffect(() => () => controller.current?.abort(), []);
+  useEffect(() => () => {controller.current?.abort();uploadController.current?.abort();}, []);
   useEffect(() => { const show = () => setOpen(true); window.addEventListener("rp1-open-assistant", show); return () => window.removeEventListener("rp1-open-assistant", show); }, []);
   const threads = useQuery({ queryKey: ["assistant-threads", accountKey], queryFn: ({ signal }) => assistantApi.threads(signal), enabled: open, retry: false });
   const history = useQuery({ queryKey: ["assistant-history", accountKey, thread], queryFn: ({ signal }) => assistantApi.history(thread, signal), enabled: open && !!thread, retry: false });
@@ -92,16 +94,24 @@ export function AssistantPanel({ accountKey, context, navigate }: { accountKey: 
 
   async function send(payload: NonNullable<typeof pending.current>) {
     controller.current?.abort(); const abort = new AbortController(); controller.current = abort; setSending(true); setError(""); setCanRetry(false);
-    try { const result = await assistantApi.submitJob(payload, abort.signal); if (abort.signal.aborted) return; setThread(result.thread_id); setJob(result.id); setInput(""); setApproved(false); pending.current = null; await threads.refetch(); }
+    try { const result = await assistantApi.submitJob(payload, abort.signal); if (abort.signal.aborted) return; setThread(result.thread_id); setJob(result.id); setInput(""); setAttachments([]); setApproved(false); pending.current = null; await threads.refetch(); }
     catch (e) { if (!abort.signal.aborted) { setError(e instanceof Error ? e.message : "发送失败，可用原请求标识重试并查询回执。"); setCanRetry(pending.current !== null); } }
     finally { if (!abort.signal.aborted) setSending(false); }
   }
   function submit(event: FormEvent) {
-    event.preventDefault(); if (!input.trim() || active || sending || blocked) return;
-    const payload = { request_key: requestId(), ...(thread ? { thread_id: thread } : {}), message: input.trim(), context: structuredClone(context) };
+    event.preventDefault(); if ((!input.trim() && !attachments.length) || active || sending || uploading || blocked) return;
+    const payload = { request_key: requestId(), ...(thread ? { thread_id: thread } : {}), message: input.trim()||"请分析所附图片或日志，结合项目源码说明原因与依据。", context: structuredClone(context), attachments:attachments.map(a=>a.id) };
     pending.current = payload; void send(payload);
   }
-  function newThread() { if (active || sending) return; setThread(""); setJob(""); setInput(""); setError(""); setApproved(false); pending.current = null; setShowHistory(false); textarea.current?.focus(); }
+  async function addFiles(files:FileList|null) {
+    if(!files||active||sending||uploading)return;
+    if(files.length+attachments.length>3){setError("每条消息最多3个附件。");return;}
+    const abort=new AbortController();uploadController.current=abort;setUploading(true);setError("");
+    try{for(const file of Array.from(files)){const item=await assistantApi.uploadAttachment(file,abort.signal);if(!abort.signal.aborted)setAttachments(previous=>[...previous,item]);}}
+    catch(e){if(!abort.signal.aborted)setError(e instanceof Error?e.message:"附件上传失败");}
+    finally{if(!abort.signal.aborted)setUploading(false);if(fileInput.current)fileInput.current.value="";}
+  }
+  function newThread() { if (active || sending) return; setThread(""); setJob(""); setInput(""); setAttachments([]); setError(""); setApproved(false); pending.current = null; setShowHistory(false); textarea.current?.focus(); }
   const outcome = job.data?.result?.setup;
   const publish = outcome?.operations?.some((op) => op.kind === "case_publish" || op.data.publish === true);
   const queryError = threads.error ?? history.error ?? job.error ?? budget.error;
@@ -117,14 +127,14 @@ export function AssistantPanel({ accountKey, context, navigate }: { accountKey: 
       {(error || queryError || blocked) && <div className="assistant-notice" role="alert"><p>{error || (queryError instanceof Error ? queryError.message : blocked ? "计费信息待核对，暂时无法发起新的模型调用。" : "助手连接异常，现有业务仍可使用。")}</p>{error && canRetry && <button type="button" className="assistant-text-button" disabled={sending} onClick={() => { if (pending.current) void send(pending.current); }}>使用原请求标识重试并核对回执</button>}</div>}
       <div className="assistant-conversation" aria-live="polite">
         {!hasConversation && <div className="assistant-welcome"><span className="assistant-welcome-mark"><Sparkles size={24}/></span><h3>今天想了解什么？</h3><p>从当前页面开始，<br/>让数据和测试进展更清楚。</p><div className="assistant-suggestions">{suggestions.map(({ icon: Icon, text, hint }) => <button key={text} type="button" onClick={() => { setInput(text); textarea.current?.focus(); }}><span className="assistant-suggestion-icon"><Icon size={17}/></span><span><strong>{text}</strong><small>{hint}</small></span><ChevronDown className="assistant-suggestion-arrow" size={15}/></button>)}</div></div>}
-        {messages.map((message) => <section className={`assistant-message is-${message.role}`} key={message.id}>{message.role === "assistant" && <span className="assistant-message-avatar"><Sparkles size={13}/></span>}<div className="assistant-message-content"><span className="assistant-message-name">{message.role === "user" ? "你" : "RP1 助手"}</span><p>{message.body}</p>{message.cards.map((card, index) => <ResultCard key={index} card={card} context={message.context?.kind ? message.context : context} navigate={navigate}/>)}</div></section>)}
+        {messages.map((message) => <section className={`assistant-message is-${message.role}`} key={message.id}>{message.role === "assistant" && <span className="assistant-message-avatar"><Sparkles size={13}/></span>}<div className="assistant-message-content"><span className="assistant-message-name">{message.role === "user" ? "你" : "RP1 助手"}</span><p>{message.body}</p>{message.attachments?.map(a=><span className="assistant-file-label" key={a.id}>附件：{a.name}</span>)}{message.cards.map((card, index) => <ResultCard key={index} card={card} context={message.context?.kind ? message.context : context} navigate={navigate}/>)}</div></section>)}
         {job.data && !currentReplyInHistory && job.data.result && <section className="assistant-message is-assistant"><span className="assistant-message-avatar"><Sparkles size={13}/></span><div className="assistant-message-content"><span className="assistant-message-name">RP1 助手</span><p>{job.data.result.reply}</p>{job.data.result.cards.map((card, index) => <ResultCard key={index} card={card} context={job.data!.context} navigate={navigate}/>)}</div></section>}
         {(active || sending) && <div className="assistant-working"><span className="assistant-live-dot"/>{sending ? "正在提交…" : job.data?.state === "QUEUED" ? "排队中，稍后为你处理" : "正在整理结果…"}</div>}
         {job.data && <div className="assistant-task-state" aria-label="当前任务"><span title={`模型交互 ${job.data.rounds}/6`}>{job.data.receipt && <CheckCircle2 size={12}/>}任务：{stateNames[job.data.state] ?? job.data.state}{job.data.result?.business_status && ` · ${businessNames[job.data.result.business_status]}`}</span>{active && <button type="button" className="assistant-text-button" onClick={() => void assistantApi.cancel(jobId).then(() => job.refetch()).catch((e: unknown) => setError(e instanceof Error ? e.message : "停止失败，请核对回执。"))}><Square size={10}/>停止并核对回执</button>}</div>}
         {outcome?.status === "needs_adoption" && <section className="assistant-proposal"><strong>需要你采用参数</strong><p>以下建议尚未保存，请补充真实值或采用后执行。</p><pre>{JSON.stringify(outcome.operations, null, 2)}</pre>{publish && <label><input type="checkbox" checked={approved} onChange={(event) => setApproved(event.target.checked)}/>我明确要求发布所示版本</label>}<button type="button" className="assistant-adopt-button" disabled={sending || (publish && !approved)} onClick={() => { setSending(true); void assistantApi.adoptSetup(outcome.proposal_id!, outcome.proposal_hash!, approved).then(() => { void job.refetch(); void history.refetch(); }).catch((e: unknown) => setError(e instanceof Error ? e.message : "采用失败")).finally(() => setSending(false)); }}>采用所示参数并执行</button></section>}
         <div ref={bottom}/>
       </div>
-      <footer className="assistant-footer"><form onSubmit={submit}><div className="assistant-composer"><label htmlFor="assistant-message" className="assistant-sr-only">消息</label><textarea id="assistant-message" ref={textarea} required rows={2} maxLength={8000} placeholder="向助手提问，或描述你要做的事…" value={input} onChange={(event) => setInput(event.target.value)} disabled={active || sending} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }}/><div className="assistant-composer-actions"><span><Link2 size={12}/>已关联当前页面</span><button className="assistant-send" type="submit" aria-label="发送" title="发送" disabled={active || sending || !input.trim() || blocked}><ArrowUp size={18}/></button></div></div><p className="assistant-input-hint">Enter 发送<span>Shift + Enter 换行</span></p></form>
+      <footer className="assistant-footer">{attachments.length>0&&<div className="assistant-attachments">{attachments.map(a=><div key={a.id}>{a.kind==="image"&&<img src={`/api/v1/assistant/attachments/${a.id}`} alt={a.name}/>}<span>{a.name}</span><button type="button" aria-label={`移除${a.name}`} disabled={sending||active} onClick={()=>{setAttachments(items=>items.filter(x=>x.id!==a.id));void assistantApi.deleteAttachment(a.id).catch(()=>{});}}><X size={13}/></button></div>)}</div>}{uploading&&<p role="status">正在上传附件…</p>}<form onSubmit={submit}><div className="assistant-composer"><label htmlFor="assistant-message" className="assistant-sr-only">消息</label><textarea id="assistant-message" ref={textarea} rows={2} maxLength={8000} placeholder="询问测试、Linux，或上传报错截图…" value={input} onChange={(event) => setInput(event.target.value)} disabled={active || sending || uploading} onPaste={(event)=>{if(event.clipboardData.files.length){event.preventDefault();void addFiles(event.clipboardData.files);}}} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }}/><div className="assistant-composer-actions"><button type="button" aria-label="添加图片或日志" title="添加图片或日志" disabled={active||sending||uploading||attachments.length>=3} onClick={()=>fileInput.current?.click()}><Paperclip size={17}/></button><input ref={fileInput} type="file" hidden multiple accept="image/png,image/jpeg,image/webp,image/gif,.txt,.log,.json" onChange={event=>void addFiles(event.target.files)}/><span><Link2 size={12}/>已关联当前页面</span><button className="assistant-send" type="submit" aria-label="发送" title="发送" disabled={active || sending || uploading || (!input.trim()&&!attachments.length) || blocked}><ArrowUp size={18}/></button></div></div><p className="assistant-privacy-note">图片和日志将交给模型分析，请先遮盖个人信息与密钥。</p><p className="assistant-input-hint">Enter 发送<span>Shift + Enter 换行</span></p></form>
         <div className="assistant-meta">{budget.data ? <details className="assistant-budget"><summary><span className={`assistant-budget-dot${blocked ? " is-blocked" : ""}`}/>今日 ¥{money(budget.data.spent_cny)}<span className="assistant-budget-limit"> / ¥100</span><ChevronDown size={11}/></summary><div className="assistant-budget-popover"><strong>站点每日预算</strong><p>费用上界 ¥{money(budget.data.spent_cny)}</p><p>已预留 ¥{money(budget.data.reserved_cny)}</p><p>北京时间零点重置。费用为保守上界，非供应商账单。</p></div></details> : <span/>}<span title="聊天按当前账号保存30天，业务操作证据独立长期保留。">聊天保留30天</span></div>
       </footer>
     </aside>}

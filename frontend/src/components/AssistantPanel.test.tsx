@@ -78,3 +78,14 @@ it("shows missing-input business state instead of claiming a write completed",as
   expect(screen.getByLabelText("当前任务").textContent).toContain("待补充，尚未保存");
   expect(screen.getByLabelText("当前任务").textContent).not.toContain("已完成");
 });
+
+
+it("uploads an image and submits its immutable identifier without requiring text",async()=>{
+  vi.spyOn(assistantApi,"uploadAttachment").mockResolvedValue({id:identifier,name:"error.png",kind:"image",mime:"image/png",sha256:"synthetic",size:100,expires_at:"2026-11-21"});
+  const result=view();fireEvent.click(screen.getByText("助手"));
+  fireEvent.change(result.container.querySelector('input[type="file"]')!,{target:{files:[new File(["synthetic"],"error.png",{type:"image/png"})]}});
+  await screen.findByAltText("error.png");
+  fireEvent.submit(screen.getByLabelText("消息").closest("form")!);
+  await screen.findByText("已取得实际数据");
+  expect(assistantApi.submitJob).toHaveBeenCalledWith(expect.objectContaining({attachments:[identifier],message:expect.stringContaining("分析")}),expect.any(AbortSignal));
+});

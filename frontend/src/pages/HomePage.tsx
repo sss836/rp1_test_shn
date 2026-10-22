@@ -10,6 +10,7 @@ import {
   CirclePlay,
   ExternalLink
 } from "lucide-react";
+import { useAssistantPageContext } from "../assistantContext";
 import { getDashboardHome } from "../api";
 import { formatDate, formatDuration, isShowcaseValue } from "../navigation";
 import type { AssetKind, HomeScope, TargetPartCode } from "../types";
@@ -82,6 +83,7 @@ export function HomePage({
   );
   const activeIndex = objects.length > 0 ? index % objects.length : 0;
   const current = objects[activeIndex] as HomeScope | undefined;
+  useAssistantPageContext({view:"home",kind:assetKind,...(current?{target_part_code:current.target_part_code}:{})});
   const modelAsset = current ? getPartModelAsset(current.target_part_code) : null;
   const allCaseItems = useMemo(() => current?.test_cases ?? [], [current]);
   const caseItems = useMemo(
