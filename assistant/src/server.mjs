@@ -25,6 +25,7 @@ export function buildServer(config, probe = runProbe) {
     const isChat=request.url === "/internal/chat";
     if (request.method !== "POST" || (!isChat && !isSetup && request.url !== "/internal/probe")) return send(response, 404, { error: "not_found" });
     if (!secretMatches(request.headers["x-rp1-bridge-secret"], config.bridgeSecret)) return send(response, 403, { error: "forbidden" });
+    if (!isChat && config.allowLegacy === false) return send(response,410,{error:"legacy_closed"});
     if (active >= 2) return send(response, 429, { error: "probe_busy" });
     active++;
     const controller = new AbortController();

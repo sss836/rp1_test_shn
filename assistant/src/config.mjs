@@ -16,6 +16,7 @@ export function loadConfig(env = process.env) {
   if (mode === "mock" && env.APP_ENV !== "test") throw new Error("mock requires test environment");
   return Object.freeze({
     mode,
+    allowLegacy: env.APP_ENV === 'test',
     // There is no configurable arbitrary model URL or model-supplied URL tool.
     modelUrl: mode === "live" ? "https://api.deepseek.com" : "http://model-mock:3100/v1",
     apiKey: mode === "live" ? secretFile(env.DEEPSEEK_API_KEY_FILE) : "synthetic-model-key-for-isolated-test",

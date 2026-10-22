@@ -13,12 +13,24 @@ test("server-only config fixes official model endpoint and rejects device/DB con
   try {
     const env = { RP1_BRIDGE_SECRET_FILE: secret, DEEPSEEK_API_KEY_FILE: secret };
     assert.equal(loadConfig(env).modelUrl, "https://api.deepseek.com");
+    assert.equal(loadConfig({...env,APP_ENV:'production'}).allowLegacy,false);
     assert.throws(() => loadConfig({ ...env, DATABASE_URL: "forbidden" }));
     assert.throws(() => loadConfig({ ...env, PLC_HOST: "forbidden" }));
     assert.throws(() => loadConfig({ ...env, PI_MODEL_MODE: "mock", APP_ENV: "production" }));
     assert.throws(() => loadConfig({ RP1_BRIDGE_SECRET_FILE: secret }));
     assert.equal(loadConfig({ ...env, PI_MODEL_MODE: "mock", APP_ENV: "test" }).modelUrl, "http://model-mock:3100/v1");
   } finally { rmSync(dir, { recursive: true }); }
+});
+
+test('production bridge closes legacy unmetered endpoints even with bridge authentication',async(t)=>{
+  const secret='c'.repeat(48);
+  const server=buildServer({bridgeSecret:secret,allowLegacy:false},async()=>{throw new Error('must not call model');});
+  server.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));
+  t.after(()=>new Promise(resolve=>server.close(resolve)));
+  for(const path of ['/internal/probe','/internal/setup']){
+    const response=await fetch(`http://127.0.0.1:${server.address().port}`+path,{method:'POST',headers:{'X-RP1-Bridge-Secret':secret},body:'{}'});
+    assert.equal(response.status,410);
+  }
 });
 
 test("private server rejects unauthenticated, arbitrary input and oversized bodies", async (t) => {
