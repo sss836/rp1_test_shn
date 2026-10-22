@@ -21,12 +21,14 @@ function presenceLabel(items: HmiStation[], live: boolean, admin: boolean) {
   return stationLabels[online[0].state];
 }
 
-export default function BenchOverviewPage({ navigate }: { navigate: (view: View) => void }) {
+export default function BenchOverviewPage({ navigate,initialStationId }: { navigate: (view: View) => void;initialStationId?:string }) {
   const { session } = useAuth();
   const admin = session?.user.role === "SYSTEM_ADMIN";
+  const canCreate = ["SYSTEM_ADMIN", "TEST_EXECUTOR"].includes(session?.user.role ?? "");
   const [automatic, setAutomatic] = useState(true);
   const [creating, setCreating] = useState(false);
   const [search, setSearch] = useState("");
+  const [focused,setFocused]=useState(initialStationId??"");
   const [type, setType] = useState("all");
   const [filter, setFilter] = useState("all");
   const [now, setNow] = useState(Date.now);
@@ -48,6 +50,7 @@ export default function BenchOverviewPage({ navigate }: { navigate: (view: View)
   const { byCode, unmatched } = associateStations(stations, hmis);
   const needle = search.trim().toLocaleLowerCase();
   const rows = stations.filter((station) => {
+    if(focused&&station.id!==focused)return false;
     const items = byCode.get(benchCode(station.code)) ?? [];
     const matchesSearch = [station.code, station.name, station.site_code, station.site_name, station.lab_code, station.lab_name, station.site_location].join(" ").toLocaleLowerCase().includes(needle);
     const matchesState = filter === "all" || (filter === "available" ? station.available : filter === "disabled" ? !station.available : filter === "unreported" ? live && !items.length : filter === "online" ? live && items.some((item) => item.online) : filter === "running" ? live && items.some(isStationTesting) : live && !!items.length && items.every((item) => !item.online));
@@ -60,8 +63,8 @@ export default function BenchOverviewPage({ navigate }: { navigate: (view: View)
   return (
     <div className="workbench bench-overview-page">
       <PageTitle eyebrow="BENCH OVERVIEW" title="台架总览" description="查看全部已建档台架的编号、名称、位置和运行情况。整机、模块和共用台架在此统一显示。"
-        trailing={<div className="bench-actions">{admin && <button type="button" className="primary-button" aria-expanded={creating} onClick={() => setCreating((value) => !value)}>{creating ? "收起新建" : "新建台架"}</button>}<button type="button" className="subtle-button" onClick={() => navigate("stations")}>上位机监控</button><button type="button" className="subtle-button" onClick={refresh} disabled={fetching}><RefreshCw aria-hidden="true" />{fetching ? "刷新中…" : "立即刷新"}</button></div>} />
-      {admin && creating && <StationCreateForm after={() => { setCreating(false); setSearch(""); setType("all"); setFilter("all"); }} />}
+        trailing={<div className="bench-actions">{canCreate && <button type="button" className="primary-button" aria-expanded={creating} onClick={() => setCreating((value) => !value)}>{creating ? "收起新建" : "新建台架"}</button>}<button type="button" className="subtle-button" onClick={() => navigate("stations")}>上位机监控</button><button type="button" className="subtle-button" onClick={refresh} disabled={fetching}><RefreshCw aria-hidden="true" />{fetching ? "刷新中…" : "立即刷新"}</button></div>} />
+      {canCreate && creating && <StationCreateForm after={() => { setCreating(false); setSearch(""); setType("all"); setFilter("all"); }} />}
       <p className="hmi-scope-note">台架名称来自平台建档。运行状态按上位机填写的台架编号关联，不能代替现场设备身份核对；此页不计入正式测试统计。</p>
       {!admin && <p className="hmi-snapshot-note">台架清单包含全部已建档台架；运行状态仅包含当前账号可见的上位机。“无可见上报”不代表台架离线或无人使用。</p>}
       {registry.isPending ? <LoadingState label="正在读取台架清单" /> : registry.isError && !registry.data ? <ErrorState error={registry.error} retry={refresh} /> : <>
@@ -73,6 +76,7 @@ export default function BenchOverviewPage({ navigate }: { navigate: (view: View)
           <div><span>{admin ? "测试运行中的台架" : "可见测试运行中的台架"}</span><strong>{live ? testingCount : "—"}</strong></div>
         </section>
         <section className="bench-filters" aria-label="台架筛选">
+          {focused&&<p>当前定位台架：{focused}<button type="button" onClick={()=>setFocused("")}>返回全部台架</button></p>}
           <label>搜索台架<input type="search" placeholder="编号、名称、站点或实验室" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
           <label>台架类型<select value={type} onChange={(event) => setType(event.target.value)}><option value="all">全部类型</option>{Object.entries(typeLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
           <label>台架状态<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">全部状态</option><option value="available">已启用</option><option value="disabled">已停用（含所属位置）</option><option value="online">上位机在线</option><option value="running">测试运行中</option><option value="offline">上位机离线</option><option value="unreported">{admin ? "无上报记录" : "无可见上报"}</option></select></label>

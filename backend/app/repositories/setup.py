@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.errors import ApiError
-from app.schemas.setup import AssetCreate, CampaignCreate, ContextCreate, ProgramCreate, StationCreate
+from app.schemas.setup import AssetCreate, CampaignCreate, ContextCreate, ProgramCreate, StationCreate, CaseCreate, CaseDefinition, CaseRevision, ConfigurationCreate, MetadataChange
 
 
 def _parts_match(case_part: str | None, asset_part: str | None) -> bool:
@@ -38,7 +38,7 @@ class SetupRepository:
         return self.rows("""
             SELECT tc.public_id AS id, tc.case_code AS code, tc.name, tc.asset_kind,
                    tc.target_part_code, p.name AS target_part_name, tc.enabled,
-                   tc.domain, tc.evidence_type, v.public_id AS version_id,
+                   tc.domain, tc.evidence_type, iam.owns_setup('case',tc.id) AS can_edit, v.public_id AS version_id,
                    v.version, v.procedure_spec
             FROM catalog.test_case tc
             LEFT JOIN catalog.test_target_part p ON p.part_code=tc.target_part_code
@@ -52,9 +52,9 @@ class SetupRepository:
     def options(self):
         return {
             "parts": self.rows("SELECT part_code AS code,name,asset_kind FROM catalog.test_target_part WHERE enabled ORDER BY part_code"),
-            "programs": self.rows("SELECT public_id AS id,program_code AS code,name,status FROM test.test_program WHERE iam.is_system_admin() ORDER BY id DESC"),
-            "stations": self.rows("SELECT s.public_id AS id,s.station_code AS code,s.name,s.station_type FROM test.station s JOIN test.lab l ON l.id=s.lab_id JOIN test.site t ON t.id=l.site_id WHERE s.enabled AND l.enabled AND t.enabled ORDER BY s.station_code"),
-            "assets": self.rows("SELECT a.public_id AS id,a.asset_code AS code,a.display_name AS name,a.asset_kind,CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN 'SYS' ELSE m.target_part_code END AS target_part_code FROM test.asset a LEFT JOIN test.module_profile m ON m.asset_id=a.id WHERE NOT a.voided ORDER BY a.asset_code"),
+            "programs": self.rows("SELECT public_id AS id,program_code AS code,name,status,true AS can_edit FROM test.test_program WHERE iam.owns_setup('program',id) ORDER BY id DESC"),
+            "stations": self.rows("SELECT s.public_id AS id,s.station_code AS code,s.name,s.station_type,iam.owns_setup('station',s.id) AS can_edit FROM test.station s JOIN test.lab l ON l.id=s.lab_id JOIN test.site t ON t.id=l.site_id WHERE s.enabled AND l.enabled AND t.enabled ORDER BY s.station_code"),
+            "assets": self.rows("SELECT a.public_id AS id,a.asset_code AS code,a.display_name AS name,a.asset_kind,iam.can_access_asset(a.id,true) AS can_edit,CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN 'SYS' ELSE m.target_part_code END AS target_part_code FROM test.asset a LEFT JOIN test.module_profile m ON m.asset_id=a.id WHERE NOT a.voided ORDER BY a.asset_code"),
             "configurations": self.rows("SELECT c.public_id AS id,a.public_id AS asset_id,c.fingerprint,c.reliability_impact FROM test.configuration_snapshot c JOIN test.asset a ON a.id=c.asset_id WHERE NOT a.voided ORDER BY c.effective_from DESC,c.id DESC"),
         }
 
@@ -108,7 +108,9 @@ class SetupRepository:
     def create_campaign(self, value: CampaignCreate):
         self.reason(value.reason)
         params = value.model_dump()
-        program = self.one("SELECT id,status FROM test.test_program WHERE public_id=:program_id FOR UPDATE", params)
+        program = self.one("SELECT id,status,iam.owns_setup('program',id) AS can_edit FROM test.test_program WHERE public_id=:program_id FOR UPDATE", params)
+        if not program["can_edit"]:
+            raise ApiError(403, "forbidden", "创建计划需要所属项目的管理权限。")
         if program["status"] in {"CLOSED", "CANCELLED"}:
             raise ApiError(409, "program_closed", "所属项目已关闭，不能创建计划。")
         params["program"] = program["id"]
@@ -117,7 +119,9 @@ class SetupRepository:
 
     def activate_campaign(self, campaign_id: UUID, reason: str):
         self.reason(reason)
-        campaign = self.one("SELECT id,status FROM test.test_campaign WHERE public_id=:id FOR UPDATE", {"id": campaign_id})
+        campaign = self.one("SELECT id,status,iam.can_access_campaign(id,true) AS can_edit FROM test.test_campaign WHERE public_id=:id FOR UPDATE", {"id": campaign_id})
+        if not campaign["can_edit"]:
+            raise ApiError(403, "forbidden", "开放计划需要该计划的编辑权限。")
         if campaign["status"] != "PLANNED":
             raise ApiError(409, "invalid_transition", "仅待执行计划可开放使用。")
         return self.one("UPDATE test.test_campaign SET status='ACTIVE' WHERE id=:id RETURNING public_id AS id", {"id": campaign["id"]})
@@ -178,3 +182,82 @@ class SetupRepository:
         params["selector"] = json.dumps(context)
         coverage = self.one("INSERT INTO test.campaign_coverage_item(campaign_id,test_case_version_id,target_asset_id,target_configuration_selector,planned_runs) VALUES (:campaign,:case,:asset,CAST(:selector AS jsonb),:planned_runs) RETURNING public_id AS id", params)
         return {**coverage, "context": context}
+
+    def case_versions(self, case_id: UUID):
+        case = self.one("SELECT id,case_code,name,asset_kind,target_part_code,iam.owns_setup('case',id) AS can_edit FROM catalog.test_case WHERE public_id=:id", {"id": case_id})
+        versions = self.rows("""SELECT public_id AS id,version,status,procedure_spec,stage_definitions,equipment_requirements,
+            sampling_requirements,metric_requirements,fault_rules,termination_rules,decision_rules,source_references,deviation_notes,published_at,created_at
+            FROM catalog.test_case_version WHERE test_case_id=:id ORDER BY id DESC""", {"id": case["id"]})
+        return {"case": {k:v for k,v in case.items() if k != "id"}, "versions": versions}
+
+    def create_case(self, value: CaseCreate):
+        self.reason(value.reason)
+        case = self.one("""INSERT INTO catalog.test_case(case_code,name,asset_kind,target_part_code,domain,evidence_type)
+            VALUES(:case_code,:name,:asset_kind,:target_part_code,:domain,:evidence_type) RETURNING id,public_id""", value.model_dump())
+        version = self._append_case_version(case["id"], value)
+        return {"id": case["public_id"], **version}
+
+    def _editable_case(self, case_id):
+        row = self.one("SELECT id,public_id,iam.owns_setup('case',id) AS can_edit FROM catalog.test_case WHERE public_id=:id FOR UPDATE", {"id":case_id})
+        if not row["can_edit"]: raise ApiError(403, "forbidden", "需要用例创建者或管理员权限。")
+        return row
+
+    def revise_case(self, case_id: UUID, value: CaseRevision):
+        self.reason(value.reason)
+        row = self._editable_case(case_id)
+        latest=self.one("SELECT public_id FROM catalog.test_case_version WHERE test_case_id=:id ORDER BY id DESC LIMIT 1",{"id":row["id"]})
+        if value.base_version_id is not None and str(latest["public_id"])!=str(value.base_version_id):
+            raise ApiError(409,"case_version_conflict","用例已出现新版本，请刷新并核对新版本后修订。")
+        return {"id": row["public_id"], **self._append_case_version(row["id"], value)}
+
+    def _append_case_version(self, internal_id, value):
+        params = {key: json.dumps(getattr(value,key), ensure_ascii=False, allow_nan=False) for key in (
+            "procedure_spec","stage_definitions","equipment_requirements","sampling_requirements","metric_requirements","fault_rules","termination_rules","decision_rules","source_references")}
+        number = self.one("SELECT count(*)+1 AS n FROM catalog.test_case_version WHERE test_case_id=:id", {"id":internal_id})["n"]
+        version = "managed-" + str(number)
+        while self.rows("SELECT id FROM catalog.test_case_version WHERE test_case_id=:id AND version=:version", {"id":internal_id,"version":version}):
+            number += 1
+            version = "managed-" + str(number)
+        params.update(case=internal_id, version=version, status="PUBLISHED" if value.publish else "DRAFT",deviation_notes=value.deviation_notes)
+        return self.one("""INSERT INTO catalog.test_case_version(test_case_id,version,procedure_spec,stage_definitions,
+            equipment_requirements,sampling_requirements,metric_requirements,fault_rules,termination_rules,decision_rules,source_references,deviation_notes,status,definition_schema,published_by,published_at)
+            VALUES(:case,:version,CAST(:procedure_spec AS jsonb),CAST(:stage_definitions AS jsonb),CAST(:equipment_requirements AS jsonb),
+            CAST(:sampling_requirements AS jsonb),CAST(:metric_requirements AS jsonb),CAST(:fault_rules AS jsonb),CAST(:termination_rules AS jsonb),CAST(:decision_rules AS jsonb),CAST(:source_references AS jsonb),:deviation_notes,:status,1,
+            CASE WHEN :status='PUBLISHED' THEN iam.current_user_id() ELSE NULL END,CASE WHEN :status='PUBLISHED' THEN now() ELSE NULL END)
+            RETURNING public_id AS version_id,version,status""", params)
+
+    def publish_case(self, version_id: UUID, reason: str, validate):
+        self.reason(reason)
+        row = self.one("SELECT * FROM catalog.test_case_version WHERE public_id=:id FOR UPDATE", {"id": version_id})
+        case = self.one("SELECT public_id FROM catalog.test_case WHERE id=:id", {"id":row["test_case_id"]})
+        self._editable_case(case["public_id"])
+        if row["status"] != "DRAFT": raise ApiError(409, "case_not_draft", "只有草稿可发布；已发布版本须追加修订。")
+        value = CaseDefinition(reason=reason, publish=True, **{key:row[key] for key in CaseDefinition.model_fields if key not in {"reason","publish"}})
+        validate(value)
+        result=self.one("UPDATE catalog.test_case_version SET status='PUBLISHED',definition_schema=1,published_by=iam.current_user_id(),published_at=now() WHERE public_id=:id RETURNING public_id AS version_id,version,status", {"id":version_id})
+        return {**result,'case_id':case['public_id']}
+
+    def append_configuration(self, asset_id: UUID, value: ConfigurationCreate):
+        self.reason(value.reason)
+        asset = self.one("SELECT id,iam.can_access_asset(id,true) AS can_edit FROM test.asset WHERE public_id=:id AND NOT voided FOR UPDATE", {"id":asset_id})
+        if not asset["can_edit"]: raise ApiError(403,"forbidden","需要样品编辑权限。")
+        params = value.model_dump()
+        params.update(asset=asset["id"], **{key:json.dumps(getattr(value,key),allow_nan=False) for key in ("hardware_manifest","software_manifest","parameter_manifest")})
+        result = self.one("""INSERT INTO test.configuration_snapshot(asset_id,fingerprint,hardware_manifest,software_manifest,parameter_manifest,reliability_impact,captured_from,captured_by,effective_from)
+            VALUES(:asset,:fingerprint,CAST(:hardware_manifest AS jsonb),CAST(:software_manifest AS jsonb),CAST(:parameter_manifest AS jsonb),'UNKNOWN','unified setup',iam.current_user_id(),now()) RETURNING public_id AS configuration_id""", params)
+        return {"id":asset_id, **result}
+
+    def update_metadata(self, kind: str, public_id: UUID, value: MetadataChange):
+        self.reason(value.reason)
+        table, permission, column = {
+            "asset":("test.asset","iam.can_access_asset(id,true)","display_name"),
+            "program":("test.test_program","iam.owns_setup('program',id)","name"),
+            "campaign":("test.test_campaign","iam.can_access_campaign(id,true)","name"),
+            "station":("test.station","iam.owns_setup('station',id)","name"),
+        }[kind]
+        row = self.one(f"SELECT id,{permission} AS can_edit FROM {table} WHERE public_id=:id FOR UPDATE", {"id":public_id})
+        if not row["can_edit"]: raise ApiError(403,"forbidden","当前账号没有该对象的管理权限。")
+        params={"id":row["id"],"name":value.name,"objective":value.objective}
+        extra = ",objective=coalesce(:objective,objective)" if kind == "program" else ""
+        if kind != "program" and value.objective is not None: raise ApiError(422,"invalid_setup","该对象不接受项目目标字段。")
+        return self.one(f"UPDATE {table} SET {column}=:name{extra} WHERE id=:id RETURNING public_id AS id",params)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -37,6 +38,25 @@ class Settings(BaseSettings):
     archive_max_file_bytes: int = Field(default=50 * 1024**3, ge=1024, le=50 * 1024**3)
     archive_query_memory_mb: int = Field(default=512, ge=128, le=4096)
     archive_worker_poll_seconds: float = Field(default=2, ge=.1, le=60)
+    # Milestone 2 is an isolated connection probe, never a production chat entry.
+    assistant_enabled: bool = False
+    assistant_pilot_user_ids: Annotated[list[UUID], NoDecode] = []
+    assistant_pi_url: str = "http://pi:3000"
+    assistant_service_secret_file: str | None = None
+    assistant_legacy_probes: bool = False
+    assistant_runtime_enabled: bool = False
+    assistant_production_enabled: bool = False
+    assistant_task_seconds: int = Field(default=120,ge=1,le=120)
+    # Verified official CNY peak rates per million tokens. Applying peak rates
+    # at all times conservatively bounds spend without guessing holidays.
+    assistant_price_valid_until: str = "2026-10-29T00:00:00+08:00"
+
+    @field_validator("assistant_pilot_user_ids", mode="before")
+    @classmethod
+    def split_pilot_ids(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
     @property
     def secure_auth_cookie(self) -> bool:

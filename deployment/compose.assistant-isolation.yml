@@ -1,0 +1,130 @@
+# Standalone QA stack. Never combine with the site's compose.yml or .env.
+services:
+  postgres:
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    environment:
+      POSTGRES_DB: rp1_presence_assistant
+      POSTGRES_USER: assistant_qa_admin
+      POSTGRES_PASSWORD: ${QA_ADMIN_PASSWORD:?}
+      RP1_APP_USER: rp1_app
+      RP1_APP_PASSWORD: ${QA_APP_PASSWORD:?}
+      RP1_READONLY_USER: rp1_readonly
+      RP1_READONLY_PASSWORD: ${QA_READ_PASSWORD:?}
+    volumes:
+      - ../database/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d:ro
+    tmpfs: [/var/lib/postgresql/data]
+    networks: [database]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U assistant_qa_admin -d rp1_presence_assistant']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  migrate:
+    image: ${QA_MIGRATE_IMAGE:-rp1-assistant-qa:milestone2}
+    working_dir: /workspace
+    command: [alembic, upgrade, head]
+    environment:
+      DATABASE_URL: postgresql+psycopg://assistant_qa_admin:${QA_ADMIN_PASSWORD}@postgres:5432/rp1_presence_assistant
+      RP1_APP_USER: rp1_app
+      RP1_READONLY_USER: rp1_readonly
+      IMPORT_LEGACY_HISTORY: 'false'
+      PYTHONDONTWRITEBYTECODE: '1'
+    volumes: ['../database:/workspace:ro']
+    networks: [database]
+    depends_on:
+      postgres: {condition: service_healthy}
+  api:
+    image: ${QA_API_IMAGE:-rp1-assistant-qa:milestone2}
+    user: '${QA_UID:?}:${QA_GID:?}'
+    command: [uvicorn, app.main:app, --host, 0.0.0.0, --port, '8000', --workers, '1']
+    environment: &api-env
+      DATABASE_URL: postgresql+psycopg://rp1_app:${QA_APP_PASSWORD}@postgres:5432/rp1_presence_assistant
+      APP_ENV: test
+      AUTH_MODE: session
+      AUTH_COOKIE_SECURE: 'false'
+      SEED_ADMIN_USERNAME: ''
+      SEED_ADMIN_PASSWORD: null
+      ASSISTANT_ENABLED: 'true'
+      ASSISTANT_LEGACY_PROBES: 'true'
+      ASSISTANT_PILOT_USER_IDS: ${QA_PILOT_IDS:?}
+      ASSISTANT_SERVICE_SECRET_FILE: /run/secrets/bridge
+      ASSISTANT_PI_URL: http://pi:3000
+      ARCHIVE_ROOT: /qa-archives
+      PYTHONPATH: /app
+      PYTHONDONTWRITEBYTECODE: '1'
+    volumes: ['../backend:/app:ro', '${QA_ARCHIVE_ROOT:?}:/qa-archives']
+    secrets: [bridge]
+    networks: [database, tools, frontend]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz',timeout=3)"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+  pi:
+    image: ${QA_PI_IMAGE:-rp1-pi-bridge:0.4.0}
+    build: ../assistant
+    environment:
+      APP_ENV: test
+      PI_MODEL_MODE: mock
+      RP1_BRIDGE_SECRET_FILE: /run/secrets/bridge
+    secrets: [bridge]
+    networks: [tools, model]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 384m
+    cpus: 1
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  model-mock:
+    image: node:22.22.0-bookworm-slim@sha256:dd9d21971ec4395903fa6143c2b9267d048ae01ca6d3ea96f16cb30df6187d94
+    user: node
+    command: [node, /tests/mock-model.mjs]
+    volumes: ['../assistant/tests:/tests:ro']
+    networks: [model]
+    read_only: true
+    cap_drop: [ALL]
+  web:
+    image: ${QA_WEB_IMAGE:-nginxinc/nginx-unprivileged:1.29-alpine@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6}
+    entrypoint: [nginx, -c, /etc/nginx/assistant-qa.conf, -g, 'daemon off;']
+    volumes: ['./assistant-isolation.nginx.conf:/etc/nginx/assistant-qa.conf:ro']
+    networks: [frontend]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, wget, -qO-, 'http://127.0.0.1:8080/']
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  checks:
+    image: ${QA_API_IMAGE:-rp1-assistant-qa:milestone2}
+    user: '${QA_UID:?}:${QA_GID:?}'
+    environment:
+      <<: *api-env
+      ASSISTANT_QA_ADMIN_URL: postgresql+psycopg://assistant_qa_admin:${QA_ADMIN_PASSWORD}@postgres:5432/rp1_presence_assistant
+      ASSISTANT_QA_HTTP_URL: http://web:8080
+      ASSISTANT_QA_PILOT_IDS: ${QA_PILOT_IDS}
+    volumes: ['../backend:/app:ro', '${QA_REPORT_DIR:?}:/reports', '${QA_ARCHIVE_ROOT:?}:/qa-archives']
+    command: [python, -m, pytest, -p, 'no:cacheprovider', tests/test_assistant.py, tests/test_assistant_integration.py, tests/test_security_http.py, -q, '--junitxml=/reports/backend-junit.xml']
+    networks: [database, frontend, tools, model]
+  node-checks:
+    image: ${QA_PI_IMAGE:-rp1-pi-bridge:0.4.0}
+    command: [npm, test]
+    volumes: ['../assistant/tests:/app/tests:ro']
+    networks: [tools]
+    read_only: true
+    tmpfs: [/tmp]
+networks:
+  database: {internal: true}
+  tools: {internal: true}
+  model: {internal: true}
+  frontend: {internal: true}
+secrets:
+  bridge: {file: '${QA_BRIDGE_SECRET_FILE:?}'}

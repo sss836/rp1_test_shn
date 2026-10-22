@@ -45,7 +45,7 @@ function cookieValue(name: string) {
   return match ? decodeURIComponent(match.slice(prefix.length)) : "";
 }
 
-function requestId() {
+export function requestId() {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
   }

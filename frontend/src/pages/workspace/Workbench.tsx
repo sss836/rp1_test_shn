@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useAssistantPageContext } from "../../assistantContext";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { ChevronDown, Columns2, Info, Link, Plus, RotateCcw, Save, Search, X } from "lucide-react";
 import { archivesApi, type Archive } from "../../archiveApi";
@@ -110,6 +111,11 @@ export function CurveWorkbench({ item, navigate, onSingle, initialViewport, init
   const viewport = selectedViewport && selectedViewport.start < domain.end && selectedViewport.end > domain.start ? { start: Math.max(domain.start, selectedViewport.start), end: Math.min(domain.end, selectedViewport.end) } : domain;
   const stageChoices = choices(item.manifest?.stages ?? []), cycleChoices = choices(item.manifest?.cycles ?? []);
   const effectiveConfig = { ...config, cursors: selectedCursors, viewport: selectedViewport ? viewport : null, stage: stageChoices.some((entry) => entry.value === config.stage) ? config.stage : "", cycle: cycleChoices.some((entry) => entry.value === config.cycle) ? config.cycle : "", alignment: absolute ? "absolute" as const : "elapsed" as const };
+  const assistantRecord=records[0]??item,assistantPanel=config.panels.find((panel)=>panel.id===focus)??config.panels[0];
+  const assistantOffset=absolute?archiveStart(assistantRecord)??0:0;
+  const assistantStart=Math.max(archiveRange(assistantRecord).start,(viewport.start-assistantOffset)/(absolute?1000:1));
+  const assistantEnd=Math.min(archiveRange(assistantRecord).end,(viewport.end-assistantOffset)/(absolute?1000:1));
+  useAssistantPageContext({view:"curves",archive_id:assistantRecord.id,metrics:assistantPanel?[assistantPanel.metric]:[],subjects:assistantPanel?.subjects.slice(0,8)??[],selection_empty:assistantStart>assistantEnd,...(assistantStart<=assistantEnd?{start:assistantStart,end:assistantEnd}:{}),stage:effectiveConfig.stage||undefined,cycle:effectiveConfig.cycle||undefined});
   const compareSearch = useQuery({ queryKey: ["workspace", scope, "search", search], queryFn: ({ signal }) => archivesApi.list({ q: search, processing_state: "READY" }, signal), enabled: !!search });
   function changeViewport(value: CurveViewport | null) { setConfig((current) => ({ ...current, viewport: value })); onViewportChange?.(value, absolute ? "absolute" : "elapsed"); }
   function restore(view: SavedView) {

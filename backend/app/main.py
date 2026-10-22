@@ -13,6 +13,8 @@ from app.api.routes import (
     access,
     admin,
     archives,
+    assistant,
+    assistant_chat,
     archive_imports,
     auth,
     dashboard,
@@ -44,7 +46,17 @@ async def lifespan(_: FastAPI):
             ).bootstrap_initial_admin()
         if bootstrapped:
             logger.info("initial administrator credential bootstrapped")
-    yield
+    from app.services.assistant_chat import runtime
+    if settings.assistant_enabled and settings.assistant_runtime_enabled:
+        import os
+        from app.services.assistant import require_isolation,service_secret
+        require_isolation(settings)
+        service_secret(settings)
+        if os.getenv('WEB_CONCURRENCY','1')!='1':raise RuntimeError('Assistant requires a single API worker')
+        await runtime.start()
+    try:yield
+    finally:
+        if runtime.workers:await runtime.stop()
 
 
 app = FastAPI(
@@ -138,6 +150,8 @@ async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResp
 
 
 app.include_router(health.router)
+app.include_router(assistant.router)
+app.include_router(assistant_chat.router)
 app.include_router(hmi_presence.router)
 app.include_router(auth.router)
 app.include_router(access.router)

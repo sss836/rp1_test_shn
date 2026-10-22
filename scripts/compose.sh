@@ -12,4 +12,7 @@ compose_files=(-f compose.yml)
 if [[ -f compose.override.yml ]]; then
   compose_files+=(-f compose.override.yml)
 fi
+if [[ -f deployment/assistant-site.override.yml ]]; then
+  compose_files+=(-f deployment/compose.assistant.yml -f deployment/assistant-site.override.yml)
+fi
 exec env "${unset_args[@]}" docker compose --env-file .env "${compose_files[@]}" "$@"

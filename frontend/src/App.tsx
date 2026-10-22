@@ -30,6 +30,8 @@ import {
 import type { AssetKind, TargetPartCode } from "./types";
 import { adminApi } from "./securityApi";
 import { roleLabels } from "./security";
+import { AssistantPanel } from "./components/AssistantPanel";
+import { useAssistantContext } from "./assistantContext";
 
 const CatalogPage = lazy(() => import("./pages/SetupPages").then((module) => ({ default: module.CatalogPage })));
 const PlanningPage = lazy(() => import("./pages/SetupPages").then((module) => ({ default: module.PlanningPage })));
@@ -79,6 +81,7 @@ function initialTheme(): "day" | "night" {
 export default function App() {
   const { status, session, logout, logoutPending } = useAuth();
   const [location, setLocation] = useState<LocationState>(() => readLocation());
+  const assistantPage=useAssistantContext();
   const [theme, setTheme] = useState<"day" | "night">(initialTheme);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(() => Boolean(document.fullscreenElement));
@@ -274,7 +277,7 @@ export default function App() {
         <LogoutNotice />
         <Suspense fallback={<LoadingState label="正在加载页面" />}>
         {location.view === "catalog" && <CatalogPage assetKind={location.kind} navigate={(id) => go("test-case", id)} />}
-        {location.view === "planning" && <PlanningPage key={location.kind} assetKind={location.kind} />}
+        {location.view === "planning" && <PlanningPage key={location.kind+(location.id??"")} assetKind={location.kind} initialCampaignId={location.id??undefined} />}
         {location.view === "home" && <HomePage assetKind={location.kind} navigate={(view, id, part) => go(view, id ?? null, location.kind, part ?? null)} />}
         {location.view === "durations" && <DurationsPage assetKind={location.kind} navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "mtbf" && <MtbfPage assetKind={location.kind} />}
@@ -285,7 +288,7 @@ export default function App() {
         {location.view === "account" && <AccountPage />}
         {location.view === "live" && <LiveRunsPage navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "stations" && <HmiStationsPage />}
-        {location.view === "benches" && <BenchOverviewPage navigate={(view) => go(view)} />}
+        {location.view === "benches" && <BenchOverviewPage key={location.id??"all"} initialStationId={location.id??undefined} navigate={(view) => go(view)} />}
         {location.view === "submissions" && <SubmissionsPage navigate={(id) => go("execution", id)} navigateArchive={(id) => go("archive", id)} />}
         {location.view === "archives" && <ArchivesPage navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "import" && <CsvImportPage navigate={(view, id) => go(view, id ?? null)} />}
@@ -299,6 +302,7 @@ export default function App() {
         )}
         </Suspense>
       </main>
+      {session&&["SYSTEM_ADMIN","TEST_EXECUTOR"].includes(session.user.role)&&<AssistantPanel key={`${session.user.id}:${session.expires_at}`} accountKey={`${session.user.id}:${session.expires_at}`} context={{view:location.view,kind:location.kind,...(location.id&&/^[0-9a-f-]{36}$/i.test(location.id)?{object_id:location.id}:{}),...(assistantPage?.view===location.view?assistantPage:{})}} navigate={(view,id)=>go(view,id)}/>}
     </div>
   );
 }

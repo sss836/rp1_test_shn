@@ -1,0 +1,17 @@
+# Only use with the standalone isolation stack and a server-side secret file.
+# This does not enable the existing station or production API.
+services:
+  pi:
+    environment:
+      PI_MODEL_MODE: live
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek
+    secrets: [bridge, deepseek]
+    networks: [tools, model, live-egress]
+  checks:
+    environment:
+      ASSISTANT_QA_LIVE: '1'
+    command: [python, -m, pytest, -p, 'no:cacheprovider', tests/test_assistant_integration.py::test_live_official_probe, -q, '--junitxml=/reports/live-junit.xml']
+networks:
+  live-egress: {}
+secrets:
+  deepseek: {file: '${QA_DEEPSEEK_SECRET_FILE:?}'}

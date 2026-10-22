@@ -1,0 +1,52 @@
+# Loaded by scripts/compose.sh only when assistant-site.override.yml exists.
+# The local override pins images, server secret paths and the approved pilot IDs.
+services:
+  api:
+    image: rp1-shn-api:${ASSISTANT_VERSION:-2.0.7-assistant-20261022-r1}
+    command: [uvicorn, app.main:app, --host, 0.0.0.0, --port, '8000', --workers, '1', --proxy-headers, --forwarded-allow-ips, '*']
+    environment:
+      APP_VERSION: ${ASSISTANT_VERSION:-2.0.7-assistant-20261022-r1}
+      WEB_CONCURRENCY: '1'
+      ASSISTANT_ENABLED: 'false'
+      ASSISTANT_RUNTIME_ENABLED: 'false'
+      ASSISTANT_PRODUCTION_ENABLED: 'false'
+      ASSISTANT_LEGACY_PROBES: 'false'
+      ASSISTANT_PI_URL: http://pi:3000
+      ASSISTANT_SERVICE_SECRET_FILE: /run/secrets/assistant-bridge
+    secrets: [assistant-bridge]
+    networks: [default, assistant-tools]
+  web:
+    image: rp1-shn-web:${ASSISTANT_VERSION:-2.0.7-assistant-20261022-r1}
+  migrate:
+    image: rp1-shn-migrate:${ASSISTANT_VERSION:-2.0.7-assistant-20261022-r1}
+  pi:
+    image: rp1-pi-bridge:0.4.0
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      PI_MODEL_MODE: live
+      RP1_BRIDGE_SECRET_FILE: /run/secrets/assistant-bridge
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek
+    secrets: [assistant-bridge, deepseek]
+    networks: [assistant-tools, assistant-model]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 384m
+    cpus: 1
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: '5'}
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+networks:
+  assistant-tools: {internal: true}
+  assistant-model: {}
+secrets:
+  assistant-bridge: {file: '${RP1_ASSISTANT_BRIDGE_FILE:-/etc/rp1-assistant/bridge.key}'}
+  deepseek: {file: '${RP1_DEEPSEEK_KEY_FILE:-/etc/rp1-assistant/deepseek.key}'}

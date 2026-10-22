@@ -1,6 +1,8 @@
-import { useState, type FormEvent } from "react";
+import { useState, useRef, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../auth";
+import { requestId } from "../client";
+import { useAssistantPageContext } from "../assistantContext";
 import { setupApi } from "../setupApi";
 import { displayPartName, partsCompatible } from "../homeCarousel";
 import { formatDate } from "../navigation";
@@ -11,10 +13,15 @@ type Field = { name: string; label: string; hint?: string; optional?: boolean; t
 const reason: Field = { name: "reason", label: "建档或配置理由" };
 const text = (name: string, label: string, hint?: string): Field => ({ name, label, hint });
 
-function CreateForm({ title, path, fields, values = {}, after }: { title: string; path: string; fields: Field[]; values?: Record<string, unknown>; after?: () => void }) {
+function CreateForm({ title, path, fields, values = {}, after, method = "POST", transform }: { title: string; path: string; fields: Field[]; values?: Record<string, unknown>; after?: () => void; method?: string; transform?: (data: Record<string, unknown>) => Record<string, unknown> }) {
+  const pendingKey = useRef<{ payload: string; key: string } | null>(null);
   const cache = useQueryClient();
   const mutation = useMutation({
-    mutationFn: (payload: Record<string, unknown>) => setupApi.create(path, payload),
+    mutationFn: (payload: Record<string, unknown>) => {
+      const fingerprint = JSON.stringify(payload);
+      if (pendingKey.current?.payload !== fingerprint) pendingKey.current = { payload: fingerprint, key: requestId() };
+      return setupApi.create(path, payload, pendingKey.current.key, method);
+    },
     onSuccess: async () => {
       await cache.invalidateQueries();
       after?.();
@@ -24,23 +31,25 @@ function CreateForm({ title, path, fields, values = {}, after }: { title: string
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
-    const payload: Record<string, unknown> = { ...Object.fromEntries(new FormData(form)), ...values };
+    let payload: Record<string, unknown> = { ...Object.fromEntries(new FormData(form)), ...values };
     try {
       for (const field of fields) {
         if (field.type === "json") payload[field.name] = JSON.parse(String(payload[field.name] || "{}"));
+        if (field.type === "boolean") payload[field.name] = payload[field.name] === "true";
         if (field.type === "number") payload[field.name] = Number(payload[field.name]);
         if (field.type === "datetime-local") payload[field.name] = payload[field.name] ? new Date(String(payload[field.name])).toISOString() : null;
       }
+      if (transform) payload = transform(payload);
       setInputError("");
       mutation.mutate(payload, { onSuccess: () => form.reset() });
-    } catch {
-      setInputError("配置清单必须是有效JSON对象，日期必须有效。");
+    } catch (error) {
+      setInputError(error instanceof Error ? error.message : "配置清单必须是有效JSON对象，日期必须有效。");
     }
   }
   return <form className="setup-form" onSubmit={submit}>
     <h3>{title}</h3>
     <div className="setup-fields">{fields.map((field) => <label key={field.name}>{field.label}
-      {field.options ? <select name={field.name} required={!field.optional} defaultValue=""><option value="">请选择</option>{field.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select> : field.type === "json" ? <textarea name={field.name} defaultValue="{}" rows={2} /> : <input name={field.name} type={field.type ?? "text"} required={!field.optional} defaultValue={field.value ?? ""} placeholder={field.hint} min={field.type === "number" ? 1 : undefined} max={field.type === "number" ? 100000 : undefined} maxLength={field.name === "reason" ? 2048 : 255} />}
+      {field.options ? <select name={field.name} required={!field.optional} defaultValue={field.value ?? ""}><option value="">请选择</option>{field.options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select> : field.type === "json" || field.type === "textarea" ? <textarea name={field.name} defaultValue={field.value ?? (field.type === "json" ? "{}" : "")} rows={3} maxLength={24000} /> : <input name={field.name} type={field.type ?? "text"} required={!field.optional} defaultValue={field.value ?? ""} placeholder={field.hint} min={field.type === "number" ? 1 : undefined} max={field.type === "number" ? 100000 : undefined} maxLength={field.name === "reason" ? 2048 : 255} />}
       {field.hint && <small>{field.hint}</small>}
     </label>)}</div>
     {(mutation.error || inputError) && <p role="alert">{inputError || (mutation.error instanceof Error ? mutation.error.message : "保存失败")}</p>}
@@ -53,7 +62,7 @@ export function AssetCreateForm({ assetKind }: { assetKind: AssetKind }) {
   const { session } = useAuth();
   const [open, setOpen] = useState(false);
   const options = useQuery({ queryKey: ["setup-options"], queryFn: ({ signal }) => setupApi.options(signal), enabled: open });
-  if (session?.user.role !== "SYSTEM_ADMIN") return null;
+  if (!(["SYSTEM_ADMIN", "TEST_EXECUTOR"].includes(session?.user.role ?? ""))) return null;
   return <section className="setup-section">
     <button className="primary-button" onClick={() => setOpen(!open)} type="button">{open ? "收起样品建档" : "新增样品"}</button>
     {open && (options.isLoading ? <LoadingState /> : options.error ? <ErrorState error={options.error} retry={() => void options.refetch()} /> : <CreateForm key={assetKind} title="样品建档与初始配置" path="assets" values={{ asset_kind: assetKind }} fields={[
@@ -77,6 +86,7 @@ export function CatalogPage({ assetKind, navigate }: { assetKind: AssetKind; nav
   const items = (catalog.data ?? []).filter((c) => c.asset_kind === assetKind && `${c.code} ${c.name} ${c.target_part_name ?? ""}`.toLowerCase().includes(search.toLowerCase()));
   return <>
     <PageTitle eyebrow="TEST CASE CATALOG" title={`${assetKind === "MODULE" ? "模块" : "整机"}测试目录`} description="独立展示全部测试项目及发布状态。样品和执行记录为零时也可浏览。" />
+    <CaseManagement assetKind={assetKind} />
     <div className="filter-bar"><label>搜索测试项目<input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="编号、名称或部位" /></label><span>{items.length} 项 / 全目录 {catalog.data?.length ?? 0} 项</span></div>
     {catalog.isLoading ? <LoadingState /> : catalog.error ? <ErrorState error={catalog.error} retry={() => void catalog.refetch()} /> : <Panel title="测试项目与版本">
       {items.length ? <div className="table-scroll"><table className="data-table"><thead><tr><th>编号</th><th>名称</th><th>部位</th><th>领域</th><th>发布版本</th><th>状态</th></tr></thead><tbody>{items.map((c) => <tr key={c.id}><td><button className="link-button" onClick={() => navigate(c.id)}>{c.code}</button></td><td>{c.name}</td><td>{c.target_part_code ? displayPartName(c.target_part_code, c.target_part_name ?? "未指定") : "未指定"}</td><td>{c.domain}</td><td>{c.version ?? "未发布"}</td><td>{c.enabled ? c.version_id ? "可配置" : "待发布版本" : "已停用"}</td></tr>)}</tbody></table></div> : <EmptyState title="没有匹配测试项目" description="请调整搜索条件。" />}
@@ -84,18 +94,21 @@ export function CatalogPage({ assetKind, navigate }: { assetKind: AssetKind; nav
   </>;
 }
 
-export function PlanningPage({ assetKind }: { assetKind: AssetKind }) {
+export function PlanningPage({ assetKind,initialCampaignId }: { assetKind: AssetKind;initialCampaignId?:string }) {
   const { session } = useAuth();
-  const admin = session?.user.role === "SYSTEM_ADMIN";
-  const [selected, setSelected] = useState("");
+  const admin = ["SYSTEM_ADMIN", "TEST_EXECUTOR"].includes(session?.user.role ?? "");
+  const [selected, setSelected] = useState(initialCampaignId??"");
+  useAssistantPageContext({view:"planning",kind:assetKind,object_id:selected||undefined});
   const [assetId, setAssetId] = useState("");
   const [caseId, setCaseId] = useState("");
-  const [tab, setTab] = useState("plans");
+  const [requestedTab, setTab] = useState(initialCampaignId?"object":"plans");
   const plans = useQuery({ queryKey: ["setup-campaigns"], queryFn: ({ signal }) => setupApi.campaigns(signal) });
   const options = useQuery({ queryKey: ["setup-options"], queryFn: ({ signal }) => setupApi.options(signal) });
   const catalog = useQuery({ queryKey: ["setup-catalog"], queryFn: ({ signal }) => setupApi.catalog(signal) });
   const contexts = useQuery({ queryKey: ["setup-contexts", selected], queryFn: ({ signal }) => setupApi.contexts(selected, signal), enabled: Boolean(selected) });
   const campaign = plans.data?.find((p) => p.id === selected && p.asset_kind === assetKind);
+  const initialProgram=options.data?.programs.find((p)=>p.id===initialCampaignId);
+  const tab=requestedTab==="object"?(initialProgram?"manage":"plans"):requestedTab;
   const asset = options.data?.assets.find((a) => a.id === assetId && a.asset_kind === assetKind);
   const cases = (catalog.data ?? []).filter((c) => c.enabled && c.version_id && c.asset_kind === assetKind && partsCompatible(c.target_part_code, asset?.target_part_code));
   const chosenCase = cases.find((c) => c.version_id === caseId);
@@ -103,7 +116,7 @@ export function PlanningPage({ assetKind }: { assetKind: AssetKind }) {
   if (error) return <ErrorState error={error} retry={() => { void plans.refetch(); void options.refetch(); void catalog.refetch(); }} />;
   return <>
     <PageTitle eyebrow="TEST PLANNING" title={`${assetKind === "MODULE" ? "模块" : "整机"}测试计划`} description="建立项目、测试计划，再配置样品、已发布用例、台架和周期。配置不启动测试；结果及正式审批仍走独立流程。" />
-    <nav className="setup-tabs" aria-label="计划管理">{[["plans", "计划与关联"], ...(admin ? [["create", "创建项目和计划"], ["stations", "台架建档"]] : [])].map(([value, label]) => <button type="button" key={value} aria-pressed={tab === value} onClick={() => setTab(value)}>{label}</button>)}</nav>
+    <nav className="setup-tabs" aria-label="计划管理">{[["plans", "计划与关联"], ...(admin ? [["create", "创建项目和计划"], ["stations", "台架建档"], ["manage", "管理已建对象"], ["dialogue", "对话建档"]] : [])].map(([value, label]) => <button type="button" key={value} aria-pressed={tab === value} onClick={() => setTab(value)}>{label}</button>)}</nav>
     {tab === "create" && admin && <div className="setup-columns">
       <Panel title="1 · 创建项目"><CreateForm title="项目是测试计划的归属" path="programs" fields={[text("program_code", "项目编号"), text("name", "项目名称"), { name: "objective", label: "项目目标", optional: true }, reason]} /></Panel>
       <Panel title="2 · 创建测试计划"><CreateForm key={assetKind} title="计划初始状态：待执行" path="campaigns" values={{ asset_kind: assetKind }} fields={[
@@ -112,9 +125,11 @@ export function PlanningPage({ assetKind }: { assetKind: AssetKind }) {
       ]} /></Panel>
     </div>}
     {tab === "stations" && admin && <StationCreateForm />}
+    {tab === "manage" && admin && <SetupManagement initialKind={initialProgram?"programs":undefined} initialId={initialProgram?.id}/>}
+    {tab === "dialogue" && admin && <Panel title="统一助手建档"><p>对话建档已接入全局助手，页面切换可继续查看任务与历史。</p><button type="button" onClick={()=>window.dispatchEvent(new Event("rp1-open-assistant"))}>打开全局助手</button></Panel>}
     {tab === "plans" && <>
       <Panel title="可访问的计划">
-        {plans.isLoading ? <LoadingState /> : !(plans.data ?? []).some((p) => p.asset_kind === assetKind) ? <EmptyState title="暂无可访问计划" description={admin ? "请使用“创建项目和计划”建立真实测试计划。" : "请联系管理员创建计划并授权。"} /> : <div className="setup-plan-list">{plans.data?.filter((p) => p.asset_kind === assetKind).map((p) => <button key={p.id} type="button" aria-pressed={selected === p.id} onClick={() => { setSelected(p.id); setAssetId(""); setCaseId(""); }}><strong>{p.code} · {p.name}</strong><span>{p.program_code ?? "项目详情不可见"} · {p.status} · {(p.stages ?? []).map((stage) => stage.stage_name).join("、") || "测试阶段1"} · {p.asset_count} 个样品 · {p.case_count} 个配置项</span><small>{formatDate(p.planned_start)} 至 {formatDate(p.planned_end)}</small></button>)}</div>}
+        {plans.isLoading ? <LoadingState /> : !(plans.data ?? []).some((p) => p.asset_kind === assetKind) ? <EmptyState title="暂无可访问计划" description={admin ? "请使用“创建项目和计划”建立真实测试计划。" : "当前账号没有计划建档权限。"} /> : <div className="setup-plan-list">{plans.data?.filter((p) => p.asset_kind === assetKind).map((p) => <button key={p.id} type="button" aria-pressed={selected === p.id} onClick={() => { setSelected(p.id); setAssetId(""); setCaseId(""); }}><strong>{p.code} · {p.name}</strong><span>{p.program_code ?? "项目详情不可见"} · {p.status} · {(p.stages ?? []).map((stage) => stage.stage_name).join("、") || "测试阶段1"} · {p.asset_count} 个样品 · {p.case_count} 个配置项</span><small>{formatDate(p.planned_start)} 至 {formatDate(p.planned_end)}</small></button>)}</div>}
       </Panel>
       {campaign && <Panel title={`${campaign.code} · 样品与用例关联`} description={campaign.can_edit ? "配置所需样品和台架须先建档；执行员需要计划与样品的编辑权限。" : "当前计划为只读。"}>
         {admin && campaign.status === "PLANNED" && <CreateForm title="开放计划使用与权限申请（不启动硬件）" path={`campaigns/${campaign.id}/activate`} fields={[reason]} />}
@@ -129,4 +144,71 @@ export function PlanningPage({ assetKind }: { assetKind: AssetKind }) {
       </Panel>}
     </>}
   </>;
+}
+
+const publishField: Field = {name:"publish",label:"保存状态",type:"boolean",value:"false",options:[{value:"false",label:"保存草稿"},{value:"true",label:"明确发布此版本"}]};
+const definitionFields: Field[] = [
+  {name:"steps",label:"测试步骤（每行一步）",type:"textarea",optional:true},
+  {name:"equipment",label:"设备要求",optional:true},
+  {name:"sampling",label:"采样要求（注明频率、单位及采集信号）",optional:true},
+  {name:"termination",label:"终止条件",optional:true},
+  {name:"mode",label:"判定模式",optional:true,options:[{value:"TEXT_ONLY",label:"文字判据，不能自动判为通过"},{value:"RECORD_ONLY",label:"仅记录，未配置自动判据"},{value:"AUTOMATIC",label:"使用支持的结构化自动判据"}]},
+  {name:"judgment",label:"文字判定说明",optional:true},
+  {name:"automatic",label:"自动判据（JSON，仅自动模式使用）",type:"json",optional:true},
+  publishField,reason,
+];
+
+function makeCasePayload(input:Record<string,unknown>) {
+  const {steps,equipment,sampling,termination,mode,judgment,automatic,...rest}=input;
+  const describe=(value:unknown)=>value?{description:String(value)}:{};
+  if(mode!=="AUTOMATIC"&&automatic&&Object.keys(automatic).length)throw new Error("文字或仅记录模式不能填写自动判据。");
+  return {...rest,procedure_spec:steps?{steps:String(steps).split("\n").filter(Boolean)}:{},stage_definitions:[],
+    equipment_requirements:describe(equipment),sampling_requirements:describe(sampling),termination_rules:describe(termination),
+    decision_rules:mode?{mode,...(mode==="TEXT_ONLY"?{text:judgment}:mode==="AUTOMATIC"?{archive_acceptance:automatic}:{})}:{}};
+}
+
+function CaseManagement({assetKind}:{assetKind:AssetKind}) {
+  const {session}=useAuth();
+  const [open,setOpen]=useState(false);
+  const [selected,setSelected]=useState("");
+  const writer=["SYSTEM_ADMIN","TEST_EXECUTOR"].includes(session?.user.role??"");
+  const options=useQuery({queryKey:["setup-options"],queryFn:({signal})=>setupApi.options(signal),enabled:open&&writer});
+  const catalog=useQuery({queryKey:["setup-catalog"],queryFn:({signal})=>setupApi.catalog(signal)});
+  const versions=useQuery({queryKey:["case-versions",selected],queryFn:({signal})=>setupApi.versions(selected,signal),enabled:!!selected&&writer});
+  if(!writer)return null;
+  const latest=versions.data?.versions[0];
+  const jsonFields=(latest?[
+    "procedure_spec","stage_definitions","equipment_requirements","sampling_requirements","metric_requirements","fault_rules","termination_rules","decision_rules","source_references","deviation_notes"
+  ] as const:[]).map((name)=>({name,label:name,type:"json",value:JSON.stringify(latest?.[name]??{})}));
+  return <section className="setup-section">
+    <button className="primary-button" type="button" onClick={()=>setOpen(!open)}>{open?"收起用例管理":"新建或管理测试用例"}</button>
+    {open&&<>
+      {options.error&&<ErrorState error={options.error} retry={()=>void options.refetch()}/>}
+      <CreateForm key={assetKind} title="新建测试用例；仅发布时要求完整定义" path="cases" values={{asset_kind:assetKind}} transform={makeCasePayload} fields={[
+        text("case_code","用例编号"),text("name","用例名称"),{name:"target_part_code",label:"适用部位",options:(options.data?.parts??[]).filter((p)=>p.asset_kind===assetKind).map((p)=>({value:p.code,label:`${p.code} · ${p.name}`}))},...definitionFields,
+      ]}/>
+      <label>选择可管理的用例<select value={selected} onChange={(e)=>setSelected(e.target.value)}><option value="">请选择</option>{catalog.data?.filter((item)=>item.can_edit&&item.asset_kind===assetKind).map((item)=><option key={item.id} value={item.id}>{item.code} · {item.name}</option>)}</select></label>
+      {versions.error&&<ErrorState error={versions.error} retry={()=>void versions.refetch()}/>}
+      {versions.data&&<Panel title="用例版本历史" description="发布版本保持不变；修订使用新版本。文字或仅记录的版本不能自动判为通过。">
+        {versions.data.versions.map((version)=><article key={version.id}><strong>{version.version} · {version.status}</strong><details><summary>查看实际版本内容与标识</summary><pre>{JSON.stringify(version,null,2)}</pre></details>{version.status==="DRAFT"&&<CreateForm title={`明确发布 ${version.version}`} path={`case-versions/${version.id}/publish`} fields={[reason]}/>}</article>)}
+        {latest&&<CreateForm key={latest.id} title="追加修订版本（保留全部原字段，可修改JSON）" path={`cases/${selected}/versions`} values={{base_version_id:latest.id}} fields={[...jsonFields,publishField,reason]}/>}
+      </Panel>}
+    </>}
+  </section>;
+}
+
+function SetupManagement({initialKind,initialId}:{initialKind?:string;initialId?:string}) {
+  const [kind,setKind]=useState(initialKind??"assets");
+  const [id,setId]=useState(initialId??"");
+  const options=useQuery({queryKey:["setup-options"],queryFn:({signal})=>setupApi.options(signal)});
+  const campaigns=useQuery({queryKey:["setup-campaigns"],queryFn:({signal})=>setupApi.campaigns(signal)});
+  const choices=kind==="assets"?options.data?.assets:kind==="programs"?options.data?.programs:kind==="stations"?options.data?.stations:campaigns.data;
+  return <Panel title="管理已有对象" description="按创建者或已有对象编辑权限管理；新配置始终追加快照。">
+    <label>对象类型<select value={kind} onChange={(e)=>{setKind(e.target.value);setId("");}}>{[["assets","样品"],["programs","项目"],["campaigns","计划"],["stations","台架"]].map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label>
+    <label>可编辑对象<select value={id} onChange={(e)=>setId(e.target.value)}><option value="">请选择</option>{choices?.filter((row)=>row.can_edit).map((row)=><option key={row.id} value={row.id}>{row.code} · {row.name}</option>)}</select></label>
+    {options.error&&<ErrorState error={options.error} retry={()=>void options.refetch()}/>}
+    {campaigns.error&&<ErrorState error={campaigns.error} retry={()=>void campaigns.refetch()}/>}
+    {id&&<CreateForm key={kind+id} title="修改名称" path={`${kind}/${id}`} method="PATCH" fields={[text("name","新名称"),...(kind==="programs"?[{name:"objective",label:"项目目标",optional:true}]:[]),reason]}/>}
+    {id&&kind==="assets"&&<CreateForm key={id} title="追加样品配置快照" path={`assets/${id}/configurations`} fields={[text("fingerprint","新配置标识"),...(["hardware_manifest","software_manifest","parameter_manifest"].map((name)=>({name,label:name,type:"json"}))),reason]}/>}
+  </Panel>;
 }

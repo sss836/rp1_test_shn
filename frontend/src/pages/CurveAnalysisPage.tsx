@@ -1,4 +1,5 @@
 import { useRef, useState, type CSSProperties, type FormEvent } from "react";
+import { useAssistantPageContext } from "../assistantContext";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { ArrowLeft, ChevronDown, History, Info, Plus, Search, X } from "lucide-react";
 import { archivesApi, archiveTitle, archiveStation, type Archive, type ArchiveCatalogItem, type ArchiveCurves } from "../archiveApi";
@@ -130,6 +131,10 @@ function Explorer({ item, navigate, initialViewport, initialAlignment, onViewpor
   const domain = { start: Math.min(...ranges.map((range) => range.start)), end: Math.max(...ranges.map((range) => range.end)) };
   const visible = viewport && viewport.start < domain.end && viewport.end > domain.start
     ? { start: Math.max(viewport.start, domain.start), end: Math.min(viewport.end, domain.end) } : domain;
+  const assistantOffset=absolute?startTime(item)??0:0;
+  const assistantStart=Math.max(rangeFor(item).start,(visible.start-assistantOffset)/(absolute?1000:1));
+  const assistantEnd=Math.min(rangeFor(item).end,(visible.end-assistantOffset)/(absolute?1000:1));
+  useAssistantPageContext({view:"curves",archive_id:item.id,metrics:chosen?[chosen.metric]:[],subjects:selectedSubjects.slice(0,8),selection_empty:assistantStart>assistantEnd,...(assistantStart<=assistantEnd?{start:assistantStart,end:assistantEnd}:{}),stage:stage||undefined,cycle:cycle||undefined});
   function curveQuery(record: ComparedArchive, overview: boolean) {
     const matching = chosen ? compatibleCatalog(record.manifest?.catalog ?? [], chosen.metric, chosen.unit, recordSubjects(record)) : [];
     const targets = chosen && showTargets ? targetColumns(record.manifest?.catalog ?? [], chosen.metric, chosen.unit, recordSubjects(record)) : [];

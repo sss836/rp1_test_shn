@@ -9,6 +9,7 @@ This repository combines application source and third-party components. Existing
 | PyInstaller | GPL with its bootloader distribution exception; upstream license applies | Build tool and bootloader |
 | FastAPI, React, Vite, NumPy and other libraries | Their respective upstream licenses | Exact versions in Python lockfiles and `frontend/package-lock.json` |
 | PostgreSQL / Nginx container images | Respective upstream licenses and notices | Version/digest-pinned images obtained from upstream registries |
+| `@earendil-works/pi-agent-core`, `@earendil-works/pi-ai` | MIT; earendil-works/pi upstream notices | Isolated Node service; exact versions and transitive integrity hashes in `assistant/package-lock.json` |
 
 Motor source and modifications are provided in this repository. Keep these sources, build scripts, dependency lockfiles and notices with every corresponding binary delivery. The HMI package is a directory-based build with shared Qt libraries, not a statically linked Qt application. Preserve applicable LGPL notices, library replacement/relinking rights, and source availability obligations when redistributing. Obtain any commercial Qt license directly from its rights holder if that is the chosen distribution model.
 

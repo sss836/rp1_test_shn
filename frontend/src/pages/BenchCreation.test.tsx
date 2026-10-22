@@ -39,7 +39,7 @@ it("creates from the overview and refreshes the full list after successful save"
   fireEvent.click(screen.getByRole("button", { name: "新建台架" }));
   fireEvent.submit(fillForm());
   await screen.findByText("新增测试台架");
-  expect(create).toHaveBeenCalledWith("stations", expect.objectContaining({ station_code: "A02", name: "新增测试台架", station_type: "MODULE", reason: "隔离页面验证" }));
+  expect(create).toHaveBeenCalledWith("stations", expect.objectContaining({ station_code: "A02", name: "新增测试台架", station_type: "MODULE", reason: "隔离页面验证" }),expect.any(String),"POST");
   expect(screen.queryByLabelText("台架编号")).toBeNull();
   expect((screen.getByLabelText("搜索台架") as HTMLInputElement).value).toBe("");
   expect(getRegisteredStations).toHaveBeenCalledTimes(2);
@@ -57,8 +57,8 @@ it("preserves the entered form and reports a conflict without inventing a new st
   expect(getRegisteredStations).toHaveBeenCalledTimes(1);
 });
 
-it("keeps creation unavailable to non-administrators", async () => {
-  identity.role = "TEST_EXECUTOR";
+it("keeps creation unavailable to viewers", async () => {
+  identity.role = "VIEWER";
   mount();
   await screen.findByText("已有台架");
   expect(screen.queryByRole("button", { name: "新建台架" })).toBeNull();
