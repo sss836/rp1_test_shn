@@ -1,0 +1,550 @@
+{
+  "schema_version": 1,
+  "id": "roboparty-official",
+  "version": "2026-10-23.v1",
+  "collected_at": "2026-10-23T08:50:47.033958+00:00",
+  "review_after_days": 30,
+  "scope": "萝博派对官网公司与产品介绍；不含个人资料、客户数据或平台实测结果。",
+  "sources": [
+    {
+      "id": "home",
+      "url": "https://roboparty.com/",
+      "title": "RoboParty 官网首页",
+      "fetched_at": "2026-10-23T08:38:44.270993+00:00",
+      "sha256": "68b6dfc9fdcad67798eec8be7a5b2a72cd2906b0b336aff7380e46e39c7b13f3",
+      "publisher_updated_at": null
+    },
+    {
+      "id": "rp1",
+      "url": "https://roboparty.com/products/RP1",
+      "title": "ROBOTO 01：RP1 / RP1 Pro",
+      "fetched_at": "2026-10-23T08:38:45.545385+00:00",
+      "sha256": "1594f379cf6bd757fbd8d8baee34541047a8566e6883b3518ebb96af98839da0",
+      "publisher_updated_at": null
+    },
+    {
+      "id": "origin",
+      "url": "https://roboparty.com/products/RPO",
+      "title": "ROBOTO Origin",
+      "fetched_at": "2026-10-23T08:38:45.765333+00:00",
+      "sha256": "f20b98bffb756059af6e67c7f05f0c1d421cdc14702eba24339a23c0abd9645f",
+      "publisher_updated_at": null
+    },
+    {
+      "id": "hand",
+      "url": "https://roboparty.com/products/rp-hand",
+      "title": "RP Hand 灵巧手",
+      "fetched_at": "2026-10-23T08:38:45.966864+00:00",
+      "sha256": "b45d193a0c7766cf9acf8c827a730c2b664abf63bd50f0438b1500d487328f75",
+      "publisher_updated_at": null
+    },
+    {
+      "id": "romomo",
+      "url": "https://roboparty.com/products/ROMOMO",
+      "title": "ROMOMO 关节模组",
+      "fetched_at": "2026-10-23T08:38:46.199624+00:00",
+      "sha256": "9b2eea405b59738687071574187d8a704e831bce89df89eb04157310b1fb1327",
+      "publisher_updated_at": null
+    },
+    {
+      "id": "lab",
+      "url": "https://lab.roboparty.com/",
+      "title": "RoboParty Lab 官方实验室",
+      "fetched_at": "2026-10-23T08:50:47.033958+00:00",
+      "sha256": "8c8267f45b767f2cd6c32631881abf59c59127d12b16be4a9c5c1e67599d6a05",
+      "publisher_updated_at": null
+    }
+  ],
+  "chunks": [
+    {
+      "id": "company",
+      "source_id": "home",
+      "title": "萝博派对公司简介",
+      "entities": [
+        "company"
+      ],
+      "keywords": [
+        "公司",
+        "企业",
+        "上海",
+        "萝博派对",
+        "介绍",
+        "是谁"
+      ],
+      "text": "RoboParty 的中文品牌为萝博派对，官网页脚署名上海萝博派对科技有限公司。其公开介绍聚焦开源机器人及开发者生态，强调软件与硬件开放，服务研究者和独立开发者。官网链接 RoboParty Lab 实验室。公司成立时间、创始人、融资、人员规模与客户名单未在本快照中核实，不得补编。"
+    },
+    {
+      "id": "portfolio",
+      "source_id": "home",
+      "title": "萝博派对产品系列与选型概览",
+      "entities": [
+        "company",
+        "portfolio"
+      ],
+      "keywords": [
+        "产品",
+        "系列",
+        "有哪些",
+        "选型",
+        "机器人",
+        "灵巧手",
+        "关节模组",
+        "区别"
+      ],
+      "text": "官网列出四条产品线：ROBOTO 01 是面向研究与开发的人形机器人平台，其产品页区分 RP1 和 RP1 Pro；ROBOTO Origin 是开放结构、电路和控制资料的人形平台；RP Hand 是轻薄灵巧手；ROMOMO 是关节模组系列。产品规格必须按对应页面、型号和配置分别回答，不能把机器人本体、灵巧手和关节模组的自由度或峰值扭矩混为一谈。"
+    },
+    {
+      "id": "rp1-overview",
+      "source_id": "rp1",
+      "title": "ROBOTO 01 定位、别名和模块化",
+      "entities": [
+        "rp1"
+      ],
+      "keywords": [
+        "介绍",
+        "定位",
+        "ROBOTO01",
+        "RP1",
+        "RP1Pro",
+        "开源",
+        "模块化",
+        "头部"
+      ],
+      "text": "官网路径 /products/RP1 的展示名称是 ROBOTO 01，参数表分 RP1 与 RP1 Pro 两种版本。平台面向研究者和独立开发者，支持硬件及软件二次开发。可配置运控头、交互头、数采头和感知头，开放腕部及扩展接口；末端可选假手、灵巧手或夹爪。网页适配概念与实机装配结果不能等同。"
+    },
+    {
+      "id": "rp1-structure",
+      "source_id": "rp1",
+      "title": "RP1 与 RP1 Pro 尺寸、重量和自由度",
+      "entities": [
+        "rp1"
+      ],
+      "keywords": [
+        "身高",
+        "重量",
+        "体重",
+        "尺寸",
+        "自由度",
+        "单臂",
+        "手臂",
+        "腿",
+        "腰",
+        "头",
+        "区别",
+        "Pro"
+      ],
+      "text": "RP1 / RP1 Pro 身高均为1.35 m，站立尺寸1350×450×200 mm；含末端执行器和电池的重量约39 / 41 kg。主动自由度分别24 / 30，头部0 / 2，单臂5 / 7，腰部均2，单腿均6。大腿250 mm、小腿300 mm、单臂总长550 mm。斜线前后严格对应RP1与RP1 Pro，不能说两个型号都为30自由度。"
+    },
+    {
+      "id": "rp1-motion",
+      "source_id": "rp1",
+      "title": "RP1 系列运动和动力标称参数",
+      "entities": [
+        "rp1"
+      ],
+      "keywords": [
+        "速度",
+        "跑步",
+        "扭矩",
+        "力矩",
+        "负载",
+        "爬坡",
+        "台阶",
+        "峰值",
+        "160"
+      ],
+      "text": "RP1与RP1 Pro官网均标最高跑步速度≤4 m/s、负载3 kg、爬坡30°、最大台阶跨越高度50 mm、避障最小尺寸50 mm，并支持自动出箱。160 N·m是100 mm外径关节模组的峰值扭矩，不是每个关节的额定扭矩或当前平台测得的力矩；峰值不能当持续输出。运动表现随负载、地形、电池和软件配置变化。"
+    },
+    {
+      "id": "rp1-battery",
+      "source_id": "rp1",
+      "title": "RP1 系列电池、续航和充电",
+      "entities": [
+        "rp1"
+      ],
+      "keywords": [
+        "电池",
+        "续航",
+        "电量",
+        "容量",
+        "充电",
+        "热插拔",
+        "多久",
+        "小时",
+        "USB"
+      ],
+      "text": "RP1和RP1 Pro官网标电池10 Ah、续航3 h、充电1.5 h；大小双电池设计，支持不关机热插拔、140 W USB-C快充、磁吸充电及边充边用。3 h是官网标称续航，受负载和工况影响；不是测试台累计运行时长，也不能替代本台电池或现场测试结果。"
+    },
+    {
+      "id": "rp1-options",
+      "source_id": "rp1",
+      "title": "RP1 与 Pro 感知、计算及标准配置",
+      "entities": [
+        "rp1"
+      ],
+      "keywords": [
+        "标配",
+        "选配",
+        "相机",
+        "计算",
+        "RK3588",
+        "A733",
+        "Orin",
+        "传感器",
+        "手",
+        "Pro",
+        "通信"
+      ],
+      "text": "RP1标配运控头、假手，无标配视觉相机，基础计算为RK3588；RP1 Pro标配交互头、6主动自由度灵巧手、单目RGB相机，基础计算为RK3588+A733，开发计算模块列Orin NX 16 GB。Intel D435i深度相机为选配，感知头可配深度相机和3D激光雷达，数采头用双目RGB相机。两者支持Wi-Fi 6、蓝牙5.2、4G；具体配置以所选版本为准。"
+    },
+    {
+      "id": "rp1-development",
+      "source_id": "rp1",
+      "title": "RP1 开源开发资料和安全环境",
+      "entities": [
+        "rp1"
+      ],
+      "keywords": [
+        "开发",
+        "开源",
+        "SDK",
+        "ROS2",
+        "软件",
+        "硬件",
+        "安全",
+        "急停",
+        "工作温度"
+      ],
+      "text": "官网列硬件资料包括本体与模组结构图、BOM、接口、PCB及3D模型；软件资料包括操作系统、电机驱动、步态算法、ROS 2中间件、SDK、仿真及训练代码。RP1系列工作环境温度−10～40 °C，采用遥控与随身急停的三路冗余、包围式关节防夹设计。工作环境温度不是关节内部温度报警阈值，不能用于绕过测试规则或设备保护。"
+    },
+    {
+      "id": "origin-overview",
+      "source_id": "origin",
+      "title": "ROBOTO Origin 尺寸和自由度",
+      "entities": [
+        "origin"
+      ],
+      "keywords": [
+        "Origin",
+        "RPO",
+        "介绍",
+        "身高",
+        "重量",
+        "自由度",
+        "关节",
+        "手臂",
+        "腿",
+        "腰"
+      ],
+      "text": "ROBOTO Origin官网标身高1.25 m、重量34 kg、整机23自由度；单臂5（肩3、肘1、腕1），单腿6（髋3、膝1、踝2），腰1。大腿250 mm、小腿300 mm、单臂440 mm。它与ROBOTO 01的RP1/Pro是不同产品，不能套用24/30自由度或1.35 m的参数。"
+    },
+    {
+      "id": "origin-motion-power",
+      "source_id": "origin",
+      "title": "Origin 动力、电池与续航",
+      "entities": [
+        "origin"
+      ],
+      "keywords": [
+        "扭矩",
+        "力矩",
+        "速度",
+        "负载",
+        "电池",
+        "续航",
+        "电压",
+        "容量",
+        "小时"
+      ],
+      "text": "ROBOTO Origin官网运动速度3 m/s，手臂关节峰值扭矩27 N·m、腿关节峰值120 N·m；电池48 V、15 Ah，续航2小时以上。续航随负载、配置及运行条件变化。不能把Origin的120 N·m与ROBOTO 01所用100 mm模组的160 N·m相互替换。"
+    },
+    {
+      "id": "origin-development",
+      "source_id": "origin",
+      "title": "Origin 开发连接与结构设计",
+      "entities": [
+        "origin"
+      ],
+      "keywords": [
+        "开发",
+        "ROS2",
+        "WiFi",
+        "蓝牙",
+        "OTA",
+        "SDK",
+        "相机",
+        "雷达",
+        "结构"
+      ],
+      "text": "Origin使用ROS 2，支持Wi-Fi 6、蓝牙5.2及OTA升级，提供底层控制SDK与手动控制；开放机械、电路、控制算法和仿真资料。Intel D435i与3D激光雷达为可选配件。结构介绍包括CNC加工、并联脚踝、类人偏置关节和骨肉分离设计。"
+    },
+    {
+      "id": "hand-motion",
+      "source_id": "hand",
+      "title": "RP Hand 自由度、尺寸和开合能力",
+      "entities": [
+        "hand"
+      ],
+      "keywords": [
+        "灵巧手",
+        "RPHand",
+        "自由度",
+        "主动",
+        "重量",
+        "尺寸",
+        "开合",
+        "速度",
+        "角度"
+      ],
+      "text": "RP Hand是人形机器人灵巧手，总自由度11、主动自由度6；不能把11说成主动自由度。重量379±10 g，尺寸长147.54×宽73.53×厚26.35 mm，最小开合时间≤0.7 s，蜗轮蜗杆传动。拇指侧摆0–87.5°、屈伸0–65°，四指弯曲0–72°，角度分辨率1°。"
+    },
+    {
+      "id": "hand-interface",
+      "source_id": "hand",
+      "title": "RP Hand 供电、通信与开发支持",
+      "entities": [
+        "hand"
+      ],
+      "keywords": [
+        "电压",
+        "电流",
+        "供电",
+        "协议",
+        "CAN",
+        "EtherCAT",
+        "RS485",
+        "Windows",
+        "Linux",
+        "ROS2",
+        "SDK",
+        "Python"
+      ],
+      "text": "RP Hand输入电压范围在官网写为12 V(−10%)至48 V(+10%)，静态电流≤0.1 A、最大电流≤2.5 A，使用无刷空心杯模组。通信列EtherCAT、CAN FD与RS485，CAN FD和RS485为二选一配置。支持Windows、Linux、ROS 2、x86/ARM及C++/Python，提供可视化上位机、开源SDK、示例及URDF/MJCF/STEP模型。实际接口以购置配置为准。"
+    },
+    {
+      "id": "hand-tactile",
+      "source_id": "hand",
+      "title": "RP Hand 可选触觉传感器",
+      "entities": [
+        "hand"
+      ],
+      "keywords": [
+        "触觉",
+        "压力",
+        "力传感器",
+        "分辨率",
+        "掌心",
+        "手指",
+        "量程",
+        "选配"
+      ],
+      "text": "RP Hand掌心与五指可配置触觉传感器，并非所有型号必然标配。掌心测法向力，分辨率0.1 N、量程0–25 N；五指测切向与法向力，分辨率0.01 N，法向量程0–20 N、切向方向0–360°、方向分辨率1°。这些感知指标仅适用于配置相应传感器的版本，不是抓握力指标。"
+    },
+    {
+      "id": "hand-life",
+      "source_id": "hand",
+      "title": "RP Hand 寿命与工作环境",
+      "entities": [
+        "hand"
+      ],
+      "keywords": [
+        "寿命",
+        "开合",
+        "次数",
+        "年",
+        "温度",
+        "环境",
+        "湿度",
+        "防护",
+        "IP30"
+      ],
+      "text": "RP Hand官网标空载开合25万次、带载开合25万次（满载侧握）、设计使用寿命3年；一次开合指打开加闭合。工作温度−10～45 °C，工作湿度10%–90% RH，存储温度−10～70 °C，防护IP30。设计寿命和官网寿命指标不是对任意负载的实测保证，不能自动当作本项目验收结论。"
+    },
+    {
+      "id": "romomo-overview",
+      "source_id": "romomo",
+      "title": "ROMOMO 型号及峰值、额定扭矩比较",
+      "entities": [
+        "romomo"
+      ],
+      "keywords": [
+        "关节",
+        "模组",
+        "ROMOMO",
+        "型号",
+        "对比",
+        "区别",
+        "6562",
+        "8462",
+        "10062",
+        "扭矩",
+        "力矩",
+        "额定",
+        "峰值"
+      ],
+      "text": "ROMOMO官网比较表列6562、8462、10062三个型号：额定扭矩分别10±5%、14、44±5% N·m；峰值分别35、42、160 N·m；额定转速60、60、80 rpm；样机实测重量533.1、779.4、1197 g。各型号额定电压48 V。160 N·m仅对应10062短时峰值，不能当6562/8462或连续输出能力；未标注的参数不能从其他型号移植。"
+    },
+    {
+      "id": "romomo-6562",
+      "source_id": "romomo",
+      "title": "ROMOMO 6562 技术参数",
+      "entities": [
+        "romomo"
+      ],
+      "keywords": [
+        "6562",
+        "电流",
+        "扭矩",
+        "转速",
+        "功率",
+        "减速比",
+        "编码器",
+        "尺寸",
+        "通信"
+      ],
+      "text": "ROMOMO 6562：额定/峰值扭矩10±5% / 35 N·m，额定/峰值转速60 / 200 rpm，额定功率62.8±5% W，减速比19.5:1，背隙≤15 arcmin，额定48 V，额定/峰值电流2±5% / 16±10% A；CAN FD/EtherCAT，双编码器17 bit电机端、19 bit减速机端。外径65 mm、轴向61.2±0.5 mm、中空4.5 mm，样机533.1 g。"
+    },
+    {
+      "id": "romomo-8462",
+      "source_id": "romomo",
+      "title": "ROMOMO 8462 已公开与未标注参数",
+      "entities": [
+        "romomo"
+      ],
+      "keywords": [
+        "8462",
+        "8463",
+        "电流",
+        "扭矩",
+        "转速",
+        "功率",
+        "减速比",
+        "编码器",
+        "尺寸",
+        "通信",
+        "缺失"
+      ],
+      "text": "ROMOMO 8462官网表列额定扭矩14 N·m、峰值42 N·m，额定/峰值转速60 / 155 rpm，减速比20:1，额定48 V，样机779.4 g。其额定功率、额定/峰值电流、通信协议、编码器及主要尺寸等在该表未标注，不能照搬6562的值。本官网知识快照没有8463型号规格，不能将8462与8463视为同型号或把42 N·m归给8463。"
+    },
+    {
+      "id": "romomo-10062",
+      "source_id": "romomo",
+      "title": "ROMOMO 10062 技术参数",
+      "entities": [
+        "romomo"
+      ],
+      "keywords": [
+        "10062",
+        "电流",
+        "扭矩",
+        "转速",
+        "功率",
+        "减速比",
+        "编码器",
+        "尺寸",
+        "通信"
+      ],
+      "text": "ROMOMO 10062：额定/峰值扭矩44±5% / 160 N·m，额定/峰值转速80 / 130 rpm，额定功率370±5% W，减速比22:1，背隙11.4 arcmin，额定48 V，额定/峰值电流11±5% / 55±10% A；CAN FD/EtherCAT，双编码器17 bit内圈、19 bit外圈。外径100 mm、轴向61.7±0.5 mm、中空7.5 mm，样机1197 g。"
+    },
+    {
+      "id": "romomo-integration",
+      "source_id": "romomo",
+      "title": "ROMOMO 集成与参数适用边界",
+      "entities": [
+        "romomo"
+      ],
+      "keywords": [
+        "结构",
+        "集成",
+        "中空",
+        "安装",
+        "开源",
+        "四款",
+        "三款",
+        "峰值",
+        "持续"
+      ],
+      "text": "ROMOMO产品页介绍抱箍固定、中空走线及硬件图纸与驱动源码开放。中空尺寸随型号变化；网站首页或ROBOTO 01页提到四款自研模组，但当前ROMOMO公开对比表只列三个型号，不能据此发明第四款规格。模组峰值、额定值和样机实测重量各有口径；参数不能替代本机控制协议确认、校准或真实测试。"
+    },
+    {
+      "id": "purchase-freshness",
+      "source_id": "home",
+      "title": "价格、库存、交期和快照时效",
+      "entities": [
+        "company",
+        "rp1",
+        "origin",
+        "hand",
+        "romomo"
+      ],
+      "keywords": [
+        "价格",
+        "报价",
+        "售价",
+        "多少钱",
+        "库存",
+        "现货",
+        "交期",
+        "下单",
+        "购买",
+        "预订",
+        "保修"
+      ],
+      "text": "本知识快照没有核实当前成交价、库存、交期或保修细则，不提供固定报价。官网为Origin与RP Hand提供购买/价格链接，为ROMOMO提供预订入口；需经官网当前入口或官方商务确认。本库是采集日期的官网快照，不是实时库存，也不是模型权重的永久记忆；更新日期不等于官网发布日期。",
+      "retrieval_requires_keyword": true
+    },
+    {
+      "id": "lab-overview",
+      "source_id": "lab",
+      "title": "RoboParty Lab 实验室与研究方向",
+      "entities": [
+        "lab"
+      ],
+      "keywords": [
+        "Lab",
+        "实验室",
+        "研究",
+        "方向",
+        "技术",
+        "关于"
+      ],
+      "text": "RoboParty Lab官网介绍其面向具身智能前沿研究与开源产出，技术方向包括人形机器人双足基础运动控制，以及全身协调控制与操作。平台支持研究与开源探索；愿景、研究方向或项目展示不能视为全部能力已经量产交付，也不构成本测试平台对产品性能的认证。"
+    },
+    {
+      "id": "party-os",
+      "source_id": "lab",
+      "title": "Party OS 人形机器人开放研发底座",
+      "entities": [
+        "party_os"
+      ],
+      "keywords": [
+        "Party OS",
+        "PartyOS",
+        "Party_OS",
+        "研发",
+        "系统",
+        "功能",
+        "开源"
+      ],
+      "text": "RoboParty Lab将Party OS介绍为面向全球开发者的人形机器人开放研发底座。其方向包括基础运动控制（数据生成、动作重定向、训练、Sim2Real/Real2Sim）、感知交互、全身协调控制与操作，以及Agent与Skills的任务规划和技能组合。该页描述研究与演进方向；不能据此声称所有模块都已开源、可直接用于生产，或与当前测试大屏的智能助手是同一个系统。具体发布状态需核对官方资料。"
+    },
+    {
+      "id": "lab-projects",
+      "source_id": "lab",
+      "title": "RoboParty Lab 公开研究项目入口",
+      "entities": [
+        "lab"
+      ],
+      "keywords": [
+        "项目",
+        "成果",
+        "Mimiclite",
+        "UFO",
+        "Human-Humanoid",
+        "INTACT",
+        "TeCH"
+      ],
+      "text": "Lab官网展示Mimiclite监督学习框架、UFO无监督强化学习框架、Human-Humanoid Tools、INTACT意图—动作接口，以及TeCH全身运动基础模型等项目入口。这些是官方研究项目介绍；本知识库未核验其论文、基准指标、代码完整性或与具体硬件版本的适配，不能把展示指标当作当前产品的可靠性验收结论。"
+    }
+  ]
+}

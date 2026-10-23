@@ -235,7 +235,7 @@ class ChatRuntime:
     def read(self,token,payload):
         item=self.authorize(token)
         from app.services.assistant_parts import known_part,canonical_part
-        stable=payload.tool in {'search_project_source','read_project_source'} or (payload.tool=='search_business' and payload.arguments.get('resource') in {'cases','parts'} and not payload.arguments.get('include_contexts'))
+        stable=payload.tool in {'search_project_source','read_project_source','search_knowledge'} or (payload.tool=='search_business' and payload.arguments.get('resource') in {'cases','parts'} and not payload.arguments.get('include_contexts'))
         arguments={k:v for k,v in payload.arguments.items() if v is not None}
         if stable and payload.tool=='search_business':
             alias=known_part(arguments.get('query'))
@@ -245,12 +245,12 @@ class ChatRuntime:
         cache=item.setdefault('read_cache',{})
         if stable and key in cache:
             logger.info('assistant_read_reused job=%s tool=%s',item['id'],payload.tool)
-            return {**cache[key],'retrieval':{'reused':True,'instruction':'相同条件的目录/源码已在本任务提供；请使用已有证据，或沿next_cursor读取下一页。'}}
+            return {**cache[key],'retrieval':{'reused':True,'instruction':'相同条件的目录/源码/知识库已在本任务提供；请使用已有证据，或沿next_cursor读取下一页。'}}
         item['reads']+=1
         if item['reads']>12:raise ApiError(409,"assistant_tool_limit","单任务工具调用过多。")
         from app.services.assistant_privacy import public_evidence
         try:
-            if payload.tool in {'search_project_source','read_project_source','search_web','read_web_page'}:
+            if payload.tool in {'search_project_source','read_project_source','search_web','read_web_page','search_knowledge'}:
                 card=query(None,payload.tool,payload.arguments,item['context'])
             else:
                 with actor_session(item['actor']) as session:card=query(session,payload.tool,payload.arguments,item['context'])

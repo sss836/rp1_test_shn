@@ -14,7 +14,7 @@ from app.services.curve_analysis import CurveAnalysisService
 from app.services.assistant_privacy import public_evidence
 from app.services.assistant_parts import known_part, canonical_part
 
-TOOLS=("search_business","read_business_object","get_runtime_summary","compare_joint_torque","search_project_source","read_project_source","search_web","read_web_page","search_my_history")
+TOOLS=("search_business","read_business_object","get_runtime_summary","compare_joint_torque","search_project_source","read_project_source","search_web","read_web_page","search_my_history","search_knowledge")
 RESOURCES=("parts","assets","archives","cases","programs","campaigns","stations","live_executions","test_case_durations","data_sources")
 
 def wire(value):
@@ -210,6 +210,9 @@ def compare_torque(session,args,context):
 
 def query(session,tool,args,context):
     if not isinstance(args,dict) or len(str(args))>12000:raise ApiError(422,"query_invalid","查询参数无效。")
+    if tool=="search_knowledge":
+        from app.services.assistant_knowledge import search_knowledge
+        return card("knowledge_evidence","萝博派对官网知识库",search_knowledge(args),"https://roboparty.com/",scope="官方公开资料快照；不是平台实测或审批结果")
     if tool=="search_business":return card("business_search","业务资料检索",search(session,args),"/api/v1/"+str(args.get("resource","assets")))
     if tool=="get_runtime_summary":return runtime_summary(session,args,context)
     if tool=="compare_joint_torque":return compare_torque(session,args,context)

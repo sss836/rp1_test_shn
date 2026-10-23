@@ -29,8 +29,10 @@ parser.add_argument("--production-checks", action="store_true", help="production
 parser.add_argument("--observe-seconds",type=int,help="continuous synthetic observation, 60..86400 seconds; no live API key")
 parser.add_argument("--engineering-checks",action="store_true")
 parser.add_argument("--query-control-checks",action="store_true")
+parser.add_argument("--knowledge-checks",action="store_true")
 parser.add_argument("--source-root",type=Path)
 args = parser.parse_args()
+if args.knowledge_checks:args.chat_checks=True
 if args.engineering_checks:
     args.chat_checks=True
     if not args.source_root:parser.error("--engineering-checks requires --source-root")
@@ -93,6 +95,7 @@ with tempfile.TemporaryDirectory(prefix="rp1-assistant-qa-") as directory:
         override = temp / 'chat-checks.yml'
         files='tests/test_assistant_engineering.py tests/test_assistant_engineering_integration.py' if args.engineering_checks else 'tests/test_assistant_runtime.py tests/test_assistant_runtime_live.py'
         if args.query_control_checks:files='tests/test_assistant_query_control.py tests/test_assistant_query_control_live.py tests/test_assistant_runtime.py tests/test_assistant_engineering.py'
+        if args.knowledge_checks:files='tests/test_assistant_knowledge.py tests/test_assistant_knowledge_live.py tests/test_assistant_query_control.py tests/test_assistant_engineering.py'
         override.write_text("services:\n  api:\n    environment:\n      ASSISTANT_RUNTIME_ENABLED: 'true'\n      ASSISTANT_LEGACY_PROBES: 'false'\n  checks:\n    environment:\n      ASSISTANT_RUNTIME_ENABLED: 'true'\n      ASSISTANT_LEGACY_PROBES: 'false'\n    command: [python, -m, pytest, -p, 'no:cacheprovider', "+', '.join(files.split())+", -q, '--junitxml=/reports/backend-junit.xml']\n")
         compose += ['-f',str(override)]
     if args.production_checks:
