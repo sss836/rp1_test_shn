@@ -388,3 +388,69 @@ def test_creation_without_tool_receipt_never_reports_saved(environment):
         job=wait(client,submit(client,'创建项目，编号 FIX-NO-RECEIPT，名称 无回执项目')['id'])
         assert not job.get('receipt') and job['result']['business_status']=='needs_input'
         assert '尚未保存' in job['result']['reply']
+
+
+def test_original_question_repeated_reads_preserve_one_card_and_final_answer(environment):
+    _,users=environment
+    control(mode='repeat',tool='search_business',arguments={'resource':'cases','query':'upper_body','published_only':True})
+    with signed_in(users['first']) as client:
+        job=wait(client,submit(client,'为什么我的上位机没有upper_body的可选用例编号')['id'])
+        from pathlib import Path
+        import json
+        Path('/reports/original-controlled.json').write_text(json.dumps(job,ensure_ascii=False,default=str))
+        assert job['rounds']==6 and job['state']=='COMPLETED',job
+        assert job['result']['completion']=='partial' and job['result']['termination_reason']=='round_limit'
+        assert len(job['result']['cards'])==1
+        data=job['result']['cards'][0]['data']
+        assert data['applied_filters']['target_part_code']=='UPPER'
+        assert all(x['target_part_code']=='UPPER' for x in data['items'])
+        assert '模型链路中断' not in job['result']['reply']
+        stats=model_requests();assert len(stats)==6 and stats[-1]['tool_names']==[]
+
+
+@pytest.mark.parametrize('mode,reason',[('no_usage','billing_unverified'),('disconnect','provider_network'),('limited','provider_http')])
+def test_failure_reason_survives_model_bridge(environment,mode,reason):
+    # Other integration cases deliberately freeze finance; clear only this
+    # disposable QA database, never use the site's connection configuration.
+    from sqlalchemy import text
+    engine,users=environment
+    with engine.begin() as c:
+        c.execute(text('DELETE FROM integration.assistant_model_call'))
+        c.execute(text('DELETE FROM integration.assistant_budget_day'))
+        c.execute(text('UPDATE integration.assistant_finance SET blocked=false,reason=NULL'))
+    control(mode=mode)
+    with signed_in(users['first']) as client:
+        job=wait(client,submit(client)['id'])
+        assert job['state']=='FAILED' and job['result']['termination_reason']==reason,job
+        assert len(model_requests())==1
+        assert 'sensitive provider detail' not in job['result']['reply']
+        assert client.get('/api/v1/assistant/budget').json()['data']['blocked']
+
+
+def test_context_counts_follow_normal_campaign_read_scope(environment):
+    engine,users=environment
+    prefix='QUERY-CONTEXT-'+uuid4().hex[:8]
+    with signed_in(users['first']) as owner,signed_in(users['second']) as other:
+        def create(path,value):
+            r=owner.post('/api/v1/setup/'+path,json={**value,'reason':'synthetic query scope'},headers={'Idempotency-Key':str(uuid4())})
+            assert r.status_code==201,r.text
+            return r.json()['data']
+        program=create('programs',{'program_code':prefix,'name':'合成项目'})
+        campaign=create('campaigns',{'program_id':program['id'],'campaign_code':prefix,'name':'合成计划','asset_kind':'MODULE'})
+        with engine.begin() as c:
+            owner_id=c.execute(text('SELECT id FROM iam.app_user WHERE username=:name'),{'name':users['first']}).scalar_one()
+            asset_id=c.execute(text("""INSERT INTO test.asset(asset_code,asset_kind,product_family,serial_number,display_name,created_by)
+                VALUES('RP1.3-UPPER-901','MODULE','SYNTHETIC',:serial,'合成查询样品',:owner) RETURNING id"""),{'serial':str(uuid4()),'owner':owner_id}).scalar_one()
+            c.execute(text("""INSERT INTO test.campaign_coverage_item(campaign_id,test_case_version_id)
+                SELECT campaign.id,v.id FROM test.test_campaign campaign,catalog.test_case tc
+                JOIN catalog.test_case_version v ON v.test_case_id=tc.id AND v.status='PUBLISHED'
+                WHERE campaign.public_id=:campaign AND tc.case_code='REL-UPPER-001' LIMIT 1"""),{'campaign':campaign['id']})
+            c.execute(text("UPDATE test.campaign_coverage_item SET target_asset_id=:asset WHERE campaign_id=(SELECT id FROM test.test_campaign WHERE public_id=:campaign)"),{'asset':asset_id,'campaign':campaign['id']})
+        for client in (owner,other):
+            visible=client.get('/api/v1/setup/campaigns/'+campaign['id']+'/contexts')
+            control(tool='search_business',arguments={'resource':'cases','query':'REL-UPPER-001','include_contexts':True})
+            job=wait(client,submit(client,'核对合成用例的计划关联')['id'])
+            assert job['state']=='COMPLETED',job
+            actual=job['result']['cards'][0]['data']['items'][0]['plan_contexts']
+            expected=len(visible.json()['data']) if visible.status_code==200 else 0
+            assert actual=={'visible_contexts':expected,'active_plan_contexts':expected}

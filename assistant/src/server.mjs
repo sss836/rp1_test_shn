@@ -5,6 +5,7 @@ import { loadConfig } from "./config.mjs";
 import { runProbe } from "./probe.mjs";
 import { runSetup } from "./setup.mjs";
 import { runChat } from "./chat.mjs";
+import { safeFailure } from "./chat-errors.mjs";
 
 function secretMatches(provided, expected) {
   const left = Buffer.from(typeof provided === "string" ? provided : "");
@@ -17,7 +18,7 @@ function send(response, status, data) {
   response.end(JSON.stringify(data));
 }
 
-export function buildServer(config, probe = runProbe) {
+export function buildServer(config, probe = runProbe, chat = runChat) {
   let active = 0;
   const server = createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/healthz") return send(response, 200, { status: "ok" });
@@ -47,10 +48,11 @@ export function buildServer(config, probe = runProbe) {
       if(isSetup && (!Array.isArray(body.messages)||body.messages.length>12||!body.messages.every((m)=>typeof m==="string"&&m.length<=8000)||!body.choices||typeof body.choices!=="object"))return send(response,422,{error:"invalid_setup"});
       if(isChat&&(!Array.isArray(body.messages)||body.messages.length>20||!body.context||!body.choices||!Number.isInteger(body.timeout_ms)||body.timeout_ms<1000||body.timeout_ms>120000))return send(response,422,{error:"invalid_chat"});
       if(isChat&&body.attachments!==undefined&&(!Array.isArray(body.attachments)||body.attachments.length>3||body.attachments.some(a=>!a||!["text","image"].includes(a.type)||(a.type==="image"&&(!["image/png","image/jpeg"].includes(a.mimeType)||typeof a.data!=="string"||a.data.length>5700000))||(a.type==="text"&&(typeof a.text!=="string"||a.text.length>25000)))))return send(response,422,{error:"invalid_attachment"});
-      send(response, 200, isChat?await runChat(config,body,controller.signal):isSetup ? await runSetup(config, body, controller.signal) : await probe(config, body.tool_grant, controller.signal));
-    } catch {
+      send(response, 200, isChat?await chat(config,body,controller.signal):isSetup ? await runSetup(config, body, controller.signal) : await probe(config, body.tool_grant, controller.signal));
+    } catch(error) {
       // Never return or log provider errors, prompts, tokens or raw payloads.
-      send(response, controller.signal.aborted ? 504 : 502, { error: "probe_failed" });
+      if(isChat){const failure=safeFailure(error,controller.signal.aborted);console.log(JSON.stringify({event:"assistant_request_failed",reason:failure.body.error}));send(response,failure.status,failure.body);}
+      else send(response, controller.signal.aborted ? 504 : 502, { error: "probe_failed" });
     } finally {
       active--;
       clearTimeout(timeout);

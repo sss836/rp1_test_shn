@@ -16,6 +16,12 @@ beforeEach(()=>{
   vi.spyOn(assistantApi,"submitJob").mockResolvedValue({id:identifier,thread_id:identifier,state:"QUEUED"});
 });
 afterEach(()=>{cleanup();vi.restoreAllMocks();});
+it("labels partial answers with the actual stopping reason",async()=>{
+  vi.mocked(assistantApi.job).mockResolvedValue({...complete,state:"FAILED",rounds:6,result:{reply:"已取得实际数据",cards:[],completion:"partial",termination_reason:"round_limit"}});
+  view();await send();
+  expect(screen.getByLabelText("当前任务").textContent).toContain("部分答复 · 达到交互上限");
+  expect(screen.queryByText(/模型链路中断/)).toBeNull();
+});
 function view(account="one",page=context){const client=new QueryClient({defaultOptions:{queries:{retry:false,gcTime:0}}});return render(<QueryClientProvider client={client}><AssistantPanel key={account} accountKey={account} context={page} navigate={vi.fn()}/></QueryClientProvider>);}
 async function send(){fireEvent.click(screen.getByText("助手"));const input=screen.getByLabelText("消息");fireEvent.change(input,{target:{value:"解释当前选区"}});fireEvent.submit(input.closest("form")!);await screen.findByText("已取得实际数据");}
 

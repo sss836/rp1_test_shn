@@ -31,7 +31,7 @@ export const assistantApi = {
 export type PageContext={view:string;kind:"MODULE"|"WHOLE_MACHINE";object_id?:string;archive_id?:string;selection_empty?:boolean;metrics?:string[];subjects?:string[];start?:number;end?:number;stage?:string;cycle?:string;target_part_code?:string};
 export type AssistantCard={type:string;title:string;source:string;updated_at:string;unit?:string;range?:unknown;scope?:string;data:Record<string,unknown>;target?:{view:string;id:string|null}};
 export type ChatHistory={messages:Array<{id:number;job_id:string;role:"user"|"assistant";body:string;context:PageContext;cards:AssistantCard[];attachments?:AssistantAttachment[];created_at:string}>;jobs:Array<{id:string;state:string}>};
-export type ChatJob={id:string;thread_id:string;state:string;rounds:number;context:PageContext;result?:{reply:string;setup?:SetupOutcome;cards:AssistantCard[];business_status?:"saved"|"needs_input"|"needs_adoption"|"answered"|"not_saved"};receipt?:SetupOutcome["receipt"]};
+export type ChatJob={id:string;thread_id:string;state:string;rounds:number;context:PageContext;result?:{reply:string;setup?:SetupOutcome;cards:AssistantCard[];completion?:"answered"|"partial"|"failed";termination_reason?:string;business_status?:"saved"|"needs_input"|"needs_adoption"|"answered"|"not_saved"};receipt?:SetupOutcome["receipt"]};
 
 export type SetupOutcome = {
   status: "created" | "needs_input" | "needs_adoption";

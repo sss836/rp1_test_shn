@@ -26,6 +26,7 @@ from app.services.assistant import grants,require_pilot,service_secret
 from app.services import setup_assistant as setup_flow
 from app.services.assistant_queries import query
 from app.services import assistant_billing as billing
+from app.services.assistant_outcomes import failure_reason,partial_reply
 from app.services.setup import canonical
 
 TERMINAL={'COMPLETED','FAILED','TIMED_OUT','INTERRUPTED','CANCELLED'}
@@ -154,7 +155,7 @@ class ChatRuntime:
             if asyncio.current_task().cancelling():return
 
     async def run(self,identifier,actor,cookie):
-        settings=get_settings();token=None;intent=None;state='FAILED';reply='助手未完成，请核对真实回执。';cards=[];outcome=None;started=time.monotonic()
+        settings=get_settings();token=None;intent=None;state='FAILED';reply='助手未完成，请核对真实回执。';cards=[];outcome=None;started=time.monotonic();termination='tool_failed';completion='failed'
         try:
             with actor_session(actor) as session:
                 job=own_job(session,identifier)
@@ -177,18 +178,24 @@ class ChatRuntime:
                     response=await client.post(settings.assistant_pi_url.rstrip('/')+'/internal/chat',json={'tool_grant':token,'messages':messages,'choices':choices,'context':job['context'],'attachments':model_content(actor,snapshot.get('attachments',[])),'timeout_ms':settings.assistant_task_seconds*1000},headers={'X-RP1-Bridge-Secret':service_secret(settings)})
             outcome=intent.outcome
             if response.status_code!=200:
-                state='TIMED_OUT' if response.status_code==504 else 'FAILED'
-                reply='模型链路中断；已核对实际提交回执，不会自动撤销已保存对象。'
+                try:error_body=response.json()
+                except ValueError:error_body={}
+                termination=failure_reason(response.status_code,error_body)
+                state='TIMED_OUT' if termination in {'deadline','provider_timeout'} else 'FAILED'
+                reply=partial_reply(termination,cards)
             else:
                 data=response.json();reply=data.get('reply','')
                 if not isinstance(reply,str) or not reply or len(reply)>16000 or any(v in reply for v in (token,cookie,service_secret(settings))):raise ValueError('invalid reply')
                 state='COMPLETED'
-        except (httpx.TimeoutException,asyncio.TimeoutError):state='TIMED_OUT';reply='任务达到时限，已停止新增调用并核对真实回执。'
-        except asyncio.CancelledError:state='CANCELLED';reply='任务已停止，已提交结果保留；请核对真实回执。'
+                completion='partial' if data.get('completion')=='partial' else 'answered'
+                termination='round_limit' if completion=='partial' else 'complete'
+                if completion=='partial':reply='已达到本次交互上限，以下为已有结果，未完成部分仍待核实。\n'+reply
+        except (httpx.TimeoutException,asyncio.TimeoutError):state='TIMED_OUT';termination='deadline';reply=partial_reply(termination,cards)
+        except asyncio.CancelledError:state='CANCELLED';termination='cancelled';reply=partial_reply(termination,cards)
         except Exception as exc:
             # Provider payloads and credentials are deliberately not logged.
             logger.warning('assistant_task_failed job=%s elapsed_ms=%d kind=%s',identifier,int((time.monotonic()-started)*1000),type(exc).__name__)
-            state='FAILED';reply='助手处理失败，已核对真实回执；既有业务可继续使用。'
+            state='FAILED';termination='provider_network' if isinstance(exc,httpx.NetworkError) else 'tool_failed';reply=partial_reply(termination,cards)
         finally:
             if token:
                 self.tokens.pop(grants.key(token),None);grants.revoke(token)
@@ -198,11 +205,12 @@ class ChatRuntime:
                 if intent and intent.operation_kinds:outcome['receipt']['object_types']=intent.operation_kinds
                 reply=outcome.get('question','已核对实际回执。')+' '+reply
             if outcome:cards+=setup_cards(outcome)
+            if state!='COMPLETED':completion='partial' if any(c.get('type')!='query_issue' for c in cards) else 'failed'
             if state=='COMPLETED' and intent and setup_flow.explicit_intent(intent.messages) and not outcome:
                 outcome={'status':'needs_input','question':'本次未取得保存回执，尚未保存。请补充说明后重新提交，或使用普通建档页面。'}
                 reply=outcome['question']
             business_status='saved' if outcome and outcome.get('receipt') else outcome.get('status') if outcome else 'answered' if state=='COMPLETED' else 'not_saved'
-            result={'reply':reply,'setup':outcome,'cards':cards,'business_status':business_status}
+            result={'reply':reply,'setup':outcome,'cards':cards,'business_status':business_status,'completion':completion,'termination_reason':termination}
             # Resolving the original login remains mandatory for tools, but final
             # metadata and receipt reconciliation must survive account revocation.
             with SessionLocal.begin() as session:
@@ -225,7 +233,20 @@ class ChatRuntime:
         return item
 
     def read(self,token,payload):
-        item=self.authorize(token);item['reads']+=1
+        item=self.authorize(token)
+        from app.services.assistant_parts import known_part,canonical_part
+        stable=payload.tool in {'search_project_source','read_project_source'} or (payload.tool=='search_business' and payload.arguments.get('resource') in {'cases','parts'} and not payload.arguments.get('include_contexts'))
+        arguments={k:v for k,v in payload.arguments.items() if v is not None}
+        if stable and payload.tool=='search_business':
+            alias=known_part(arguments.get('query'))
+            if alias and (not arguments.get('target_part_code') or canonical_part(arguments['target_part_code'])==alias):arguments['target_part_code']=alias;arguments.pop('query',None)
+            if arguments.get('target_part_code'):arguments['target_part_code']=canonical_part(arguments['target_part_code'])
+        key=canonical({'tool':payload.tool,'arguments':arguments})
+        cache=item.setdefault('read_cache',{})
+        if stable and key in cache:
+            logger.info('assistant_read_reused job=%s tool=%s',item['id'],payload.tool)
+            return {**cache[key],'retrieval':{'reused':True,'instruction':'相同条件的目录/源码已在本任务提供；请使用已有证据，或沿next_cursor读取下一页。'}}
+        item['reads']+=1
         if item['reads']>12:raise ApiError(409,"assistant_tool_limit","单任务工具调用过多。")
         from app.services.assistant_privacy import public_evidence
         try:
@@ -237,7 +258,12 @@ class ChatRuntime:
             if isinstance(exc,ApiError) and exc.status_code in (401,403):raise
             card={'type':'query_issue','title':'查询需要调整','source':payload.tool,'updated_at':datetime.now(timezone.utc).isoformat(),'data':{'status':'unavailable','code':getattr(exc,'code','invalid_arguments'),'message':getattr(exc,'message','查询参数不匹配，请根据真实目录调整。')}}
         card=public_evidence(card)
-        item['cards'].append(json.loads(canonical(card)))
+        stored=json.loads(canonical(card))
+        sources=stored.get('data',{}).pop('availability_sources',[])
+        item['cards'].append(stored)
+        for source in sources:
+            item['cards'].append({'type':'source_evidence','title':'候选用例规则源码','source':'版本化项目源码快照','updated_at':card['updated_at'],'data':source})
+        if stable and card.get('type')!='query_issue':cache[key]=json.loads(canonical(card))
         return card
 
     def meter(self,token,payload):

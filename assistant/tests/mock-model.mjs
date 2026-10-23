@@ -23,8 +23,8 @@ const server = createServer(async (req, res) => {
   const body = JSON.parse(raw);
   requests.push({
     model: body.model, max_tokens: body.max_tokens, thinking: body.thinking,
-    tool_names: body.tools.map((item) => item.function.name),
-    tool_parameters: body.tools.map((item) => item.function.parameters),
+    tool_names: (body.tools??[]).map((item) => item.function.name),
+    tool_parameters: (body.tools??[]).map((item) => item.function.parameters),
     roles: body.messages.map((item) => item.role),
     image_count: body.messages.filter(item=>item.role==="user").flatMap(item=>Array.isArray(item.content)?item.content:[]).filter(item=>item.type==="image_url").length,
     has_actual_question: body.messages.some(item=>item.role==="user"&&JSON.stringify(item.content).includes("当前用户问题")),
@@ -35,15 +35,15 @@ const server = createServer(async (req, res) => {
   if (mode === "pause_before_tool") await new Promise((resolve) => setTimeout(resolve, 1500));
   if (mode === "slow") await new Promise((resolve) => setTimeout(resolve, 22000));
   const toolResult = body.messages.findLast((item) => item.role === "tool");
-  const isSetup=body.tools.some((item)=>item.function.name==="apply_setup_bundle");
-  const isChat=body.tools.some((item)=>item.function.name==="get_test_progress");
+  const isSetup=(body.tools??[]).some((item)=>item.function.name==="apply_setup_bundle");
+  const isChat=(body.tools??[]).some((item)=>item.function.name==="get_test_progress");
   if(isSetup && mode==="lose_final" && toolResult){req.socket.destroy();return;}
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
   function event(delta, finish_reason = null) {
     res.write(`data: ${JSON.stringify({ id: "synthetic-completion", object: "chat.completion.chunk", created: 1, model: "deepseek-flash", choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
   }
   event({ role: "assistant" });
-  if (mode === "no_tool") {
+  if (mode === "no_tool" || (mode === "repeat" && body.tool_choice === "none")) {
     event({ content: "未调用工具。" }); event({}, "stop");
   } else if (!toolResult || mode === "repeat") {
     event({ tool_calls: [{ index: 0, id: "synthetic-tool-call-" + requests.length, type: "function", function: {

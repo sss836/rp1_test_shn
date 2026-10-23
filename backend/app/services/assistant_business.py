@@ -2,6 +2,7 @@
 from datetime import datetime,timezone
 import time
 from uuid import UUID
+from pathlib import PurePosixPath
 from sqlalchemy import text
 from app.core.config import get_settings
 from app.core.errors import ApiError
@@ -11,6 +12,7 @@ from app.repositories.archives import ArchiveRepository
 from app.services.archive_storage import ArchiveStorage
 from app.services.curve_analysis import CurveAnalysisService
 from app.services.assistant_privacy import public_evidence
+from app.services.assistant_parts import known_part, canonical_part
 
 TOOLS=("search_business","read_business_object","get_runtime_summary","compare_joint_torque","search_project_source","read_project_source","search_web","read_web_page","search_my_history")
 RESOURCES=("parts","assets","archives","cases","programs","campaigns","stations","live_executions","test_case_durations","data_sources")
@@ -25,7 +27,7 @@ def card(kind,title,data,source,unit="资料",scope="当前登录账号可读取
 def part_codes(session,part):
     if not part:return []
     parts=[dict(r) for r in session.execute(text("SELECT part_code AS code,name,asset_kind FROM catalog.test_target_part WHERE enabled ORDER BY part_code")).mappings()]
-    needle=part.casefold()
+    needle=(known_part(part) or part).casefold()
     return [r["code"] for r in parts if needle==r["code"].casefold() or needle in r["name"].casefold()]
 
 def search(session,args):
@@ -34,8 +36,26 @@ def search(session,args):
     limit=min(50,max(1,int(args.get("limit",20))));cursor=args.get("cursor")
     kind=args.get("asset_kind")
     if kind not in (None,"MODULE","WHOLE_MACHINE"):raise ApiError(422,"query_kind","对象类型无效。")
+    supported={
+        "assets":{"asset_kind","target_part_code"},"archives":{"execution_id"},
+        "cases":{"asset_kind","target_part_code","published_only","enabled","include_contexts"},
+        "test_case_durations":{"asset_kind","asset"},"parts":{"asset_kind","target_part_code"},
+        "campaigns":{"asset_kind"},"programs":set(),"stations":set(),
+        "live_executions":set(),"data_sources":set(),
+    }
+    unused={key for key,value in args.items() if key not in {"resource","query","cursor","limit"} and value is not None and key not in supported.get(resource,set())}
+    if unused:raise ApiError(422,"unsupported_query_filter","此类资料不支持这些过滤字段："+"、".join(sorted(unused)))
+    if any(args.get(key) is not None and type(args[key]) is not bool for key in ("published_only","enabled","include_contexts")):
+        raise ApiError(422,"query_boolean","启用及发布过滤必须为布尔值。")
+    args=dict(args)
+    if args.get("target_part_code"):args["target_part_code"]=canonical_part(args["target_part_code"])
+    alias=known_part(q) if resource in {"assets","cases","parts"} else None
+    if alias:
+        if args.get("target_part_code") and args['target_part_code']!=alias:raise ApiError(422,"conflicting_part_filters","检索词与指定部位不一致，请明确要查询的部位。")
+        args["target_part_code"]=alias;q=""
     if resource=="assets":
-        return wire(repo.list_assets(asset_kind=kind,target_part_code=args.get("target_part_code"),status=None,search=q or None,limit=limit,cursor=cursor))
+        result=wire(repo.list_assets(asset_kind=kind,target_part_code=args.get("target_part_code"),status=None,search=q or None,limit=limit,cursor=cursor))
+        return {**result,"applied_filters":{k:v for k,v in {"target_part_code":args.get("target_part_code"),"asset_kind":kind,"query":q}.items() if v},"returned_count":len(result["items"])}
     if resource=="archives":
         result=ArchiveRepository(session).list(query=q or None,execution_id=UUID(args["execution_id"]) if args.get("execution_id") else None,before=int(cursor) if cursor else None,limit=limit)
         # Explicit projection: never send raw verification/configuration payloads.
@@ -54,10 +74,64 @@ def search(session,args):
         if q:result["items"]=[r for r in result["items"] if q.casefold() in (str(r.get("name",""))+" "+str(r.get("code",""))).casefold()]
         return result
     else:raise ApiError(422,"unknown_business_resource","未知业务资源。")
-    if q:rows=[r for r in rows if q.casefold() in (str(r.get("name",""))+" "+str(r.get("code",""))).casefold()]
+    filters={}
+    target=args.get("target_part_code")
+    alias=known_part(q) if resource in {"cases","parts"} else None
+    if alias:
+        if target and canonical_part(target)!=alias:raise ApiError(422,"conflicting_part_filters","检索词与指定部位不一致，请明确要查询的部位。")
+        target=alias;q=""
+    if target:
+        target=canonical_part(target);filters["target_part_code"]=target
+        rows=[r for r in rows if (r.get("code") if resource=="parts" else r.get("target_part_code"))==target]
+    if kind:
+        filters["asset_kind"]=kind;rows=[r for r in rows if r.get("asset_kind")==kind]
+    if resource=="cases":
+        if args.get("published_only"):
+            filters["published_only"]=True;rows=[r for r in rows if r.get("version_id")]
+        if args.get("enabled") is not None:
+            filters["enabled"]=bool(args["enabled"]);rows=[r for r in rows if bool(r.get("enabled"))==args["enabled"]]
+        # List evidence is deliberately concise. Version details/steps remain
+        # available through read_business_object(cases,id).
+        rows=[{k:v for k,v in r.items() if k!="procedure_spec"} for r in rows]
+    if q:
+        filters["query"]=q;rows=[r for r in rows if q.casefold() in (str(r.get("name",""))+" "+str(r.get("code",""))).casefold()]
     offset=int(cursor or 0)
     if offset<0:raise ApiError(422,"invalid_cursor","游标无效。")
-    return {"items":rows[offset:offset+limit],"next_cursor":str(offset+limit) if len(rows)>offset+limit else None}
+    items=rows[offset:offset+limit]
+    if resource=="cases" and args.get("include_contexts") and items:
+        counts=session.execute(text("""
+            SELECT tc.public_id AS case_id,count(ci.id) FILTER (WHERE c.id IS NOT NULL AND a.id IS NOT NULL) AS visible_contexts,
+                   count(ci.id) FILTER (WHERE a.id IS NOT NULL AND c.status IN ('PLANNED','ACTIVE') AND ci.status<>'CANCELLED') AS active_plan_contexts
+            FROM catalog.test_case tc
+            LEFT JOIN catalog.test_case_version v ON v.test_case_id=tc.id
+            LEFT JOIN test.campaign_coverage_item ci ON ci.test_case_version_id=v.id
+            LEFT JOIN test.test_campaign c ON c.id=ci.campaign_id
+            LEFT JOIN test.asset a ON a.id=ci.target_asset_id
+            WHERE tc.public_id=ANY(CAST(:ids AS uuid[]))
+            GROUP BY tc.public_id
+        """),{"ids":[str(r['id']) for r in items]}).mappings()
+        by_id={str(r['case_id']):{'visible_contexts':r['visible_contexts'],'active_plan_contexts':r['active_plan_contexts']} for r in counts}
+        items=[{**r,'plan_contexts':by_id.get(str(r['id']),{'visible_contexts':0,'active_plan_contexts':0})} for r in items]
+        filters['include_contexts']=True
+    result={"items":items,"next_cursor":str(offset+limit) if len(rows)>offset+limit else None,
+            "total":len(rows),"applied_filters":filters,"returned_count":len(rows[offset:offset+limit]),
+            "details_hint":"用例目录存在不等于上位机可选；候选来自当前账号可读取计划的关联上下文profiles，再按模块和样品部位过滤。include_contexts=true可查询当前账号可见计划关联数量（非远端实际加载状态）。源码入口：app.py的_refresh_case_choices，reliability_platform.py的profiles_from_setup。" if resource=="cases" else ""}
+    if resource=="cases" and args.get("include_contexts"):
+        # Fetch the two fixed rule entry points from the same versioned source
+        # tool used by the model. These are evidence, not hand-written diagnoses.
+        from app.services.assistant_sources import source_query
+        evidence=[]
+        try:
+            for path,symbol in [("hmi/factory_hmi/desktop/app.py","def _refresh_case_choices("),("hmi/factory_hmi/sync/reliability_platform.py","def profiles_from_setup(")]:
+                matches=source_query({"query":symbol,"directory":str(PurePosixPath(path).parent)})
+                hit=next((m for m in matches.get('matches',[]) if m['path']==path),None)
+                if hit:evidence.append(source_query({'path':path,'start':hit['line']}))
+            result['availability_sources']=evidence
+            result['client_state_verified']=False
+        except (ApiError,OSError):
+            result['availability_sources']=[]
+            result['rule_warning']='当前源码规则未核验，不能断言远端候选生成方式；平台关联计数仍有效。'
+    return result
 
 def runtime_summary(session,args,context):
     repo=ReadModelRepository(session)
