@@ -75,13 +75,26 @@ def _resource_yaml(package: str, *parts: str) -> dict[str, Any]:
     return data
 
 
+def _normalize_motor_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Accept a module mapping or the upstream motors envelope, preserving overrides."""
+    nested = config.get("motors")
+    if nested is None:
+        return config
+    if not isinstance(nested, dict):
+        raise ValueError("motors must be a mapping")
+    outer = {k: v for k, v in config.items() if k != "motors"}
+    if any(k in outer and outer[k] != value for k, value in nested.items()):
+        raise ValueError("ambiguous top-level and nested motor configuration")
+    return {**outer, **nested}
+
+
 def _load_station_yaml(canonical: str, path: Path | str | None) -> dict[str, Any]:
     if path is not None:
-        return load_yaml_config(path)
+        return _normalize_motor_config(load_yaml_config(path))
     external = DEFAULT_CONFIG_PATHS[canonical]
     try:
         if external.is_file():
-            return load_yaml_config(external)
+            return _normalize_motor_config(load_yaml_config(external))
     except OSError:
         pass
     return _resource_yaml("scripts", "config", CONFIG_FILENAMES[canonical])
@@ -245,6 +258,7 @@ def build_station_config(
     bus_bindings: Sequence[Mapping[str, Any]] | None = None,
     motor_overrides: Sequence[Mapping[str, Any]] | None = None,
 ) -> StationConfig:
+    config = _normalize_motor_config(config)
     canonical = require_supported_limb(limb)
     bound_config = _config_with_bus_bindings(config, bus_bindings)
     entries = _apply_motor_overrides(

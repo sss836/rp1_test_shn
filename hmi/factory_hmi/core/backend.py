@@ -5,12 +5,14 @@ from __future__ import annotations
 import math
 import threading
 import time
+from dataclasses import replace
 from abc import ABC, abstractmethod
 from typing import Any, Iterable
 
 import numpy as np
 
 from factory_hmi.models import MotorSample
+from .control_watchdog import CommandWatchdog
 
 from ._legacy import (
     MotorEntry,
@@ -36,6 +38,25 @@ class MotorSafetyError(MotorBackendError):
     pass
 
 
+class _MaintenanceTransport:
+    """Retryable ownership handle; close marks completion only after release."""
+    def __init__(self, backend):
+        self.backend = backend
+        self.closed = False
+
+    def __enter__(self):
+        self.backend._begin_maintenance_transport(self)
+        return self
+
+    def close(self):
+        if not self.closed:
+            self.backend._finish_maintenance_transport(self)
+            self.closed = True
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+
 _RESOURCE_LOCK = threading.Lock()
 _RESOURCE_OWNERS: dict[str, int] = {}
 
@@ -51,6 +72,48 @@ class MotorBackend(ABC):
         self._connected = False
         self._enabled = False
         self._claimed_resources: tuple[str, ...] = ()
+        self._command_inhibit = threading.Event()
+        self._inhibit_lock = threading.Lock()
+        self._control_generation = 0
+        self._control_generation_lock = threading.Lock()
+        self._damping_owner_generation = None
+        self._damping_owner = None
+        self._damping_cancelled = threading.Event()
+        self._command_watchdog: CommandWatchdog | None = None
+        self.control_stop_error: str | None = None
+        self._versions = None
+
+    def motor_versions(self) -> list[dict]:
+        if self._versions is not None:
+            return self._versions.snapshot(connected=self._connected)
+        from .motor_versions import MotorVersions
+        return [{k: v for k, v in MotorVersions._empty(e).items() if k != "_monotonic"}
+                for e in self.entries]
+
+    @property
+    def commands_inhibited(self) -> bool:
+        return self._command_inhibit.is_set()
+
+    def set_control_watchdog(self, timeout_s: float, on_fault: Any) -> None:
+        def trip(message: str, generation: int) -> None:
+            # Latch before acquiring any motor/controller lock. If a native
+            # dispatch is stuck, future commands stay fenced when it returns.
+            with self._inhibit_lock:
+                if not self._command_watchdog.is_current(generation):
+                    return
+                self._command_inhibit.set()
+                try:
+                    on_fault(message)
+                except Exception as exc:
+                    self.control_stop_error = f"control fault notification failed: {exc}"
+            try:
+                with self._lock:
+                    if not self._command_watchdog.is_current(generation):
+                        return
+                    self.disable()
+            except Exception as exc:
+                self.control_stop_error = str(exc)
+        self._command_watchdog = CommandWatchdog(timeout_s, trip)
 
     @property
     def connected(self) -> bool:
@@ -82,6 +145,8 @@ class MotorBackend(ABC):
 
     def open_transport(self) -> None:
         with self._lock:
+            if getattr(self, "_maintenance_active", False) or getattr(self, "_maintenance_quarantined", False):
+                raise BackendInUseError("firmware maintenance owns or quarantines this backend")
             if self._connected:
                 raise BackendInUseError("this backend is already connected")
             resources = tuple(sorted(set(self._exclusive_resources())))
@@ -108,6 +173,8 @@ class MotorBackend(ABC):
 
     def enable_motors(self) -> None:
         with self._lock:
+            if getattr(self, "_maintenance_quarantined", False):
+                raise MotorSafetyError("maintenance transport close failed; normal disconnect recovery required")
             self._require_connected()
             if self._enabled:
                 raise BackendInUseError("motors are already enabled")
@@ -121,41 +188,91 @@ class MotorBackend(ABC):
                 self._enabled = False
                 raise
             self._enabled = True
+            with self._control_generation_lock:self._control_generation += 1
+            self._damping_owner = None
+            with self._inhibit_lock:
+                self._command_inhibit.clear()
+                self.control_stop_error = None
+                if self._command_watchdog is not None:
+                    self._command_watchdog.arm()
 
     def disable_motors(self) -> None:
+        self._revoke_damping()
+        self._command_inhibit.set()
+        if self._command_watchdog is not None:
+            self._command_watchdog.disarm()
         with self._lock:
             self._require_connected()
+            self._damping_owner = None
             if not self._enabled:
                 return
-            try:
-                self._disable_impl(None)
-            finally:
-                self._enabled = False
+            self._disable_impl(None)
+            self._enabled = False
 
     def disconnect(self) -> None:
         self.close_transport()
 
     def close_transport(self) -> None:
+        self._revoke_damping()
+        if getattr(self, "_maintenance_active", False):
+            raise BackendInUseError("cancel and join maintenance before closing transport")
+        self._command_inhibit.set()
+        if self._command_watchdog is not None:
+            self._command_watchdog.disarm()
         with self._lock:
+            self._damping_owner = None
             if not self._connected:
                 self._release_resources()
+                self._maintenance_owner = None
                 return
-            first_error: Exception | None = None
             if self._enabled:
-                try:
-                    self._disable_impl(None)
-                except Exception as exc:
-                    first_error = exc
+                self._disable_impl(None)
                 self._enabled = False
+            self._close_transport_impl()
+            self._connected = False
+            self._maintenance_quarantined = False
+            self._release_resources()
+            self._maintenance_owner = None
+
+    def maintenance_transport(self):
+        """A retryable claim held through the caller's terminal persistence."""
+        return _MaintenanceTransport(self)
+
+    def _begin_maintenance_transport(self, owner):
+        with self._lock:
+            if self._enabled or getattr(self, "_maintenance_active", False) or getattr(self, "_maintenance_quarantined", False):
+                raise MotorSafetyError("maintenance requires disabled motors and an idle backend")
+            resources = tuple(sorted(set(self._exclusive_resources())))
+            with _RESOURCE_LOCK:
+                if any(_RESOURCE_OWNERS.get(r) not in (None, id(self)) for r in resources):
+                    raise BackendInUseError("maintenance interface is owned by another station")
+                for resource in resources:
+                    _RESOURCE_OWNERS[resource] = id(self)
+            self._claimed_resources = resources
+            self._maintenance_active = True
+            self._maintenance_owner = owner
             try:
-                self._close_transport_impl()
-            except Exception as exc:
-                first_error = first_error or exc
-            finally:
-                self._connected = False
+                if self._connected:
+                    self._close_transport_impl()
+                    self._connected = False
+            except Exception:
+                # Keep ownership but allow a subsequent normal close to retry.
+                self._maintenance_active = False
+                self._maintenance_quarantined = True
+                raise
+
+    def _finish_maintenance_transport(self, owner):
+        with self._lock:
+            if getattr(self, "_maintenance_owner", None) is not owner:
+                return
+            if getattr(self, "_maintenance_quarantined", False):
+                # An entry close failed; retry normal cleanup before releasing.
+                self.close_transport()
+            else:
+                # Keep the active fence if releasing ownership itself fails.
                 self._release_resources()
-            if first_error is not None:
-                raise first_error
+            self._maintenance_active = False
+            self._maintenance_owner = None
 
     def _release_resources(self) -> None:
         with _RESOURCE_LOCK:
@@ -170,6 +287,8 @@ class MotorBackend(ABC):
 
     def _require_enabled(self) -> None:
         self._require_connected()
+        if self._command_inhibit.is_set():
+            raise MotorSafetyError("motor commands inhibited; explicit recovery and enable required")
         if not self._enabled:
             raise MotorSafetyError("motor command rejected while motors are disabled")
 
@@ -203,6 +322,69 @@ class MotorBackend(ABC):
                 kp_scale=float(kp_scale),
                 kd_scale=float(kd_scale),
             )
+            if self._command_watchdog is not None:
+                self._command_watchdog.touch()
+
+    @property
+    def control_generation(self):
+        with self._control_generation_lock:return self._control_generation
+
+    def _revoke_damping(self):
+        self._damping_cancelled.set()
+        with self._control_generation_lock:self._control_generation += 1
+
+    def begin_protective_damping(self, expected_generation=None):
+        """Fence normal commands; this never connects or enables a motor."""
+        with self._lock:
+            self._require_connected()
+            if not self._enabled:
+                raise MotorSafetyError("protective damping cannot enable disabled motors")
+            if expected_generation is not None and expected_generation != self.control_generation:
+                raise MotorSafetyError("protective damping request belongs to an old control generation")
+            if self._damping_owner is not None and self._damping_cancelled.is_set():
+                raise MotorSafetyError("protective damping was explicitly cancelled")
+            if self._damping_owner is None:
+                if self._command_inhibit.is_set():
+                    raise MotorSafetyError("emergency inhibit cannot be overridden by damping")
+                self._damping_owner = object()
+                self._damping_owner_generation = self.control_generation
+                self._damping_cancelled.clear()
+            self._command_inhibit.set()
+            return self._damping_owner
+
+    def command_protective_damping(self, owner, kd: float = 1.0) -> None:
+        # Absolute Kd, not a multiplier on the trajectory's configured gains.
+        if not math.isfinite(kd) or not 0 < kd <= 1.0:
+            raise ValueError("protective damping Kd must be finite and in (0, 1]")
+        with self._lock:
+            self._require_connected()
+            if owner is None or owner is not self._damping_owner or not self._enabled or self._damping_cancelled.is_set() or self._damping_owner_generation != self.control_generation:
+                raise MotorSafetyError("protective damping authority is no longer active")
+            self._command_protective_damping_impl(kd)
+            if self._command_watchdog is not None:
+                self._command_watchdog.touch()
+
+    def _command_protective_damping_impl(self, kd: float) -> None:
+        raise MotorSafetyError("backend does not support protective damping")
+
+    def cancel_protective_damping(self) -> None:
+        """Latch explicit cancellation without waiting behind native I/O."""
+        self._revoke_damping()
+
+    def disable_protective_owner(self, owner):
+        with self._lock:
+            if (owner is None or owner is not self._damping_owner
+                    or self._damping_owner_generation != self.control_generation
+                    or self._damping_cancelled.is_set()):
+                return False
+            self.disable_motors()
+            return True
+
+    def end_protective_damping(self, owner) -> None:
+        with self._lock:
+            if owner is self._damping_owner:
+                self._damping_owner = None
+        # Normal commands remain inhibited until an explicit fresh enable.
 
     def read_samples(self) -> list[MotorSample]:
         with self._lock:
@@ -238,9 +420,19 @@ class MotorBackend(ABC):
                 self._validate_index(index)
             self._clear_errors_impl(index)
 
+    def disable_feedback(self) -> str:
+        """No transport acknowledgement is available; command flags are not feedback."""
+        return "unknown"
+
     def disable(self, index: int | None = None) -> None:
+        self._revoke_damping()
+        if index is None:
+            self._command_inhibit.set()
+            if self._command_watchdog is not None:
+                self._command_watchdog.disarm()
         with self._lock:
             self._require_connected()
+            self._damping_owner = None
             if index is not None:
                 self._validate_index(index)
             self._disable_impl(index)
@@ -379,6 +571,10 @@ class MotorsPyBackend(MotorBackend):
             if setter is not None:
                 setter(self._motors_py.MotorControlMode.MIT)
 
+        from .motor_versions import MotorVersions
+        self._versions = MotorVersions(self.entries, self._motors)
+        self._versions.start()
+
     def _enable_motors_impl(self) -> None:
         errors: list[int] = []
         initialized: list[Any] = []
@@ -405,6 +601,8 @@ class MotorsPyBackend(MotorBackend):
 
     def _close_transport_impl(self) -> None:
         first_error: Exception | None = None
+        if self._versions is not None:
+            self._versions.close()
         for motor in self._motors:
             try:
                 motor.deinit_motor()
@@ -431,6 +629,14 @@ class MotorsPyBackend(MotorBackend):
             kd_scale=kd_scale,
         )
         self._last_command[:] = target
+        self._last_mit_command_at = time.monotonic()
+
+    def _command_protective_damping_impl(self, kd: float) -> None:
+        count = len(self.entries)
+        damping_entries = [replace(e, kp=0.0, kd=kd) for e in self.entries]
+        legacy_command_mit(self._motors, damping_entries, np.zeros(count),
+                           velocity=np.zeros(count), torque=np.zeros(count))
+        self._last_command[:] = np.nan
         self._last_mit_command_at = time.monotonic()
 
     def _refresh_feedback_impl(self) -> None:
@@ -745,6 +951,21 @@ class FakeMotorBackend(MotorBackend):
         )
         self._command_condition.notify_all()
 
+    def _command_protective_damping_impl(self, kd: float) -> None:
+        if not np.all(self.enabled):
+            raise MotorSafetyError("protective damping rejected while a fake motor is disabled")
+        now = time.monotonic()
+        self.commanded[:] = np.nan
+        self.torques[:] = -kd * self.speeds
+        self.feedback_timestamps[~self.stale] = now
+        if len(self.command_history) >= 4096:
+            del self.command_history[:len(self.command_history)-4095]
+        self.command_history.append({"timestamp_s": now, "mode": "protective_damping",
+            "target": np.zeros(len(self.entries)), "velocity": np.zeros(len(self.entries)),
+            "kp": np.zeros(len(self.entries)), "kd": np.full(len(self.entries), kd),
+            "feedforward_torque": np.zeros(len(self.entries))})
+        self._command_condition.notify_all()
+
     def _read_samples_impl(self) -> list[MotorSample]:
         now = time.monotonic()
         return [
@@ -786,6 +1007,10 @@ class FakeMotorBackend(MotorBackend):
             self.error_ids[:] = 0
         else:
             self.error_ids[index] = 0
+
+    def disable_feedback(self) -> str:
+        with self._lock:
+            return "confirmed_mock" if not self._enabled and not self.enabled.any() else "not_disabled_mock"
 
     def _disable_impl(self, index: int | None) -> None:
         if index is None:

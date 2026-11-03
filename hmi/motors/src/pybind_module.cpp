@@ -16,6 +16,7 @@ namespace py = pybind11;
 #endif
 #ifdef RP1_SDK_TESTING
 #include "fake_motor.hpp"
+#include "version_transport.hpp"
 #endif
 
 PYBIND11_MODULE(RP1_SDK_MODULE_NAME, m) {
@@ -46,6 +47,8 @@ PYBIND11_MODULE(RP1_SDK_MODULE_NAME, m) {
         .def("set_motor_zero", &MotorDriver::set_motor_zero, py::call_guard<py::gil_scoped_release>())
         .def("write_motor_flash", &MotorDriver::write_motor_flash, py::call_guard<py::gil_scoped_release>())
         .def("get_motor_param", &MotorDriver::get_motor_param, py::call_guard<py::gil_scoped_release>())
+        .def("request_version", &MotorDriver::request_version, py::call_guard<py::gil_scoped_release>())
+        .def("version_payload", &MotorDriver::version_payload)
         .def("motor_pos_cmd", &MotorDriver::motor_pos_cmd, py::arg("pos"), py::arg("spd"), py::arg("ignore_limit") = false)
         .def("motor_spd_cmd", &MotorDriver::motor_spd_cmd)
         .def("motor_mit_cmd", static_cast<void (MotorDriver::*)(float, float, float, float, float)>(&MotorDriver::motor_mit_cmd))
@@ -77,6 +80,8 @@ PYBIND11_MODULE(RP1_SDK_MODULE_NAME, m) {
         .def("get_can_name", &MotorDriver::get_can_name);
 
 #ifdef RP1_SDK_TESTING
+    m.def("_test_create_version_motor", &version_test_motor);
+    m.def("_test_lro_version_checks", &version_native_checks, py::call_guard<py::gil_scoped_release>());
     // This factory is compiled only into the separate, uninstalled test module.
     m.def("_test_create_motor", []() -> std::shared_ptr<MotorDriver> {
         return std::make_shared<FakeMotor>();

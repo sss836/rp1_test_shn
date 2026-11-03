@@ -70,9 +70,10 @@ def test_quick_run_duration_local_sample_and_uncertain_response_cancellation(win
         page.start(2.5,True)
         page.runner.call_args.args[1]()
         assert start.call_args.args==(2.5,'任意离线标识')
-        assert start.call_args.kwargs=={'physical_estop_confirmed':True,'power_source':'external'}
+        assert start.call_args.kwargs=={'physical_estop_confirmed':True,'power_source':'external',
+                                      'data_domain':'RESEARCH','bench_id':'','operator_id':''}
     page._start_failed(TimeoutError('simulated response loss'))
-    assert page.runner.call_args.args[1]==page.client.quick_end
+    assert page.runner.call_args.args[1]==page.client.quick_abort
 
 
 def test_switching_part_updates_suggested_sample_but_preserves_operator_input(window):

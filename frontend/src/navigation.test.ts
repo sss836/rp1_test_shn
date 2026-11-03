@@ -12,6 +12,14 @@ describe("read-model navigation", () => {
     });
   });
 
+  it("round-trips the factory and unknown business partitions independently of asset kind", () => {
+    for (const domain of ["FACTORY", "UNCLASSIFIED"] as const) {
+      const href = locationHref({ view: domain === "FACTORY" ? "factory" : "archives", kind: "MODULE", id: null, part: null, domain });
+      expect(readLocation(href).domain).toBe(domain);
+    }
+    expect(readLocation("?view=archives&domain=invalid").domain).toBeUndefined();
+  });
+
   it("falls back to the home route for unknown views", () => {
     expect(readLocation("?view=fixture&kind=whole")).toEqual({
       view: "home",

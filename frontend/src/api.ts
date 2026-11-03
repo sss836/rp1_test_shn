@@ -135,8 +135,8 @@ export function getTestCase(identifier: string, cursor?: string, signal?: AbortS
   );
 }
 
-export function getLiveExecutions(signal?: AbortSignal) {
-  return apiRequest<ExecutionList>("/api/v1/executions/live", { signal });
+export function getLiveExecutions(signal?: AbortSignal, cursor?: string) {
+  return apiRequest<ExecutionList>(`/api/v1/executions/live${cursor?`?cursor=${encodeURIComponent(cursor)}`:""}`, { signal });
 }
 
 export function getExecution(identifier: string, signal?: AbortSignal) {

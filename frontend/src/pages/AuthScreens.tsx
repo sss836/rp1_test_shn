@@ -97,8 +97,8 @@ export function PasswordChangeScreen() {
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (busy) return;
-    if (next.length < 12 || next !== confirm || next === current) {
-      setError(next.length < 12 ? "新密码至少需要 12 个字符。" : next !== confirm ? "两次输入的新密码不一致。" : "新密码不能与当前密码相同。");
+    if (next.length < 6 || next !== confirm || next === current) {
+      setError(next.length < 6 ? "新密码至少需要 6 个字符。" : next !== confirm ? "两次输入的新密码不一致。" : "新密码不能与当前密码相同。");
       return;
     }
     setBusy(true);
@@ -121,7 +121,7 @@ export function PasswordChangeScreen() {
         <p>账户 <strong>{session?.user.username}</strong> 使用的是一次性本地初始密码。完成修改前，仅可访问本页或退出。</p>
         <form onSubmit={submit}>
           <label>当前密码<input type="password" autoComplete="current-password" value={current} onChange={(event) => setCurrent(event.target.value)} required /></label>
-          <label>新密码<input type="password" autoComplete="new-password" minLength={12} value={next} onChange={(event) => setNext(event.target.value)} required /><small>至少 12 个字符，且不能与当前密码相同</small></label>
+          <label>新密码<input type="password" autoComplete="new-password" minLength={6} value={next} onChange={(event) => setNext(event.target.value)} required /><small>至少 6 个字符，且不能与当前密码相同</small></label>
           <label>确认新密码<input type="password" autoComplete="new-password" value={confirm} onChange={(event) => setConfirm(event.target.value)} required /></label>
           {error && <p className="form-error" role="alert">{error}</p>}
           <button className="primary-button" type="submit" disabled={busy}>{busy ? "正在更新…" : "更新密码并进入平台"}</button>

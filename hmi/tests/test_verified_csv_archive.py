@@ -226,7 +226,7 @@ def test_formal_archive_waits_for_approval_and_poll_publishes_receipt(local_reco
     client = ArchiveClient()
     worker = worker_for(service, review, client)
     row = service.outbox.get(ID)
-    service.outbox.enqueue({**row.manifest, **CTX, "recording_scope": "platform"}, report.bundle_path)
+    service.outbox.enqueue({**row.manifest, **CTX, "recording_scope": "platform", "data_domain": "RESEARCH", "data_domain_source": "EXPLICIT"}, report.bundle_path)
     worker.process_once()
     assert service.outbox.get(ID).state == "pending_review"
     submit = next(call for call in client.calls if call[0] == "submit")
@@ -245,7 +245,7 @@ def test_station_correction_adds_classification_and_reuses_frozen_request_after_
     client = ArchiveClient()
     worker = worker_for(service, {**review, "station_id": actual_station, "bench": "B20"}, client)
     row = service.outbox.get(ID)
-    service.outbox.enqueue({**row.manifest, **CTX, "recording_scope": "platform"}, report.bundle_path)
+    service.outbox.enqueue({**row.manifest, **CTX, "recording_scope": "platform", "data_domain": "RESEARCH", "data_domain_source": "EXPLICIT"}, report.bundle_path)
     client.lose_classification = True
     worker.process_once()
     assert service.outbox.get(ID).state == "sync_failed"
@@ -322,6 +322,9 @@ def generic_record(tmp_path, legacy_passed=False):
     source = tmp_path / "generic.csv"
     source.write_text("time_s,hip_cmd_pos_rad,hip_pos_rad,hip_torque_nm,hip_temp_c,hip_error_id\n0,0,0,1,20,0\n0.05,0,0,1,20,0\n0.1,0,0,1,20,0\n", encoding="utf-8")
     defaults = yaml.safe_load((Path(__file__).resolve().parents[1] / "factory_hmi/config/station_defaults.yaml").read_text(encoding="utf-8"))
+    # Explicit historical v1 baseline; new runtime-v2 intentionally omits these rules.
+    defaults['factory_hmi_acceptance'].update(criteria_version='generic-v1',
+        max_temperature_rise_c=30., max_torque_p999_utilization=1., max_tracking_rms_rad=.5)
     # Model an older algorithm at initial sealing, not a post-seal mutation.
     from unittest.mock import patch
     import factory_hmi.core.report as report_module
@@ -333,7 +336,7 @@ def generic_record(tmp_path, legacy_passed=False):
         return summary
     with patch.object(report_module, "_build_summary", side_effect=historical_algorithm):
         report = service.report_manager.finalize(source, {**CTX, "execution_uuid": ID, "test_id": "synthetic-test", "test_case_id": "REL-ARM-001",
-            "test_name": "通用判据测试", "sample_id": "RP1.3-ARM-001", "actual_object": "RP1.3-ARM-001", "bench_id": "A10", "recording_scope": "platform",
+            "test_name": "通用判据测试", "sample_id": "RP1.3-ARM-001", "actual_object": "RP1.3-ARM-001", "bench_id": "A10", "recording_scope": "platform", "data_domain": "RESEARCH",
             "started_at": "2026-10-15T00:00:00Z", "ended_at": "2026-10-15T00:00:00.1Z", "active_seconds": .1, "completed_cycles": 0,
             "outcome": "completed", "record_rate_hz": 20, "config": defaults})
     review = {"tester": "实际测试人", "bench": "A10", "station_id": ID, "outcome": "成功", "notes": "无", "discrepancy_reason": "",

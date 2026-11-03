@@ -651,7 +651,7 @@ class PlcCabinetPage(QWidget):
         permits = status.get("ChannelPermit") or [False] * 4
         any_channel = any(bool(_at(permits, index, False)) for index in range(4))
         flow_states = (
-            (f"1  PLC通信  {'LIVE' if live else communication}", live),
+            (f"1  PLC通信  {'LIVE' if fresh else 'STALE' if stale else communication}", fresh),
             (f"2  主回路  {'已就绪' if main_ready else '未就绪'}", main_ready),
             (f"3  PS1输出  {'未确认' if status.get('PS1ActualOutput') is None else '已开启' if ps1_actual else '已关闭'}", ps1_actual),
             (
@@ -917,8 +917,10 @@ class PlcCabinetPage(QWidget):
         self.setpoint_feedback.setText(setpoint_feedback_text)
         if not ranges_valid:
             setpoint_reason = "配置未提供有效的PS1设定范围，控制已禁用。"
-        elif not live:
+        elif not fresh:
             setpoint_reason = "PLC通信不可用，禁止修改设定。"
+        elif read_only:
+            setpoint_reason = "只读监控模式：PLC通信在线，当前未启用控制与设定值写入。"
         elif phase != "OFF" or ps1_actual:
             setpoint_reason = "运行中禁止修改；请先执行正常总停止。"
         elif setpoint_state == "pending" or any_pending:

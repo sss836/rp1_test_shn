@@ -82,7 +82,9 @@ def test_uuid_ownership_reconnect_station_correction_aliases_and_late_heartbeat(
         station = post(owner, "stations", {"site_code": "AC-"+tag, "site_name": "Actual QA site", "lab_code": "AC-"+tag,
             "lab_name": "Actual QA lab", "station_code": "AC-"+tag, "name": "Corrected actual station", "station_type": "MODULE"})
         item = upload(owner, create(owner, request))
-        item = verify(owner, item, station["id"]).json()["data"]
+        correction = owner.post(f"/api/v1/archives/{item['id']}/domain-classification",json={"expected_revision":item["revision"],"data_domain":"RESEARCH","bench_id":"AC-"+tag,"reason":"Synthetic correction of actual bench"},headers=headers())
+        assert correction.status_code==200,correction.text
+        item = verify(owner, correction.json()["data"], station["id"]).json()["data"]
         classified = classify(owner, item, {**ctx, "station_id": station["id"]})
         assert classified.status_code == 200, classified.text
         item = classified.json()["data"]

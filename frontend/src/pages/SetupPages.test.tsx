@@ -54,12 +54,42 @@ it("reports save errors instead of claiming an invalid sample was created", asyn
   const create = vi.spyOn(setupApi, "create").mockRejectedValue(new Error("编号已存在"));
   view(<AssetCreateForm assetKind="MODULE" />);
   fireEvent.click(screen.getByText("新增样品"));
-  const code = await screen.findByLabelText(/样品编号/);
+  const code = await screen.findByLabelText("产品编号");
   fireEvent.change(code, { target: { value: "RP1.3-SLEG-001" } });
+  fireEvent.change(screen.getByLabelText("是否向下编号"), { target: { value: "no" } });
+  fireEvent.change(screen.getByLabelText("创建场景"), { target: { value: "RND_TEST" } });
   fireEvent.submit(code.closest("form")!);
   await screen.findByText("编号已存在");
   await waitFor(() => expect(create).toHaveBeenCalled());
   expect(screen.queryByText(/保存成功/)).toBeNull();
+});
+
+it("registers by code and two choices, displays the saved number and keeps the retry key", async () => {
+  const create = vi.spyOn(setupApi, "create").mockRejectedValueOnce(new Error("连接中断"))
+    .mockResolvedValue({ id: "new-sample", code: "RP1.3-ARM-010", creation_scenario: "PRODUCTION" });
+  view(<AssetCreateForm assetKind="MODULE" />);
+  fireEvent.click(screen.getByText("新增样品"));
+  const code = screen.getByLabelText("产品编号");
+  fireEvent.change(code, { target: { value: "RP1.3-ARM-004" } });
+  expect(screen.getByText(/产品族：RP1.3 · 部位：7自由度手臂/)).toBeTruthy();
+  expect(screen.queryByLabelText("序列号")).toBeNull();
+  expect(screen.queryByLabelText("样品用途")).toBeNull();
+  expect(screen.queryByLabelText("配置标识")).toBeNull();
+  fireEvent.submit(code.closest("form")!);
+  expect(create).not.toHaveBeenCalled();
+  fireEvent.change(screen.getByLabelText("是否向下编号"), { target: { value: "yes" } });
+  fireEvent.change(screen.getByLabelText("创建场景"), { target: { value: "PRODUCTION" } });
+  fireEvent.submit(code.closest("form")!);
+  await screen.findByText("连接中断");
+  fireEvent.submit(code.closest("form")!);
+  await screen.findByText("已创建：RP1.3-ARM-010 · 生产");
+  expect(create.mock.calls[0][1]).toEqual({ asset_code: "RP1.3-ARM-004", auto_number: true, creation_scenario: "PRODUCTION" });
+  expect(create.mock.calls[1][2]).toBe(create.mock.calls[0][2]);
+  fireEvent.click(screen.getByText("再建一个样品"));
+  await waitFor(() => expect((screen.getByText("创建样品") as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.submit(code.closest("form")!);
+  await waitFor(() => expect(create).toHaveBeenCalledTimes(3));
+  expect(create.mock.calls[2][2]).not.toBe(create.mock.calls[1][2]);
 });
 
 it("opens the same creation paths for executors and creates a complete explicit case publication", async () => {

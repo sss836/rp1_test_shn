@@ -92,7 +92,8 @@ class Statistic:
 
 @contextmanager
 def connection(directory: Path, memory_mb: int = 512):
-    with tempfile.TemporaryDirectory(prefix=".query-", dir=directory) as temporary:
+    from .query_budget import query_slot
+    with query_slot(), tempfile.TemporaryDirectory(prefix=".query-", dir=directory) as temporary:
         conn = duckdb.connect(":memory:", config={"memory_limit": f"{memory_mb}MB", "threads": "2", "temp_directory": temporary, "max_temp_directory_size": "10GB", "enable_external_access": "true"})
         try:
             # No user-provided SQL, paths, identifiers, extensions or URLs are used.
@@ -245,6 +246,9 @@ class CurveProcessor:
     @staticmethod
     def analyze(facts, acceptance, quality, stats, *, honor_recorded_verdict=True):
         result = []
+        # Only the new HMI runtime policy removes these acceptance checks.
+        # Historical uploads and versioned published catalog rules are kept.
+        runtime_v2 = acceptance.get("criteria_version") == "hmi-runtime-v2"
         def rule(name, actual, limit, unit="", minimum=False):
             verdict = "unconfigured" if limit is None or actual is None else "passed" if (actual>=limit if minimum else actual<=limit) else "failed"
             result.append({"name": name, "actual": actual, "limit": limit, "unit": unit, "result": verdict})
@@ -257,11 +261,11 @@ class CurveProcessor:
         rule("missing_numeric_samples", sum(stat.missing for stat in stats.values()), 0)
         rule("execution_completed", None if facts["machine_status"]=="unknown" else 1 if facts["machine_status"]=="completed" else 0, 1, minimum=True)
         for key, stat in stats.items():
-            if key.endswith("_temp_c"):
+            if key.endswith("_temp_c") and not runtime_v2:
                 rule(key+".rise", stat.maximum-stat.first if stat.count else None, acceptance.get("max_temperature_rise_c"), "°C")
-            elif key.endswith("_tracking_error_rad"):
+            elif key.endswith("_tracking_error_rad") and not runtime_v2:
                 rule(key+".rms", math.sqrt(stat.sum_squares/stat.count) if stat.count else None, acceptance.get("max_tracking_rms_rad"), "rad")
-            elif key.endswith("_torque_nm"):
+            elif key.endswith("_torque_nm") and not runtime_v2:
                 peak = max(abs(stat.minimum), abs(stat.maximum)) if stat.count else None
                 rule(key+".peak_abs", peak, acceptance.get("max_torque_abs_nm"), "N·m")
             elif key.endswith("_error_id"):
@@ -269,7 +273,7 @@ class CurveProcessor:
         for suffix, threshold, unit in (("_temp_c","max_temperature_rise_c","°C"),
                                        ("_tracking_error_rad","max_tracking_rms_rad","rad"),
                                        ("_torque_nm","max_torque_abs_nm","N·m")):
-            if acceptance.get(threshold) is not None and not any(key.endswith(suffix) for key in stats):
+            if not runtime_v2 and acceptance.get(threshold) is not None and not any(key.endswith(suffix) for key in stats):
                 rule(threshold+".missing_measurement",None,acceptance[threshold],unit)
         failures = [r for r in result if r["result"]=="failed"]
         product_failure = facts["machine_status"]=="failed" or (honor_recorded_verdict and facts["automatic_verdict"]=="failed") or any(r["name"].endswith((".rise", ".rms", ".peak_abs", ".faults")) for r in failures)

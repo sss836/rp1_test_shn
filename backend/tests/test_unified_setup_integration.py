@@ -26,6 +26,135 @@ def sample(suffix="001"):
     return dict(asset_code="RP1.3-SLEG-"+suffix, asset_kind="MODULE", target_part_code="SLEG", product_family="SYNTHETIC", serial_number=str(uuid4()), display_name="合成样品", model="合成型号", configuration_fingerprint="合成配置")
 
 
+def simple_sample(code, auto=False, scenario="RND_TEST"):
+    return dict(asset_code=code,auto_number=auto,creation_scenario=scenario)
+
+
+@pytest.mark.skipif(not os.getenv("ASSISTANT_QA_SAMPLE_MIGRATION"), reason="requires revision-50 synthetic sample bootstrap")
+def test_existing_samples_are_rnd_without_rewriting_their_identity(environment):
+    engine,_=environment
+    with engine.connect() as connection:
+        row=connection.execute(text("SELECT product_family,serial_number,creation_scenario FROM test.asset WHERE asset_code='RP95.1-ARM-004'")).mappings().one()
+        assert dict(row)==dict(product_family="RP95.1",serial_number="SYNTHETIC-MIGRATION-SAMPLE",creation_scenario="RND_TEST")
+
+
+def test_simple_number_registration_needs_no_metadata_and_is_readable(environment):
+    engine,users=environment
+    with signed_in(users["first"]) as editor:
+        response=editor.post("/api/v1/setup/assets",json=simple_sample("RP91.1-ARM-004"),headers={"Idempotency-Key":str(uuid4())})
+        assert response.status_code==201,response.text
+        saved=response.json()["data"]
+        assert saved["code"]=="RP91.1-ARM-004" and saved["name"]=="7自由度手臂-004"
+        assert saved["product_family"]=="RP91.1" and saved["configuration_id"]
+        response=editor.get("/api/v1/assets/"+saved["id"])
+        assert response.status_code==200,response.text
+        assert response.json()["data"]["asset"]["serial_number"] is None
+        assert response.json()["data"]["asset"]["creation_scenario"]=="RND_TEST"
+        assert response.json()["data"]["configuration"]["id"]==saved["configuration_id"]
+        assert response.json()["data"]["configuration"]["reliability_impact"]=="UNKNOWN"
+        assert response.json()["data"]["configuration"]["fingerprint"].startswith("registration:")
+    with engine.connect() as connection:
+        row=connection.execute(text("SELECT a.serial_number,mp.module_type,mp.target_part_code,(SELECT count(*) FROM test.configuration_snapshot WHERE asset_id=a.id) AS configurations FROM test.asset a JOIN test.module_profile mp ON mp.asset_id=a.id WHERE a.public_id=:id"),{"id":saved["id"]}).mappings().one()
+        assert row["serial_number"] is row["module_type"] is None and row["configurations"]==1 and row["target_part_code"]=="ARM"
+
+
+def test_auto_number_sees_other_creators_and_both_scenarios_without_granting_read_access(environment):
+    _,users=environment
+    with signed_in(users["first"]) as first,signed_in(users["second"]) as second:
+        create(first,"assets",simple_sample("RP91.2-ARM-004"))
+        hidden=create(second,"assets",simple_sample("RP91.2-ARM-009",scenario="PRODUCTION"))
+        assert first.get("/api/v1/assets/"+hidden["id"]).status_code==404
+        result=create(first,"assets",simple_sample("RP91.2-ARM-004",auto=True))
+        assert result["code"]=="RP91.2-ARM-010"
+        assert result["creation_scenario"]=="RND_TEST" and result["name"]=="7自由度手臂-010"
+
+
+def test_concurrent_auto_numbers_and_retries_do_not_duplicate_samples(environment):
+    engine,users=environment
+    payload=simple_sample("RP91.3-ARM-004",auto=True)
+    keys=[str(uuid4()),str(uuid4())]
+    with signed_in(users["first"]) as first,signed_in(users["second"]) as second,ThreadPoolExecutor(max_workers=2) as executor:
+        futures=[executor.submit(create,client,"assets",payload,key=key) for client,key in zip((first,second),keys)]
+        results=[future.result(timeout=20) for future in futures]
+        assert {item["code"] for item in results}=={"RP91.3-ARM-004","RP91.3-ARM-005"}
+        replay=create(first,"assets",payload,key=keys[0])
+        assert replay["id"]==results[0]["id"] and replay["code"]==results[0]["code"] and replay["replayed"]
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count(*) FROM test.asset WHERE asset_code LIKE 'RP91.3-ARM-%'")).scalar_one()==2
+
+
+def test_same_auto_request_concurrently_replays_one_number(environment):
+    _,users=environment
+    key=str(uuid4());payload=simple_sample("RP91.4-ARM-004",auto=True)
+    with signed_in(users["first"]) as first,signed_in(users["first"]) as second,ThreadPoolExecutor(max_workers=2) as executor:
+        futures=[executor.submit(create,client,"assets",payload,key=key) for client in (first,second)]
+        results=[future.result(timeout=20) for future in futures]
+        assert results[0]["id"]==results[1]["id"] and results[0]["code"]==results[1]["code"]=="RP91.4-ARM-004"
+        assert sum(item["replayed"] for item in results)==1
+
+
+def test_manual_conflicts_and_exhausted_sequence_never_silently_renumber(environment):
+    _,users=environment
+    with signed_in(users["first"]) as first:
+        create(first,"assets",simple_sample("RP91.5-ARM-999"))
+        create(first,"assets",simple_sample("RP91.5-ARM-999"),status=409)
+        response=first.post("/api/v1/setup/assets",json=simple_sample("RP91.5-ARM-004",auto=True),headers={"Idempotency-Key":str(uuid4())})
+        assert response.status_code==409,response.text
+        assert response.json()["error"]["code"]=="asset_sequence_exhausted"
+
+
+@pytest.mark.parametrize("payload",[
+    {"asset_code":"RP91.6-ARM-004"},
+    {"asset_code":"RP91.6-ARM-004","auto_number":False},
+    {"asset_code":"RP91.6-ARM-004","auto_number":"yes","creation_scenario":"RND_TEST"},
+    {**simple_sample("RP91.6-ARM-004"),"sample_purpose":"TEST"},
+    {**simple_sample("RP91.6-ARM-004"),"creation_scenario":"unknown"},
+    {**simple_sample("RP91.6-ARM-004"),"target_part_code":"SARM"},
+])
+def test_missing_choices_and_extra_purpose_are_rejected(environment,payload):
+    _,users=environment
+    with signed_in(users["first"]) as first: create(first,"assets",payload,status=422)
+
+
+def test_viewer_cannot_allocate_or_create_simple_samples(environment):
+    _,users=environment
+    with signed_in(users["viewer"]) as viewer:
+        create(viewer,"assets",simple_sample("RP91.6-ARM-004",auto=True),status=403)
+
+
+@pytest.mark.parametrize("part,kind,name",[("SYS","WHOLE_MACHINE","整机-004"),("SARM","MODULE","5自由度手臂-004")])
+def test_code_determines_type_and_preserves_degree_variant(environment,part,kind,name):
+    _,users=environment
+    with signed_in(users["first"]) as first:
+        result=create(first,"assets",simple_sample("RP91.7-"+part+"-004",scenario="PRODUCTION"))
+        assert (result["asset_kind"],result["target_part_code"],result["name"])==(kind,part,name)
+
+
+def test_simple_group_failure_rolls_back_number_and_receipt(environment):
+    engine,users=environment
+    key=str(uuid4())
+    with signed_in(users["first"]) as first:
+        create(first,"programs",dict(program_code="SAMPLE-ROLLBACK",name="existing"))
+        payload=dict(request_key=key,operations=[
+            dict(kind="asset",alias="sample",data=simple_sample("RP91.8-ARM-004",auto=True)),
+            dict(kind="program",alias="program",data=dict(program_code="SAMPLE-ROLLBACK",name="duplicate",reason="synthetic"))])
+        bundle(first,payload,409)
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT count(*) FROM test.asset WHERE asset_code LIKE 'RP91.8-ARM-%'")).scalar_one()==0
+            assert connection.execute(text("SELECT count(*) FROM integration.setup_receipt WHERE request_key=:key"),{"key":key}).scalar_one()==0
+        assert create(first,"assets",simple_sample("RP91.8-ARM-004",auto=True))["code"]=="RP91.8-ARM-004"
+
+
+def test_mock_dialogue_registers_minimal_fields_without_adoption(environment):
+    _,users=environment
+    operations=[dict(kind="asset",alias="asset",data=simple_sample("RP91.9-ARM-004",auto=True))]
+    model_operations(operations)
+    with signed_in(users["first"]) as first:
+        outcome=command(first,["创建样品 RP91.9-ARM-004，向下编号是，创建场景研发测试"])
+        assert outcome["status"]=="created",outcome
+        assert outcome["receipt"]["objects"]["asset"]["code"]=="RP91.9-ARM-004"
+
+
 def definition():
     return dict(procedure_spec={"steps":["合成步骤"]}, stage_definitions=[{"name":"合成阶段"}], equipment_requirements={"description":"合成设备"}, sampling_requirements={"description":"合成采样要求"}, termination_rules={"description":"由操作员停止"}, decision_rules={"mode":"RECORD_ONLY"})
 
@@ -62,6 +191,38 @@ def group(prefix, suffix, key=None):
         op("case","case",case_code=prefix,name=prefix,asset_kind="MODULE",target_part_code="SLEG",publish=True,**definition()),
         op("context","context",campaign_id="$campaign.id",asset_id="$asset.id",configuration_id="$asset.configuration_id",test_case_version_id="$case.version_id",station_id="$station.id",cycle_code=prefix),
     ])
+
+
+def test_simple_sample_can_link_to_plan_without_entering_configuration_parameters(environment):
+    _,users=environment
+    payload=group("SIMPLE-CONTEXT","021")
+    payload["operations"][2]["data"]=simple_sample("RP91.10-SLEG-004")
+    with signed_in(users["first"]) as first:
+        result=bundle(first,payload)
+        saved=result["objects"]["asset"]
+        assert result["objects"]["context"]["context"]["configuration_id"]==saved["configuration_id"]
+        options=first.get("/api/v1/setup/options").json()["data"]
+        config=next(item for item in options["configurations"] if item["id"]==saved["configuration_id"])
+        assert config["reliability_impact"]=="UNKNOWN" and config["fingerprint"].startswith("registration:")
+
+
+def test_pre_upgrade_legacy_receipt_replays_without_changing_payload_hash(environment):
+    import hashlib
+    from app.services.setup import canonical
+    engine,users=environment
+    value=sample("022")
+    with signed_in(users["first"]) as first:
+        saved=create(first,"assets",value)
+        key=str(uuid4())
+        old_data={"reason":"isolated unified setup",**value,"hardware_manifest":{},"software_manifest":{},"parameter_manifest":{},"notes":""}
+        old_payload={"operations":[{"kind":"asset","alias":"object","data":old_data}]}
+        old_result={"request_key":key,"objects":{"object":{"id":saved["id"],"configuration_id":saved["configuration_id"]}},"replayed":False}
+        with engine.begin() as connection:
+            connection.execute(text("""INSERT INTO integration.setup_receipt(user_id,request_key,payload_hash,request_payload,authorization_evidence,result)
+                SELECT id,:key,:hash,CAST(:payload AS jsonb),'{}',CAST(:result AS jsonb) FROM iam.app_user WHERE username=:username"""),
+                {"key":key,"hash":hashlib.sha256(canonical(old_payload).encode()).hexdigest(),"payload":canonical(old_payload),"result":canonical(old_result),"username":users["first"]})
+        replay=create(first,"assets",value,key=key)
+        assert replay["id"]==saved["id"] and replay["replayed"]
 
 
 def bundle(client,payload,status=201):

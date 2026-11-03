@@ -1,3 +1,4 @@
+import {useState} from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLink, RefreshCw } from "lucide-react";
 import { getLiveExecutions } from "../api";
@@ -10,9 +11,10 @@ export default function LiveRunsPage({
 }: {
   navigate: (view: View, id?: string) => void;
 }) {
+  const [cursor,setCursor]=useState<string>();
   const query = useQuery({
-    queryKey: ["live-executions"],
-    queryFn: ({ signal }) => getLiveExecutions(signal),
+    queryKey: ["live-executions",cursor],
+    queryFn: ({ signal }) => getLiveExecutions(signal,cursor),
     refetchInterval: 5000
   });
   const items = query.data?.items ?? [];
@@ -78,6 +80,7 @@ export default function LiveRunsPage({
           </div>
         </Panel>
       )}
+      <div><button onClick={()=>setCursor(undefined)} disabled={!cursor}>返回第一页</button>{query.data?.page.next_cursor&&<button onClick={()=>setCursor(query.data!.page.next_cursor!)}>下一页运行记录</button>}</div>
       <p className="semantic-note">这里只显示仍在心跳窗口内的正式执行。工位监控里的文件名是工位本地记录名，不作为这里的执行编号。</p>
     </>
   );

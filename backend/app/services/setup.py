@@ -110,6 +110,10 @@ def apply_bundle(session, bundle: SetupBundle, authorization=None):
     results = {}
     try:
         validate_bundle_shape(bundle)
+        # Lock multiple prefixes in a stable order before allocating any number.
+        prefixes = sorted({op.data["asset_code"].strip().rsplit("-", 1)[0] for op in bundle.operations if op.kind == "asset"})
+        for prefix in prefixes:
+            session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended('asset-number:' || :prefix,0))"), {"prefix": prefix})
         for op in bundle.operations:
             results[op.alias] = operation(repo, op, resolve_refs(op.data, results))
     except (ValidationError, ValueError, TypeError) as exc:

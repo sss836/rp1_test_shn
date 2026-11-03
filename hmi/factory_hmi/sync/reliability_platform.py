@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import http.cookiejar
 import json
 import os
@@ -13,7 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
-from urllib import error, request
+from urllib import error, request, parse
 
 import yaml
 
@@ -272,6 +273,100 @@ class ReliabilityPlatformClient:
             service_auth=False,
         )
 
+    def _software_opener(self) -> Any:
+        """Snapshot this session; a package transfer must never lock heartbeats.
+
+        No redirects are accepted on this separate software channel. In
+        particular, session cookies must not be forwarded to another host.
+        """
+        class NoRedirect(request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        jar = http.cookiejar.CookieJar()
+        with self._operator_lock:
+            for cookie in self.cookies:
+                jar.set_cookie(copy.copy(cookie))
+        return request.build_opener(NoRedirect(), request.HTTPCookieProcessor(jar))
+
+    def software_latest(self, host: Mapping[str, Any]) -> dict[str, Any]:
+        query = parse.urlencode({name: str(host.get(name) or "") for name in
+                                 ("os_id", "os_version", "architecture", "current_version")})
+        req = request.Request(f"{self.base_url}/api/v1/hmi/updates/latest?{query}",
+                              headers={"Accept": "application/json"})
+        try:
+            with self._software_opener().open(req, timeout=3) as response:
+                raw = response.read(262145)
+            if len(raw) > 262144:
+                raise ValueError("软件版本目录过大")
+            payload = json.loads(raw)
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                raise ValueError("软件版本目录格式无效")
+            return data
+        except (OSError, ValueError) as exc:
+            raise PlatformError(f"软件更新检查失败：{exc}") from exc
+
+    def software_package(self, release_id: str) -> Any:
+        if not re.fullmatch(r"[0-9a-f]{32}", release_id):
+            raise ValueError("无效的软件发布编号")
+        req = request.Request(
+            f"{self.base_url}/api/v1/hmi/updates/releases/{release_id}/package",
+            headers={"Accept": "application/octet-stream"},
+        )
+        try:
+            return self._software_opener().open(req, timeout=10)
+        except OSError as exc:
+            raise PlatformError(f"软件下载失败：{exc}") from exc
+
+    def _motor_firmware_request(self, suffix: str, target: Mapping[str, Any]):
+        query = parse.urlencode({k: target[k] for k in ("model", "hardware", "protocol", "current_version")})
+        req = request.Request(f"{self.base_url}/api/v1/hmi/motor-firmware/{suffix}?{query}",
+                              headers={"Accept": "application/octet-stream" if suffix.endswith("package") else "application/json"})
+        try:
+            return self._software_opener().open(req, timeout=10)
+        except OSError as exc:
+            raise PlatformError("电机固件查询或下载失败，请核对登录、权限及分发服务") from exc
+
+    def motor_firmware_releases(self, target: Mapping[str, Any]) -> dict[str, Any]:
+        with self._motor_firmware_request("releases", target) as response:
+            raw = response.read(262145)
+        if len(raw) > 262144:
+            raise PlatformError("适用电机固件目录过大")
+        value = json.loads(raw).get("data")
+        if not isinstance(value, dict) or not isinstance(value.get("releases"), list):
+            raise PlatformError("电机固件目录格式无效")
+        return value
+
+    def motor_firmware_package(self, release_id: str, target: Mapping[str, Any]):
+        if not re.fullmatch(r"[0-9a-f]{32}", release_id):
+            raise ValueError("无效的电机固件发布编号")
+        return self._motor_firmware_request(f"releases/{release_id}/package", target)
+
+    def _motor_resource_request(self, suffix: str):
+        req = request.Request(f"{self.base_url}/api/v1/hmi/motor-firmware-resources/{suffix}",
+                              headers={"Accept": "application/octet-stream" if suffix.endswith("package") else "application/json"})
+        try:
+            return self._software_opener().open(req, timeout=10)
+        except OSError as exc:
+            raise PlatformError("电机资源查询或下载失败，请核对登录、权限及分发服务") from exc
+
+    def motor_firmware_resource_releases(self) -> dict[str, Any]:
+        with self._motor_resource_request("releases") as response:
+            raw = response.read(262145)
+        if len(raw) > 262144:
+            raise PlatformError("电机下载资源目录过大")
+        value = json.loads(raw).get("data")
+        if (not isinstance(value, dict) or not isinstance(value.get("releases"), list)
+                or value.get("artifact_type") != "motor_firmware_resource" or value.get("flash_eligible") is not False):
+            raise PlatformError("电机下载资源目录格式无效")
+        return value
+
+    def motor_firmware_resource_package(self, release_id: str):
+        if not re.fullmatch(r"[0-9a-f]{32}", release_id):
+            raise ValueError("无效的电机资源发布编号")
+        return self._motor_resource_request(f"releases/{release_id}/package")
+
     def heartbeat_presence(self, connection_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         return self._call("PUT", f"/api/v1/hmi/presence/{connection_id}", payload=payload, service_auth=False, timeout=5)
 
@@ -295,6 +390,22 @@ class ReliabilityPlatformClient:
 
     def archive(self, archive_id: str) -> dict[str, Any]:
         return self._call("GET", f"/api/v1/archives/{archive_id}", service_auth=False)
+
+    def archive_capabilities(self) -> dict[str, Any]:
+        try:
+            return self._call("GET", "/api/v1/archive-capabilities", service_auth=False)
+        except PlatformError as exc:
+            if exc.status == 404: return {"run_segments": False}
+            raise
+
+    def archive_segments(self, archive_id: str, manifest: Mapping[str, Any], key: str) -> dict[str, Any]:
+        return self._call("POST", f"/api/v1/archives/{archive_id}/segments", payload=manifest, idempotency_key=key, service_auth=False)
+
+    def archive_segment_chunk(self, archive_id: str, sequence: int, offset: int, body: bytes, key: str) -> dict[str, Any]:
+        return self._call("PUT", f"/api/v1/archives/{archive_id}/segments/{sequence}?offset={offset}", body=body, idempotency_key=key, service_auth=False)
+
+    def archive_segments_complete(self, archive_id: str, key: str) -> dict[str, Any]:
+        return self._call("POST", f"/api/v1/archives/{archive_id}/segments-complete", payload={}, idempotency_key=key, service_auth=False)
 
     def archive_chunk(self, archive_id: str, offset: int, body: bytes, key: str) -> dict[str, Any]:
         return self._call("PUT", f"/api/v1/archives/{archive_id}/content?offset={offset}", body=body, idempotency_key=key, service_auth=False)
@@ -467,6 +578,15 @@ class ReliabilityUploaderWorker:
             stations = options.get("stations") if isinstance(options.get("stations"), list) else []
             return profiles_from_setup(campaigns, contexts, stations)
 
+    def case_options(self) -> list[dict[str, Any]]:
+        """Published cases are independent of sample/campaign coverage."""
+        with self._submission_lock:
+            if not self._identity:
+                return []
+            rows = self.client._call("GET", "/api/v1/setup/catalog", service_auth=False, expect="list")
+            return [dict(row) for row in rows if isinstance(row, Mapping)
+                    and row.get("enabled") and row.get("version_id")]
+
     def sample_options(self) -> list[dict[str, Any]]:
         # The client already serializes its cookie opener. No metadata/approval write.
         return self.client._call("GET", "/api/v1/hmi/samples", service_auth=False, expect="list", timeout=3)
@@ -514,10 +634,12 @@ class ReliabilityUploaderWorker:
         self._identity = ""
         if self.presence is not None:
             self.presence.disconnect()
-            try:
-                self.client.logout_operator()
-            except PlatformError:
-                pass
+        # The shared assistant also uses this login. Revoke the server session
+        # even when online presence is disabled or failed to start.
+        try:
+            self.client.logout_operator()
+        except PlatformError:
+            pass
 
     def authorize_service_identity(self, identity: str = "SERVICE_API") -> None:
         self._identity = identity.strip() or "SERVICE_API"
@@ -688,12 +810,15 @@ class ReliabilityUploaderWorker:
         if int(detail.get("submission_revision") or item.submission_revision) < item.submission_revision:
             raise ValueError("审批回执版本过期")
         state = {"PENDING": "pending_review", "APPROVED": "approved", "REJECTED": "rejected"}.get(status, "awaiting_classification")
+        factory = detail.get("data_domain") == "FACTORY"
+        if factory and not status and detail.get("classification_state") == "CLASSIFIED":
+            state = "archived" if item.manifest.get("origin") == "HISTORY" else "needs_verification"
         classified = detail.get("classification_state") == "CLASSIFIED"
         self.outbox.update(item.execution_uuid, state=state, remote_state=status or ("CLASSIFIED" if classified else "UNCLASSIFIED"),
             submission_id=str(detail.get("submission_id") or item.submission_id),
             submission_revision=int(detail.get("submission_revision") or item.submission_revision),
             execution_code=str(detail.get("execution_code") or ""), last_error="",
-            review_reason=reason or ("中央已归类；请在平台核实并显式送审" if classified and not status else "中央状态：" + (status or "待归类")),
+            review_reason=reason or ("工厂归档已就绪，请重新核实并显式提交审批" if factory and not status else "中央已归类；请在平台核实并显式送审" if classified and not status else "中央状态：" + (status or "待归类")),
             next_attempt_at=time.time() + 30 if state in {"awaiting_classification", "pending_review"} else 0)
 
     @staticmethod
@@ -723,6 +848,11 @@ class ReliabilityUploaderWorker:
         if item.submission_id and item.remote_state == "PENDING":
             detail = self.client.archive(item.upload_id)
             canonical = self._archive_identity(item, frozen, detail)
+            if detail.get("data_domain") == "FACTORY":
+                if detail.get("is_owner") is not True:
+                    raise ValueError("工厂审批回执与当前提交账号不一致")
+                self._reconcile_archive(item, detail)
+                return
             receipt = self.client.submission(item.submission_id)
             if str(receipt.get("execution_uuid")) != canonical:
                 raise ValueError("审批回执与执行身份不一致")
@@ -761,7 +891,10 @@ class ReliabilityUploaderWorker:
             if machine not in {"completed", "failed", "stopped", "interrupted", "unknown"}:
                 machine = "unknown"
             auto = "unconfigured" if criteria["criteria_version"] == "UNCONFIGURED" else str(verdict.get("status") or "blocked")
+            from factory_hmi.data_domain import archive_domain_fields, domain_metadata
+            partition = archive_domain_fields(manifest)
             create = {
+                **partition,
                 "execution_uuid": producer, "test_name": manifest["test_name"], "actual_object": manifest["actual_object"],
                 "station_label": str(manifest.get("bench_id") or "unknown"), "origin": manifest.get("origin", "HMI"),
                 "filename": csv_path.name, "size_bytes": verified_size, "sha256": verified_sha256,
@@ -773,15 +906,15 @@ class ReliabilityUploaderWorker:
                     "summary": analysis_text(summary)[:500]},
                 "acceptance": criteria,
             }
-            if manifest.get("recording_scope") == "platform" and all(manifest.get(key) for key in _PROFILE_REQUIRED):
+            if domain_metadata(manifest)["data_domain"] != "FACTORY" and manifest.get("recording_scope") == "platform" and all(manifest.get(key) for key in _PROFILE_REQUIRED):
                 create["classification"] = {key: manifest[key] for key in _PROFILE_REQUIRED}
             history_import = manifest.get("origin") == "HISTORY"
             if not history_import and (timing.get("active_seconds") is None or timing.get("completed_cycles") is None):
                 raise ValueError("实测记录缺少运行事实，不能填零上传")
             if history_import:
-                # Exactly the existing seven-field import contract; facts are
-                # server-owned unknowns, never CSV span/zero placeholders.
+                # Imported acquisition facts remain server-owned unknowns.
                 create = {"filename": csv_path.name, "size_bytes": verified_size, "sha256": verified_sha256,
+                    **partition,
                     "test_name": manifest["test_name"], "actual_object": manifest["actual_object"],
                     "station_id": manifest["operator_review"]["station_id"], "classification": None}
             frozen = {"create": create, "review": dict(manifest["operator_review"]),
@@ -826,15 +959,33 @@ class ReliabilityUploaderWorker:
         offset = int(detail.get("received_bytes") or 0)
         if offset < 0 or offset > create["size_bytes"]:
             raise ValueError("归档回执字节偏移无效")
-        with csv_path.open("rb") as handle:
-            handle.seek(offset)
-            while chunk := handle.read(4 * 1024 * 1024):
-                receipt = self.client.archive_chunk(archive_id, offset, chunk, f"{producer}:chunk:{offset}")
-                received = int(receipt["received_bytes"])
-                if received != offset + len(chunk):
-                    raise ValueError("归档分块回执偏移不一致")
-                offset = received
-                self.outbox.update(producer, next_chunk_index=offset)
+        segment_manifest = csv_path.parent / "segments/manifest.json"
+        segment_capable = (segment_manifest.is_file() and not history_import and
+            hasattr(self.client, "archive_capabilities") and self.client.archive_capabilities().get("run_segments") is True)
+        if segment_capable:
+            declared = json.loads(segment_manifest.read_text(encoding="utf-8"))
+            receipt = self.client.archive_segments(archive_id, declared, producer + ":segments")
+            for segment in declared["segments"]:
+                sequence = segment["sequence"]
+                offset = int(receipt["segments"][sequence]["received_bytes"])
+                with (segment_manifest.parent / f"{sequence:06d}.csv").open("rb") as handle:
+                    handle.seek(offset)
+                    while chunk := handle.read(4 * 1024 * 1024):
+                        receipt = self.client.archive_segment_chunk(archive_id, sequence, offset, chunk, f"{producer}:segment:{sequence}:{offset}")
+                        confirmed = int(receipt["segments"][sequence]["received_bytes"])
+                        if confirmed != offset + len(chunk): raise ValueError("分段上传回执不一致")
+                        offset = confirmed
+            detail = self.client.archive_segments_complete(archive_id, producer + ":segments-complete")
+        else:
+            with csv_path.open("rb") as handle:
+                handle.seek(offset)
+                while chunk := handle.read(4 * 1024 * 1024):
+                    receipt = self.client.archive_chunk(archive_id, offset, chunk, f"{producer}:chunk:{offset}")
+                    received = int(receipt["received_bytes"])
+                    if received != offset + len(chunk):
+                        raise ValueError("归档分块回执偏移不一致")
+                    offset = received
+                    self.outbox.update(producer, next_chunk_index=offset)
         if detail.get("processing_state") != "READY":
             # The worker resets corrupt content to offset 0. After retransmitting
             # the unchanged frozen CSV, complete must re-run SHA256 validation.
@@ -865,6 +1016,7 @@ class ReliabilityUploaderWorker:
         if history_import:
             self._reconcile_archive(item, detail, reason="历史 CSV 已核实归档，可查看曲线；缺少运行事实，不能送审或进入正式统计")
             return
+        factory = detail.get("data_domain") == "FACTORY"
         if detail.get("classification_state") != "CLASSIFIED":
             self.outbox.update(producer, state="awaiting_classification", remote_state="UNCLASSIFIED", review_reason="中央归档已完成，等待补齐正式用例关联；后续仅对账，不自动送审", last_error="", next_attempt_at=time.time() + 30)
             return
@@ -872,7 +1024,7 @@ class ReliabilityUploaderWorker:
         # actual station is a new auditable classification after verification.
         classification = detail.get("classification") or create.get("classification") or {}
         corrected_station = frozen["review"]["station_id"]
-        if "classification" not in frozen and str(classification.get("station_id") or "") != corrected_station:
+        if not factory and "classification" not in frozen and str(classification.get("station_id") or "") != corrected_station:
             missing = [key for key in _PROFILE_REQUIRED if not classification.get(key)]
             if missing:
                 raise ValueError("正式归类上下文不完整，无法记录工位修正：" + "、".join(missing))
@@ -880,7 +1032,7 @@ class ReliabilityUploaderWorker:
                 "context": {**{key: str(classification[key]) for key in _PROFILE_REQUIRED}, "station_id": corrected_station},
                 "reason": manifest["submission_reason"]}
             self.outbox.update(producer, submission_payload=json.dumps(frozen, ensure_ascii=False, sort_keys=True))
-        if "classification" in frozen:
+        if not factory and "classification" in frozen:
             detail = self.client.archive_action(archive_id, "classification", frozen["classification"],
                 f"{producer}:station:{frozen['review'].get('revision', 1)}")
         if "submit" not in frozen:

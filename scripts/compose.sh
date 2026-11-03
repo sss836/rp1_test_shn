@@ -15,4 +15,10 @@ fi
 if [[ -f deployment/assistant-site.override.yml ]]; then
   compose_files+=(-f deployment/compose.assistant.yml -f deployment/assistant-site.override.yml)
 fi
+if [[ -f deployment/hmi-updates-site.override.yml ]]; then
+  compose_files+=(-f deployment/hmi-updates-site.override.yml)
+fi
+if [[ -f deployment/platform-latest-site.override.yml ]]; then
+  compose_files+=(-f deployment/platform-latest-site.override.yml)
+fi
 exec env "${unset_args[@]}" docker compose --env-file .env "${compose_files[@]}" "$@"

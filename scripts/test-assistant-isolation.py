@@ -24,6 +24,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--report-dir", type=Path, required=True)
 parser.add_argument("--deepseek-key-file", type=Path, help="optional server key file; makes one live probe with synthetic data")
 parser.add_argument("--setup-checks", action="store_true", help="run milestone 3 unified setup checks")
+parser.add_argument("--sample-checks", action="store_true", help="run simplified sample checks and migrate an existing synthetic sample from revision 50")
 parser.add_argument("--chat-checks", action="store_true", help="run milestone 4 runtime checks")
 parser.add_argument("--production-checks", action="store_true", help="production API/Web settings on a disposable DB; requires server key file")
 parser.add_argument("--observe-seconds",type=int,help="continuous synthetic observation, 60..86400 seconds; no live API key")
@@ -71,7 +72,7 @@ with tempfile.TemporaryDirectory(prefix="rp1-assistant-qa-") as directory:
         shutil.copyfile(args.deepseek_key_file.resolve(strict=True), live_secret)
         live_secret.chmod(0o444)
         values["QA_DEEPSEEK_SECRET_FILE"] = str(live_secret)
-    for key in ("QA_API_IMAGE", "QA_WEB_IMAGE", "QA_MIGRATE_IMAGE"):
+    for key in ("QA_API_IMAGE", "QA_WEB_IMAGE", "QA_MIGRATE_IMAGE", "QA_PI_IMAGE"):
         if os.getenv(key): values[key] = os.environ[key]
     envfile = temp / "compose.env"
     envfile.write_text("\n".join(f"{key}={value}" for key, value in values.items()))
@@ -79,10 +80,14 @@ with tempfile.TemporaryDirectory(prefix="rp1-assistant-qa-") as directory:
     compose = ["docker", "compose", "--env-file", str(envfile), "-p", project, "-f", str(ROOT / "deployment/compose.assistant-isolation.yml")]
     if args.deepseek_key_file:
         compose += ["-f", str(ROOT / "deployment/compose.assistant-live-isolation.yml")]
-    if args.setup_checks or args.chat_checks:
+    if args.setup_checks or args.chat_checks or args.sample_checks:
         override = temp / "setup-checks.yml"
         override.write_text("services:\n  checks:\n    command: [python, -m, pytest, -p, 'no:cacheprovider', tests/test_unified_setup.py, tests/test_unified_setup_integration.py, tests/test_security_http.py, -q, '--junitxml=/reports/backend-junit.xml']\n")
         compose += ["-f", str(override)]
+    if args.sample_checks:
+        override=temp/'sample-migration.yml'
+        override.write_text("services:\n  migrate:\n    command: [python, tests/check_simple_asset_migration.py]\n  checks:\n    environment:\n      ASSISTANT_QA_SAMPLE_MIGRATION: '1'\n")
+        compose += ['-f',str(override)]
     if args.chat_checks:
         override = temp / 'chat-checks.yml'
         files='tests/test_assistant_runtime.py tests/test_assistant_runtime_live.py'

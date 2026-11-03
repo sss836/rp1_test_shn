@@ -192,8 +192,8 @@ class AuthService:
             or not self._verify_password(str(row["password_hash"]), current_password)
         ):
             raise CurrentPasswordInvalidError
-        if len(new_password) < 12:
-            raise ValueError("new password must contain at least 12 characters")
+        if len(new_password) < 6:
+            raise ValueError("new password must contain at least 6 characters")
         if current_password == new_password:
             raise ValueError("new password must differ from current password")
         if principal.session_id is None:
@@ -209,8 +209,8 @@ class AuthService:
         return UserView(**user_data)
 
     def hash_new_password(self, password: str) -> str:
-        if len(password) < 12:
-            raise ValueError("password must contain at least 12 characters")
+        if len(password) < 6:
+            raise ValueError("password must contain at least 6 characters")
         return self.password_hasher.hash(password)
 
     def _verify_password(self, password_hash: str, password: str) -> bool:

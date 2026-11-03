@@ -53,7 +53,8 @@ it.each(["network", "503", "malformed-envelope", "malformed-session"])("keeps st
   expect(screen.queryByRole("heading", { name: "账户设置" })).toBeNull();
   expect(screen.queryByRole("heading", { name: "登录平台" })).toBeNull();
   expect(screen.queryByLabelText("用户名")).toBeNull();
-  expect(latest.status).toBe("unavailable");
+  // Probe publishes through a passive effect after the DOM commit.
+  await waitFor(() => expect(latest.status).toBe("unavailable"));
   fireEvent.click(screen.getByRole("button", { name: "重试验证登录" }));
   await screen.findByRole("heading", { name: "账户设置" });
   expect(latest.session?.user.id).toBe("reader-a");

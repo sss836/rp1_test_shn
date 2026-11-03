@@ -1,0 +1,508 @@
+{
+  "status": "owner_confirmed_values_unpublished",
+  "protocol_profile": "lro-pn-script-v1",
+  "source_sha256": "34f2214d52cf5e879e9ec169ec91725b22cdc99228a47d2671a491c9c85b0f3c",
+  "owner_confirmation": {
+    "statement": "但是之前的代码已经写入很多次了都没有问题，这个就是可以确认参数",
+    "reference_sha256": "996d6a7ac68507845b6c2f3a04e7846c1d58cb040161d1f23db8eec37ba2bd4c",
+    "scope": "脚本参数值及用户报告的既往使用，不替代独立实机验证、全部固件适用性或管理员实际发布"
+  },
+  "warnings": [
+    "Pn按uint32原始整数处理，scale=1；不套串口16位定义或重复缩放",
+    "回包不含Pn编号；仅单请求时序关联，不等于编号校验",
+    "精确完整版本适用表尚未填写，当前不能发布或用于写入",
+    "CAN超时0关闭保护，发布时明确核对",
+    "脚本值可由管理员维护为新版本；执行员不可改模板值"
+  ],
+  "templates": [
+    {
+      "schema": "rp1-motor-parameters-v2",
+      "template_id": "1ad03b31baa01eebf2e9441627cde7a8",
+      "version": "script-reference-1",
+      "model": "LRO_5550",
+      "source_sha256": "34f2214d52cf5e879e9ec169ec91725b22cdc99228a47d2671a491c9c85b0f3c",
+      "source": "user-supplied/deploy_motorlro_params.py",
+      "applicability": [],
+      "entries": [
+        {
+          "key": "kt",
+          "expected_raw": [
+            174
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "kp",
+          "expected_raw": [
+            0,
+            500
+          ],
+          "tolerance_raw": 5
+        },
+        {
+          "key": "kd",
+          "expected_raw": [
+            0,
+            50
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "pos",
+          "expected_raw": [
+            -1250,
+            1250
+          ],
+          "tolerance_raw": 12
+        },
+        {
+          "key": "spd",
+          "expected_raw": [
+            -2000,
+            2000
+          ],
+          "tolerance_raw": 20
+        },
+        {
+          "key": "tor",
+          "expected_raw": [
+            -300,
+            300
+          ],
+          "tolerance_raw": 3
+        },
+        {
+          "key": "cur",
+          "expected_raw": [
+            -180,
+            180
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "can_timeout",
+          "expected_raw": [
+            0
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0401",
+          "expected_raw": [
+            200
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0402",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0403",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e71",
+          "expected_raw": [
+            75
+          ],
+          "tolerance_raw": 0
+        }
+      ],
+      "confirmation": null,
+      "protocol_profile": "lro-pn-script-v1"
+    },
+    {
+      "schema": "rp1-motor-parameters-v2",
+      "template_id": "6ff0f7e5f495dc44b2804b0643cf8843",
+      "version": "script-reference-1",
+      "model": "LRO_6562",
+      "source_sha256": "34f2214d52cf5e879e9ec169ec91725b22cdc99228a47d2671a491c9c85b0f3c",
+      "source": "user-supplied/deploy_motorlro_params.py",
+      "applicability": [],
+      "entries": [
+        {
+          "key": "kt",
+          "expected_raw": [
+            162
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "kp",
+          "expected_raw": [
+            0,
+            500
+          ],
+          "tolerance_raw": 5
+        },
+        {
+          "key": "kd",
+          "expected_raw": [
+            0,
+            50
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "pos",
+          "expected_raw": [
+            -1250,
+            1250
+          ],
+          "tolerance_raw": 12
+        },
+        {
+          "key": "spd",
+          "expected_raw": [
+            -4000,
+            4000
+          ],
+          "tolerance_raw": 40
+        },
+        {
+          "key": "tor",
+          "expected_raw": [
+            -400,
+            400
+          ],
+          "tolerance_raw": 4
+        },
+        {
+          "key": "cur",
+          "expected_raw": [
+            -320,
+            320
+          ],
+          "tolerance_raw": 3
+        },
+        {
+          "key": "can_timeout",
+          "expected_raw": [
+            0
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0401",
+          "expected_raw": [
+            200
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0402",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0403",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0407",
+          "expected_raw": [
+            10000
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e05",
+          "expected_raw": [
+            56
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0eb2",
+          "expected_raw": [
+            45
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0f09",
+          "expected_raw": [
+            65
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0f0a",
+          "expected_raw": [
+            287
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e71",
+          "expected_raw": [
+            75
+          ],
+          "tolerance_raw": 0
+        }
+      ],
+      "confirmation": null,
+      "protocol_profile": "lro-pn-script-v1"
+    },
+    {
+      "schema": "rp1-motor-parameters-v2",
+      "template_id": "ddbb5d5e7f00fa04be8b54496a34c7b0",
+      "version": "script-reference-1",
+      "model": "LRO_8462",
+      "source_sha256": "34f2214d52cf5e879e9ec169ec91725b22cdc99228a47d2671a491c9c85b0f3c",
+      "source": "user-supplied/deploy_motorlro_params.py",
+      "applicability": [],
+      "entries": [
+        {
+          "key": "kt",
+          "expected_raw": [
+            231
+          ],
+          "tolerance_raw": 2
+        },
+        {
+          "key": "kp",
+          "expected_raw": [
+            0,
+            500
+          ],
+          "tolerance_raw": 5
+        },
+        {
+          "key": "kd",
+          "expected_raw": [
+            0,
+            50
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "pos",
+          "expected_raw": [
+            -1250,
+            1250
+          ],
+          "tolerance_raw": 12
+        },
+        {
+          "key": "spd",
+          "expected_raw": [
+            -3500,
+            3500
+          ],
+          "tolerance_raw": 35
+        },
+        {
+          "key": "tor",
+          "expected_raw": [
+            -650,
+            650
+          ],
+          "tolerance_raw": 6
+        },
+        {
+          "key": "cur",
+          "expected_raw": [
+            -350,
+            350
+          ],
+          "tolerance_raw": 3
+        },
+        {
+          "key": "can_timeout",
+          "expected_raw": [
+            0
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0401",
+          "expected_raw": [
+            200
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0402",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0403",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0407",
+          "expected_raw": [
+            10000
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e05",
+          "expected_raw": [
+            56
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0eb2",
+          "expected_raw": [
+            39
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e71",
+          "expected_raw": [
+            75
+          ],
+          "tolerance_raw": 0
+        }
+      ],
+      "confirmation": null,
+      "protocol_profile": "lro-pn-script-v1"
+    },
+    {
+      "schema": "rp1-motor-parameters-v2",
+      "template_id": "b6397d96f387c2d2e03cc5b1b201301a",
+      "version": "script-reference-1",
+      "model": "LRO_10062",
+      "source_sha256": "34f2214d52cf5e879e9ec169ec91725b22cdc99228a47d2671a491c9c85b0f3c",
+      "source": "user-supplied/deploy_motorlro_params.py",
+      "applicability": [],
+      "entries": [
+        {
+          "key": "kt",
+          "expected_raw": [
+            238
+          ],
+          "tolerance_raw": 2
+        },
+        {
+          "key": "kp",
+          "expected_raw": [
+            0,
+            500
+          ],
+          "tolerance_raw": 5
+        },
+        {
+          "key": "kd",
+          "expected_raw": [
+            0,
+            50
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "pos",
+          "expected_raw": [
+            -1250,
+            1250
+          ],
+          "tolerance_raw": 12
+        },
+        {
+          "key": "spd",
+          "expected_raw": [
+            -1600,
+            1600
+          ],
+          "tolerance_raw": 16
+        },
+        {
+          "key": "tor",
+          "expected_raw": [
+            -1650,
+            1650
+          ],
+          "tolerance_raw": 16
+        },
+        {
+          "key": "cur",
+          "expected_raw": [
+            -900,
+            900
+          ],
+          "tolerance_raw": 9
+        },
+        {
+          "key": "can_timeout",
+          "expected_raw": [
+            0
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0401",
+          "expected_raw": [
+            200
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0402",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0403",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0407",
+          "expected_raw": [
+            5000
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e05",
+          "expected_raw": [
+            56
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0eb2",
+          "expected_raw": [
+            40
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e71",
+          "expected_raw": [
+            75
+          ],
+          "tolerance_raw": 0
+        }
+      ],
+      "confirmation": null,
+      "protocol_profile": "lro-pn-script-v1"
+    }
+  ]
+}

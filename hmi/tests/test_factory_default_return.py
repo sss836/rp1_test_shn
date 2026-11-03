@@ -40,6 +40,7 @@ class DefaultReturnTests(unittest.TestCase):
             mock.patch.object(controller, "_start_position_hold") as hold,
             mock.patch("factory_hmi.core.controller.time.monotonic", side_effect=lambda: clock.now),
             mock.patch("factory_hmi.core.controller.time.sleep", side_effect=clock.sleep),
+            mock.patch.object(controller._default_return_stop, "wait", side_effect=lambda delay: (clock.sleep(delay) or False)),
             mock.patch("factory_hmi.core.controller.motor_default_positions", return_value=np.array([0.1, -0.1])),
         ):
             controller.connect()
@@ -74,6 +75,7 @@ class DefaultReturnTests(unittest.TestCase):
             mock.patch.object(controller, "_start_position_hold") as hold,
             mock.patch("factory_hmi.core.controller.time.monotonic", side_effect=lambda: clock.now),
             mock.patch("factory_hmi.core.controller.time.sleep", side_effect=clock.sleep),
+            mock.patch.object(controller._default_return_stop, "wait", side_effect=lambda delay: (clock.sleep(delay) or False)),
             mock.patch("factory_hmi.core.controller.motor_default_positions", return_value=np.array([0.2, -0.2])),
         ):
             controller.connect()
@@ -95,6 +97,7 @@ class DefaultReturnTests(unittest.TestCase):
             mock.patch.object(controller, "_start_position_hold"),
             mock.patch("factory_hmi.core.controller.time.monotonic", side_effect=lambda: clock.now),
             mock.patch("factory_hmi.core.controller.time.sleep", side_effect=clock.sleep),
+            mock.patch.object(controller._default_return_stop, "wait", side_effect=lambda delay: (clock.sleep(delay) or False)),
             mock.patch("factory_hmi.core.controller.motor_default_positions", return_value=np.array([0.2, -0.2])),
         ):
             controller.connect()

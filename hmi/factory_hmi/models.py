@@ -8,7 +8,7 @@ part of the real-time control path.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
@@ -74,6 +74,16 @@ class MotorSample:
     @property
     def velocity(self) -> float:
         return self.spd_rad_s
+
+    def with_feedback_age(self, now_s: float) -> "MotorSample":
+        """Age a cached observation without changing any measured value/time."""
+        if (not math.isfinite(self.timestamp_s) or self.timestamp_s <= 0
+                or not math.isfinite(now_s) or now_s < self.timestamp_s
+                or not math.isfinite(self.feedback_age_s) or self.feedback_age_s < 0):
+            age = float("inf")
+        else:
+            age = max(self.feedback_age_s, now_s - self.timestamp_s)
+        return replace(self, feedback_age_s=age)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -149,6 +159,7 @@ class PreflightReport:
     max_velocity_rad_s: float
     max_first_frame_delta_rad: float | None
     warnings: tuple[str, ...] = ()
+    approach: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -159,6 +170,7 @@ class PreflightReport:
             "max_velocity_rad_s": json_number(self.max_velocity_rad_s),
             "max_first_frame_delta_rad": json_number(self.max_first_frame_delta_rad),
             "warnings": list(self.warnings),
+            "approach": self.approach,
         }
 
 
@@ -205,12 +217,18 @@ class PlaybackOptions:
     cycles: int = 0
     duration_s: float | None = None
     speed: float = 1.0
+    completion_mode: str = "configured"
+    parking_pose_confirmed: bool = False
 
     def __post_init__(self) -> None:
+        if self.completion_mode not in {"configured", "mujoco_hanging"}:
+            raise ValueError("unsupported normal completion mode")
+        if self.completion_mode == "mujoco_hanging" and self.parking_pose_confirmed is not True:
+            raise ValueError("请先确认 MuJoCo 停放姿态适用于当前设备且可安全撤力")
         if self.cycles < 0:
             raise ValueError("cycles must be >= 0")
-        if not math.isfinite(float(self.speed)) or self.speed <= 0.0:
-            raise ValueError("speed must be a positive finite number")
+        if not math.isfinite(float(self.speed)) or not 0.1 <= self.speed <= 5.0:
+            raise ValueError("speed must be finite and in [0.1, 5.0]")
         if self.duration_s is not None and (
             not math.isfinite(float(self.duration_s)) or self.duration_s <= 0.0
         ):
@@ -290,4 +308,3 @@ class StationConfig:
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.control_rate_hz)) or self.control_rate_hz <= 0.0:
             raise ValueError("control_rate_hz must be a positive finite number")
-

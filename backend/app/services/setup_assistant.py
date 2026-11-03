@@ -96,7 +96,7 @@ def explicit_intent(messages):
     action=r"^(?:请\s*|请帮我\s*|帮我\s*)?(?:创建|新建|新增|建立|发布|修订|修改|更新|追加|关联|配置|开放|create\b|publish\b|revise\b)"
     if re.search(denied+"|"+question,last,re.I): return False
     if re.match(action,last,re.I): return True
-    if not re.match(r"^(?:名称|编号|序列号|部位|类型|项目|计划|台架|设备|采样|步骤|终止|判据|配置|型号|产品|补充|改为|name\b|code\b|serial\b|\{|\[)",last,re.I): return False
+    if not re.match(r"^(?:名称|编号|序列号|部位|类型|项目|计划|台架|设备|采样|步骤|终止|判据|配置|型号|产品|补充|改为|创建场景|场景|生产|研发测试|向下编号|顺延|自动编号|不顺延|不自动编号|是(?:[，,。\s]|$)|否(?:[，,。\s]|$)|name\b|code\b|serial\b|\{|\[)",last,re.I): return False
     for previous in reversed(messages[:-1]):
         previous=structured_parts(previous)[0]
         if re.search(denied,previous,re.I): return False
@@ -231,17 +231,37 @@ def unadopted_fields(bundle, intent):
             if field=="publish":
                 if value is True and not may_publish(intent.messages): missing.append(op.alias+".publish")
                 continue
+            if op.kind == "asset" and field == "auto_number" and isinstance(value, bool):
+                choice = numbering_choice(intent.messages)
+                if choice is not None:
+                    if choice is not value: missing.append(op.alias+"."+field)
+                    continue
             if field in baseline and canonical(value)==canonical(baseline[field]):continue
             if isinstance(value,(int,float,bool)):
                 labels={"planned_runs":"(?:计划执行次数|计划次数|执行次数|planned_runs)"}
                 explicit_number=field in labels and re.search(labels[field]+r"\s*[:：=]?\s*"+re.escape(str(value))+r"(?![0-9.])",source)
                 if (field,canonical(value)) not in numeric_fields and not explicit_number: missing.append(op.alias+"."+field)
                 continue
-            synonyms={"MODULE":("模块",),"WHOLE_MACHINE":("整机",),"SHARED":("共享","共用")}
+            synonyms={"MODULE":("模块",),"WHOLE_MACHINE":("整机",),"SHARED":("共享","共用"),"PRODUCTION":("生产",),"RND_TEST":("研发测试",)}
             if isinstance(value,str) and value in synonyms and any(v in source for v in synonyms[value]): continue
             if not grounded(value): missing.append(op.alias+"."+field)
         if op.kind=="case_publish" and not may_publish(intent.messages): missing.append(op.alias+".publish")
     return missing
+
+
+def numbering_choice(messages):
+    """Only an explicit numbering answer authorizes changing the input number."""
+    for message in reversed(messages):
+        prose, _ = structured_parts(message)
+        answer = re.match(r"^\s*(是|否)(?:[，,。！!\s]|$)", prose)
+        if answer: return answer[1] == "是"
+        choices = []
+        for match in re.finditer(r"(?:(?:不|不要)(?:向下编号|顺延(?:编号)?|自动编号)|(?:向下编号|顺延(?:编号)?|自动编号)\s*[:：=]?\s*(?:是|否|true|false)|(?:选择|选)\s*[‘'\"]?(?:是|否)[’'\"]?\s*(?:向下编号|顺延(?:编号)?|自动编号))", prose, re.I):
+            term = match.group()
+            denied = term.startswith(("不", "不要")) or bool(re.search(r"否|false", term, re.I))
+            choices.append(not denied)
+        if choices: return choices[-1]
+    return None
 
 
 def describe_error(exc):
@@ -253,6 +273,11 @@ def describe_error(exc):
 
 def commit_intent(session,bundle,intent,adopted_hash=None,publish_approved=False):
     if intent.job_id and not adopted_hash:
+        # Serialize the actual write with accepted diagnostic-only steering.
+        # An earlier preflight in allow_write alone cannot close this race.
+        session.execute(text('SELECT pg_advisory_xact_lock(hashtextextended(:key,0))'),{'key':'assistant-input:'+str(intent.job_id)})
+        if session.execute(text('SELECT 1 FROM integration.assistant_input WHERE job_id=:id LIMIT 1'),{'id':intent.job_id}).first():
+            raise ApiError(409,'assistant_steering_read_only','运行中补充仅用于诊断；请在下一条独立任务明确确认业务写入。')
         active=session.execute(text("SELECT id FROM integration.assistant_job WHERE id=:id AND user_id=iam.current_user_id() AND input_hash=:hash AND state='RUNNING' AND NOT cancel_requested AND deadline>clock_timestamp() FOR UPDATE"),{"id":intent.job_id,'hash':intent.input_hash}).first()
         if active is None: raise ApiError(409,"assistant_task_ended","任务已停止，未发起新的业务写入；请核对已有回执。")
     evidence={"channel":"assistant","source_hash":source_hash(intent),"adopted_proposal_hash":adopted_hash,"publish_approved":publish_approved or may_publish(intent.messages)}

@@ -74,6 +74,7 @@ def login(
             "用户名或密码错误。",
         ) from exc
 
+    response.delete_cookie("rp1_showcase",path="/")
     max_age = settings.auth_browser_session_hours * 3600
     response.set_cookie(
         settings.auth_cookie_name,
@@ -105,7 +106,7 @@ def login(
 def me(actor: RequestActorDep, session: DbSession) -> DataEnvelope[MeResponse]:
     access = [
         _campaign_access(row)
-        for row in SecurityRepository(session).current_campaign_access()
+        for row in ([] if actor.role == "FACTORY_REVIEWER" else SecurityRepository(session).current_campaign_access())
     ]
     return DataEnvelope(
         data=MeResponse(

@@ -93,6 +93,7 @@ class GatewayClientTest(unittest.TestCase):
             discover_request.full_url,
             self.client.base_url + "/api/v1/motors/discover",
         )
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 15.0)
 
         self.client.enable_motors(physical_estop_confirmed=True)
         enable_request = urlopen.call_args.args[0]
@@ -201,6 +202,8 @@ class GatewayClientTest(unittest.TestCase):
         urlopen.return_value = FakeResponse(b"{}")
 
         self.client.playback_start(
+            command_id="contract-start-1",
+            expected_config_revision="config-v1",
             speed=0.25,
             loop=True,
             cycles=12,
@@ -219,6 +222,9 @@ class GatewayClientTest(unittest.TestCase):
         self.assertEqual(
             json.loads(request.data),
             {
+                "command_id": "contract-start-1",
+                "expected_state": "armed",
+                "expected_config_revision": "config-v1",
                 "speed": 0.25,
                 "loop": True,
                 "cycles": 12,

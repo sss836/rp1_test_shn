@@ -318,49 +318,25 @@ class TrajectoryTests(unittest.TestCase):
 
 
 class PlaybackTests(unittest.TestCase):
-    def test_first_frame_preflight_failure_keeps_position_hold_available(self) -> None:
-        config, backend = fake_station(
-            control_rate_hz=20.0,
-            limits=SafetyLimits(max_first_frame_delta_rad=0.1),
-        )
+    def test_large_first_frame_gap_previews_approach_and_keeps_hold_until_start(self) -> None:
+        config, backend = fake_station(control_rate_hz=20.0,
+            limits=SafetyLimits(max_first_frame_delta_rad=0.1))
         controller = FactoryController(config, backend, enable_watchdog=False)
         with tempfile.TemporaryDirectory() as tmp:
-            path = write_trajectory(
-                Path(tmp),
-                np.asarray([[0.5, -0.5], [0.6, -0.6]]),
-                np.asarray([0.0, 0.1]),
-            )
-            controller.connect()
-            trajectory = controller.load_trajectory(path)
-            self.assertIn(
-                "first-frame delta check is deferred",
-                trajectory.preflight.warnings[0],
-            )
-
-            with self.assertRaisesRegex(
-                TrajectoryValidationError,
-                "first-frame delta too large",
-            ):
+            try:
+                path = write_trajectory(Path(tmp), np.asarray([[0.5, -0.5], [0.6, -0.6]]),
+                    np.asarray([0.0, 0.1]))
+                controller.connect()
+                controller.load_trajectory(path)
                 controller.arm()
-
-            self.assertEqual(controller.state, StationState.CONNECTED)
-            self.assertTrue(backend.motors_enabled)
-            self.assertTrue(controller.position_hold_active)
-
-            with (
-                mock.patch(
-                    "factory_hmi.core.controller.motor_default_positions",
-                    return_value=np.asarray([0.5, -0.5]),
-                ),
-                mock.patch(
-                    "factory_hmi.core.controller.time.sleep",
-                    return_value=None,
-                ),
-            ):
-                controller.reset(to_default=True)
-            controller.arm()
-            self.assertEqual(controller.state, StationState.ARMED)
-            controller.disconnect()
+                self.assertEqual(controller.state, StationState.ARMED)
+                self.assertTrue(controller.trajectory.preflight.approach['required'])
+                self.assertAlmostEqual(controller.trajectory.preflight.approach['max_distance_rad'], .5)
+                self.assertTrue(np.allclose(backend.positions, 0))
+                self.assertTrue(backend.motors_enabled)
+                self.assertTrue(controller.position_hold_active)
+            finally:
+                controller.disconnect()
 
     def test_enable_continuously_holds_the_measured_position(self) -> None:
         config, backend = fake_station(control_rate_hz=100.0)
@@ -475,8 +451,8 @@ class PlaybackTests(unittest.TestCase):
             controller.connect()
             controller.load_trajectory(path)
             controller.arm()
-            backend.inject_error(0, 7)
             controller.start()
+            backend.inject_error(0, 7)
             self.assertTrue(controller.wait(1.0))
             self.assertEqual(controller.state, StationState.FAULT)
             self.assertFalse(bool(np.any(backend.enabled)))
@@ -548,7 +524,7 @@ class DiagnosisTests(unittest.TestCase):
             MotorSample(
                 pos_rad=0.0,
                 cmd_pos_rad=1.0,
-                temp_c=90.0,
+                temp_c=100.0,
                 error_id=3,
                 bus_voltage_v=30.0,
                 motor_id=1,

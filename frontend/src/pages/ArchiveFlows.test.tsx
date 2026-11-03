@@ -12,7 +12,7 @@ vi.mock("../components/TimeSeriesChart", () => ({ TimeSeriesChart: ({ series, on
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 const archive: Archive = {
-  id: "archive-1", execution_uuid: "execution-1", archive_code: "ARC-001", owner_public_id: "owner", is_owner: true, can_edit: true,
+  data_domain: "RESEARCH", data_domain_source: "EXPLICIT", id: "archive-1", execution_uuid: "execution-1", archive_code: "ARC-001", owner_public_id: "owner", is_owner: true, can_edit: true,
   origin: "OTHER", test_name: "临时负载测试", actual_object: "左臂样品", station_label: "工位 A", filename: "test.csv", size_bytes: 1024, sha256: "a".repeat(64), received_bytes: 1024,
   upload_state: "COMPLETE", processing_state: "READY", processing_error: null, classification_state: "UNCLASSIFIED", revision: 2,
   facts: { started_at: "2026-10-12T00:00:00Z", ended_at: "2026-10-12T00:01:40Z", active_seconds: 100, completed_cycles: 5, exception_count: 0, machine_status: "completed", automatic_verdict: "unconfigured", data_quality: "VALID", clock_quality: "VALID" },

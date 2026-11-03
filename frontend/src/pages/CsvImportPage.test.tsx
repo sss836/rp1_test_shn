@@ -14,10 +14,10 @@ vi.mock("../imports/preflightClient", () => ({ preflightCsv: vi.fn() }));
 vi.mock("../imports/importApi", async () => ({ ...await vi.importActual("../imports/importApi"), uploadCsv: vi.fn() }));
 const preview: CsvPreflight = { sha256: "a".repeat(64), rows: 2, columns: [{ name: "time_s", unit: "s", count: 2, missing: 0, min: 0, max: 1 }, { name: "j1_bus_voltage_v", unit: "V", count: 0, missing: 2, min: null, max: null }], timeKey: "time_s", start: 0, end: 1, maxGap: 1, invalidTime: 0, nonMonotonic: 0, errors: [], warnings: ["1 个参数全部缺失"] };
 const options: SetupOptions = { stations: [{ id: "station", code: "RD-01", name: "有效工位", station_type: "RIG" }], assets: [{ id: "asset", code: "SAMPLE-A", name: "样品 A", asset_kind: "MODULE", target_part_code: "ARM" }], configurations: [], parts: [], programs: [] };
-const archive: Archive = { id: "arc", execution_uuid: "stable-execution", archive_code: "ARC-001", owner_public_id: "submitter", is_owner: true, can_edit: true, origin: "HISTORY", test_name: "原测试", actual_object: "原样品", station_label: "RD-01", filename: "first.csv", size_bytes: 4, sha256: preview.sha256, received_bytes: 0, upload_state: "UPLOADING", processing_state: "WAITING", processing_error: null, classification_state: "UNCLASSIFIED", revision: 1, facts: { active_seconds: null, completed_cycles: null, exception_count: null, machine_status: "unknown", automatic_verdict: "unconfigured" }, acceptance: {}, manifest: null, current_verification: null, classification: null, submission_id: null, submission_revision: null, submission_status: null, execution_id: null, execution_code: null, created_at: "2026-10-16T00:00:00Z" };
+const archive: Archive = { data_domain: "RESEARCH", data_domain_source: "EXPLICIT", id: "arc", execution_uuid: "stable-execution", archive_code: "ARC-001", owner_public_id: "submitter", is_owner: true, can_edit: true, origin: "HISTORY", test_name: "原测试", actual_object: "原样品", station_label: "RD-01", filename: "first.csv", size_bytes: 4, sha256: preview.sha256, received_bytes: 0, upload_state: "UPLOADING", processing_state: "WAITING", processing_error: null, classification_state: "UNCLASSIFIED", revision: 1, facts: { active_seconds: null, completed_cycles: null, exception_count: null, machine_status: "unknown", automatic_verdict: "unconfigured" }, acceptance: {}, manifest: null, current_verification: null, classification: null, submission_id: null, submission_revision: null, submission_status: null, execution_id: null, execution_code: null, created_at: "2026-10-16T00:00:00Z" };
 const ready: Archive = { ...archive, upload_state: "COMPLETE", processing_state: "READY", received_bytes: 4, manifest: { row_count: 2 } };
 const navigate = vi.fn();
-function mount() { render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })}><CsvImportPage navigate={navigate} /></QueryClientProvider>); }
+function mount(domain: "RESEARCH" | "FACTORY" = "RESEARCH") { render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })}><CsvImportPage navigate={navigate} domain={domain} /></QueryClientProvider>); }
 async function pick(name = "first.csv") { fireEvent.change(screen.getByLabelText("选择本地 CSV 文件"), { target: { files: [new File(["data"], name)] } }); return screen.findByRole("article", { name: `补录文件 ${name}` }); }
 function basics(card: HTMLElement) { const row = within(card); fireEvent.change(row.getByLabelText("测试名称"), { target: { value: "一次负载测试" } }); fireEvent.change(row.getByLabelText("样品 / 实际对象"), { target: { value: "SAMPLE-A" } }); fireEvent.change(row.getByLabelText("有效工位"), { target: { value: "station" } }); }
 beforeEach(() => {
@@ -41,7 +41,7 @@ it("preflights locally, keeps facts read only and requires explicit independent 
   fireEvent.click(within(card).getByRole("checkbox"));
   await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false)); fireEvent.click(button);
   await waitFor(() => expect(importApi.create).toHaveBeenCalled());
-  expect(vi.mocked(importApi.create).mock.calls[0][0]).toEqual({ filename: "first.csv", size_bytes: 4, sha256: preview.sha256, test_name: "一次负载测试", actual_object: "SAMPLE-A", station_id: "station", classification: null });
+  expect(vi.mocked(importApi.create).mock.calls[0][0]).toEqual({ filename: "first.csv", size_bytes: 4, sha256: preview.sha256, test_name: "一次负载测试", actual_object: "SAMPLE-A", station_id: "station", classification: null, data_domain: "RESEARCH", bench_id: "RD-01" });
   expect(archivesApi.verify).not.toHaveBeenCalled(); expect(archivesApi.submit).not.toHaveBeenCalled();
   await within(card).findByText("补录确认");
 });
@@ -50,7 +50,7 @@ it("reuses an existing file without writing draft metadata or creating a duplica
   mount(); const card = await pick(); await within(card).findByText(/相同文件已存在/);
   expect(within(card).getByText("原测试 · 原样品 · RD-01")).toBeTruthy();
   expect(within(card).queryByRole("button", { name: "上传并解析待核实记录" })).toBeNull();
-  fireEvent.click(within(card).getByRole("button", { name: "查看曲线" })); expect(navigate).toHaveBeenCalledWith("curves", "arc");
+  fireEvent.click(within(card).getByRole("button", { name: "查看曲线" })); expect(navigate).toHaveBeenCalledWith("curves", "arc", "RESEARCH");
   expect(importApi.create).not.toHaveBeenCalled(); expect(uploadCsv).not.toHaveBeenCalled(); expect(archivesApi.verify).not.toHaveBeenCalled();
 });
 it("does not upload when a race returns an existing incomplete archive; requires explicit resume", async () => {
@@ -152,4 +152,49 @@ it("labels metadata as excluded from parameter statistics and never presents its
     const row = within(card).getByText(new RegExp(`${label}（不参与参数统计）`)).closest("tr")!;
     expect(within(row).getAllByRole("cell").slice(1).map((cell) => cell.textContent)).toEqual(["—", "—", "—", "—", "—"]);
   }
+});
+
+it("uploads an explicit factory SN without a research plan and routes verification to the factory detail", async () => {
+  const factoryArchive = { ...archive, data_domain: "FACTORY" as const, data_domain_source: "EXPLICIT" as const, serial_number: "000aZ", bench_id: "RD-01" };
+  const factoryReady = { ...ready, ...factoryArchive, upload_state: "COMPLETE" as const, processing_state: "READY" as const };
+  vi.mocked(importApi.create).mockResolvedValue({ archive: factoryArchive, reused: false });
+  vi.mocked(archivesApi.detail).mockResolvedValue(factoryReady);
+  vi.mocked(uploadCsv).mockImplementation(async (_file, _initial, _signal, progress) => { progress(factoryReady); return factoryReady; });
+  mount("FACTORY"); const card = await pick(); await within(card).findByLabelText("测试名称"); basics(card);
+  expect(screen.queryByLabelText("本次业务分区")).toBeNull();
+  expect(screen.getByRole("heading", { name: "工厂记录上传" })).toBeTruthy();
+  fireEvent.change(within(card).getByLabelText("本次工厂 SN"), { target: { value: "000aZ" } });
+  expect(within(card).queryByLabelText("测试计划")).toBeNull();
+  fireEvent.click(within(card).getByRole("checkbox"));
+  fireEvent.click(within(card).getByRole("button", { name: "上传并解析待核实记录" }));
+  await waitFor(() => expect(importApi.create).toHaveBeenCalledWith(expect.objectContaining({ data_domain: "FACTORY", serial_number: "000aZ", bench_id: "RD-01", classification: null }), expect.any(String), expect.any(AbortSignal)));
+  fireEvent.click(await within(card).findByRole("button", { name: "核实工厂记录并送审" }));
+  expect(navigate).toHaveBeenCalledWith("archive", "arc", "FACTORY");
+  expect(within(card).queryByRole("button", { name: "确认并送审" })).toBeNull();
+  expect(archivesApi.submit).not.toHaveBeenCalled();
+});
+
+
+it("keeps existing research evidence intact when the same CSV is selected in factory upload", async () => {
+  vi.mocked(importApi.lookup).mockResolvedValue({ archive });
+  vi.mocked(archivesApi.detail).mockResolvedValue(archive);
+  mount("FACTORY");
+  const card = await pick();
+  await within(card).findByText(/同一原始文件已归入研发/);
+  expect(within(card).queryByRole("button", { name: "继续上传同一原文件" })).toBeNull();
+  expect(importApi.create).not.toHaveBeenCalled();
+  expect(uploadCsv).not.toHaveBeenCalled();
+  expect(archivesApi.verify).not.toHaveBeenCalled();
+  fireEvent.click(within(card).getByRole("button", { name: "查看归档 / 核实详情" }));
+  expect(navigate).toHaveBeenCalledWith("archive", "arc", "RESEARCH");
+});
+
+it("returns to its own factory ledger and denies viewers upload controls", () => {
+  mount("FACTORY");
+  fireEvent.click(screen.getByRole("button", { name: "返回工厂" }));
+  expect(navigate).toHaveBeenCalledWith("factory", undefined, "FACTORY");
+  cleanup();
+  auth.role = "VIEWER";
+  mount("FACTORY");
+  expect(screen.queryByLabelText("选择本地 CSV 文件")).toBeNull();
 });

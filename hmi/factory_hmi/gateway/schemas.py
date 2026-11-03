@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 
 class MotorOverride(BaseModel):
@@ -74,13 +74,19 @@ class EnableMotorsRequest(BaseModel):
 
 
 class PlaybackStartRequest(BaseModel):
+    command_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._-]{8,128}$")
+    expected_state: Literal["armed"] | None = None
+    expected_config_revision: str | None = Field(default=None, min_length=1, max_length=128)
     model_config = ConfigDict(extra="forbid")
-    speed: float = Field(default=1.0, gt=0.0, le=4.0)
+    completion_mode: Literal["configured", "mujoco_hanging"] = "configured"
+    parking_pose_confirmed: StrictBool = False
+    speed: float = Field(default=1.0, ge=0.1, le=5.0)
     loop: bool = True
     cycles: int = Field(default=0, ge=0)
     duration_hours: float | None = Field(default=None, gt=0.0)
     record: bool = True
     recording_scope: Literal["local", "platform"] | None = None
+    data_domain: Literal["RESEARCH", "FACTORY"] | None = None
     record_rate_hz: float = Field(default=20.0, ge=1.0, le=20.0)
     test_id: str | None = None
     robot_id: str | None = None
@@ -137,6 +143,8 @@ class PlaybackStartRequest(BaseModel):
 
     @model_validator(mode="after")
     def require_test_identity(self) -> PlaybackStartRequest:
+        if self.completion_mode == "mujoco_hanging" and not self.parking_pose_confirmed:
+            raise ValueError("请先确认 MuJoCo 停放姿态适用于当前设备且可安全撤力")
         if not str(self.test_case_id or "").strip():
             raise ValueError("测试用例编号必填，没有对应用例请选择 OTHER")
         if self.test_case_id.upper() == "OTHER":
@@ -193,6 +201,14 @@ class ExecutionActionRequest(BaseModel):
     discrepancy_reason: str = Field(default="", max_length=300)
     test_name: str = Field(default="", max_length=200)
     actual_object: str = Field(default="", max_length=200)
+
+
+class LocalCorrectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    changes: dict[str, str] = Field(min_length=1, max_length=6)
+    reason: str = Field(min_length=1, max_length=500)
+    expected_revision: int = Field(ge=0, strict=True)
+    request_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
 class HistoryImportRequest(BaseModel):
@@ -275,3 +291,14 @@ class QuickStartRequest(BaseModel):
     duration_hours: float = Field(gt=0.0)
     physical_estop_confirmed: bool
     sample_id: str = Field(min_length=1, max_length=200)
+    data_domain: Literal["RESEARCH", "FACTORY"] | None = None
+    bench_id: str | None = Field(default=None, max_length=64)
+    operator_id: str | None = Field(default=None, max_length=255)
+    completion_mode: Literal["configured", "mujoco_hanging"] = "configured"
+    parking_pose_confirmed: StrictBool = False
+
+    @model_validator(mode="after")
+    def confirm_completion_pose(self):
+        if self.completion_mode == "mujoco_hanging" and not self.parking_pose_confirmed:
+            raise ValueError("请先确认 MuJoCo 停放姿态适用于当前设备且可安全撤力")
+        return self

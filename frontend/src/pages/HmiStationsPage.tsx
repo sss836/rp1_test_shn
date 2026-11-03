@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { Monitor, RefreshCw } from "lucide-react";
 import { useAuth } from "../auth";
 import { getHmiStations, isStationTesting, runLabels, stationLabels, type HmiStation } from "../hmiPresence";
@@ -64,7 +64,7 @@ export function HmiStationCard({ station, live = true }: { station: HmiStation; 
   );
 }
 
-export default function HmiStationsPage() {
+export default function HmiStationsPage({domain}:{domain?:"RESEARCH"|"FACTORY"}={}) {
   const { session } = useAuth();
   const [automatic, setAutomatic] = useState(true);
   const [filter, setFilter] = useState("all");
@@ -73,20 +73,19 @@ export default function HmiStationsPage() {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
-  const query = useInfiniteQuery({
-    queryKey: ["hmi-stations"],
-    initialPageParam: null as string | null,
-    queryFn: ({ pageParam, signal }) => getHmiStations(pageParam, signal),
-    getNextPageParam: (page) => page.next_cursor,
+  const [cursor,setCursor]=useState<string|null>(null);
+  const query = useQuery({
+    queryKey: ["hmi-stations",cursor,domain],
+    queryFn: ({ signal }) => getHmiStations(cursor, signal),
     refetchInterval: automatic ? 5000 : false,
     refetchOnWindowFocus: true,
     retry: 1
   });
-  const stations = [...new Map((query.data?.pages.flatMap((page) => page.items) ?? []).map((station) => [station.installation_id, station])).values()];
+  const stations = (query.data?.items??[]).filter(s=>!domain||!s.runs.length||s.runs.some(r=>r.data_domain===domain||!r.data_domain)).map(s=>domain?{...s,runs:s.runs.filter(r=>!r.data_domain||r.data_domain===domain)}:s);
   const visible = stations.filter((station) => filter === "all" || (filter === "online" ? station.online : filter === "running" ? isStationTesting(station) : station.state === filter));
   const currentResponse = now - query.dataUpdatedAt < 15000;
   const healthy = !query.isError && automatic && currentResponse;
-  const latest = query.data?.pages[0]?.as_of_at;
+  const latest = query.data?.as_of_at;
   return (
     <div className="workbench hmi-stations-page">
       <PageTitle eyebrow="WORKSTATION MONITOR" title="工位监控" description={session?.user.role === "SYSTEM_ADMIN" ? "查看全部上位机的在线状态与当前测试。" : "查看使用当前账号登录的上位机。"}
@@ -95,14 +94,14 @@ export default function HmiStationsPage() {
       <section className="hmi-monitor-toolbar" aria-label="监控筛选">
         <label>显示工位<select value={filter} onChange={(event) => setFilter(event.target.value)}><option value="all">全部</option><option value="online">在线</option><option value="running">测试运行中</option><option value="offline">离线</option></select></label>
         <label className="hmi-auto-refresh"><input type="checkbox" checked={automatic} onChange={(event) => setAutomatic(event.target.checked)} />每 5 秒自动刷新</label>
-        <p>{healthy ? `${stations.filter((station) => station.online).length} 台在线 · ${stations.filter(isStationTesting).length} 台测试运行中` : "当前显示历史快照"}<span>已加载 {stations.length} 台 · 最近读取：{formatDate(latest)}</span></p>
+        <p>{healthy ? `${stations.filter((station) => station.online).length} 台在线 · ${stations.filter(isStationTesting).length} 台测试运行中` : "当前显示历史快照"}<span>当前页 {stations.length} 台 · 最近读取：{formatDate(latest)}</span></p>
       </section>
       {query.isPending ? <LoadingState label="正在读取上位机状态" /> : query.isError ? <ErrorState error={query.error} retry={() => void query.refetch()} /> : (
         <>
           {!automatic && <p className="hmi-snapshot-note" role="status">自动刷新已暂停，设备可能已改变状态。</p>}
           {automatic && !currentResponse && <p className="hmi-snapshot-note" role="status">页面暂未获取最新状态，以下为历史快照。</p>}
           {visible.length ? <div className="hmi-station-grid">{visible.map((station) => <HmiStationCard key={station.installation_id} station={station} live={healthy} />)}</div> : <EmptyState title={stations.length ? "没有符合筛选条件的工位" : "暂无上位机连接记录"} description="在已升级的 RP1 TEST HMI（PLC）中登录平台账号后，工位会自动出现在此处。" />}
-          {query.hasNextPage && <button type="button" className="subtle-button" disabled={query.isFetchingNextPage} onClick={() => void query.fetchNextPage()}>加载更多工位</button>}
+          {cursor&&<button onClick={()=>setCursor(null)}>返回第一页</button>}{query.data?.next_cursor&&<button type="button" className="subtle-button" disabled={query.isFetching} onClick={() => setCursor(query.data!.next_cursor)}>下一页工位</button>}
         </>
       )}
       <p className="hmi-monitor-footnote">上位机每 10 秒上报；超过 45 秒未收到心跳视为离线。状态采样超过 20 秒未更新时显示“状态待确认”。电柜供电不代表测试已开始。</p>

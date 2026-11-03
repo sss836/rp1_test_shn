@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup,fireEvent,render,screen,waitFor } from "@testing-library/react";
+import { act,cleanup,fireEvent,render,screen,waitFor } from "@testing-library/react";
 import { afterEach,beforeEach,it,expect,vi } from "vitest";
 import { QueryClient,QueryClientProvider } from "@tanstack/react-query";
 import { AssistantPanel,cardHref } from "./AssistantPanel";
@@ -9,6 +9,8 @@ const context:PageContext={view:"curves",kind:"MODULE",archive_id:"11111111-1111
 const identifier="22222222-2222-4222-8222-222222222222";
 const complete:ChatJob={id:identifier,thread_id:identifier,state:"COMPLETED",rounds:2,context,result:{reply:"已取得实际数据",cards:[]}};
 beforeEach(()=>{
+  sessionStorage.clear();
+  vi.spyOn(assistantApi,"capabilities").mockResolvedValue({mode:"assistant_runtime",tools:[],writes_enabled:false,features:{stream_events:false,support_workspace:false}});
   vi.spyOn(assistantApi,"threads").mockResolvedValue([]);
   vi.spyOn(assistantApi,"history").mockResolvedValue({messages:[],jobs:[]});
   vi.spyOn(assistantApi,"budget").mockResolvedValue({day:"2026-10-22",spent_cny:0,reserved_cny:0,limit_cny:100,blocked:false,pricing_verified:true});
@@ -94,4 +96,80 @@ it("uploads an image and submits its immutable identifier without requiring text
   fireEvent.submit(screen.getByLabelText("消息").closest("form")!);
   await screen.findByText("已取得实际数据");
   expect(assistantApi.submitJob).toHaveBeenCalledWith(expect.objectContaining({attachments:[identifier],message:expect.stringContaining("分析")}),expect.any(AbortSignal));
+});
+
+const attachment=(name:string,id=identifier)=>({id,name,kind:(name.endsWith('.zip')||name.endsWith('.gz')?'archive':'binary') as 'archive'|'binary',mime:'application/octet-stream',sha256:'synthetic',size:100,expires_at:'2026-11-29'});
+
+it("offers all file extensions with clear diagnostic-only scope and submits at most three immutable IDs",async()=>{
+  const names=['measurements.csv','session.tar.gz','unknown.vendor'];
+  vi.spyOn(assistantApi,'uploadAttachment').mockImplementation(async file=>attachment(file.name,file.name));
+  view();fireEvent.click(screen.getByText('助手'));
+  const picker=screen.getByLabelText('选择诊断附件');expect(picker.getAttribute('accept')).toBeNull();
+  expect(screen.getByText(/不是正式归档或审批/).textContent).toContain('每个32MiB');
+  fireEvent.change(picker,{target:{files:names.map(name=>new File([name],name))}});
+  await screen.findByText(names[2]);
+  fireEvent.submit(screen.getByLabelText('消息').closest('form')!);
+  await screen.findByText('已取得实际数据');
+  expect(assistantApi.submitJob).toHaveBeenCalledWith(expect.objectContaining({attachments:names,message:expect.stringContaining('未读内容')}),expect.any(AbortSignal));
+});
+
+it("rejects four files and an oversized file before uploading any selected content",async()=>{
+  const upload=vi.spyOn(assistantApi,'uploadAttachment');view();fireEvent.click(screen.getByText('助手'));
+  const picker=screen.getByLabelText('选择诊断附件');
+  fireEvent.change(picker,{target:{files:Array.from({length:4},(_,i)=>new File(['x'],i+'.csv'))}});
+  await screen.findByText('每条消息最多3个附件。');expect(upload).not.toHaveBeenCalled();
+  const huge=new File(['x'],'huge.tar');Object.defineProperty(huge,'size',{value:32*1024*1024+1});
+  fireEvent.change(picker,{target:{files:[new File(['x'],'small.csv'),huge]}});
+  await screen.findByText('附件须为非空且每个不超过32MiB。');expect(upload).not.toHaveBeenCalled();
+});
+
+it("retains all independent uploads when one file fails and retries only the failed item",async()=>{
+  const upload=vi.spyOn(assistantApi,'uploadAttachment').mockImplementation(async file=>{if(file.name==='second.zip'&&upload.mock.calls.filter(([f])=>f.name==='second.zip').length===1)throw new Error('合成上传失败');return attachment(file.name,file.name);});
+  view();fireEvent.click(screen.getByText('助手'));
+  fireEvent.change(screen.getByLabelText('选择诊断附件'),{target:{files:['first.csv','second.zip','third.tar'].map(n=>new File([n],n))}});
+  await screen.findByText('合成上传失败');await waitFor(()=>expect(upload).toHaveBeenCalledTimes(3));
+  expect(screen.getByText('first.csv')).toBeTruthy();expect(screen.getByText('third.tar')).toBeTruthy();
+  fireEvent.click(screen.getByLabelText('重试second.zip'));await waitFor(()=>expect(upload).toHaveBeenCalledTimes(4));
+  fireEvent.submit(screen.getByLabelText('消息').closest('form')!);await screen.findByText('已取得实际数据');
+  expect(assistantApi.submitJob).toHaveBeenCalledWith(expect.objectContaining({attachments:['first.csv','second.zip','third.tar']}),expect.any(AbortSignal));
+});
+
+it("cancels one upload, ignores its late response and preserves the independent queue",async()=>{
+  let resolvePending!:(value:ReturnType<typeof attachment>)=>void;
+  const upload=vi.spyOn(assistantApi,'uploadAttachment').mockImplementation(file=>file.name==='late.zip'?new Promise(resolve=>{resolvePending=resolve;}):Promise.resolve(attachment(file.name,file.name)));
+  view();fireEvent.click(screen.getByText('助手'));
+  fireEvent.change(screen.getByLabelText('选择诊断附件'),{target:{files:['kept.csv','late.zip','other.tar'].map(n=>new File([n],n))}});
+  await waitFor(()=>expect(upload).toHaveBeenCalledTimes(3));
+  const signal=upload.mock.calls.find(([file])=>file.name==='late.zip')![1]!;fireEvent.click(screen.getByLabelText('取消上传late.zip'));expect(signal.aborted).toBe(true);
+  await act(async()=>{resolvePending(attachment('late.zip','late'));});
+  expect(screen.getByText('kept.csv')).toBeTruthy();expect(screen.getByText('other.tar')).toBeTruthy();
+  expect(screen.getByLabelText('重试late.zip')).toBeTruthy();
+  fireEvent.submit(screen.getByLabelText('消息').closest('form')!);await screen.findByText('已取得实际数据');
+  expect(assistantApi.submitJob).toHaveBeenCalledWith(expect.objectContaining({attachments:['kept.csv','other.tar']}),expect.any(AbortSignal));
+});
+
+it("aborts and clears account attachment drafts even if accountKey changes without a React key",async()=>{
+  let resolvePending!:(value:ReturnType<typeof attachment>)=>void;
+  const upload=vi.spyOn(assistantApi,'uploadAttachment').mockImplementation(()=>new Promise(resolve=>{resolvePending=resolve;}));
+  const client=new QueryClient({defaultOptions:{queries:{retry:false,gcTime:0}}});const props={context,navigate:vi.fn()};
+  const result=render(<QueryClientProvider client={client}><AssistantPanel accountKey='one' {...props}/></QueryClientProvider>);
+  fireEvent.click(screen.getByText('助手'));fireEvent.change(screen.getByLabelText('消息'),{target:{value:'old private draft'}});
+  fireEvent.change(screen.getByLabelText('选择诊断附件'),{target:{files:[new File(['private'],'old.csv')]}});
+  await waitFor(()=>expect(upload).toHaveBeenCalledOnce());
+  const signal=upload.mock.calls[0][1]!;
+  result.rerender(<QueryClientProvider client={client}><AssistantPanel accountKey='two' {...props}/></QueryClientProvider>);
+  expect(signal.aborted).toBe(true);fireEvent.click(screen.getByText('助手'));
+  await act(async()=>{resolvePending(attachment('old.csv'));});
+  expect(screen.queryByText('old.csv')).toBeNull();expect((screen.getByLabelText('消息') as HTMLTextAreaElement).value).toBe('');
+  expect(assistantApi.submitJob).not.toHaveBeenCalled();
+});
+
+it("keeps the attachment visible if explicit removal fails",async()=>{
+  vi.spyOn(assistantApi,'uploadAttachment').mockResolvedValue(attachment('evidence.csv'));
+  const deletion=vi.spyOn(assistantApi,'deleteAttachment').mockRejectedValue(new Error('合成删除失败'));
+  view();fireEvent.click(screen.getByText('助手'));
+  fireEvent.change(screen.getByLabelText('选择诊断附件'),{target:{files:[new File(['x'],'evidence.csv')]}});
+  await screen.findByText('evidence.csv');fireEvent.click(screen.getByLabelText('移除evidence.csv'));
+  await screen.findByText('合成删除失败');expect(screen.getByText('evidence.csv')).toBeTruthy();
+  expect(deletion).toHaveBeenCalledWith(identifier,expect.any(AbortSignal));
 });

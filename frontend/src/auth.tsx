@@ -12,6 +12,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { invalidateAuthenticationRequests, isSessionInvalidationError, setUnauthorizedHandler } from "./client";
 import type { Session } from "./security";
 import { authApi } from "./securityApi";
+import { clearAssistantStorage } from "./assistantStorage";
 
 type AuthStatus = "booting" | "unavailable" | "anonymous" | "authenticated";
 type AuthContextValue = {
@@ -50,6 +51,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const clearSession = useCallback(() => {
+    clearAssistantStorage();
     advanceEpoch();
     queryClient.clear();
     verifiedSession.current = null;
@@ -69,6 +71,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const next = await authApi.me(controller.signal);
       if (!current()) return;
       if (verifiedSession.current?.user.id !== next.user.id) {
+        if (verifiedSession.current) clearAssistantStorage();
         advanceEpoch();
         queryClient.clear();
       }
@@ -110,6 +113,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const login = useCallback(async (username: string, password: string) => {
     if (mutation.current) throw new Error("正在处理认证请求，请稍后重试。");
     mutation.current = "login";
+    clearAssistantStorage();
     const operation = advanceEpoch();
     queryClient.clear();
     verifiedSession.current = null;

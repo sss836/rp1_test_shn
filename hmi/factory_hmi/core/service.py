@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import re
 import shutil
 import threading
 import uuid
+import time
+import inspect
+from functools import wraps
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -28,6 +32,8 @@ from .can_manager import (
 )
 from .config import load_station_config
 from .controller import FactoryController
+from .command_receipts import StartReceipts
+from .motion_completion import automatic_completion_parameters
 from .identity import build_execution_code, build_local_execution_code
 from .report import ReportManager, ReportResult
 from .zeroing import MotorZeroingSession
@@ -35,6 +41,18 @@ from factory_hmi.sync.outbox import Outbox
 
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _open_service_operation(method):
+    """Serialize resource creation with close, never heartbeat/snapshot reads."""
+    @wraps(method)
+    def operation(self, *args, **kwargs):
+        with self._lifecycle_lock:
+            self._require_open()
+            if any(t.active for t in self.maintenance_tasks()):
+                raise RuntimeError("模块固件或参数维护占用当前实例；先取消并等待任务退出")
+            return method(self, *args, **kwargs)
+    return operation
 
 
 class FactoryService:
@@ -59,7 +77,14 @@ class FactoryService:
         self.trajectory_root.mkdir(parents=True, exist_ok=True)
         self.report_manager = ReportManager(report_root or self.data_root)
         self.outbox = outbox or Outbox(self.data_root / "sync" / "outbox.sqlite3")
+        from .recording.policy import CapacityReservations
+        self.capacity_reservations = CapacityReservations(self.report_manager.data_root / "record-capacity.sqlite3")
         self._lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._closing = threading.Event()
+        self._closed = False
+        self._maintenance = None
+        self._parameters = None
         self._controller: FactoryController | None = None
         self._zeroing: MotorZeroingSession | None = None
         self._backend_name: str | None = None
@@ -71,16 +96,94 @@ class FactoryService:
         self._fake_can_connected = False
         self._report_threads: set[threading.Thread] = set()
         self._report_errors: dict[str, str] = {}
+        self._recording_session: Any = None
         self._record_identity: dict[str, str] = {}
+        self._config_revision = uuid.uuid4().hex
+        self._start_receipts = StartReceipts(self.data_root / "start-receipts.sqlite3")
         self._record_sidecar: Path | None = None
         self._live_report_context: dict[str, Any] | None = None
-        recovery = threading.Thread(
-            target=self._recover_existing_records,
-            name="factory-report-recovery",
-            daemon=True,
-        )
-        self._report_threads.add(recovery)
-        recovery.start()
+        # Empty stations have nothing to recover. In particular, do not create
+        # an evidence lock/SQLite connection/empty ledger after __init__ returns.
+        # The first explicit history query still creates the empty ledger.
+        if (any(self.record_root.glob("*.checkpoint.json")) or any(self.record_root.glob("*.csv"))
+                or any(self.report_manager.executions_root.glob("*/manifest.json"))):
+            self._start_report_worker(self._recover_existing_records, "factory-report-recovery")
+
+    def _require_open(self) -> None:
+        if self._closing.is_set():
+            raise RuntimeError("station service is closing or closed")
+
+    def _start_report_worker(self, target, name: str, args=()) -> None:
+        with self._lock:
+            self._require_open()
+            self._report_threads = {t for t in self._report_threads if t.is_alive()}
+            worker = threading.Thread(target=target, name=name, args=args, daemon=True)
+            self._report_threads.add(worker)
+            # Start under the registry lock: close must never join an unstarted
+            # thread. Keep finished handles until a join/reap confirms exit.
+            worker.start()
+
+    def wait_for_reports(self, timeout: float = 5.0) -> None:
+        """Drain owned file writers without holding the service/report locks."""
+        if not np.isfinite(timeout) or timeout < 0:
+            raise ValueError("report timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                workers = list(self._report_threads)
+            if not workers:
+                return
+            for worker in workers:
+                if worker is threading.current_thread():
+                    raise RuntimeError("report worker cannot wait for itself")
+                worker.join(max(0.0, deadline - time.monotonic()))
+            with self._lock:
+                self._report_threads.difference_update(t for t in workers if not t.is_alive())
+                pending = [t.name for t in self._report_threads if t.is_alive()]
+            if not pending:
+                return
+            if time.monotonic() >= deadline:
+                message = "report shutdown timed out; still running: " + ", ".join(pending)
+                with self._lock:
+                    self._report_errors["shutdown"] = message
+                raise TimeoutError(message)
+
+    def close(self, timeout: float = 5.0) -> dict[str, Any]:
+        """Normally disconnect, then drain recovery/finalization before return.
+
+        Timeout bounds the report drain, not an unresponsive native disconnect.
+        A failed close remains closing and can be retried; it never authorizes
+        deleting state or forcibly terminating a device/worker.
+        """
+        with self._lifecycle_lock:
+            if self._closed:
+                return {"closed": True, "report_errors": dict(self._report_errors)}
+            with self._lock:
+                self._closing.set()
+                controller = self._controller
+            for task in self.maintenance_tasks():
+                task.cancel(timeout)
+            disconnect_error = None
+            if controller is not None:
+                try:
+                    controller.disconnect()
+                except Exception as exc:
+                    disconnect_error = exc
+                    with self._lock:
+                        self._report_errors["shutdown-disconnect"] = str(exc)
+            self.wait_for_reports(timeout)
+            if disconnect_error is not None:
+                raise RuntimeError("station disconnect failed during close") from disconnect_error
+            self._zeroing = None
+            self._closed = True
+            return {"closed": True, "report_errors": dict(self._report_errors)}
+
+    def __enter__(self):
+        self._require_open()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
 
     @property
     def controller(self) -> FactoryController:
@@ -89,6 +192,7 @@ class FactoryService:
                 raise RuntimeError("station is not configured")
             return self._controller
 
+    @_open_service_operation
     def configure(
         self,
         *,
@@ -98,6 +202,7 @@ class FactoryService:
         bus_bindings: Sequence[Mapping[str, Any]] | None = None,
         motor_overrides: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        self._require_protective_damping_released()
         backend = backend.strip().lower()
         if backend not in {"motors_py", "fake"}:
             raise ValueError("backend must be motors_py or fake")
@@ -175,15 +280,18 @@ class FactoryService:
             self._zeroing = None
             self._backend_name = backend
             self._config_path = path
+            self._config_revision = uuid.uuid4().hex
             self._last_stop_reason = None
             self._can_interfaces = can_interfaces
             self._can_bindings = normalized_bindings
             self._fake_can_connected = False
             return self.snapshot()
 
+    @_open_service_operation
     def clear_configuration(self) -> dict[str, Any]:
         """Safely stop hardware and remove the active station configuration."""
 
+        self._require_protective_damping_released()
         with self._lock:
             if self._controller is not None:
                 self._controller.disconnect()
@@ -352,6 +460,7 @@ class FactoryService:
             "policy": policy_payload,
         }
 
+    @_open_service_operation
     def can_connect(
         self,
         *,
@@ -402,15 +511,31 @@ class FactoryService:
             return self.snapshot()
 
     def can_disconnect(self) -> dict[str, Any]:
-        with self._lock:
-            if self._controller is not None and self._controller.backend.connected:
-                raise RuntimeError("disconnect motors before disconnecting CAN")
-            if self._backend_name == "fake":
-                self._fake_can_connected = False
-            elif self._can_interfaces:
-                self._can_manager.disconnect(self._can_interfaces)
-            return self.snapshot()
+        # Use the same boundary as maintenance start/close, so a fresh task
+        # cannot start between cancellation and the explicit interface down.
+        with self._lifecycle_lock:
+            self._require_open()
+            for task in self.maintenance_tasks():
+                task.cancel()
+            with self._lock:
+                if self._controller is not None and self._controller.backend.connected:
+                    raise RuntimeError("disconnect motors before disconnecting CAN")
+                if self._backend_name == "fake":
+                    self._fake_can_connected = False
+                elif self._can_interfaces:
+                    self._can_manager.disconnect(self._can_interfaces)
+                    statuses = self._can_manager.status(self._can_interfaces)
+                    if ({row.interface for row in statuses} != set(self._can_interfaces)
+                            or any(row.up for row in statuses)):
+                        raise RuntimeError("CAN关闭状态未确认；保留Pn通道隔离")
+                from .motor_parameter_transport import archive_pn_quarantine
+                archive_pn_quarantine(
+                    self.report_manager.data_root / 'pn-quarantine', self._can_interfaces,
+                    reason='用户显式断开CAN，接口关闭已确认；重新接入仍需Pn静默窗口。'
+                           '仅重新建立主机时序边界，不代表检测到电机重新上电。')
+                return self.snapshot()
 
+    @_open_service_operation
     def can_recover(self) -> dict[str, Any]:
         with self._lock:
             if self._controller is not None and self._controller.backend.connected:
@@ -434,6 +559,7 @@ class FactoryService:
                     raise RuntimeError("CAN recovery did not restore healthy interfaces")
             return self.snapshot()
 
+    @_open_service_operation
     def connect(self) -> dict[str, Any]:
         """Backward-compatible discovery plus enable operation."""
 
@@ -442,12 +568,14 @@ class FactoryService:
         self.discover_motors()
         return self.enable_motors(physical_estop_confirmed=True)
 
+    @_open_service_operation
     def discover_motors(self) -> dict[str, Any]:
         if not self.can_status()["all_up"]:
             raise RuntimeError("connect and validate all CAN interfaces first")
         self.controller.discover_motors()
         return self.snapshot()
 
+    @_open_service_operation
     def enable_motors(
         self,
         *,
@@ -476,19 +604,42 @@ class FactoryService:
             raise
         return self.snapshot()
 
+    def protective_damping_snapshot(self):
+        controller = self._controller
+        session = controller._protective_damping if controller is not None else None
+        return session.snapshot() if session is not None else None
+
+    def _require_protective_damping_released(self):
+        status = self.protective_damping_snapshot()
+        if status and status.get('active') is True:
+            raise RuntimeError('保护阻尼中；先可靠支撑机构并显式失能，再修改配置')
+
+    def enter_protective_damping(self, reason: str):
+        controller = self._controller
+        if controller is None:return None
+        return controller.enter_protective_damping(reason, kd=1.0)
+
     def disable_motors(self) -> dict[str, Any]:
+        if any(t.active for t in self.maintenance_tasks()):
+            for task in self.maintenance_tasks():
+                task.cancel()
+            return self.snapshot()
         controller = self.controller
         controller.disable_motors()
         return self.snapshot()
 
     def disconnect(self) -> dict[str, Any]:
+        for task in self.maintenance_tasks():
+            task.cancel()
         controller = self.controller
         controller.disconnect()
         with self._lock:
             self._zeroing = None
         return self.snapshot()
 
+    @_open_service_operation
     def import_trajectory(self, path: str) -> dict[str, Any]:
+        self.controller.state_machine.require({StationState.DISCONNECTED, StationState.CONNECTED, StationState.COMPLETED})
         source = Path(path).expanduser().resolve(strict=True)
         if not source.is_file():
             raise ValueError("trajectory path must be a file")
@@ -501,15 +652,58 @@ class FactoryService:
         if source != destination:
             shutil.copy2(source, destination)
         trajectory = self.controller.load_trajectory(destination)
+        self._config_revision = uuid.uuid4().hex
         return trajectory.to_dict()
 
     load_trajectory = import_trajectory
 
+    @_open_service_operation
     def arm(self) -> dict[str, Any]:
         self.controller.arm()
         return self.snapshot()
 
-    def start(
+    def start_receipt(self, command_id: str) -> dict[str, Any]:
+        return self._start_receipts.get(command_id)
+
+    @_open_service_operation
+    def start(self, *, command_id: str | None = None, expected_state: str | None = None,
+              expected_config_revision: str | None = None, **kwargs) -> dict[str, Any]:
+        # Normalize defaults so omitted/default-valued fields describe the same command.
+        bound = inspect.signature(self._start_once).bind(**kwargs)
+        bound.apply_defaults()
+        payload = {**bound.arguments, "expected_state": expected_state,
+                   "expected_config_revision": expected_config_revision}
+        key = command_id or uuid.uuid4().hex  # legacy caller: one distinct command
+        if not re.fullmatch(r"[A-Za-z0-9._-]{8,128}", key):
+            raise ValueError("command_id must contain 8-128 safe characters")
+        digest = self._start_receipts.digest(payload)
+        receipt = self._start_receipts.get(key)
+        if receipt["status"] != "not_found":
+            if receipt["payload_hash"] != digest:
+                raise ValueError("启动命令编号已用于不同载荷")
+            if receipt["status"] == "accepted":
+                return receipt["result"]
+            raise RuntimeError(receipt.get("error") or "启动结果待确认；先查询回执，不可重发设备动作")
+        self._start_receipts.begin(key, digest)
+        previous_playback = self._controller.playback if self._controller else None
+        try:
+            if expected_config_revision is not None and expected_config_revision != self._config_revision:
+                raise ValueError("配置或轨迹版本已变化，请刷新后重新预检")
+            if expected_state is not None and self.controller.state.value != expected_state:
+                raise ValueError("启动状态已变化，请刷新当前执行")
+            self.controller.state_machine.require(StationState.ARMED)
+            result = self._start_once(**bound.arguments)
+        except Exception as exc:
+            # A live action is never labelled rejected simply because response assembly failed.
+            active = (self._controller and self._controller.playback is not previous_playback
+                      and self._controller.playback is not None)
+            self._start_receipts.finish(key, "unknown" if active else "rejected", error=str(exc))
+            raise
+        result["start_command"] = {"command_id": key, "status": "accepted"}
+        self._start_receipts.finish(key, "accepted", result=result)
+        return result
+
+    def _start_once(
         self,
         *,
         speed: float = 1.0,
@@ -518,6 +712,7 @@ class FactoryService:
         duration_hours: float | None = None,
         record: bool = True,
         recording_scope: str | None = None,
+        data_domain: str | None = None,
         record_rate_hz: float = 20.0,
         test_id: str | None = None,
         robot_id: str | None = None,
@@ -537,14 +732,27 @@ class FactoryService:
         stage_code: str | None = None,
         stage_name: str | None = None,
         subject_map: Mapping[str, str] | None = None,
+        completion_mode: str = "configured",
+        parking_pose_confirmed: bool = False,
     ) -> dict[str, Any]:
         controller = self.controller
+        automatic_completion_parameters(controller.config)
         report_context: dict[str, Any] | None = None
         record_path: Path | None = None
         sidecar: Path | None = None
         effective_test_id = test_id
         execution_code = ""
         selected_case = str(test_case_id or "").strip().upper()
+        from factory_hmi.data_domain import domain_metadata, bench_evidence
+        if data_domain is not None and data_domain not in {"RESEARCH", "FACTORY"}:
+            raise ValueError("data_domain must be RESEARCH or FACTORY")
+        resolved_sample = str(robot_id or "").strip()
+        resolved_bench = str(bench_id or os.environ.get("RP1_FACTORY_BENCH_ID", "")).strip()
+        domain = domain_metadata({"data_domain": data_domain, "bench_id": resolved_bench, "robot_id": resolved_sample})
+        if data_domain == "FACTORY" and (not resolved_sample or not resolved_bench):
+            raise ValueError("工厂测试必须填写 SN 和实际台架")
+        if data_domain == "FACTORY" and (len(resolved_sample) > 200 or not bench_evidence(resolved_bench)):
+            raise ValueError("工厂 SN 最多200字，实际台架须为有效编号")
         if not selected_case:
             raise ValueError("测试用例编号必填，没有对应用例请选择 OTHER 并填写测试名称")
         if selected_case == "OTHER":
@@ -552,11 +760,34 @@ class FactoryService:
                 raise ValueError("其他用例必须填写临时测试名称")
             if not str(robot_id or "").strip() or not str(bench_id or "").strip():
                 raise ValueError("其他用例必须填写实际测试对象和工位")
+        if not record and (recording_scope == "platform" or any((campaign_id, cycle_id, segment_id, asset_id, configuration_id, test_case_version_id)) or selected_case != "OTHER"):
+            raise ValueError("正式任务必须启用测量记录；无记录仅允许 OTHER 调试，不取得正式资格")
+        requirements=(controller.config.raw.get("factory_hmi_acceptance") or {}).get("observation_requirements")
+        if requirements:
+            from .recording.policy import check_observation_requirements
+            observation=check_observation_requirements(requirements,controller.telemetry_hub.capabilities())
+            if not observation["admitted"]:raise ValueError("配方观测能力不足："+"；".join(observation["reasons"]))
         if record:
+            reserve = int(os.environ.get("RP1_FACTORY_RECORD_RESERVE_BYTES", str(512 * 1024**2)))
+            if reserve < 0:
+                raise ValueError("record reserve bytes cannot be negative")
+            if shutil.disk_usage(self.record_root).free < reserve:
+                raise RuntimeError("recording disk free space below configured reserve")
+            from .recording.policy import capacity_budget, freeze_policy
+            from scripts.log_motor_telemetry import csv_fieldnames
+            duration_s = (float(duration_hours)*3600 if duration_hours else
+                controller.trajectory.duration_s / speed * (cycles or 1) if not loop or cycles else 7*24*3600)
+            row_bound = max(128, len(csv_fieldnames(controller.config.entries))*26)
+            capacity = capacity_budget(row_bytes=row_bound, rate_hz=record_rate_hz,
+                duration_s=max(.05,duration_s), free_bytes=shutil.disk_usage(self.record_root).free,
+                reserve_bytes=reserve, log_bytes=math.ceil(duration_s)*128)
+            if not capacity["admitted"]:
+                raise RuntimeError(f"记录容量不足：需要 {capacity['required_bytes']} 字节，可用 {capacity['free_bytes']} 字节；未删除已有记录")
+            recording_policy = freeze_policy(purpose="production" if domain["data_domain"] == "FACTORY" else "development", recipe=selected_case)
             started_at = datetime.now(timezone.utc)
             resolved_test_case = test_case_id or controller.config.limb
-            resolved_sample = robot_id or ""
-            resolved_bench = bench_id or os.environ.get("RP1_FACTORY_BENCH_ID", "")
+            if domain["data_domain"] == "FACTORY" and not resolved_sample.strip():
+                raise ValueError("工厂测试必须填写 SN")
             platform_context = {
                 "campaign_id": campaign_id, "cycle_id": cycle_id,
                 "segment_id": segment_id, "asset_id": asset_id,
@@ -567,6 +798,8 @@ class FactoryService:
             scope = recording_scope or ("platform" if has_platform_context else "local")
             if scope not in {"local", "platform"}:
                 raise ValueError("recording_scope must be local or platform")
+            if data_domain == "FACTORY" and scope != "local":
+                raise ValueError("工厂记录使用独立 SN 身份，不能绑定研发执行上下文")
             if scope == "local" and has_platform_context:
                 raise ValueError("本地记录不能同时携带平台测试上下文；请明确选择记录用途。")
             execution_id = str(execution_uuid or uuid.uuid4())
@@ -609,15 +842,16 @@ class FactoryService:
             record_path = self.record_root / f"{safe_test_id}.csv"
             if record_path.exists() or record_path.with_suffix(".context.json").exists():
                 raise ValueError("记录编号已存在，不能覆盖之前的记录。")
-            controller.enable_recording = True
-            controller.record_output = record_path
             trajectory = controller.trajectory
             now = started_at.isoformat().replace("+00:00", "Z")
             report_context = {
+                "capacity_admission": capacity, "recording_policy": recording_policy,
                 "execution_uuid": execution_id,
                 "test_id": safe_test_id,
                 "execution_code": execution_code,
                 "recording_scope": scope,
+                "origin": "OTHER" if selected_case == "OTHER" else "HMI",
+                **domain,
                 "campaign_id": campaign_id,
                 "cycle_id": cycle_id,
                 "segment_id": segment_id,
@@ -673,14 +907,12 @@ class FactoryService:
                 + "\n",
                 encoding="utf-8",
             )
-        else:
-            controller.enable_recording = False
-            controller.record_output = None
-        self._record_identity = {
+        candidate_identity = {
             "test_id": effective_test_id or "",
             "execution_uuid": str((report_context or {}).get("execution_uuid") or ""),
             "execution_code": execution_code,
             "recording_scope": report_context.get("recording_scope", "") if report_context else "",
+            **domain, "bench_id": resolved_bench, "operator_id": str(operator_id or ""),
             "campaign_id": str((report_context or {}).get("campaign_id") or ""),
             "cycle_id": str((report_context or {}).get("cycle_id") or ""),
             "asset_id": str((report_context or {}).get("asset_id") or ""),
@@ -689,50 +921,76 @@ class FactoryService:
             "test_case_id": str((report_context or {}).get("test_case_id") or ""),
             "station_id": str((report_context or {}).get("station_id") or ""),
         }
-        self._record_sidecar = sidecar if record else None
-        self._live_report_context = report_context
-        controller.start(
-            loop=loop,
-            cycles=cycles,
-            duration_s=(
-                None
-                if duration_hours is None
-                else float(duration_hours) * 3600.0
-            ),
-            speed=speed,
-            record_rate_hz=record_rate_hz,
-            test_id=effective_test_id,
-            robot_id=robot_id,
-        )
-        if report_context is not None and record_path is not None:
-            thread = threading.Thread(
-                target=self._finalize_after_run,
-                args=(controller, record_path, report_context, controller.playback),
-                name=f"factory-report-{report_context['test_id']}",
-                daemon=True,
+        if report_context is not None:
+            try:
+                self.capacity_reservations.reserve(report_context["execution_uuid"],capacity["required_bytes"],shutil.disk_usage(self.record_root).free)
+            except Exception:
+                if sidecar is not None: sidecar.unlink(missing_ok=True)
+                raise
+        previous_playback = controller.playback
+        previous = (controller.enable_recording, controller.record_output, controller.completion_output)
+        controller.enable_recording = record
+        controller.record_output = record_path
+        controller.completion_output = self.data_root / "motion-completion" / (str(uuid.uuid4()) + ".json")
+        try:
+            controller.start(
+                loop=loop,
+                cycles=cycles,
+                duration_s=(
+                    None
+                    if duration_hours is None
+                    else float(duration_hours) * 3600.0
+                ),
+                speed=speed,
+                record_rate_hz=record_rate_hz,
+                test_id=effective_test_id,
+                robot_id=robot_id,
+                completion_mode=completion_mode,
+                parking_pose_confirmed=parking_pose_confirmed,
             )
-            with self._lock:
-                self._report_threads.add(thread)
-            thread.start()
+        except Exception:
+            controller.enable_recording, controller.record_output, controller.completion_output = previous
+            if report_context is not None and controller.playback is previous_playback:
+                self.capacity_reservations.complete(report_context["execution_uuid"])
+            if sidecar is not None:
+                sidecar.unlink(missing_ok=True)
+            raise
+        # Commit identity and download pointer only after playback accepted the run.
+        self._record_identity = candidate_identity
+        self._record_sidecar = sidecar if record else None
+        controller.telemetry_hub.begin((report_context or {}).get("execution_uuid") or test_id or "local", self._config_revision)
+        self._live_report_context = report_context
+        self._recording_session = controller.playback if record else None
+        if report_context is not None and record_path is not None:
+            self._start_report_worker(self._finalize_after_run,
+                f"factory-report-{report_context['test_id']}",
+                (controller, record_path, report_context, controller.playback))
         return self.snapshot()
 
     def pause(self) -> dict[str, Any]:
         self.controller.pause()
         return self.snapshot()
 
+    @_open_service_operation
     def resume(self) -> dict[str, Any]:
         self.controller.resume()
         return self.snapshot()
 
+    def finish(self, reason: str | None = None) -> dict[str, Any]:
+        self._last_stop_reason = reason
+        self.controller.finish(reason=reason)
+        return self.snapshot()
+
     def stop(self, *, reason: str | None = None) -> dict[str, Any]:
         self._last_stop_reason = reason
-        self.controller.stop()
+        self.controller.stop(reason=reason)
         return self.snapshot()
 
     def prepare_next_run(self) -> dict[str, Any]:
         self.controller.prepare_next_run()
         return self.snapshot()
 
+    @_open_service_operation
     def manual_move(
         self,
         *,
@@ -756,7 +1014,8 @@ class FactoryService:
         return self.snapshot()
 
     def record_file(self) -> Path:
-        output = self.controller.record_output
+        # Download only from the committed recording session, never a start draft.
+        output = self._recording_session.record_output if self._recording_session is not None else None
         if output is None:
             raise RuntimeError("no recorded CSV is available")
         resolved = Path(output).expanduser().resolve()
@@ -765,11 +1024,36 @@ class FactoryService:
             raise RuntimeError("recorded CSV is outside the records directory")
         if not resolved.is_file():
             raise RuntimeError("recorded CSV has not been finalized")
+        session = self._recording_session
+        if session is not None and not session.snapshot()["recording"]["finished"]:
+            raise RuntimeError("recorded CSV is not closed or recording failed")
         return resolved
 
     def execution_history(self, limit: int = 100) -> list[dict[str, Any]]:
-        items = self.report_manager.history(limit=limit)
-        by_test_id = {item.test_id: item for item in self.outbox.list(limit=limit)}
+        return self.execution_history_page(limit=limit)["items"]
+
+    def execution_history_page(self, limit: int | None = 100, *, offset: int = 0,
+                               start_at: str = "", end_at: str = "", sn: str = "", data_domain: str = "", bench: str = "") -> dict[str, Any]:
+        from factory_hmi.execution_history import history_bounds, select_history
+        history_bounds(start_at, end_at)
+        if not self.report_manager.history_index.initialized():
+            raise RuntimeError("历史索引正在恢复，请稍后刷新；损坏时请显式重建索引")
+        page = self.report_manager.history_index.page(limit=min(limit or 500, 500), offset=offset,
+            start_at=start_at, end_at=end_at, sn=sn, data_domain=data_domain, bench=bench)
+        self._annotate_execution_history(page["items"])
+        return {**page, "ledger_path": str(self.report_manager.executions_root / "执行台账.csv"), "ledger_error": ""}
+
+    def iter_execution_history(self, **filters):
+        cursor = None
+        while True:
+            page = self.report_manager.history_index.page(limit=500, cursor=cursor, **filters)
+            self._annotate_execution_history(page["items"])
+            yield from page["items"]
+            cursor = page["next_cursor"]
+            if not cursor: break
+
+    def _annotate_execution_history(self, items: list[dict[str, Any]]) -> None:
+        by_test_id = self.outbox.for_test_ids([str(item["test_id"]) for item in items])
         for item in items:
             queued = by_test_id.get(str(item["test_id"]))
             item.update(
@@ -785,7 +1069,33 @@ class FactoryService:
                     "execution_code_confirmed": bool(queued and queued.execution_code),
                 }
             )
-        return items
+
+    def execution_location(self, test_id: str = "") -> dict[str, str]:
+        directory = self.report_manager.execution_dir(test_id) if test_id else self.report_manager.executions_root
+        return {"directory": str(directory), "executions_root": str(self.report_manager.executions_root),
+                "ledger_path": str(self.report_manager.executions_root / "执行台账.csv"),
+                "test_id": test_id}
+
+    def execution_local_corrections(self, test_id: str) -> dict[str, Any]:
+        return self.report_manager.local_corrections(test_id)
+
+    def correct_execution_locally(self, test_id: str, changes: dict[str, str], *, reason: str,
+                                  actor: str, expected_revision: int, request_id: str) -> dict[str, Any]:
+        # One cross-window/process boundary protects the appended correction
+        # and derived ledger. This path never calls submit/enqueue/wake/upload.
+        with self.report_manager.evidence_lock():
+            result = self.report_manager.local_correction_store(test_id).save(
+                changes, reason=reason, actor=actor, expected_revision=expected_revision, request_id=request_id)
+            self.report_manager.refresh_history_index(test_id)
+            items = self.report_manager.history(limit=None)
+            self._annotate_execution_history(items)
+            ledger_error = ''
+            try:
+                self.report_manager.write_ledger(items)
+            except OSError as exc:
+                ledger_error = str(exc)
+        return {**result, 'ledger_error': ledger_error,
+                'ledger_path': str(self.report_manager.executions_root / '执行台账.csv')}
 
     def execution_summary(self, test_id: str) -> dict[str, Any]:
         summary = self.report_manager.summary(test_id)
@@ -925,6 +1235,7 @@ class FactoryService:
                 active_seconds=None, completed_cycles=None, record_rate_hz=None, outcome="unknown")
             result = self.report_manager.finalize(source, context)
             results.append(self._report_result(result))
+        self.execution_history_page(limit=1)
         return results
 
     def sync_status(self, test_id: str) -> dict[str, Any]:
@@ -936,21 +1247,39 @@ class FactoryService:
         )
 
     def recover_reports(self) -> list[dict[str, Any]]:
-        return [
+        results = [
             self._report_result(result)
             for result in self.report_manager.recover_orphans(self.record_root)
         ]
+        self.execution_history_page(limit=1)
+        return results
 
     def _recover_existing_records(self) -> None:
-        current = threading.current_thread()
         try:
+            if not self.report_manager.history_index.initialized():
+                self.report_manager.rebuild_history_index()
+            from .recording.segments import recover_checkpoint
+            inspected=0
+            for checkpoint in self.record_root.glob("*.checkpoint.json"):
+                source=checkpoint.with_name(checkpoint.name.removesuffix(".checkpoint.json")+".csv")
+                if source.with_suffix(".segments.json").exists():continue
+                inspected+=1
+                if inspected>100:
+                    self._report_errors["partial-recovery-budget"]="未完成记录超过本次恢复预算，请分批检查；原始文件均保留"
+                    break
+                event=source.with_suffix(".recovery.json")
+                if not event.exists():
+                    recovered=recover_checkpoint(source)
+                    from .report import _write_fsynced,_json_bytes
+                    _write_fsynced(event,_json_bytes(recovered))
+                self._report_errors[source.stem]="记录存在未封段尾部；已保留原件和确认持久前缀，需核实，未自动续测"
+            from .report_jobs import recover_report_jobs
+            for result in recover_report_jobs(self.report_manager.data_root):
+                if result["state"] == "failed":self._report_errors[result["id"]] = result["reason"]
             self.recover_reports()
         except Exception as exc:
             with self._lock:
                 self._report_errors["startup-recovery"] = str(exc)
-        finally:
-            with self._lock:
-                self._report_threads.discard(current)
 
     def _finalize_after_run(
         self,
@@ -959,7 +1288,6 @@ class FactoryService:
         context: dict[str, Any],
         playback_session: Any = None,
     ) -> None:
-        current = threading.current_thread()
         test_id = str(context["test_id"])
         try:
             # Hold the execution's playback identity across quick disconnects.
@@ -967,22 +1295,28 @@ class FactoryService:
             # before this background finalizer gets CPU time.
             if playback_session is not None:
                 playback_session.wait()
+                playback_session.wait_recording()
                 playback = playback_session.snapshot()
+                if playback.get("record_error"):
+                    raise RuntimeError(playback["record_error"])
             else:
                 controller.wait()
                 playback = controller.snapshot().get("playback")
-            snapshot = controller.snapshot()
             progress = (
                 playback.get("progress", {})
                 if isinstance(playback, Mapping)
                 else {}
             )
-            fault = snapshot.get("fault")
+            fault = playback.get("fault") if isinstance(playback, Mapping) else None
+            if isinstance(playback, Mapping) and playback.get("test_started_at"):
+                context["preparation"] = {"requested_at": context.get("started_at"),
+                    "first_frame_approach": (playback.get("completion") or {}).get("approach"),
+                    "approach_elapsed_s": (playback.get("completion") or {}).get("approach_elapsed_s", 0.)}
+                context["started_at"] = playback["test_started_at"]
             context.update(
                 {
-                    "ended_at": datetime.now(timezone.utc)
-                    .isoformat()
-                    .replace("+00:00", "Z"),
+                    "ended_at": (playback.get("ended_at") if isinstance(playback, Mapping) else None)
+                    or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "active_seconds": float(progress.get("active_seconds") or 0),
                     "completed_cycles": int(
                         progress.get("completed_cycles") or 0
@@ -993,20 +1327,20 @@ class FactoryService:
                     "stop_reason": (
                         str(fault.get("message") or "")
                         if isinstance(fault, Mapping)
-                        else self._last_stop_reason or ""
+                        else playback.get("stop_reason") or ""
                     ),
                 }
             )
-            self.report_manager.finalize(record_path, context)
+            from .report_jobs import run_report_job
+            run_report_job(self.report_manager.data_root, record_path, context)
+            self.capacity_reservations.complete(context.get("execution_uuid", ""))
+            self.execution_history_page(limit=1)
             record_path.with_suffix(".context.json").unlink(missing_ok=True)
             with self._lock:
                 self._report_errors.pop(test_id, None)
         except Exception as exc:
             with self._lock:
                 self._report_errors[test_id] = str(exc)
-        finally:
-            with self._lock:
-                self._report_threads.discard(current)
 
     @staticmethod
     def _report_result(result: ReportResult) -> dict[str, Any]:
@@ -1019,6 +1353,7 @@ class FactoryService:
             "verdict": result.summary["verdict"]["status"],
         }
 
+    @_open_service_operation
     def reset(self) -> dict[str, Any]:
         controller = self.controller
         controller.reset(to_default=True)
@@ -1026,6 +1361,7 @@ class FactoryService:
 
     reset_to_default = reset
 
+    @_open_service_operation
     def reset_motor_fault(self) -> dict[str, Any]:
         if not self.can_status()["all_up"]:
             raise RuntimeError("connect and validate CAN before resetting motor faults")
@@ -1039,6 +1375,9 @@ class FactoryService:
         return bool(controller and controller.request_motion_stop())
 
     def disable(self) -> dict[str, Any]:
+        if any(t.active for t in self.maintenance_tasks()):
+            for task in self.maintenance_tasks():
+                task.cancel()
         controller = self.controller
         if controller.state in {StationState.RUNNING, StationState.PAUSED}:
             controller.stop()
@@ -1047,6 +1386,7 @@ class FactoryService:
 
     emergency_disable = disable
 
+    @_open_service_operation
     def zero_motor(self, motor_index: int) -> dict[str, Any]:
         result = self.controller.zero_motors([int(motor_index)])
         return {
@@ -1054,6 +1394,7 @@ class FactoryService:
             "snapshot": self.snapshot(),
         }
 
+    @_open_service_operation
     def zero_all_motors(self) -> dict[str, Any]:
         controller = self.controller
         result = controller.zero_motors(
@@ -1064,6 +1405,7 @@ class FactoryService:
             "snapshot": self.snapshot(),
         }
 
+    @_open_service_operation
     def zero_prepare(self, motor_index: int) -> dict[str, Any]:
         controller = self.controller
         with self._lock:
@@ -1082,6 +1424,7 @@ class FactoryService:
     def zero_read(self) -> dict[str, Any]:
         return self._require_zeroing().read().to_dict()
 
+    @_open_service_operation
     def zero_confirm(self, *, allow_on_fault: bool = False) -> dict[str, Any]:
         if allow_on_fault:
             raise ValueError("factory gateway does not permit fault-state zeroing")
@@ -1117,7 +1460,31 @@ class FactoryService:
             )
         return {"execution_code": code}
 
+    def maintenance_tasks(self):
+        return tuple(t for t in (self._maintenance, self._parameters) if t is not None)
+
+    def maintenance_targets(self):
+        from .motor_maintenance import effective_targets
+        return effective_targets(self.controller.config)
+
+    def maintenance_ready(self):
+        self._require_open()
+        controller = self.controller
+        value = controller.snapshot()
+        playback = value.get("playback") or {}
+        if (controller.backend.motors_enabled or controller.position_hold_active
+                or controller.state in {StationState.RUNNING, StationState.PAUSED, StationState.ARMED, StationState.STOPPING}
+                or (playback.get("completion") or {}).get("active")
+                or self._zeroing is not None and self._zeroing.snapshot().get("state") in {"prepared", "reading"}):
+            raise RuntimeError("请先停止测试、失能并结束归零/保持动作，再维护固件")
+        if not self.can_status()["all_up"]:
+            raise RuntimeError("CAN接口未就绪；维护不会自动配置或启动接口")
+
     def snapshot(self) -> dict[str, Any]:
+        # Never take the task lock while holding the service lock: preview
+        # reads final targets in the opposite direction.
+        maintenance_snapshot = self._maintenance.snapshot() if self._maintenance else {"active": False, "status": "idle"}
+        parameters_snapshot = self._parameters.snapshot() if self._parameters else {"active": False, "status": "idle"}
         with self._lock:
             if self._controller is None:
                 return {
@@ -1139,16 +1506,22 @@ class FactoryService:
                     "diagnostics": [],
                 }
             snapshot = self._controller.snapshot()
+            snapshot["motor_maintenance"] = maintenance_snapshot
+            snapshot["motor_parameters"] = parameters_snapshot
+            snapshot["motor_versions"] = self._controller.backend.motor_versions()
             playback = snapshot.get("playback")
             identity = dict(self._record_identity)
             if isinstance(playback, dict) and playback.get("test_id") == identity.get("test_id"):
                 playback["execution_code"] = identity.get("execution_code", "")
                 playback["execution_uuid"] = identity.get("execution_uuid", "")
+                playback.update({key: identity.get(key, "") for key in ("data_domain", "data_domain_source", "serial_number", "bench_id", "operator_id")})
+            snapshot["config_revision"] = self._config_revision
             snapshot["platform"] = {
                 key: identity.get(key, "")
                 for key in (
                     "campaign_id", "cycle_id", "asset_id", "configuration_id",
                     "test_case_version_id", "test_case_id", "station_id", "execution_code",
+                    "data_domain", "data_domain_source", "serial_number", "bench_id", "operator_id",
                 )
             }
             snapshot["platform"]["execution_uuid"] = (
@@ -1171,7 +1544,7 @@ class FactoryService:
             fault = snapshot.get("fault")
             diagnoses = fault.get("diagnoses", []) if isinstance(fault, dict) else []
             can_snapshot = self.can_status()
-            motors_discovered = bool(station.get("backend_connected", False))
+            motors_discovered = bool(station.get("motors_discovered", station.get("backend_connected", False)))
             motors_enabled = bool(station.get("motors_enabled", False))
             if motors_enabled:
                 connection_phase = "motors_enabled"

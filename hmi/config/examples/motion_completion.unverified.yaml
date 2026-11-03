@@ -1,0 +1,25 @@
+# Merge into the station YAML. Every null must be filled from verified product
+# and station evidence. Never set verified/safe_to_disable using this template.
+factory_hmi:
+  motion_completion:
+    verified: false
+    parameter_revision: null
+    verification_evidence: null  # product limit/cable/mapping/parking approval evidence
+    limb: null
+    configuration_sha256: null  # motion_tools hash after all effective overrides
+    safe_to_disable: false      # elbow natural hanging, support and torque-off checked
+    joint_min_rad: null
+    joint_max_rad: null
+    motor_min_rad: null
+    motor_max_rad: null
+    max_velocity_rad_s: null
+    max_acceleration_rad_s2: null
+    return_velocity_rad_s: null
+    return_acceleration_rad_s2: null
+    parking_joint_rad: null
+    position_tolerance_rad: null # actual motor-space error, each axis
+    speed_tolerance_rad_s: null # actual motor-space velocity, each axis
+    max_first_frame_delta_rad: null
+    stable_seconds: null
+    timeout_seconds: null       # entire return + settling budget
+    feedback_stale_seconds: null

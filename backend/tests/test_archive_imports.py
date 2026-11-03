@@ -14,7 +14,7 @@ from test_archives import archive_payload
 
 
 def import_payload(station_id=None, raw=b"time_s,j_pos_rad\n0,0\n1,9\n2,-4\n"):
-    return {"filename": "original.csv", "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+    return {"data_domain":"RESEARCH", "filename": "original.csv", "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
             "test_name": "Synthetic historical test", "actual_object": "SYNTHETIC-SAMPLE",
             "station_id": station_id or str(uuid4()), "classification": None}
 

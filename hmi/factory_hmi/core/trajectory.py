@@ -147,6 +147,8 @@ def preflight_trajectory(
     config: dict[str, Any],
     limits: SafetyLimits | None = None,
     current_motor_pos: np.ndarray | list[float] | None = None,
+    check_velocity: bool = True,
+    check_initial_gap: bool = True,
 ) -> PreflightReport:
     limits = limits or SafetyLimits.from_config(config)
     count = len(entries)
@@ -210,7 +212,7 @@ def preflight_trajectory(
     velocity_limit = _limit_vector(
         limits.max_velocity_rad_s, count, "max_velocity_rad_s"
     )
-    if velocity_limit is not None and velocities.size:
+    if check_velocity and velocity_limit is not None and velocities.size:
         where = np.argwhere(velocities > velocity_limit.reshape(1, -1))
         if where.size:
             frame, index = (int(item) for item in where[0])
@@ -234,7 +236,7 @@ def preflight_trajectory(
         else:
             first_delta = np.abs(values[0] - current)
             first_delta_max = float(np.max(first_delta))
-            if first_limit is not None:
+            if check_initial_gap and first_limit is not None:
                 where = np.flatnonzero(first_delta > first_limit)
                 if where.size:
                     index = int(where[0])
@@ -242,10 +244,12 @@ def preflight_trajectory(
                         f"motor[{index}] first-frame delta too large: "
                         f"{first_delta[index]:.6g} > {first_limit[index]:.6g} rad"
                     )
-    elif first_limit is not None:
+    elif check_initial_gap and first_limit is not None:
         warnings.append(
             "first-frame delta check is deferred until live motor feedback is available"
         )
+    if not check_velocity:
+        warnings.append("启动时按所选倍率核验实际轨迹速度；当前仅检查文件结构、位置与相邻帧变化")
 
     report = PreflightReport(
         safe=not violations,
@@ -292,4 +296,3 @@ __all__ = [
     "load_and_preflight_trajectory",
     "preflight_trajectory",
 ]
-

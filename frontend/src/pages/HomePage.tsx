@@ -13,7 +13,7 @@ import {
 import { useAssistantPageContext } from "../assistantContext";
 import { getDashboardHome } from "../api";
 import { formatDate, formatDuration, isShowcaseValue } from "../navigation";
-import type { AssetKind, HomeScope, TargetPartCode } from "../types";
+import type { DashboardHome, AssetKind, HomeScope, TargetPartCode } from "../types";
 import {
   caseSlot,
   circularIndex,
@@ -53,16 +53,20 @@ function useReducedMotion() {
 
 export function HomePage({
   assetKind,
-  navigate
+  navigate, projection, mediaAllowed = true
 }: {
   assetKind: AssetKind;
+  projection?: DashboardHome;
+  mediaAllowed?: boolean;
   navigate: (view: "assets" | "test-case", id?: string, part?: TargetPartCode) => void;
 }) {
-  const query = useQuery({
+  const fetched = useQuery({
     queryKey: ["dashboard-home"],
     queryFn: ({ signal }) => getDashboardHome(signal),
-    refetchInterval: 30_000
+    enabled: !projection,
+    refetchInterval: projection ? false : 30_000
   });
+  const query = projection ? {...fetched,data:projection,isLoading:false,isError:false} : fetched;
   const [index, setIndex] = useState(0);
   const [paused, setPaused] = useState(false);
   const [focusPaused, setFocusPaused] = useState(false);
@@ -186,7 +190,7 @@ export function HomePage({
         <span><b>SOURCES</b> {data.data_sources.healthy_count}/{data.data_sources.sources.length} 健康 · {data.data_sources.warning_count} 需关注</span>
         <span className={data.anomaly_count ? "risk" : ""}>
           {data.anomaly_count > 0 && <AlertTriangle aria-hidden="true" />}
-          <b>ANOMALIES</b> {data.anomaly_count} · {data.anomalies[0] ?? "未发现已记录异常"}
+          <b>ANOMALIES</b> {data.anomaly_count} · {projection?"仅展示获准历史成果；当前设备状态未知":data.anomalies[0] ?? "未发现已记录异常"}
         </span>
       </section>
       <section className="source-ribbon" aria-label="数据源健康明细">
@@ -290,14 +294,14 @@ export function HomePage({
                   <span>{assetKind === "MODULE" ? "MODULE PART SCOPE" : "SYSTEM SCOPE"} / {String(activeIndex + 1).padStart(2, "0")}</span>
                   <strong>{current.target_part_name} · {current.code}</strong>
                 </div>
-                {modelAsset ? (
+                {mediaAllowed && modelAsset ? (
                   <img
                     key={current.target_part_code}
                     className={`scope-hero-image ${assetKind === "WHOLE_MACHINE" ? "scope-hero-whole" : "scope-hero-module"}`}
                     src={modelAsset.poster}
                     alt={`${current.target_part_name}外观`}
                   />
-                ) : assetKind === "WHOLE_MACHINE" ? (
+                ) : mediaAllowed && assetKind === "WHOLE_MACHINE" ? (
                   <img
                     className="robot-asset"
                     src="/assets/humanoid-robot.webp"
@@ -307,14 +311,14 @@ export function HomePage({
                   />
                 ) : (
                   <>
-                    <img
+                    {mediaAllowed && <img
                       className="module-assembly-ghost"
                       src="/assets/humanoid-robot.webp"
                       width="512"
                       height="768"
                       alt=""
                       aria-hidden="true"
-                    />
+                    />}
                     <div className="module-schematic" role="img" aria-label={`${current.name} 装配关系拓扑`}>
                       <span className="module-core"><i />{current.name}</span>
                       <span className="module-node node-control">控制器</span>
@@ -331,8 +335,8 @@ export function HomePage({
                     <strong>{formatDuration(current.part_durations.active_elapsed_seconds)}</strong>
                   </div>
                   <div className="stage-callout callout-exposure">
-                    <span>有效暴露</span>
-                    <strong>{formatDuration(current.part_durations.effective_exposure_seconds)}</strong>
+                    <span>{projection?"有效暴露未配置展示口径":"有效暴露"}</span>
+                    <strong>{projection?"—":formatDuration(current.part_durations.effective_exposure_seconds)}</strong>
                   </div>
                 </div>
                 <div className="stage-floor" aria-hidden="true" />
@@ -476,10 +480,11 @@ export function HomePage({
                           tabIndex={isHidden ? -1 : 0}
                           data-case-code={item.code}
                           aria-current={isCurrent ? "true" : undefined}
-                          aria-label={isCurrent ? `打开 ${item.code} 详情` : `切换到 ${item.code}`}
+                          aria-label={isCurrent ? projection ? `暂停或继续 ${item.code}` : `打开 ${item.code} 详情` : `切换到 ${item.code}`}
                           onClick={() => {
                             if (isCurrent) {
-                              navigate("test-case", item.code);
+                              if(projection)setCasePaused(value=>!value);
+                              else navigate("test-case", item.code);
                             } else {
                               setCaseDirection(slot === "previous" ? "previous" : "next");
                               setCaseIndex(itemIndex);

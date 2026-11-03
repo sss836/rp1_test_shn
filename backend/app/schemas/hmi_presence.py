@@ -7,6 +7,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class HmiRun(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    data_domain: Literal["RESEARCH", "FACTORY", "UNCLASSIFIED"] | None = None
+    data_domain_source: str = Field(default="", max_length=64)
+    serial_number: str = Field(default="", max_length=200)
+    bench_id: str = Field(default="", max_length=100)
+    operator_id: str = Field(default="", max_length=200)
     session_key: str = Field(min_length=1, max_length=128)
     state: Literal["idle", "armed", "running", "paused", "stopping", "fault", "completed", "unknown"]
     test_id: str = Field(default="", max_length=255)

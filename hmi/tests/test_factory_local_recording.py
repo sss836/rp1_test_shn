@@ -141,7 +141,10 @@ def test_complete_platform_context_preserves_canonical_identity_and_independent_
 
 
 def test_unrecorded_run_still_needs_no_identity_or_record_files(service):
-    service.start(test_case_id='REL-SARM-001',record=False,loop=False)
+    with pytest.raises(ValueError,match='正式任务必须启用测量记录'):
+        service.start(test_case_id='REL-SARM-001',record=False,loop=False)
+    assert not list(service.record_root.glob('*'))
+    service.start(test_case_id='OTHER',test_name='隔离调试',robot_id='synthetic',bench_id='MP-01',record=False,loop=False)
     assert service.controller.wait(timeout=3)
     assert service.controller.enable_recording is False
     assert service.controller.record_output is None

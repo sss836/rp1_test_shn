@@ -5,14 +5,15 @@ import { PageTitle, Panel, ErrorState } from "../components/Workbench";
 import { useAuth } from "../auth";
 import { HistoricalIntakeForm } from "./HistoricalIntakeForm";
 import { setupApi, type SetupOptions } from "../setupApi";
-import { archivesApi, archiveTitle, type Archive, type ArchiveContext, type ArchiveVerdict } from "../archiveApi";
+import { archivesApi, archiveTitle, archiveDomain, dataDomainLabels, type ArchiveDataDomain, type Archive, type ArchiveContext, type ArchiveVerdict } from "../archiveApi";
 import { type CsvPreflight } from "../imports/csvPreflight";
 import { preflightCsv } from "../imports/preflightClient";
 import { importApi, importRequestKey, uploadCsv } from "../imports/importApi";
 import { ArchiveStatus } from "./ArchivesPage";
 import "./csvImport.css";
 
-type Navigate = (view: "archives" | "archive" | "curves", id?: string) => void;
+type Navigate = (view: "archives" | "factory" | "archive" | "curves", id?: string, domain?: ArchiveDataDomain) => void;
+type ImportDomain = "RESEARCH" | "FACTORY";
 type Metadata = { actualObject: string; station: string; tester: string; verdict: ArchiveVerdict | ""; notes: string; discrepancy: string };
 const uploadReceiptNotice = "原文件已接收，等待服务器校验和解析。人工核实尚未提交。";
 const metadataLabels: Record<string, string> = { sample: "采样索引", stage: "阶段", stage_code: "阶段", cycle: "循环标识", cycle_no: "循环标识", cycle_index: "循环标识" };
@@ -33,11 +34,13 @@ function PreflightDetails({ result }: { result: CsvPreflight }) {
   </>;
 }
 
-function ImportFile({ file, initial, bulk, options, owner, navigate, remove }: { file: File; initial: Metadata; bulk: { value: Metadata; revision: number }; options?: SetupOptions; owner: string; navigate: Navigate; remove: () => void }) {
+function ImportFile({ file, initial, bulk, options, owner, domain, navigate, remove }: { domain: ImportDomain; file: File; initial: Metadata; bulk: { value: Metadata; revision: number }; options?: SetupOptions; owner: string; navigate: Navigate; remove: () => void }) {
   const cache = useQueryClient();
   const fieldId = useId();
   const [meta, setMeta] = useState(initial);
   const [name, setName] = useState("");
+  const [serialNumber, setSerialNumber] = useState("");
+  const factory = domain === "FACTORY";
   const [confirmed, setConfirmed] = useState(false);
   const [preflight, setPreflight] = useState<CsvPreflight | null>(null);
   const [percent, setPercent] = useState(0);
@@ -54,11 +57,15 @@ function ImportFile({ file, initial, bulk, options, owner, navigate, remove }: {
   const abort = useRef<AbortController | null>(null);
   const active = useRef(true);
   const previousBulk = useRef(bulk.revision);
-  const campaigns = useQuery({ queryKey: ["setup", "campaigns"], queryFn: ({ signal }) => setupApi.campaigns(signal) });
-  const contexts = useQuery({ queryKey: ["setup", "contexts", campaign], queryFn: ({ signal }) => setupApi.contexts(campaign, signal), enabled: Boolean(campaign) });
+  const campaigns = useQuery({ queryKey: ["setup", "campaigns"], queryFn: ({ signal }) => setupApi.campaigns(signal), enabled: !factory });
+  const contexts = useQuery({ queryKey: ["setup", "contexts", campaign], queryFn: ({ signal }) => setupApi.contexts(campaign, signal), enabled: !factory && Boolean(campaign) });
   const context = contexts.data?.find((item) => item.id === contextId);
   const detail = useQuery({ queryKey: ["archives", "detail", archive?.id], queryFn: ({ signal }) => archivesApi.detail(archive!.id, signal), enabled: Boolean(archive), refetchInterval: (query) => ["READY", "FAILED"].includes(query.state.data?.processing_state ?? "") ? false : 3000 });
   const current = detail.data ?? archive;
+  const domainMismatch = Boolean(current && archiveDomain(current) !== domain);
+  function openRecord(view: "archive" | "curves") {
+    if (current) navigate(view, current.id, archiveDomain(current));
+  }
   useEffect(() => {
     active.current = true;
     const controller = new AbortController();
@@ -84,14 +91,14 @@ function ImportFile({ file, initial, bulk, options, owner, navigate, remove }: {
     catch (failure) { setError(`查重失败：${message(failure)}`); }
   }
   async function upload() {
-    if (!preflight || busy) return;
+    if (!preflight || busy || domainMismatch) return;
     const controller = new AbortController(); abort.current = controller;
     setBusy(true); setUploading(true); setError(""); setNotice("");
     try {
       let target = current;
       if (!target) {
-        const classification = context ? { ...context.context, station_id: meta.station } as ArchiveContext : null;
-        const result = await importApi.create({ filename: file.name, size_bytes: file.size, sha256: preflight.sha256, test_name: name.trim(), actual_object: meta.actualObject.trim(), station_id: meta.station, classification }, importRequestKey(owner, preflight.sha256), controller.signal);
+        const classification = !factory && context ? { ...context.context, station_id: meta.station } as ArchiveContext : null;
+        const result = await importApi.create({ filename: file.name, size_bytes: file.size, sha256: preflight.sha256, test_name: name.trim(), actual_object: meta.actualObject.trim(), station_id: meta.station, classification, data_domain: domain, bench_id: options?.stations.find((entry) => entry.id === meta.station)?.code, ...(factory ? { serial_number: serialNumber } : {}) }, importRequestKey(owner, preflight.sha256), controller.signal);
         target = result.archive; setArchive(target); setReused(result.reused);
         if (result.reused) { setNotice("发现相同文件，已复用原归档。请核对原信息后再选择续传。"); return; }
       }
@@ -102,10 +109,10 @@ function ImportFile({ file, initial, bulk, options, owner, navigate, remove }: {
     finally { abort.current = null; if (active.current) { setBusy(false); setUploading(false); } }
   }
   const validBasic = Boolean(name.trim() && meta.actualObject.trim() && meta.station && options?.stations.some((item) => item.id === meta.station));
-  const contextMismatch = Boolean(context && (context.asset_code !== meta.actualObject.trim() || context.context.station_id !== meta.station));
-  const canUpload = preflight && !preflight.errors.length && lookupDone && confirmed && validBasic && (!campaign || context) && !contextMismatch;
-  const canResume = current?.upload_state === "UPLOADING" && current.is_owner && current.can_edit;
-  const canConfirm = current?.processing_state === "READY" && current.origin === "HISTORY" && current.is_owner && current.can_edit;
+  const contextMismatch = !factory && Boolean(context && (context.asset_code !== meta.actualObject.trim() || context.context.station_id !== meta.station));
+  const canUpload = preflight && !preflight.errors.length && lookupDone && confirmed && validBasic && (factory ? Boolean(serialNumber.trim()) : !campaign || context) && !contextMismatch;
+  const canResume = !domainMismatch && current?.upload_state === "UPLOADING" && current.is_owner && current.can_edit;
+  const canConfirm = !domainMismatch && current?.processing_state === "READY" && current.origin === "HISTORY" && current.data_domain !== "FACTORY" && current.is_owner && current.can_edit;
   const displayNotice = notice === uploadReceiptNotice && current
     ? current.processing_state === "READY"
       ? "原文件校验和解析已完成，可查看曲线。人工核实尚未提交。"
@@ -118,7 +125,7 @@ function ImportFile({ file, initial, bulk, options, owner, navigate, remove }: {
   const uploadMissing = [
     !name.trim() && "测试名称", !meta.actualObject.trim() && "样品 / 实际对象",
     (!meta.station || !options?.stations.some((item) => item.id === meta.station)) && "有效工位",
-    !confirmed && "独立执行确认", Boolean(campaign && !context) && "完整计划上下文",
+    !confirmed && "独立执行确认", factory && !serialNumber.trim() && "本次工厂 SN", !factory && Boolean(campaign && !context) && "完整计划上下文",
     contextMismatch && "样品 / 工位与计划一致", !lookupDone && "完成文件查重"
   ].filter(Boolean);
   return <article className="import-file" aria-label={`补录文件 ${file.name}`}>
@@ -126,18 +133,20 @@ function ImportFile({ file, initial, bulk, options, owner, navigate, remove }: {
     {!preflight && !preflightError && <div role="status" aria-live="polite" aria-atomic="true" className="import-progress"><span>正在本地预检与计算校验值 · {percent}%</span><progress aria-label={`${file.name} 本地预检与校验进度`} value={percent} max={100} /></div>}
     {preflightError && <p className="import-errors" role="alert">{preflightError}</p>}
     {preflight && <PreflightDetails result={preflight} />}
-    {!current && preflight && !preflight.errors.length && <div className="import-file-form"><h4>执行信息</h4><p className="import-hint">填写测试名称、样品和工位。解析完成后确认结论，一次送审。</p><label>测试名称<input required maxLength={200} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="填写这一次测试的名称" /></label><MetadataFields value={meta} onChange={setMeta} options={options} prefix={`file-${fieldId}`} disabled={busy} requiredBasic />
-      <details><summary>可选：关联正式计划与用例</summary><div className="import-form-grid"><label>测试计划<select value={campaign} disabled={busy} onChange={(event) => { setCampaign(event.target.value); setContextId(""); }}><option value="">暂不关联，作为待归类记录</option>{campaigns.data?.filter((entry) => entry.can_edit).map((entry) => <option key={entry.id} value={entry.id}>{entry.code} · {entry.name}</option>)}</select></label><label>已发布用例与样品<select value={contextId} disabled={!campaign || busy || contexts.isLoading} onChange={(event) => setContextId(event.target.value)}><option value="">选择完整计划上下文</option>{contexts.data?.filter((entry) => entry.status !== "CANCELLED").map((entry) => <option key={entry.id} value={entry.id}>{entry.case_code} · {entry.case_name} · {entry.version} · {entry.asset_code}</option>)}</select></label></div>{contextMismatch && <p className="import-errors">所选计划中的样品或工位与本次填写不一致，请核对后再上传。</p>}{(campaigns.error || contexts.error) && <p role="alert" className="import-errors">正式上下文读取失败：{message(campaigns.error || contexts.error)}</p>}<p className="import-hint">仅保存已有计划的完整归属；解析后在同一表单确认并送审。</p></details>
+    {!current && preflight && !preflight.errors.length && <div className="import-file-form"><h4>执行信息</h4><p className="import-hint">{factory ? "填写本次工厂 SN、测试名称、实际对象和工位，无需预先建立研发样品。" : "填写本次测试名称、实际对象和工位。"}</p>{factory && <label>本次工厂 SN<input type="text" required maxLength={200} disabled={busy} value={serialNumber} onChange={(event) => setSerialNumber(event.target.value)} placeholder="按原文填写，保留大小写和前导零" /></label>}<label>测试名称<input required maxLength={200} value={name} disabled={busy} onChange={(event) => setName(event.target.value)} placeholder="填写这一次测试的名称" /></label><MetadataFields value={meta} onChange={setMeta} options={options} prefix={`file-${fieldId}`} disabled={busy} requiredBasic />
+      {!factory && <details><summary>可选：关联正式计划与用例</summary><div className="import-form-grid"><label>测试计划<select value={campaign} disabled={busy} onChange={(event) => { setCampaign(event.target.value); setContextId(""); }}><option value="">暂不关联，作为待归类记录</option>{campaigns.data?.filter((entry) => entry.can_edit).map((entry) => <option key={entry.id} value={entry.id}>{entry.code} · {entry.name}</option>)}</select></label><label>已发布用例与样品<select value={contextId} disabled={!campaign || busy || contexts.isLoading} onChange={(event) => setContextId(event.target.value)}><option value="">选择完整计划上下文</option>{contexts.data?.filter((entry) => entry.status !== "CANCELLED").map((entry) => <option key={entry.id} value={entry.id}>{entry.case_code} · {entry.case_name} · {entry.version} · {entry.asset_code}</option>)}</select></label></div>{contextMismatch && <p className="import-errors">所选计划中的样品或工位与本次填写不一致，请核对后再上传。</p>}{(campaigns.error || contexts.error) && <p role="alert" className="import-errors">正式上下文读取失败：{message(campaigns.error || contexts.error)}</p>}<p className="import-hint">仅保存已有计划的完整归属；解析后在同一表单确认并送审。</p></details>}
       <label className="import-confirm"><input type="checkbox" required checked={confirmed} disabled={busy} onChange={(event) => setConfirmed(event.target.checked)} />我确认此文件对应一次独立执行，不与其他所选文件合并</label>
       <p className="import-hint">上传为待核实记录。实际测试人、人工结论和备注可在解析后确认；不会自动批准或计入正式统计 / MTBF。</p>
       {uploadMissing.length > 0 && <p className="import-hint" id={`${fieldId}-upload-missing`}>上传前还需：{uploadMissing.join("、")}。</p>}
       <button type="button" className="import-primary" aria-describedby={uploadMissing.length ? `${fieldId}-upload-missing` : undefined} disabled={!canUpload || busy} onClick={() => void upload()}><UploadCloud aria-hidden="true" />{busy ? "正在上传…" : "上传并解析待核实记录"}</button>
     </div>}
     {current && <div className="import-receipt"><div className="import-receipt-title"><CheckCircle2 aria-hidden="true" /><strong>{reused ? "相同文件已存在" : "归档记录已建立"} · {archiveTitle(current)}</strong></div><p>{current.test_name} · {current.actual_object} · {current.station_label}</p><ArchiveStatus item={current} /><p className="import-hint">执行 UUID：{current.execution_uuid}</p>
+      {domainMismatch && <p role="alert" className="import-errors">同一原始文件已归入{current ? dataDomainLabels[archiveDomain(current)] : "其他分区"}，请进入原归档核对；不能在本入口重复上传或改写其分区。</p>}
       {reused && <p className="import-hint">显示原记录。批量填写的信息未写入此归档，修改需进入原归档追加核实版本。</p>}
       {current.upload_state === "UPLOADING" && <div role="status" aria-live="polite" aria-atomic="true" className="import-progress"><span>服务器已接收 {(current.received_bytes / 1024 / 1024).toFixed(2)} / {(current.size_bytes / 1024 / 1024).toFixed(2)} MiB</span><progress aria-label={`${file.name} 原文件上传进度`} max={current.size_bytes} value={current.received_bytes} /></div>}
       {current.processing_error && <p role="alert" className="import-errors">服务器校验 / 解析失败：{current.processing_error}</p>}
-      <div className="import-actions">{canResume && <button type="button" disabled={busy} onClick={() => void upload()}>继续上传同一原文件</button>}{uploading && <button type="button" onClick={() => abort.current?.abort()}>暂停上传</button>}<button type="button" onClick={() => navigate("archive", current.id)}>查看归档 / 核实详情</button><button type="button" disabled={current.processing_state !== "READY"} onClick={() => navigate("curves", current.id)}><ChartNoAxesCombined aria-hidden="true" />查看曲线</button></div>
+      <div className="import-actions">{canResume && <button type="button" disabled={busy} onClick={() => void upload()}>继续上传同一原文件</button>}{uploading && <button type="button" onClick={() => abort.current?.abort()}>暂停上传</button>}<button type="button" onClick={() => openRecord("archive")}>查看归档 / 核实详情</button><button type="button" disabled={current.processing_state !== "READY"} onClick={() => openRecord("curves")}><ChartNoAxesCombined aria-hidden="true" />查看曲线</button></div>
+      {current.data_domain === "FACTORY" && current.processing_state === "READY" && current.can_edit && <div><p className="import-hint">工厂原始文件已就绪；请到详情核实 SN、真实台架工位和结论，再显式送审。</p><button type="button" className="import-primary" onClick={() => openRecord("archive")}>核实工厂记录并送审</button></div>}
       {canConfirm && <HistoricalIntakeForm key={`intake:${current.revision}`} item={current} onSubmitted={async (updated) => { setArchive(updated); cache.setQueryData(["archives", "detail", current.id], updated); setNotice("已送审，请到测试数据审批页面审核。"); await cache.invalidateQueries({ queryKey: ["archives"] }); await cache.invalidateQueries({ queryKey: ["submissions"] }); }} />}
 
     </div>}
@@ -145,7 +154,8 @@ function ImportFile({ file, initial, bulk, options, owner, navigate, remove }: {
   </article>;
 }
 
-export default function CsvImportPage({ navigate }: { navigate: Navigate }) {
+export default function CsvImportPage({ navigate, domain = "RESEARCH" }: { navigate: Navigate; domain?: ImportDomain }) {
+  const factory = domain === "FACTORY";
   const { session } = useAuth();
   const [files, setFiles] = useState<{ id: string; file: File; initial: Metadata }[]>([]);
   const [meta, setMeta] = useState<Metadata>(blank);
@@ -153,7 +163,7 @@ export default function CsvImportPage({ navigate }: { navigate: Navigate }) {
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState("");
   const input = useRef<HTMLInputElement>(null);
-  const allowed = Boolean(session && session.user.role !== "VIEWER");
+  const allowed = Boolean(session && ["SYSTEM_ADMIN", "TEST_EXECUTOR"].includes(session.user.role));
   const options = useQuery({ queryKey: ["setup", "options"], queryFn: ({ signal }) => setupApi.options(signal), enabled: allowed });
   function selectFiles(selected: File[]) {
     const next: typeof files = [], issues: string[] = [];
@@ -166,15 +176,15 @@ export default function CsvImportPage({ navigate }: { navigate: Navigate }) {
     }
     setFiles((previous) => [...previous, ...next]); setNotice(issues.join(" "));
   }
-  if (!allowed) return <Panel title="数据补录"><p>仅执行员和管理员可以补录测试数据，请联系有权限的人员。</p></Panel>;
-  return <div className="csv-import-page"><button type="button" className="back-button" onClick={() => navigate("archives")}><ArrowLeft aria-hidden="true" />返回数据归档</button><PageTitle eyebrow="LOCAL CSV IMPORT" title="数据补录" description="选择本地 CSV，核对每次测试的信息，再归档查看曲线。" />
+  if (!allowed) return <Panel title={factory ? "工厂记录上传" : "数据补录"}><p>仅执行员和管理员可以补录测试数据，请联系有权限的人员。</p></Panel>;
+  return <div className="csv-import-page"><button type="button" className="back-button" onClick={() => navigate(factory ? "factory" : "archives", undefined, domain)}><ArrowLeft aria-hidden="true" />{factory ? "返回工厂" : "返回数据归档"}</button><PageTitle eyebrow={factory ? "FACTORY RECORD UPLOAD" : "LOCAL CSV IMPORT"} title={factory ? "工厂记录上传" : "数据补录"} description={factory ? "上传工厂测试 CSV，按 SN 和台架独立保存每次测试记录。" : "选择本地 CSV，核对每次测试的信息，再归档查看曲线。"} />
     <ol className="import-steps"><li><span>1</span>选择 CSV</li><li><span>2</span>核对信息并上传</li><li><span>3</span>确认并送审</li></ol>
     <div className={`import-workbench${files.length > 1 ? "" : " single"}`}>{files.length > 1 && <aside><Panel title="批量填写" description="应用到尚未上传的文件，每份文件仍独立确认。"><MetadataFields value={meta} onChange={setMeta} options={options.data} prefix="bulk" /><button type="button" className="import-bulk-button" disabled={!files.length} onClick={() => { setBulk({ value: { ...meta }, revision: bulk.revision + 1 }); setNotice("已应用到尚未建立归档的文件；现有归档信息保持原样。"); }}>应用到未上传文件</button><p className="import-hint">登录提交人：{session?.user.display_name ?? "当前账户"}。测试人会在确认表单中自动带入，可修改。</p>{options.error && <ErrorState error={options.error} retry={() => void options.refetch()} />}</Panel></aside>}
     <div className="import-queue"><div className={`import-dropzone${dragging ? " dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); selectFiles(Array.from(event.dataTransfer.files)); }}><UploadCloud aria-hidden="true" /><h2>拖入 CSV 文件</h2><p>支持多份文件 · 先在本机预检，不自动上传</p><button type="button" onClick={() => input.current?.click()}>选择本地 CSV</button><input ref={input} tabIndex={-1} type="file" accept=".csv,text/csv" multiple aria-label="选择本地 CSV 文件" onChange={(event) => { selectFiles(Array.from(event.target.files ?? [])); event.target.value = ""; }} /></div>
       <p className="import-execution-note"><AlertCircle aria-hidden="true" />一份文件对应一次独立执行。属于同一次执行的分片请保留原件，勿作为多次测试补录。</p>
       {notice && <p role="status" className="import-notice">{notice}</p>}
       {files.length > 0 && <div className="import-queue-heading"><h2>待处理文件</h2><span>{files.length} 份</span></div>}
-      {files.map(({ id, file, initial }) => <ImportFile key={id} file={file} initial={initial} bulk={bulk} options={options.data} owner={session!.user.id} navigate={navigate} remove={() => setFiles((previous) => previous.filter((item) => item.id !== id))} />)}
+      {files.map(({ id, file, initial }) => <ImportFile key={id} file={file} initial={initial} bulk={bulk} options={options.data} owner={session!.user.id} domain={domain} navigate={navigate} remove={() => setFiles((previous) => previous.filter((item) => item.id !== id))} />)}
     </div></div>
   </div>;
 }

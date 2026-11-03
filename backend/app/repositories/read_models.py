@@ -688,12 +688,12 @@ ledger AS (
     FROM test.runtime_interval ri
     JOIN test.asset a ON a.id = ri.asset_id
     LEFT JOIN overall_scope os ON os.asset_kind = a.asset_kind
-    WHERE NOT ri.voided
+    WHERE NOT ri.voided AND integration.interval_data_domain(ri.id)='RESEARCH'
       AND (
         ri.source_method IS DISTINCT FROM 'hmi-live-heartbeat'
         OR NOT EXISTS (
             SELECT 1
-            FROM test.test_execution unapproved
+            FROM test.research_execution unapproved
             WHERE unapproved.id = ri.execution_id
               AND unapproved.approved_submission_id IS NULL
         )
@@ -716,9 +716,9 @@ class ReadModelRepository:
                 """
                 SELECT max(received_at)
                 FROM (
-                    SELECT received_at FROM test.test_execution
-                    UNION ALL SELECT received_at FROM test.test_event
-                    UNION ALL SELECT received_at FROM test.runtime_interval
+                    SELECT received_at FROM test.research_execution
+                    UNION ALL SELECT received_at FROM test.test_event WHERE integration.execution_data_domain(execution_id)='RESEARCH'
+                    UNION ALL SELECT received_at FROM test.runtime_interval WHERE integration.interval_data_domain(id)='RESEARCH'
                     UNION ALL SELECT received_at FROM integration.ingestion_receipt
                 ) facts
                 """
@@ -800,8 +800,9 @@ class ReadModelRepository:
                       AND NOT i.voided
                   ) AS blocked_count,
                   (SELECT count(*) FROM test.test_event e
-                   WHERE NOT e.voided AND e.data_quality IN ('INVALID', 'MISSING')) AS quality_count
-                FROM reliability.interruption i
+                   WHERE NOT e.voided AND e.data_quality IN ('INVALID', 'MISSING')
+                     AND integration.execution_data_domain(e.execution_id)='RESEARCH') AS quality_count
+                FROM reliability.interruption i WHERE integration.interruption_data_domain(i.id)='RESEARCH'
                 """
             )
         ).mappings().one()
@@ -850,7 +851,7 @@ class ReadModelRepository:
                     LEFT JOIN scoped_assets scoped
                       ON target_part.part_code = scoped.target_part_code
                      AND target_part.asset_kind = scoped.asset_kind
-                    LEFT JOIN test.test_execution e
+                    LEFT JOIN test.research_execution e
                       ON e.asset_id = scoped.id AND e.status <> 'VOIDED'
                     LEFT JOIN LATERAL (
                       SELECT health_status
@@ -978,7 +979,7 @@ class ReadModelRepository:
                       ORDER BY tcv.published_at DESC NULLS LAST, tcv.id DESC
                       LIMIT 1
                     ) published ON true
-                    LEFT JOIN test.test_execution e
+                    LEFT JOIN test.research_execution e
                       ON e.asset_id = scoped_assets.id
                      AND e.status <> 'VOIDED'
                      AND EXISTS (
@@ -1132,7 +1133,7 @@ class ReadModelRepository:
                         coalesce(sum(CASE
                           WHEN test.is_live_running(e.id) THEN coalesce(e.reported_active_seconds, 0)
                           ELSE 0 END), 0) AS active_elapsed_seconds
-                      FROM test.test_execution e
+                      FROM test.research_execution e
                       JOIN test.asset a ON a.id = e.asset_id
                       JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
                       JOIN catalog.test_case tc ON tc.id = tcv.test_case_id
@@ -1259,16 +1260,16 @@ class ReadModelRepository:
                     last_data AS (
                       SELECT asset_id, max(received_at) AS last_received_at
                       FROM (
-                        SELECT asset_id, received_at FROM test.test_execution
-                        UNION ALL SELECT asset_id, received_at FROM test.test_event
-                        UNION ALL SELECT asset_id, received_at FROM test.runtime_interval
+                        SELECT asset_id, received_at FROM test.research_execution
+                        UNION ALL SELECT asset_id, received_at FROM test.test_event WHERE integration.execution_data_domain(execution_id)='RESEARCH'
+                        UNION ALL SELECT asset_id, received_at FROM test.runtime_interval WHERE integration.interval_data_domain(id)='RESEARCH'
                       ) facts GROUP BY asset_id
                     )
                     SELECT a.id AS internal_id, a.public_id, a.asset_code, a.asset_kind,
                            coalesce(nullif(a.display_name, ''), a.asset_code) AS display_name,
                            target_part.part_code AS target_part_code,
                            target_part.name AS target_part_name,
-                           a.product_family, b.batch_code, a.serial_number, a.lifecycle_status,
+                           a.product_family, b.batch_code, a.serial_number, a.lifecycle_status, a.creation_scenario,
                            current_execution.public_id AS execution_public_id,
                            current_execution.execution_code, current_execution.case_code,
                            current_execution.current_elapsed_seconds,
@@ -1293,7 +1294,7 @@ class ReadModelRepository:
                     LEFT JOIN LATERAL (
                       SELECT e.public_id, e.execution_code, tc.case_code,
                         CASE WHEN test.is_live_running(e.id) THEN coalesce(e.reported_active_seconds, 0) ELSE 0 END AS current_elapsed_seconds
-                      FROM test.test_execution e
+                      FROM test.research_execution e
                       JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
                       JOIN catalog.test_case tc ON tc.id = tcv.test_case_id
                       WHERE e.asset_id = a.id AND e.status IN ('RUNNING', 'PAUSED', 'BLOCKED')
@@ -1369,6 +1370,7 @@ class ReadModelRepository:
             product_family=row["product_family"],
             batch_code=row["batch_code"],
             serial_number=row["serial_number"],
+            creation_scenario=row.get("creation_scenario", "RND_TEST"),
             lifecycle_status=row["lifecycle_status"],
             current_test_case_code=row["case_code"],
             current_execution_id=row["execution_public_id"],
@@ -1416,16 +1418,16 @@ class ReadModelRepository:
                 ),
                 last_data AS (
                   SELECT max(received_at) AS last_received_at FROM (
-                    SELECT received_at FROM test.test_execution WHERE asset_id = :asset_id
-                    UNION ALL SELECT received_at FROM test.test_event WHERE asset_id = :asset_id
-                    UNION ALL SELECT received_at FROM test.runtime_interval WHERE asset_id = :asset_id
+                    SELECT received_at FROM test.research_execution WHERE asset_id = :asset_id
+                    UNION ALL SELECT received_at FROM test.test_event WHERE asset_id = :asset_id AND integration.execution_data_domain(execution_id)='RESEARCH'
+                    UNION ALL SELECT received_at FROM test.runtime_interval WHERE asset_id = :asset_id AND integration.interval_data_domain(id)='RESEARCH'
                   ) facts
                 )
                 SELECT a.public_id, a.asset_code, a.asset_kind,
                        CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN 'SYS' ELSE mp.target_part_code END AS target_part_code,
                        target_part.name AS target_part_name,
                        coalesce(nullif(a.display_name, ''), a.asset_code) AS display_name,
-                       a.product_family, b.batch_code, a.serial_number, a.lifecycle_status,
+                       a.product_family, b.batch_code, a.serial_number, a.lifecycle_status, a.creation_scenario,
                        current_execution.public_id AS execution_public_id,
                        current_execution.execution_code, current_execution.case_code,
                        current_execution.current_elapsed_seconds,
@@ -1445,7 +1447,7 @@ class ReadModelRepository:
                 LEFT JOIN LATERAL (
                   SELECT e.public_id, e.execution_code, tc.case_code,
                     CASE WHEN test.is_live_running(e.id) THEN coalesce(e.reported_active_seconds, 0) ELSE 0 END AS current_elapsed_seconds
-                  FROM test.test_execution e
+                  FROM test.research_execution e
                   JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
                   JOIN catalog.test_case tc ON tc.id = tcv.test_case_id
                   WHERE e.asset_id = a.id AND e.status IN ('RUNNING', 'PAUSED', 'BLOCKED')
@@ -1474,7 +1476,7 @@ class ReadModelRepository:
                 SELECT c.campaign_code, cy.cycle_code, e.public_id AS execution_public_id,
                        e.execution_code, tc.case_code, e.status, e.normalized_started_at,
                        st.stage_code, st.stage_name, e.received_at
-                FROM test.test_execution e
+                FROM test.research_execution e
                 JOIN test.test_campaign c ON c.id = e.campaign_id
                 JOIN test.test_cycle cy ON cy.id = e.cycle_id
                 JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
@@ -1550,8 +1552,8 @@ class ReadModelRepository:
             text(
                 """
                 SELECT
-                  (SELECT count(*) FROM test.test_execution WHERE asset_id = :asset_id) AS execution_count,
-                  (SELECT count(*) FROM test.test_event WHERE asset_id = :asset_id AND NOT voided) AS event_count,
+                  (SELECT count(*) FROM test.research_execution WHERE asset_id = :asset_id) AS execution_count,
+                  (SELECT count(*) FROM test.test_event WHERE asset_id = :asset_id AND NOT voided AND integration.execution_data_domain(execution_id)='RESEARCH') AS event_count,
                   (SELECT count(*) FROM integration.artifact WHERE asset_id = :asset_id) AS artifact_count,
                   (SELECT count(*) FROM integration.artifact
                    WHERE asset_id = :asset_id AND availability_status = 'AVAILABLE') AS available_count,
@@ -1605,7 +1607,7 @@ class ReadModelRepository:
             text(
                 """
                 SELECT e.id, e.public_id, e.execution_code, tc.case_code
-                FROM test.test_execution e
+                FROM test.research_execution e
                 JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
                 JOIN catalog.test_case tc ON tc.id = tcv.test_case_id
                 WHERE e.asset_id = :asset_id
@@ -1780,7 +1782,7 @@ class ReadModelRepository:
                            coalesce(stage_totals.stage_count, 0) AS stage_count,
                            coalesce(runtime_totals.closed_duration_seconds, 0) AS closed_duration_seconds,
                            CASE WHEN test.is_live_running(e.id) THEN coalesce(e.reported_active_seconds, 0) ELSE 0 END AS active_elapsed_seconds
-                    FROM test.test_execution e
+                    FROM test.research_execution e
                     JOIN test.asset a ON a.id = e.asset_id
                     JOIN test.test_campaign c ON c.id = e.campaign_id
                     JOIN test.test_cycle cy ON cy.id = e.cycle_id
@@ -1872,7 +1874,8 @@ class ReadModelRepository:
             clock_quality=row["clock_quality"],
         )
 
-    def live_executions(self) -> ExecutionList:
+    def live_executions(self, limit: int = 100, cursor: str | None = None) -> ExecutionList:
+        (after_id,) = _decode_cursor(cursor)
         as_of_at = self._as_of()
         rows = list(
             self.session.execute(
@@ -1889,28 +1892,28 @@ class ReadModelRepository:
                            0 AS stage_count,
                            0 AS closed_duration_seconds,
                            coalesce(e.reported_active_seconds, 0) AS active_elapsed_seconds
-                    FROM test.test_execution e
+                    FROM test.research_execution e
                     JOIN test.asset a ON a.id = e.asset_id
                     JOIN test.test_campaign c ON c.id = e.campaign_id
                     JOIN test.test_cycle cy ON cy.id = e.cycle_id
                     JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
                     JOIN catalog.test_case tc ON tc.id = tcv.test_case_id
                     LEFT JOIN test.station st ON st.id = e.station_id
-                    WHERE test.is_live_running(e.id)
-                    ORDER BY e.normalized_started_at DESC NULLS LAST, e.id DESC
-                    LIMIT 100
+                    WHERE test.is_live_running(e.id) AND (:after_id=0 OR e.id<:after_id)
+                    ORDER BY e.id DESC
+                    LIMIT :limit
                     """
                 ),
-                {"as_of_at": as_of_at},
+                {"as_of_at": as_of_at, "after_id":after_id, "limit":limit+1},
             ).mappings()
         )
         items = [
             self._execution_item(row).model_copy(update={"station_code": row["station_code"]})
-            for row in rows
+            for row in rows[:limit]
         ]
         return ExecutionList(
             items=items,
-            page=PageMeta(limit=100, next_cursor=None),
+            page=PageMeta(limit=limit, next_cursor=_encode_cursor(rows[limit-1]["internal_id"]) if len(rows)>limit else None),
             as_of_at=as_of_at,
             data_cutoff_at=rows[0]["all_data_cutoff_at"] if rows else None,
         )
@@ -1935,9 +1938,10 @@ class ReadModelRepository:
                            i.classification, i.review_status,
                            max(e.received_at) OVER () AS all_data_cutoff_at
                     FROM test.test_event e
-                    LEFT JOIN test.test_execution execution ON execution.id = e.execution_id
+                    LEFT JOIN test.research_execution execution ON execution.id = e.execution_id
                     LEFT JOIN reliability.interruption i ON i.event_id = e.id AND NOT i.voided
                     WHERE e.asset_id = :asset_id AND e.id > :after_id AND NOT e.voided
+                      AND integration.execution_data_domain(e.execution_id)='RESEARCH'
                     ORDER BY e.id LIMIT :fetch_limit
                     """
                 ),
@@ -1999,7 +2003,7 @@ class ReadModelRepository:
                 WITH {LEDGER_CTE},
                 case_executions AS (
                   SELECT e.id, e.status, e.normalized_started_at, e.received_at, e.reported_active_seconds
-                  FROM test.test_execution e
+                  FROM test.research_execution e
                   JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
                   WHERE tcv.test_case_id = :case_id AND e.status <> 'VOIDED'
                 ),
@@ -2058,12 +2062,12 @@ class ReadModelRepository:
                   ) AS pending_count
                 FROM reliability.interruption i
                 JOIN test.test_event ev ON ev.id = i.event_id
-                JOIN test.test_execution e ON e.id = ev.execution_id
+                JOIN test.research_execution e ON e.id = ev.execution_id
                 JOIN catalog.test_case_version tcv ON tcv.id = e.test_case_version_id
                 LEFT JOIN overall_scope os ON true
                 LEFT JOIN reliability.interruption_scope_assignment isa
                   ON isa.interruption_id = i.id AND isa.scope_id = os.id
-                WHERE tcv.test_case_id = :case_id AND NOT i.voided
+                WHERE tcv.test_case_id = :case_id AND NOT i.voided AND integration.interruption_data_domain(i.id)='RESEARCH'
                 """
             ),
             {"case_id": case["id"], "asset_kind": case["asset_kind"]},
@@ -2128,7 +2132,7 @@ class ReadModelRepository:
             text(
                 """
                 SELECT id, public_id, execution_code
-                FROM test.test_execution
+                FROM test.research_execution
                 WHERE public_id::text = :identifier OR execution_code = :identifier
                    OR id IN (SELECT execution_id FROM integration.execution_archive_alias WHERE alias=:identifier)
                 """
@@ -2542,7 +2546,7 @@ class ReadModelRepository:
                        cfg.software_manifest, cfg.parameter_manifest,
                        station.station_code, station.name AS station_name,
                        operator.display_name AS operator_name, source.source_code
-                FROM test.test_execution e
+                FROM test.research_execution e
                 JOIN test.asset a ON a.id = e.asset_id
                 JOIN test.test_campaign c ON c.id = e.campaign_id
                 JOIN test.test_cycle cy ON cy.id = e.cycle_id
@@ -2771,7 +2775,7 @@ class ReadModelRepository:
                     JOIN test.test_campaign c ON c.id = cfg.campaign_id
                     JOIN reliability.mtbf_scope s ON s.id = cfg.scope_id
                     LEFT JOIN reliability.current_mtbf_result r
-                      ON r.campaign_id = cfg.campaign_id AND r.scope_id = cfg.scope_id
+                      ON r.campaign_id = cfg.campaign_id AND r.scope_id = cfg.scope_id AND r.data_domain_policy_version='research-only-v1' AND r.data_domain_epoch=integration.campaign_domain_epoch(cfg.campaign_id)
                     LEFT JOIN reliability.calculation_run run ON run.id = r.calculation_run_id
                     LEFT JOIN reliability.current_conclusion conclusion
                       ON conclusion.population_id = r.population_id

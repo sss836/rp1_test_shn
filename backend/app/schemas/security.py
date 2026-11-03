@@ -7,7 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-Role = Literal["VIEWER", "TEST_EXECUTOR", "SYSTEM_ADMIN"]
+Role = Literal["VIEWER", "TEST_EXECUTOR", "SYSTEM_ADMIN", "FACTORY_REVIEWER"]
 PrincipalKind = Literal["HUMAN", "SERVICE"]
 AccessLevel = Literal["VIEW", "EDIT"]
 AccessRequestStatus = Literal["PENDING", "APPROVED", "REJECTED", "CANCELLED"]
@@ -121,7 +121,7 @@ class MeResponse(BaseModel):
 
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=1, max_length=1024)
-    new_password: str = Field(min_length=12, max_length=1024)
+    new_password: str = Field(min_length=6, max_length=1024)
 
     @model_validator(mode="after")
     def passwords_must_differ(self) -> ChangePasswordRequest:
@@ -132,7 +132,7 @@ class ChangePasswordRequest(BaseModel):
 
 class UserCreateRequest(BaseModel):
     username: str = Field(min_length=1, max_length=128)
-    password: str = Field(min_length=12, max_length=1024)
+    password: str = Field(min_length=6, max_length=1024)
     display_name: str = Field(min_length=1, max_length=255)
     role: Role
     must_change_password: bool = True

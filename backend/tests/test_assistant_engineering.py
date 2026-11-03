@@ -32,9 +32,11 @@ def test_attachments_are_owned_immutable_and_validated(tmp_path,monkeypatch):
     (tmp_path/str(actor.public_id)/meta["id"]/"content").write_bytes(b"changed")
     with pytest.raises(ApiError):attachments.model_content(actor,frozen)
     with pytest.raises(ApiError):attachments.upload(actor,b"not an image","fake.png","image/png")
-    with pytest.raises(ApiError):attachments.upload(actor,b"measurement","raw.csv","text/plain")
+    csv=attachments.upload(actor,b"time_s,value\n0,1\n","raw.csv","text/csv")
+    assert csv['diagnostic_only'] and attachments.read(actor,csv['id'])[1]==b"time_s,value\n0,1\n"
     log=attachments.upload(actor,b"password=synthetic-private","error.log","text/plain")
-    assert b"synthetic-private" not in attachments.read(actor,log["id"])[1]
+    assert attachments.read(actor,log['id'])[1]==b"password=synthetic-private"
+    assert "synthetic-private" not in attachments.model_content(actor,[log])[0]['text']
 
 def test_expired_attachment_cleanup(tmp_path,monkeypatch):
     monkeypatch.setattr(attachments,"get_settings",lambda:SimpleNamespace(assistant_attachment_root=str(tmp_path)))

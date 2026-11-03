@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,10 +23,15 @@ from factory_hmi.models import (
 
 from ._legacy import motor_default_positions
 from .backend import MotorBackend, MotorsPyBackend
+from .telemetry_hub import TelemetryHub
 from .config import build_station_config, load_station_config
+from .fault_response import new_fault_response, request_fault_disable
 from .fault_diagnosis import DiagnosisThresholds, FaultDiagnosisEngine
+from .discovery import MotorDiscoveryPolicy
 from .manual_control import ManualControlSession, motor_positions_to_joint
 from .playback import PlaybackController
+from .motion_completion import automatic_completion_parameters, motion_readiness
+from .first_frame_approach import plan_first_frame_approach
 from .state_machine import InvalidStateTransition, StationStateMachine
 from .trajectory import (
     import_trajectory,
@@ -35,6 +42,9 @@ from .zeroing import MotorZeroingSession
 
 class FactoryControllerError(RuntimeError):
     pass
+
+
+logger = logging.getLogger(__name__)
 
 
 class FactoryController:
@@ -85,21 +95,54 @@ class FactoryController:
             raise ValueError("record_output is required when recording is enabled")
 
         self._lock = threading.RLock()
+        self.completion_output: Path | None = None
         self._trajectory: TrajectoryData | None = None
         self._playback: PlaybackController | None = None
         self._manual: ManualControlSession | None = None
         self._zeroing: MotorZeroingSession | None = None
         self._last_samples: list[MotorSample] = []
+        self.telemetry_hub = TelemetryHub()
+        self._motors_discovered = False
+        self._snapshot_read_error: str | None = None
         self._fault: FaultStatus | None = None
+        self._fault_response: dict | None = None
         self._diagnosis = FaultDiagnosisEngine(
             DiagnosisThresholds.from_config(station_config.raw)
         )
+        self._discovery_policy = MotorDiscoveryPolicy.from_config(station_config.raw)
+        self._protective_damping = None
+        self._damping_transition = False
+        self._damping_guard = threading.RLock()
         self._position_hold_stop = threading.Event()
         self._position_hold_thread: threading.Thread | None = None
         self._position_hold_target: np.ndarray | None = None
         self._default_return_active = threading.Event()
         self._default_return_stop = threading.Event()
         self._motor_recovery_active = threading.Event()
+        self.backend.set_control_watchdog(
+            self._diagnosis.thresholds.heartbeat_stale_seconds,
+            self._on_control_timeout,
+        )
+
+    def _on_control_timeout(self, message: str) -> None:
+        """Publish the fault without waiting for hardware or command locks."""
+        self._position_hold_stop.set()
+        self._default_return_stop.set()
+        manual = self._manual
+        if manual is not None:
+            manual.request_stop()
+        fault = FaultStatus(message=message, kind="ControlTimeout",
+                            timestamp_s=time.monotonic())
+        self._fault = fault
+        playback = self._playback
+        if playback is not None:
+            playback.signal_fault(fault)
+        state = self.state_machine.state
+        if state is not StationState.FAULT:
+            try:
+                self.state_machine.transition(StationState.FAULT, expected=state)
+            except InvalidStateTransition:
+                pass
 
     @property
     def state(self) -> StationState:
@@ -140,11 +183,15 @@ class FactoryController:
             self._default_return_stop.clear()
             self._motor_recovery_active.set()
             try:
+                self._motors_discovered = False
                 self.backend.open_transport()
                 self._last_samples = self._confirm_motor_feedback(
-                    "motor discovery", allow_errors=True
+                    "motor discovery", allow_errors=True,
+                    timeout_s=self._discovery_policy.timeout_s,
+                    poll_interval_s=self._discovery_policy.poll_interval_s,
                 )
                 self._fault = None
+                self._motors_discovered = True
                 self.state_machine.transition(
                     StationState.CONNECTED, expected=StationState.DISCONNECTED
                 )
@@ -217,6 +264,8 @@ class FactoryController:
         allow_errors: bool = False,
         baseline: list[MotorSample] | None = None,
         updates: int = 2,
+        timeout_s: float | None = None,
+        poll_interval_s: float = 0.005,
     ) -> list[MotorSample]:
         """Require new replies from every motor; cached zero errors cannot pass.
 
@@ -225,42 +274,77 @@ class FactoryController:
         replies are accepted by the hardware backend, before position hold.
         """
         previous = baseline if baseline is not None else self.backend.read_samples()
+        if len(previous) != len(self.config.entries):
+            raise FactoryControllerError(f"{phase}: feedback motor count does not match configuration")
         stamps = [sample.timestamp_s for sample in previous]
         progress = [0] * len(previous)
-        # A bounded confirmation window, capped by the existing stale limit.
-        deadline = time.monotonic() + min(1.0, self._diagnosis.thresholds.stale_seconds)
+        # Only disabled discovery supplies a longer startup budget. Enable and
+        # fault-reset gates retain their strict budget and freshness threshold.
+        budget = (min(1.0, self._diagnosis.thresholds.stale_seconds)
+                  if timeout_s is None else timeout_s)
+        started = time.monotonic()
+        deadline = started + budget
+        stale_seconds = self._diagnosis.thresholds.stale_seconds
+        logger.info("Motor feedback confirmation started: phase=%s timeout_s=%.3f motors=%d",
+                    phase, budget, len(previous))
         while True:
             self._check_motor_operation_cancelled()
             self.backend.refresh_feedback()
             samples = self.backend.read_samples()
+            if len(samples) != len(previous):
+                raise FactoryControllerError(f"{phase}: feedback motor count changed during confirmation")
             self._last_samples = samples
+            self.telemetry_hub.publish(samples)
             for index, sample in enumerate(samples):
-                if (
+                fresh = (
                     np.isfinite(sample.timestamp_s)
-                    and sample.timestamp_s > stamps[index]
+                    and sample.timestamp_s > 0
                     and np.isfinite(sample.feedback_age_s)
-                    and sample.feedback_age_s < self._diagnosis.thresholds.stale_seconds
-                ):
+                    and 0 <= sample.feedback_age_s < stale_seconds
+                )
+                if not fresh:
+                    progress[index] = 0
+                elif sample.timestamp_s > stamps[index]:
                     if not np.isfinite(sample.pos_rad):
-                        raise FactoryControllerError(f"{phase}: non-finite position: id={sample.motor_id}")
+                        raise FactoryControllerError(f"{phase}: non-finite position: bus={sample.bus}:id={sample.motor_id}")
                     if not allow_errors and sample.error_id != 0:
-                        raise FactoryControllerError(f"{phase}: motor error: id={sample.motor_id}:error_id={sample.error_id}")
+                        raise FactoryControllerError(f"{phase}: motor error: bus={sample.bus}:id={sample.motor_id}:error_id={sample.error_id}")
+                    # Two replies separated by an expired interval do not
+                    # establish stable readiness in the longer startup window.
+                    if sample.timestamp_s - stamps[index] >= stale_seconds:
+                        progress[index] = 0
                     stamps[index] = sample.timestamp_s
-                    progress[index] += 1
+                    progress[index] = min(updates, progress[index] + 1)
             self._check_motor_operation_cancelled()
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 missing = ",".join(
                     str(sample.motor_id) for index, sample in enumerate(samples)
                     if progress[index] < updates
                 ) or "all"
-                raise FactoryControllerError(f"{phase}: fresh feedback timeout: motor_ids={missing}")
+                pending = "; ".join(
+                    f"{sample.bus or self.config.entries[index].interface}#{sample.motor_id}"
+                    f"[{sample.joint_name or self.config.entries[index].joint_name}]"
+                    f"({progress[index]}/{updates},age_s="
+                    + (f"{sample.feedback_age_s:.3f}" if sample.timestamp_s > 0
+                       and np.isfinite(sample.feedback_age_s) else "none") + ")"
+                    for index, sample in enumerate(samples) if progress[index] < updates
+                )
+                detail = (f"{phase}: fresh feedback timeout: motor_ids={missing}; "
+                          f"elapsed_s={now - started:.3f}; pending={pending}")
+                logger.warning(detail)
+                raise FactoryControllerError(detail)
             if all(count >= updates for count in progress) and all(
                 np.isfinite(sample.feedback_age_s)
-                and sample.feedback_age_s < self._diagnosis.thresholds.stale_seconds
+                and sample.feedback_age_s < stale_seconds
                 for sample in samples
             ):
+                logger.info("Motor feedback confirmed: phase=%s elapsed_s=%.3f motors=%d",
+                            phase, now - started, len(samples))
                 return samples
-            time.sleep(0.005)
+            # Event waiting wakes immediately on software disable/disconnect;
+            # no Qt objects or additional worker threads are created per poll.
+            self._default_return_stop.wait(min(poll_interval_s, deadline - now))
 
     def reset_motor_fault(self) -> None:
         """Explicit fault reset only; leave the transport open and torque disabled."""
@@ -289,6 +373,7 @@ class FactoryController:
             self._default_return_stop.clear()
             self._motor_recovery_active.set()
             try:
+                self._motors_discovered = False
                 if self.backend.connected:
                     self.backend.disconnect()
                 self.backend.open_transport()
@@ -301,6 +386,7 @@ class FactoryController:
                 if state is not StationState.CONNECTED:
                     self.state_machine.transition(StationState.CONNECTED, expected=state)
                 self._fault = None
+                self._motors_discovered = True
                 self._playback = None
                 self._zeroing = None
                 self._trajectory = None
@@ -338,6 +424,7 @@ class FactoryController:
                 config=self.config.raw,
                 limits=self.config.safety_limits,
                 current_motor_pos=None,
+                check_velocity=False,
             )
             self._trajectory = trajectory
             if self.state_machine.state is StationState.COMPLETED:
@@ -363,8 +450,10 @@ class FactoryController:
                 raise FactoryControllerError("enable motors before arming")
             if self._trajectory is None:
                 raise FactoryControllerError("load a trajectory before arming")
+            parameters = automatic_completion_parameters(self.config)
             samples = self.backend.read_samples()
             self._last_samples = samples
+            self.telemetry_hub.publish(samples)
             faulted = [sample for sample in samples if sample.error_id != 0]
             if faulted:
                 error = FactoryControllerError(
@@ -385,7 +474,13 @@ class FactoryController:
                 config=self.config.raw,
                 limits=self.config.safety_limits,
                 current_motor_pos=current,
+                check_velocity=False,
+                check_initial_gap=False,
             )
+            if parameters is not None:
+                parameters.check_trajectory(self.config, self._trajectory, check_dynamics=False)
+            approach = plan_first_frame_approach(self.config, current, self._trajectory.motor_pos[0], parameters=parameters)
+            self._trajectory.preflight = replace(self._trajectory.preflight, approach=approach.to_dict())
             self.state_machine.transition(
                 StationState.ARMED, expected=self.state_machine.state
             )
@@ -401,6 +496,8 @@ class FactoryController:
         record_rate_hz: float = 20.0,
         test_id: str | None = None,
         robot_id: str | None = None,
+        completion_mode: str = "configured",
+        parking_pose_confirmed: bool = False,
     ) -> None:
         with self._lock:
             self.state_machine.require(StationState.ARMED)
@@ -416,8 +513,10 @@ class FactoryController:
                     cycles=cycles,
                     duration_s=duration_s,
                     speed=speed,
+                    completion_mode=completion_mode,
+                    parking_pose_confirmed=parking_pose_confirmed,
                 )
-                self._playback = PlaybackController(
+                candidate = PlaybackController(
                     self.backend,
                     self.config,
                     self._trajectory,
@@ -429,12 +528,22 @@ class FactoryController:
                     test_id=test_id,
                     robot_id=robot_id,
                     on_fault=self._on_playback_fault,
+                    on_protective_fault=self._request_protective_fault,
                     on_complete=self._on_playback_complete,
+                    completion_output=self.completion_output,
+                    telemetry_hub=self.telemetry_hub,
                 )
-                self._playback.start(playback_options)
+                previous_playback = self._playback
+                self._playback = candidate
+                try:
+                    candidate.start(playback_options)
+                except Exception:
+                    self._playback = previous_playback
+                    raise
         except Exception:
             try:
-                self._resume_position_hold_from_feedback()
+                if self.state_machine.state is not StationState.FAULT:
+                    self._resume_position_hold_from_feedback()
             except Exception:
                 pass
             raise
@@ -447,9 +556,12 @@ class FactoryController:
         playback = self._require_playback()
         playback.resume()
 
-    def stop(self, *, wait: bool = True, timeout: float = 2.0) -> None:
+    def finish(self, reason: str | None = None) -> None:
+        self._require_playback().finish(reason=reason)
+
+    def stop(self, *, wait: bool = True, timeout: float = 2.0, reason: str | None = None) -> None:
         playback = self._require_playback()
-        playback.stop(wait=wait, timeout=timeout)
+        playback.stop(wait=wait, timeout=timeout, reason=reason)
 
     def manual_move(
         self,
@@ -489,6 +601,7 @@ class FactoryController:
             with self._lock:
                 self._manual = manual
                 self._last_samples = samples
+                self.telemetry_hub.publish(samples)
             try:
                 manual.start()
             except Exception:
@@ -608,6 +721,7 @@ class FactoryController:
                             if now - last_feedback_at >= 0.05:
                                 samples = self.backend.read_samples()
                                 self._last_samples = samples
+                                self.telemetry_hub.publish(samples)
                                 self._check_default_return_feedback(samples)
                                 last_feedback_at = now
                             if kp_scale == 0.5:
@@ -655,6 +769,10 @@ class FactoryController:
         This only cancels an existing operation. It never enables, clears errors,
         or starts motion; the caller still executes its normal disable command.
         """
+        playback = self._playback
+        if playback is not None and playback.running:
+            playback._stop_event.set()
+            return True
         if not (self._default_return_active.is_set() or self._motor_recovery_active.is_set()):
             return False
         self._default_return_stop.set()
@@ -684,7 +802,53 @@ class FactoryController:
                     f"{phase} feedback stale: id={sample.motor_id}"
                 )
 
+    def enter_protective_damping(self, reason: str, kd: float = 1.0, expected_generation=None):
+        from .protective_damping import ProtectiveDamping
+        with self._damping_guard:
+            origin_generation=self.backend.control_generation if expected_generation is None else expected_generation
+            if origin_generation != self.backend.control_generation:return None
+            if self._protective_damping is not None and self._protective_damping.snapshot()['active']:
+                return self._protective_damping.snapshot()
+            if not self.backend.connected or not self.backend.motors_enabled:
+                return None
+            self._damping_transition = True
+            try:
+                playback = self._playback
+                if playback is not None and playback.running:
+                    if self.state in {StationState.RUNNING, StationState.PAUSED}:
+                        playback.stop(reason=reason)
+                    else:
+                        playback._stop_event.set()
+                        if not playback.wait(2):raise TimeoutError('playback did not stop for protective damping')
+                self._stop_manual_session()
+                self._stop_position_hold()
+                def observe(samples):
+                    with self._lock:self._last_samples = samples
+                    self.telemetry_hub.publish(samples)
+                session = ProtectiveDamping(self.backend,rate_hz=min(200.,self.config.control_rate_hz),
+                    kd=kd,on_samples=observe,overtemperature_c=self._diagnosis.thresholds.overtemperature_c,
+                    expected_generation=origin_generation)
+                self._protective_damping = session
+                self._fault = FaultStatus(message=f'{reason}；保护阻尼 Kd={kd:g}，承重未确认',
+                    kind='OperatorControlLost' if reason=='operator lease expired' else 'SoftwareFaultProtectiveStop',timestamp_s=time.monotonic())
+                self._fault_response = {'playback_stop':'stopped','disable_request':'not_requested',
+                    'disable_feedback':'unknown','safe_confirmed':False,'protective_damping':'requested'}
+                if self.state is not StationState.FAULT:
+                    self.state_machine.transition(StationState.FAULT,expected=self.state)
+                session.start()
+                return session.snapshot()
+            finally:
+                self._damping_transition = False
+
+    def _stop_protective_damping(self, *, request_only=False):
+        session = self._protective_damping
+        if session is not None:
+            session.stop_event.set()
+            self.backend.cancel_protective_damping()
+            if not request_only:session.stop()
+
     def disconnect(self) -> None:
+        self._stop_protective_damping(request_only=True)
         self.request_motion_stop()
         self._stop_manual_session()
         with self._lock:
@@ -692,7 +856,11 @@ class FactoryController:
             playback = self._playback
             zeroing = self._zeroing
         if state in {StationState.RUNNING, StationState.PAUSED} and playback is not None:
-            playback.stop(wait=True)
+            try:
+                playback.stop(wait=True)
+            except InvalidStateTransition:
+                if not playback.wait(timeout=2.0):
+                    raise FactoryControllerError("playback did not stop before disconnect")
         if zeroing is not None and zeroing.state.value in {
             "idle",
             "prepared",
@@ -712,13 +880,17 @@ class FactoryController:
         except Exception as exc:
             disconnect_error = exc
 
+        self._stop_protective_damping()
         with self._lock:
             state = self.state_machine.state
-            if state is not StationState.DISCONNECTED:
+            if disconnect_error is not None:
+                self._set_fault(disconnect_error, samples=self._last_samples)
+            elif state is not StationState.DISCONNECTED:
                 self.state_machine.transition(
                     StationState.DISCONNECTED, expected=state
                 )
             self._last_samples = []
+            self._motors_discovered = False
             self._playback = None
             self._zeroing = None
             if disconnect_error is not None:
@@ -733,6 +905,7 @@ class FactoryController:
     def disable_motors(self, *, reason: str = "software disable") -> None:
         """Immediately remove motor torque without closing the transport."""
 
+        self._stop_protective_damping(request_only=True)
         self.request_motion_stop()
         self._stop_manual_session()
         self._stop_position_hold()
@@ -754,6 +927,8 @@ class FactoryController:
                     RuntimeError(reason),
                     samples=self._last_samples,
                 )
+
+        self._stop_protective_damping()
 
     def zero_motors(self, indices: list[int] | tuple[int, ...]) -> dict[str, Any]:
         """Disable the station and set selected motor positions as zero."""
@@ -866,10 +1041,18 @@ class FactoryController:
 
     def wait(self, timeout: float | None = None) -> bool:
         playback = self.playback
-        return True if playback is None else playback.wait(timeout)
+        if playback is None:
+            return True
+        started = time.monotonic()
+        if not playback.wait(timeout):
+            return False
+        remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
+        return playback.wait_recording(remaining)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
+            read_error = None
+            read_attempted = False
             playback = self._playback
             if playback is not None:
                 playback_samples = playback.last_samples()
@@ -884,19 +1067,32 @@ class FactoryController:
             if self.backend.connected and self.state_machine.state not in {
                 StationState.RUNNING,
                 StationState.PAUSED,
+                StationState.STOPPING,
             }:
+                read_attempted = True
                 try:
                     if not self.backend.motors_enabled:
                         self.backend.refresh_feedback()
                     self._last_samples = self.backend.read_samples()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    read_error = f"{type(exc).__name__}: {exc}"
+            if read_error != self._snapshot_read_error:
+                if read_error and not self._snapshot_read_error:
+                    logger.warning("Motor snapshot read failed; cached measurements are not current: %s", read_error)
+                elif not read_error and self._snapshot_read_error and read_attempted:
+                    logger.info("Motor snapshot reading recovered")
+                self._snapshot_read_error = read_error
+            now = time.monotonic()
+            view_samples = [sample.with_feedback_age(now) for sample in self._last_samples]
             joint_positions: list[float | None] = []
-            if len(self._last_samples) == len(self.config.entries):
+            if len(view_samples) == len(self.config.entries) and not read_error and all(
+                sample.feedback_age_s < self._diagnosis.thresholds.stale_seconds
+                for sample in view_samples
+            ):
                 try:
                     converted = motor_positions_to_joint(
                         self.config,
-                        [sample.pos_rad for sample in self._last_samples],
+                        [sample.pos_rad for sample in view_samples],
                     )
                     joint_positions = [
                         json_number(float(value)) for value in converted
@@ -907,26 +1103,36 @@ class FactoryController:
             return {
                 "station": {
                     "state": self.state_machine.state.value,
+                    "motion_readiness": motion_readiness(self.config),
                     "limb": self.config.limb,
                     "control_rate_hz": float(self.config.control_rate_hz),
                     "backend_connected": bool(self.backend.connected),
+                    "motors_discovered": bool(self._motors_discovered and self.backend.connected),
                     "motors_enabled": bool(self.backend.motors_enabled),
                     "position_hold_active": self.position_hold_active,
+                    "protective_damping": self._protective_damping.snapshot() if self._protective_damping else None,
                     "manual_control_active": bool(
                         manual_snapshot and manual_snapshot.get("active")
                     ),
+                    "commands_inhibited": self.backend.commands_inhibited,
+                    "control_stop_error": self.backend.control_stop_error,
                 },
-                "motors": [sample.to_dict() for sample in self._last_samples],
+                "motors": [sample.to_dict() for sample in view_samples],
+                "feedback_read_error": read_error,
                 "joint_positions_rad": joint_positions,
                 "trajectory": (
                     self._trajectory.to_dict() if self._trajectory else None
                 ),
                 "progress": progress,
+                "fault_response": ({**(self._fault_response or {}),**self._protective_damping.snapshot()} if self._protective_damping is not None else
+                    (playback_snapshot or {}).get("fault_response") or
+                    ({**self._fault_response, "playback_stop": "requested" if playback and playback.running else "stopped"}
+                     if self._fault_response else None)),
                 "playback": playback_snapshot,
                 "manual": manual_snapshot,
                 "zeroing": zeroing,
                 "fault": self._fault.to_dict() if self._fault else None,
-                "timestamp_s": json_number(time.monotonic()),
+                "timestamp_s": json_number(now),
             }
 
     def _require_playback(self) -> PlaybackController:
@@ -1001,6 +1207,7 @@ class FactoryController:
                     with self._lock:
                         if self._position_hold_stop is stop_event:
                             self._last_samples = samples
+                            self.telemetry_hub.publish(samples)
                     last_sample_at = now
                 if stop_event.is_set():
                     break
@@ -1049,6 +1256,7 @@ class FactoryController:
         )
         with self._lock:
             self._last_samples = samples
+            self.telemetry_hub.publish(samples)
         self._start_position_hold(target)
 
     def _stop_manual_session(self) -> ManualControlSession | None:
@@ -1072,9 +1280,50 @@ class FactoryController:
             )
 
     def _on_playback_complete(self) -> None:
+        # Successful normal completion has already verified and disabled;
+        # interrupted protection paths retain their existing hold behavior.
+        if self._damping_transition:
+            return
+        playback = self._playback
+        if self.state_machine.state is StationState.FAULT or (playback is not None and playback.fault is not None):
+            return
+        if playback is not None and playback.snapshot()["completion"]["safe_disabled"]:
+            return
         self._resume_position_hold_from_feedback()
 
+    def _request_protective_fault(self, fault, samples):
+        if (self._motor_recovery_active.is_set() or not self.backend._connected or not self.backend._enabled
+                or not samples or any(s.error_id or (np.isfinite(s.temp_c) and s.temp_c >= self._diagnosis.thresholds.overtemperature_c) for s in samples)):
+            return False
+        if self._damping_transition:return True
+        if self._protective_damping is not None and self._protective_damping.snapshot()['active']:return True
+        if self.backend.commands_inhibited:return False
+        if getattr(self, '_protective_fault_pending', False):return True
+        self._protective_fault_pending = True
+        origin_generation=self.backend.control_generation
+        def transition():
+            try:
+                self.enter_protective_damping(fault.message, kd=1.0,expected_generation=origin_generation)
+            except Exception as exc:
+                if self.backend.control_generation != origin_generation:
+                    logger.warning('discarded stale protective fault transition')
+                    return
+                logger.exception('software fault could not enter protective damping')
+                self._fault_response = new_fault_response()
+                request_fault_disable(self.backend,self._fault_response)
+                self._fault = FaultStatus(message=f'{fault.message}；保护阻尼不可用：{exc}',
+                    kind='ProtectiveDampingFailed',timestamp_s=time.monotonic())
+            finally:self._protective_fault_pending = False
+        try:
+            threading.Thread(target=transition,name='factory-protective-fault-transition',daemon=True).start()
+        except Exception:
+            self._protective_fault_pending = False
+            logger.exception('could not start protective fault transition')
+            return False
+        return True
+
     def _on_playback_fault(self, fault: FaultStatus) -> None:
+        self._position_hold_stop.set()
         with self._lock:
             self._fault = fault
 
@@ -1100,14 +1349,20 @@ class FactoryController:
             timestamp_s=time.monotonic(),
             diagnoses=diagnoses,
         )
-        if self.backend.connected:
-            try:
-                self.backend.disable()
-            except Exception:
-                pass
+        playback = self._playback
+        if playback is not None and playback.running:
+            playback.signal_fault(self._fault)
         state = self.state_machine.state
         if state is not StationState.FAULT:
             self.state_machine.transition(StationState.FAULT, expected=state)
+        if self._request_protective_fault(self._fault,actual_samples):
+            self._fault_response = {"playback_stop":"requested" if playback and playback.running else "stopped",
+                "disable_request":"not_requested","disable_feedback":"unknown", "safe_confirmed":False,
+                "protective_damping":"transition_requested"}
+        else:
+            self._fault_response = new_fault_response()
+            request_fault_disable(self.backend,self._fault_response)
+            self._fault_response["playback_stop"] = "requested" if playback and playback.running else "stopped"
 
 
 __all__ = ["FactoryController", "FactoryControllerError"]

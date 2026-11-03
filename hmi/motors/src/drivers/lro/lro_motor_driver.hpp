@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <shared_mutex>
 #include <string>
 
@@ -123,7 +124,8 @@ typedef struct {
 class LroMotorDriver : public MotorDriver {
    public:
     LroMotorDriver(uint16_t motor_id, const std::string& interface_type, const std::string& can_interface,
-                    LRO_Motor_Model motor_model, double motor_zero_offset = 0.0);
+                    LRO_Motor_Model motor_model, double motor_zero_offset = 0.0,
+                    std::shared_ptr<MotorsCANFD> transport = nullptr);
     ~LroMotorDriver();
 
     virtual void lock_motor() override;
@@ -133,6 +135,8 @@ class LroMotorDriver : public MotorDriver {
     virtual bool set_motor_zero() override;
     virtual bool write_motor_flash() override;
     virtual void get_motor_param(uint8_t param_cmd) override;
+    bool request_version(uint8_t code) override;
+    std::vector<uint8_t> version_payload(uint8_t code) override;
 
     virtual void motor_pos_cmd(float pos, float spd, bool ignore_limit) override;
     virtual void motor_spd_cmd(float spd) override;
@@ -151,6 +155,10 @@ class LroMotorDriver : public MotorDriver {
     virtual void clear_motor_error() override;
 
    private:
+    std::mutex version_mutex_;
+    uint8_t pending_version_{0};
+    std::chrono::steady_clock::time_point version_deadline_;
+    std::unordered_map<uint8_t, std::vector<uint8_t>> versions_;
     uint8_t motor_index_{0};
 
     // std::atomic<float> dc_bus_voltage_{0.f};

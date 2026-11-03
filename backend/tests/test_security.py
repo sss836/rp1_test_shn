@@ -58,14 +58,18 @@ def test_secret_hash_is_sha256_and_not_plaintext():
     assert digest != "opaque-secret"
 
 
-def test_new_password_requires_twelve_characters():
+def test_new_password_requires_six_characters():
     service = AuthService(
         Settings(),
         FakeRepository(None),  # type: ignore[arg-type]
     )
-    with pytest.raises(ValueError, match="12"):
+    with pytest.raises(ValueError, match="6"):
         service.hash_new_password("short")
-    assert service.hash_new_password("long-enough-password").startswith("$argon2id$")
+    hasher = PasswordHasher(type=Type.ID)
+    for accepted in ("123456", "long-enough-password"):
+        encoded = service.hash_new_password(accepted)
+        assert encoded.startswith("$argon2id$")
+        assert hasher.verify(encoded, accepted)
 
 
 def test_initial_admin_bootstrap_hashes_password_and_commits():

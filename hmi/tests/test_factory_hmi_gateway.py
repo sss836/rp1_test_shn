@@ -43,6 +43,9 @@ class StubController:
     def disconnect(self):
         self.state = "disconnected"
 
+    def can_disconnect(self):
+        return None
+
     def arm(self):
         self.state = "armed"
 
@@ -121,6 +124,10 @@ class ControlLeaseTests(unittest.TestCase):
             lease.claim("two", now=10.5)
         self.assertFalse(lease.expired(now=10.9))
         self.assertTrue(lease.expired(now=11.1))
+        with self.assertRaises(LeaseConflict):
+            lease.claim("two", now=11.1)
+        lease.revoke_expired(now=11.1)
+        lease.release()
         lease.claim("two", now=11.1)
         self.assertEqual(lease.snapshot(now=11.2).owner, "two")
 
@@ -139,12 +146,13 @@ class GatewayApiTests(unittest.TestCase):
             ) as status_read:
                 response = client.post(
                     "/api/v1/lease/heartbeat",
-                    headers={"X-RP1-Client-ID": "operator-a"},
+                    headers={"X-RP1-Client-ID": "operator-a",
+                             "X-RP1-Lease-Generation": str(runtime.lease.snapshot().generation)},
                 )
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["lease"]["owner"], "operator-a")
                 self.assertFalse(response.json()["lease"]["expired"])
-                self.assertEqual(response.json()["lease"]["timeout_s"], 2.0)
+                self.assertEqual(response.json()["lease"]["timeout_s"], 30.0)
                 status_read.assert_not_called()
             self.assertEqual(controller.state, "running")
 
@@ -333,7 +341,9 @@ class GatewayApiTests(unittest.TestCase):
             )
             record = service.record_root / "REL-001.csv"
             record.write_text("sample,value\n0,1\n", encoding="utf-8")
-            service.controller.record_output = record
+            service.controller.record_output = service.record_root / "unaccepted-draft.csv"
+            service._recording_session = mock.Mock(record_output=record)
+            service._recording_session.snapshot.return_value = {"recording": {"finished": True}}
             with TestClient(
                 create_app(service, data_root=Path(temp_dir))
             ) as client:
@@ -384,7 +394,8 @@ class GatewayApiTests(unittest.TestCase):
                 )
                 heartbeat = client.post(
                     "/api/v1/lease/heartbeat",
-                    headers={"X-RP1-Client-ID": "operator-a"},
+                    headers={"X-RP1-Client-ID": "operator-a",
+                             "X-RP1-Lease-Generation": str(configured.json()["snapshot"]["lease"]["generation"])},
                 )
 
                 self.assertEqual(configured.status_code, 200, configured.text)
@@ -960,7 +971,7 @@ class GatewayApiTests(unittest.TestCase):
                         "speed": 1.0,
                         "loop": False,
                         "cycles": 0,
-                        "record": False,
+                        "record": True,
                         "test_case_id": "REL-ARM-001",
                     },
                 )

@@ -112,3 +112,23 @@ def test_specific_reset_feedback_is_visible_on_page(window, state, detail):
 def test_cabinet_voltage_chart_uses_confirmed_50v_transducer_limit(window):
     assert window.plc_page.voltage_chart.maximum == 50.0
     assert window.plc_page.current_chart.maximum == 50.0
+
+
+@pytest.mark.parametrize('read_only,stale,communication',[(True,False,'LIVE'),(False,False,'LIVE'),(True,True,'LIVE'),(True,True,'COMM_LOST')])
+def test_readonly_permission_is_not_reported_as_a_communication_fault(window,read_only,stale,communication):
+    page=window.plc_page
+    page._receive(dict(communication_state=communication,stale=stale,driver='modbus_tcp',
+        phase='MONITORING' if read_only else 'OFF',read_only=read_only,
+        setpoint_limits=dict(enabled=True,voltage_min_v=0.,voltage_max_v=60.,current_min_a=0.,current_max_a=10.,step=.001),
+        status=dict(ProtocolVersion=0x0102,MainReady=False,PS1ActualOutput=False,PS1FeedbackValid=False),command={}))
+    if communication=='LIVE' and not stale:
+        assert page.flow_labels[0].property('tone')=='success'
+        assert 'LIVE' in page.flow_labels[0].text()
+        if read_only:
+            assert '只读监控模式' in page.setpoint_hint.text()
+            assert 'PLC通信不可用' not in page.setpoint_hint.text()
+            assert not page.apply_setpoints_button.isEnabled() and not page.all_stop_button.isEnabled()
+    else:
+        assert page.flow_labels[0].property('tone')=='danger'
+        assert 'PLC通信不可用' in page.setpoint_hint.text()
+        assert not page.apply_setpoints_button.isEnabled()

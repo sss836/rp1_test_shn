@@ -10,6 +10,17 @@ Code = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 Part = Literal["SYS", "ARM", "SARM", "LEG", "SLEG", "UPPER", "LOWER", "WAISTHIP", "CHEST", "HEAD", "BAT"]
 Kind = Literal["WHOLE_MACHINE", "MODULE"]
+CreationScenario = Literal["PRODUCTION", "RND_TEST"]
+ASSET_PART_NAMES = {
+    "SYS": "整机", "ARM": "7自由度手臂", "SARM": "5自由度手臂",
+    "LEG": "6自由度腿部", "SLEG": "5自由度腿部", "UPPER": "上肢",
+    "LOWER": "下肢", "WAISTHIP": "腰胯", "CHEST": "胸腔", "HEAD": "头部", "BAT": "动力电池",
+}
+
+
+def asset_identity(code: str):
+    family, part, sequence = code.rsplit("-", 2)
+    return family, part, "WHOLE_MACHINE" if part == "SYS" else "MODULE", f"{ASSET_PART_NAMES[part]}-{sequence}"
 
 
 class Change(BaseModel):
@@ -18,14 +29,17 @@ class Change(BaseModel):
 
 
 class AssetCreate(Change):
+    reason: str = Field(default="sample registration", min_length=1, max_length=2048)
     asset_code: str = Field(pattern=r"^RP[0-9]+\.[0-9]+-(SYS|ARM|SARM|LEG|SLEG|UPPER|LOWER|WAISTHIP|CHEST|HEAD|BAT)-[0-9]{3}$")
-    asset_kind: Kind
-    target_part_code: Part
-    product_family: Name
-    serial_number: Name
-    display_name: Name
-    model: Name
-    configuration_fingerprint: Name
+    auto_number: StrictBool | None = None
+    creation_scenario: CreationScenario | None = None
+    asset_kind: Kind | None = None
+    target_part_code: Part | None = None
+    product_family: Name | None = None
+    serial_number: Name | None = None
+    display_name: Name | None = None
+    model: Name | None = None
+    configuration_fingerprint: Name | None = None
     hardware_manifest: dict[str, Any] = Field(default_factory=dict)
     software_manifest: dict[str, Any] = Field(default_factory=dict)
     parameter_manifest: dict[str, Any] = Field(default_factory=dict)
@@ -33,11 +47,36 @@ class AssetCreate(Change):
 
     @model_validator(mode="after")
     def consistent_part(self):
-        if self.asset_code.split("-")[1] != self.target_part_code:
+        legacy = all(getattr(self, name) is not None for name in (
+            "asset_kind", "target_part_code", "product_family", "serial_number", "display_name", "model", "configuration_fingerprint"))
+        if not legacy:
+            missing = []
+            if self.auto_number is None: missing.append("是否向下编号（是/否）")
+            if self.creation_scenario is None: missing.append("创建场景（生产/研发测试）")
+            if missing: raise ValueError("请选择" + "、".join(missing))
+        family, part, kind, _ = asset_identity(self.asset_code)
+        if self.target_part_code is not None and part != self.target_part_code:
             raise ValueError("样品编号部位必须与选择的部位一致")
-        if (self.asset_kind == "WHOLE_MACHINE") != (self.target_part_code == "SYS"):
+        if self.asset_kind is not None and self.asset_kind != kind:
             raise ValueError("整机仅使用SYS，模块必须使用模块部位")
+        if not legacy and self.product_family is not None and self.product_family != family:
+            raise ValueError("产品族必须与产品编号的版本前缀一致")
+        if self.configuration_fingerprint is None and any((self.hardware_manifest, self.software_manifest, self.parameter_manifest)):
+            raise ValueError("包含配置清单的旧完整接口需要配置标识；普通编号建档无需填写配置")
+        # Do not add derived/default fields to model_fields_set: legacy receipts
+        # must retain their pre-upgrade single-request payload and hash.
+        for field, value in {"asset_kind": kind, "target_part_code": part,
+                             "product_family": self.product_family or family,
+                             "auto_number": self.auto_number if self.auto_number is not None else False,
+                             "creation_scenario": self.creation_scenario or "RND_TEST"}.items():
+            object.__setattr__(self, field, value)
         return self
+
+    @property
+    def legacy_input(self):
+        return (not {"auto_number", "creation_scenario"}.intersection(self.model_fields_set)
+                and all(getattr(self, name) is not None for name in (
+                    "serial_number", "display_name", "model", "configuration_fingerprint")))
 
 
 class ProgramCreate(Change):

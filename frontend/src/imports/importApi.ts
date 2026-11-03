@@ -1,6 +1,6 @@
 import { apiRequest } from "../client";
 import { archivesApi, type Archive, type ArchiveContext } from "../archiveApi";
-export type ImportCreate = { filename: string; size_bytes: number; sha256: string; test_name: string; actual_object: string; station_id: string; classification?: ArchiveContext | null };
+export type ImportCreate = { data_domain?: "RESEARCH" | "FACTORY"; serial_number?: string; bench_id?: string; filename: string; size_bytes: number; sha256: string; test_name: string; actual_object: string; station_id: string; classification?: ArchiveContext | null };
 export const importApi = {
   lookup: (sha256: string, size: number, signal?: AbortSignal) => apiRequest<{ archive: Archive | null }>(`/api/v1/archive-imports/lookup?${new URLSearchParams({ sha256, size_bytes: String(size) })}`, { signal }),
   create: (payload: ImportCreate, key: string, signal?: AbortSignal) => apiRequest<{ archive: Archive; reused: boolean }>("/api/v1/archive-imports", { method: "POST", headers: { "Idempotency-Key": key }, body: JSON.stringify(payload), signal }),

@@ -3,3 +3,6 @@
 *.png binary
 *.so binary
 *.npz binary
+
+# Immutable imported reference: preserve the bytes covered by its SHA256.
+/factory_hmi/resources/motor-parameters/pn-robopartydiver-0.6.0.reference.json -text

@@ -8,9 +8,11 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, Q
 
 
 class QuickVerificationPage(QWidget):
-    def __init__(self, client, runner, render_snapshot, parent=None):
+    def __init__(self, client, runner, render_snapshot, parent=None, execution_context=None, sample_validator=None):
         super().__init__(parent)
         self.client, self.runner, self.render_snapshot = client, runner, render_snapshot
+        self.execution_context = execution_context
+        self.sample_validator = sample_validator
         self.setObjectName('quickVerificationPage')
         self.setStyleSheet("""
             QWidget#quickVerificationPage { background: #f3f5f8; }
@@ -50,7 +52,8 @@ class QuickVerificationPage(QWidget):
         settings = QGroupBox('本次验证'); settings.setObjectName('quickCard')
         form = QFormLayout(settings)
         self.sample = QLineEdit()
-        self.sample.setPlaceholderText('本地样机标识，可自由填写')
+        self.sample.setMaxLength(200)
+        self.sample.setPlaceholderText('模块编号或 SN，可自由填写，保留前导零')
         form.addRow('样机标识', self.sample)
         self.power_source = QComboBox()
         self.power_source.addItem('外部供电', 'external')
@@ -84,15 +87,17 @@ class QuickVerificationPage(QWidget):
         self.run_button = QPushButton('运行…'); self.run_button.setObjectName('primaryButton')
         self.pause_button = QPushButton('暂停'); self.pause_button.setObjectName('outlineButton')
         self.resume_button = QPushButton('继续'); self.resume_button.setObjectName('outlineButton')
-        self.end_button = QPushButton('结束并失能'); self.end_button.setObjectName('criticalOutlineButton')
-        for button in [self.run_button, self.pause_button, self.resume_button, self.end_button]:
+        self.end_button = QPushButton('正常结束测试'); self.end_button.setObjectName('outlineButton')
+        self.abort_button = QPushButton('软件失能'); self.abort_button.setObjectName('criticalOutlineButton')
+        for button in [self.run_button, self.pause_button, self.resume_button, self.end_button, self.abort_button]:
             button.setMinimumHeight(40); buttons.addWidget(button)
         self.run_button.clicked.connect(self._ask_run)
         self.pause_button.clicked.connect(lambda: self._action('暂停', self.client.playback_pause))
         self.resume_button.clicked.connect(lambda: self._action('继续', self.client.playback_resume))
         self.end_button.clicked.connect(self._end)
+        self.abort_button.clicked.connect(self._abort)
         layout.addLayout(buttons)
-        self.supply_note = QLabel('结束后电机失能并断开 CAN，外部电源由现场管理。')
+        self.supply_note = QLabel('收尾参数齐全时自动回位并确认后失能；否则结束测试后保持位置，不自动失能。外部电源由现场管理。')
         self.supply_note.setWordWrap(True); layout.addWidget(self.supply_note); layout.addStretch(1)
         self.timer = QTimer(self); self.timer.setInterval(500); self.timer.timeout.connect(self.refresh)
         self.timer.start()
@@ -107,8 +112,8 @@ class QuickVerificationPage(QWidget):
             if external else
             '由网关按默认参数控制 PLC，实际供电许可确认后才扫描和使能。')
         if hasattr(self, 'supply_note'):
-            self.supply_note.setText('结束后电机失能并断开 CAN，外部电源由现场管理。' if external else
-                                     'PLC 为各窗口共用供电；结束只清理本窗口电机与 CAN。')
+            self.supply_note.setText('收尾参数齐全时自动回位并确认后失能；否则结束后保持位置，不自动失能。外部电源由现场管理。' if external else
+                                     '收尾参数齐全时自动回位并确认后失能；否则结束后保持位置。PLC 共用供电不自动停止。')
 
     def _catalog(self, payload):
         for i, profile in enumerate(payload.get('items', [])):
@@ -185,27 +190,54 @@ class QuickVerificationPage(QWidget):
         safety = QCheckBox(('已接通外部电源，并确认支撑、运动范围及物理急停安全' if external else
                             '已确认机器人支撑、运动范围和物理急停安全'))
         form.addRow(safety)
+        from factory_hmi.core.mujoco_completion import ARM_LIMBS, pose_description
+        model_supported = self.selected in ARM_LIMBS
+        use_model = QCheckBox('结束后按 MuJoCo 轨迹下垂，再软件失能')
+        use_model.setChecked(model_supported)
+        use_model.setVisible(model_supported)
+        form.addRow(use_model)
+        pose_confirmed = QCheckBox('已核实上述模型姿态适用，且到位后可安全撤力')
+        pose_confirmed.setObjectName('quickMujocoPoseConfirmed')
+        pose_confirmed.setVisible(model_supported)
+        if model_supported:
+            note = QLabel(pose_description(self.selected)); note.setWordWrap(True)
+            form.addRow(note)
+        form.addRow(pose_confirmed)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText('确认并运行')
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
         buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
-        safety.toggled.connect(buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled)
+        def update_confirmation():
+            buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
+                safety.isChecked() and (not use_model.isChecked() or pose_confirmed.isChecked()))
+        safety.toggled.connect(update_confirmation)
+        use_model.toggled.connect(update_confirmation)
+        pose_confirmed.toggled.connect(update_confirmation)
         buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); form.addRow(buttons)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.start(hours.value(), safety.isChecked())
+            self.start(hours.value(), safety.isChecked(), use_model.isChecked(), pose_confirmed.isChecked())
         dialog.deleteLater()
 
-    def start(self, hours, confirmed):
+    def start(self, hours, confirmed, use_model=False, parking_confirmed=False):
         if self._pending or self._phase != 'ready':
             return
         sample = self.sample.text().strip()
         if not sample:
             self.detail.setText('请填写本地样机标识'); return
+        run_context = dict(self.execution_context() or {}) if self.execution_context else {}
+        if self.sample_validator and not self.sample_validator(sample, self.selected):
+            self.detail.setText('研发在线模式请选择当前部位已登记且未运行的样机编号；未登记 SN 请选工厂模式。'); return
+        if run_context.get('data_domain') == 'FACTORY' and not str(run_context.get('bench_id') or '').strip():
+            self.detail.setText('请先在顶栏填写本次实际台架'); return
         self._start_error = ''
         power_source = self.power_source.currentData()
         self._pending = True; self._phase = 'starting'; self._sync_buttons()
-        self.detail.setText('正在准备运行，可点击“结束并失能”取消')
-        self.runner('快速验证运行', lambda: self.client.quick_start(hours, sample, physical_estop_confirmed=confirmed, power_source=power_source),
+        self.detail.setText('正在准备运行，需要取消时点击“软件失能”')
+        options = {'physical_estop_confirmed':confirmed, 'power_source':power_source, **run_context}
+        if use_model:
+            options.update(completion_mode='mujoco_hanging', parking_pose_confirmed=parking_confirmed)
+        self.runner('快速验证运行', lambda: self.client.quick_start(hours, sample,
+                    **options),
                     self._received, quiet=True, on_failure=self._start_failed, on_finished=self._finished)
 
     @staticmethod
@@ -224,7 +256,7 @@ class QuickVerificationPage(QWidget):
             return
         # A lost response does not establish whether motors started. Cancel
         # uncertain/5xx requests, retaining the original cause after cleanup.
-        self.runner('取消未确认的快速验证', self.client.quick_end, self._received, quiet=True,
+        self.runner('取消未确认的快速验证', self.client.quick_abort, self._received, quiet=True,
                     on_failure=self._failed)
 
     def _action(self, label, operation):
@@ -236,8 +268,14 @@ class QuickVerificationPage(QWidget):
 
     def _end(self):
         self.end_button.setEnabled(False)
-        self.detail.setText('正在结束并等待本窗口电机失能…')
+        self.detail.setText('已请求正常结束；收尾行为取决于本次配置，请等待回执…')
         self.runner('结束快速验证', self.client.quick_end, self._received, quiet=True,
+                    on_failure=self._failed, on_finished=self._finished)
+
+    def _abort(self):
+        self.abort_button.setEnabled(False)
+        self.detail.setText('正在执行本窗口软件失能…')
+        self.runner('软件失能', self.client.quick_abort, self._received, quiet=True,
                     on_failure=self._failed, on_finished=self._finished)
 
     def _received(self, payload):
@@ -282,9 +320,12 @@ class QuickVerificationPage(QWidget):
             widget.setEnabled(not busy)
         self.reload_button.setEnabled(bool(self.selected) and not busy)
         self.run_button.setEnabled(self._phase == 'ready' and not self._pending)
-        self.pause_button.setEnabled(self._phase == 'running' and not self._pending)
+        self.pause_button.setEnabled(self._phase in {'running', 'finishing_cycle'} and not self._pending)
         self.resume_button.setEnabled(self._phase == 'paused' and not self._pending)
-        self.end_button.setEnabled(bool(self.selected) and (active or self._phase in {'ready', 'fault'}))
+        self.end_button.setEnabled(bool(self.selected) and self._phase in {
+            'ready', 'running', 'paused', 'finishing_cycle', 'starting',
+            'powering', 'connecting', 'discovering', 'enabling', 'preflight'})
+        self.abort_button.setEnabled(bool(self.selected) and (active or self._phase in {'ready', 'fault'}))
 
     def stop(self):
         self.timer.stop()

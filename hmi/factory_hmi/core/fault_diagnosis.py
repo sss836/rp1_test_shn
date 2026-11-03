@@ -20,7 +20,7 @@ class DiagnosisThresholds:
     stale_seconds: float = 2.0
     tracking_error_rad: float = 0.5
     undervoltage_v: float | None = 36.0
-    overtemperature_c: float = 85.0
+    overtemperature_c: float = 100.0
     high_torque_nm: float = 35.0
     high_torque_seconds: float = 2.0
     temperature_rise_c: float = 10.0
@@ -266,7 +266,7 @@ class FaultDiagnosisEngine:
                     f"temperature rise={rise:.1f} C within {self.thresholds.temperature_window_s:.1f} s",
                 ),
                 action="Pause and inspect binding, excess external load, lubrication, and commanded gains.",
-                severity="critical",
+                severity="warning",
                 confidence=0.8,
                 rule="persistent_torque_temperature_rise",
                 affected_motor_ids=(int(sample.motor_id),),
@@ -338,4 +338,3 @@ __all__ = [
     "FaultDiagnosisEngine",
     "diagnose_faults",
 ]
-

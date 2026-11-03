@@ -159,7 +159,19 @@ class QuickRun:
                 or not status['MainReady'] or any(not status['ChannelPermit'][n-1] for n in self._channels)):
             raise RuntimeError('PLC 实际供电许可无效，已停止本窗口测试')
 
-    def start(self, hours: float, safety_confirmed: bool, sample: str, power_source: str = 'plc') -> dict:
+    def start(self, hours: float, safety_confirmed: bool, sample: str, power_source: str = 'plc',
+              completion_mode: str = 'configured', parking_pose_confirmed: bool = False,
+              data_domain: str | None = None, bench_id: str | None = None, operator_id: str | None = None) -> dict:
+        from factory_hmi.models import PlaybackOptions
+        PlaybackOptions(completion_mode=completion_mode, parking_pose_confirmed=parking_pose_confirmed)
+        if completion_mode == 'mujoco_hanging':
+            from factory_hmi.core.mujoco_completion import plan_return
+            controller = self.runtime.controller.controller
+            trajectory = controller.trajectory
+            if trajectory is None:
+                raise ValueError('尚未载入工厂轨迹')
+            velocity = (trajectory.motor_pos[-1]-trajectory.motor_pos[-2])/(trajectory.timestamps[-1]-trajectory.timestamps[-2])
+            plan_return(controller.config, trajectory.motor_pos[-1], velocity)
         if power_source not in {'external', 'plc'}:
             raise ValueError('供电方式必须为 external 或 plc')
         if not safety_confirmed:
@@ -170,11 +182,16 @@ class QuickRun:
             raise RuntimeError('请先选择部位并读取内置轨迹')
         if not sample.strip():
             raise ValueError('请填写本地样机标识')
+        if data_domain == 'FACTORY' and not str(bench_id or '').strip():
+            raise ValueError('工厂测试必须填写实际台架')
         current = self.runtime.snapshot()
         if (current.get('trajectory') or {}).get('sha256') != self._prepared['sha256']:
             raise RuntimeError('轨迹已变化，请重新选择快速验证部位')
         if (current.get('station') or {}).get('limb') != self._prepared['id']:
             raise RuntimeError('模块配置已变化，请重新选择部位')
+        readiness = (current.get('station') or {}).get('motion_readiness') or {}
+        if not readiness.get('test_allowed', readiness.get('ready')):
+            raise RuntimeError(readiness.get('reason') or '运动参数尚未核实，禁止启动')
         self._stop = threading.Event()
         self._power_source = power_source
         self._channels = []
@@ -191,7 +208,6 @@ class QuickRun:
                 ('connecting', '连接 CAN', ('can_connect',), {}),
                 ('discovering', '扫描电机并核对反馈', ('discover_motors',), {}),
                 ('enabling', '确认使能电机', ('enable_motors',), {'physical_estop_confirmed': True}),
-                ('returning', '平滑回默认位：半 KP 1 秒，正常 KP 2 秒', ('reset',), {}),
                 ('preflight', '核对首帧、限位和轨迹速度', ('arm',), {}),
             ]:
                 self._checkpoint()
@@ -201,7 +217,9 @@ class QuickRun:
             self._checkpoint()
             self._check_power()
             self.runtime._invoke(('start',), speed=1.0, loop=True, cycles=0, duration_hours=hours,
+                completion_mode=completion_mode, parking_pose_confirmed=parking_pose_confirmed,
                 record=True, recording_scope='local', record_rate_hz=20.0,
+                data_domain=data_domain, bench_id=bench_id, operator_id=operator_id,
                 robot_id=sample.strip(), test_case_id='QUICK-'+self._prepared['id'].upper(),
                 test_name='工厂快速验证 · '+self._prepared['label'] + (' · 外部供电' if power_source == 'external' else ' · PLC 供电'),
                 stage_code='QUICK_EXTERNAL' if power_source == 'external' else 'QUICK_PLC',
@@ -239,7 +257,8 @@ class QuickRun:
         self._stop.set()
         self.runtime.controller.request_motion_stop()
 
-    def end(self) -> dict:
+    def abort(self) -> dict:
+        """Protection cancellation, including an unconfirmed start response."""
         self._stop.set()
         errors = self._cleanup()
         self._prepared = None
@@ -252,6 +271,30 @@ class QuickRun:
         self._state('ended', (failure + '；' if failure else '') + detail, active=False)
         return self.snapshot()
 
+    def end(self) -> dict:
+        """Request normal finish; ownership stays held until safe completion."""
+        state = self.runtime.controller.controller.state.value
+        if state in {'running', 'paused'}:
+            self.runtime._invoke(('finish',), reason='factory operator normal finish')
+            self._state('decelerating', '正在结束当前测试；完成前保留 CAN 占用')
+            return self.snapshot()
+        if self.snapshot()['active'] and state not in {'completed', 'fault', 'disconnected'}:
+            # No playback yet: an interrupted preparation has no NPZ tail.
+            return self.abort()
+        if state == 'completed':
+            completion = (self.runtime.controller.controller.snapshot().get('playback') or {}).get('completion') or {}
+            if completion.get('phase') == 'holding' and not completion.get('safe_disabled'):
+                self._state('holding', (completion.get('alarm') or '测试已结束并保持位置，未自动失能')+'；本窗口 CAN 继续占用')
+                return self.snapshot()
+            if completion.get('safe_disabled'):
+                errors = self._cleanup()
+                if errors:
+                    self._state('fault', '结束清理未确认：' + '；'.join(errors), active=False)
+                else:
+                    self._state('ended', '已安全失能并断开本窗口 CAN', active=False)
+                return self.snapshot()
+        return self.abort()
+
     def _watch(self, stop_event):
         try:
             while not stop_event.wait(.1):
@@ -261,28 +304,49 @@ class QuickRun:
                 expired = self.runtime.lease.snapshot().expired
                 if expired:
                     self.runtime.controller.request_motion_stop()
-                if phase not in {'running', 'paused'}:
+                if phase not in {'running', 'paused', 'finishing_cycle', 'decelerating', 'returning', 'settling', 'needs_attention', 'holding'}:
                     continue
-                state = self.runtime.controller.controller.state.value
+                controller = self.runtime.controller.controller
+                snapshot = controller.snapshot()
+                state = snapshot['station']['state']
+                completion = (snapshot.get('playback') or {}).get('completion') or {}
                 failure = '窗口心跳已失效' if expired else ''
-                if not failure and state not in {'completed', 'fault', 'disconnected'}:
+                holding = state == 'completed' and completion.get('phase') == 'holding' and not completion.get('safe_disabled')
+                if not failure and (holding or state not in {'completed', 'fault', 'disconnected'}):
                     try:
                         self._check_power()
                     except Exception as exc:
                         failure = str(exc)
+                if holding and not failure:
+                    self._state('holding', (completion.get('alarm') or '测试已结束并保持位置，未自动失能')+'；本窗口 CAN 继续占用')
+                    continue
                 if failure or state in {'completed', 'fault', 'disconnected'}:
                     with self.runtime._lease_guard:
                         if stop_event.is_set() or self._stop is not stop_event:
                             return
                         stop_event.set()
                         errors = self._cleanup()
-                        successful = state == 'completed' and not failure and not errors
+                        successful = state == 'completed' and completion.get('safe_disabled') and not failure and not errors
                         self._state('completed' if successful else 'fault',
-                            '已达到设定时长，电机已失能，记录保存在本机' if successful else
-                            '；'.join([failure or '设备运行已中止']+errors), active=False)
+                            '测试及受控收尾完成，电机已安全失能并断开本窗口 CAN；记录保存在本机' if successful else
+                            '；'.join([failure or '设备运行已中止，未确认安全收尾']+errors), active=False)
                     return
-                self._state('paused' if state == 'paused' else 'running',
-                            '已暂停，可继续或结束' if state == 'paused' else '1 倍速循环运行；记录保存在本机')
+                completion_phase = completion.get('phase')
+                details = {'finishing_cycle': '到时后正在补完当前整个周期',
+                    'decelerating': '正在按已核实加速度平滑减速',
+                    'returning': '正在慢回已核实停放姿态',
+                    'settling': '正在核对实际位置、速度和连续稳定窗口',
+                    'needs_attention': completion.get('alarm') or '未到位：保持并报警，禁止提前清理'}
+                if completion.get('source') == 'mujoco_hanging':
+                    details['returning'] = '正在执行本次确认选用的 MuJoCo 下垂轨迹'
+                if state == 'paused':
+                    self._state('paused', '补尾已暂停，可继续补完当前周期或结束'
+                        if completion_phase == 'finishing_cycle' else '已暂停，可继续或结束')
+                elif completion_phase in details:
+                    self._state(completion_phase, details[completion_phase])
+                else:
+                    self._state('paused' if state == 'paused' else 'running',
+                        '已暂停，可继续或结束' if state == 'paused' else '1 倍速循环运行；记录保存在本机')
         except Exception:
             logger.exception('quick verification watcher failed: owner=%s', self.owner)
             stop_event.set()

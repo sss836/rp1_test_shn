@@ -274,7 +274,7 @@ class MtbfRepository:
                 JOIN test.test_campaign c ON c.id = cfg.campaign_id
                 JOIN reliability.mtbf_scope s ON s.id = cfg.scope_id
                 LEFT JOIN reliability.current_mtbf_result r
-                  ON r.campaign_id = cfg.campaign_id AND r.scope_id = cfg.scope_id
+                  ON r.campaign_id = cfg.campaign_id AND r.scope_id = cfg.scope_id AND r.data_domain_policy_version='research-only-v1' AND r.data_domain_epoch=integration.campaign_domain_epoch(cfg.campaign_id)
                 LEFT JOIN reliability.calculation_run run ON run.id = r.calculation_run_id
                 LEFT JOIN LATERAL (
                     SELECT j.status FROM reliability.recompute_job j
@@ -300,7 +300,7 @@ class MtbfRepository:
                 SELECT coalesce(r.result_payload, '{}'::jsonb)
                 FROM reliability.campaign_mtbf_config cfg
                 LEFT JOIN reliability.current_mtbf_result r
-                  ON r.campaign_id = cfg.campaign_id AND r.scope_id = cfg.scope_id
+                  ON r.campaign_id = cfg.campaign_id AND r.scope_id = cfg.scope_id AND r.data_domain_policy_version='research-only-v1' AND r.data_domain_epoch=integration.campaign_domain_epoch(cfg.campaign_id)
                 WHERE cfg.campaign_id = :campaign_id AND cfg.scope_id = :scope_id
                 """
             ),
@@ -337,7 +337,7 @@ class MtbfRepository:
                     FROM reliability.interruption i
                     LEFT JOIN reliability.interruption_scope_assignment isa
                       ON isa.interruption_id = i.id AND isa.scope_id = :scope_id
-                    WHERE i.campaign_id = :campaign_id AND NOT i.voided
+                    WHERE i.campaign_id = :campaign_id AND integration.interruption_data_domain(i.id)='RESEARCH' AND NOT i.voided
                     ORDER BY i.started_at, i.id
                     """
                 ),

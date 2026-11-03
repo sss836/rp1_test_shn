@@ -1,0 +1,4 @@
+#!/bin/sh
+# Root-owned deployment target: /usr/lib/rp1-test-hmi/installer
+# No environment-selected Python/script, trust key or simulation switch.
+exec /usr/bin/python3 -I -S /opt/rp1-test-hmi/hmi/factory_hmi/installer.py "$@"

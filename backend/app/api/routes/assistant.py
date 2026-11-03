@@ -25,7 +25,20 @@ class EmptyProbe(BaseModel):
 def capabilities(actor: RequestActorDep):
     require_pilot(get_settings(), actor.public_id, actor.role, actor.principal_kind)
     if get_settings().assistant_runtime_enabled:
-        return DataEnvelope(data={'mode':'assistant_runtime','tools':['get_curve_statistics','get_test_progress','list_hmi_stations','apply_setup_bundle',*__import__('app.services.assistant_business',fromlist=['TOOLS']).TOOLS],'writes_enabled':True,'limits':{'daily_cny':100,'concurrency':2,'rounds':6,'seconds':120,'chat_days':30}})
+        model = {'provider': get_settings().assistant_model_provider, 'verified': False}
+        if model['provider'] == 'tokenhub':
+            from app.services.tokenhub import load_profile
+            try:
+                profile = load_profile(get_settings().assistant_tokenhub_profile_file)
+                model.update({k: profile[k] for k in ('region','key_type','revision','profile_sha256','text_model','vision_model')})
+                model['billing_basis'] = profile.get('billing_basis', 'tokenhub_upper_bound')
+                model['supplier_invoice_verified'] = False
+                model['verified'] = True
+            except ApiError:
+                pass
+        return DataEnvelope(data={'mode':'assistant_runtime','model':model,'tools':['get_curve_statistics','get_test_progress','list_hmi_stations','read_diagnostic_attachment','read_local_diagnostic','apply_setup_bundle','search_shared_faq','propose_local_repair',*__import__('app.services.assistant_business',fromlist=['TOOLS']).TOOLS],
+            'features':{'faq_publish':actor.role=='SYSTEM_ADMIN','stream_events':True,'steering':True,'queued_followup':True,'support_workspace':True,'local_permissions':True},
+            'writes_enabled':True,'limits':{'daily_cny':100,'concurrency':2,'rounds':6,'seconds':120,'chat_days':30,'attachment_files':3,'attachment_bytes':32*1024**2},'local_diagnostics':{'transport':'paired_hmi_outbound','access':'read_only','additional_paths':'current_window_user_permission','os_permissions':'not_elevated'}})
     return DataEnvelope(data={"mode": "isolation_probe", "tools": [TOOL_NAME], "writes_enabled": False})
 
 

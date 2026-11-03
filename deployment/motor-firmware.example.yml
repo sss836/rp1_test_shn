@@ -1,0 +1,20 @@
+# Example only. Apply with a newly built API/web image; existing site images
+# do not contain these routes. Provision a trusted public key separately.
+services:
+  api:
+    environment:
+      MOTOR_FIRMWARE_ENABLED: 'true'
+      MOTOR_FIRMWARE_ROOT: /var/lib/rp1/motor-firmware
+      MOTOR_FIRMWARE_PUBLIC_KEY_FILE: /run/rp1/motor-firmware-public.pem
+    volumes:
+      - type: volume
+        source: motor-firmware-data
+        target: /var/lib/rp1/motor-firmware
+      - type: bind
+        source: /etc/rp1/trust/motor-firmware-public.pem
+        target: /run/rp1/motor-firmware-public.pem
+        read_only: true
+        bind:
+          create_host_path: false
+volumes:
+  motor-firmware-data: null

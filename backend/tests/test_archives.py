@@ -16,7 +16,7 @@ from app.services.curve_query import CurveProcessor, CurveQueryService
 
 def archive_payload(context=None,origin="HMI",raw=b"time_s,joint_pos_rad\n0,0\n1,1\n2,0\n",facts=None):
     end = datetime.now(timezone.utc)-timedelta(minutes=10)
-    return {"execution_uuid": str(uuid4()),"test_name": "Synthetic test","actual_object": "Synthetic sample","station_label": "Synthetic station",
+    return {"data_domain":"RESEARCH", "execution_uuid": str(uuid4()),"test_name": "Synthetic test","actual_object": "Synthetic sample","station_label": "Synthetic station",
             "origin": origin,"filename": "synthetic.csv","size_bytes": len(raw),"sha256": hashlib.sha256(raw).hexdigest(),
             "facts": facts or {"started_at": (end-timedelta(seconds=2)).isoformat(),"ended_at": end.isoformat(),"active_seconds": 2,"completed_cycles": 1,
                       "machine_status": "completed","automatic_verdict": "unconfigured","data_quality": "VALID","clock_quality": "VALID","exception_count": 0,"summary": "Synthetic evidence"},

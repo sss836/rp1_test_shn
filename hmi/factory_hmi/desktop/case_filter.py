@@ -67,7 +67,7 @@ def start_decision(
     case_code: str | None,
     has_context: bool,
 ) -> str:
-    """Require a case, sample context and an independently chosen actual bench."""
+    """A case and actual bench are required; a planned sample context is optional."""
     code = str(case_code or "").strip()
     if not code:
         return "need_case"
@@ -75,11 +75,9 @@ def start_decision(
         if not saved_bench.strip():
             return "need_bench"
         return "local_other"
-    if not has_context:
-        return "need_sample"
     if not saved_bench.strip():
         return "need_bench"
-    return "ready"
+    return "ready" if has_context else "local_case"
 
 
 def profile_at_bench(

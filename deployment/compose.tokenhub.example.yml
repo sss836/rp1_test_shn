@@ -1,0 +1,17 @@
+# Review-only overlay. Does not enable or deploy the assistant automatically.
+# Mount the SAME verified JSON profile in API/Pi. No key values in Compose/.env.
+services:
+  api:
+    environment:
+      ASSISTANT_MODEL_PROVIDER: tokenhub
+      ASSISTANT_TOKENHUB_PROFILE_FILE: /run/secrets/tokenhub-profile
+    secrets: [tokenhub-profile]
+  pi:
+    environment:
+      PI_MODEL_PROVIDER: tokenhub
+      TOKENHUB_PROFILE_FILE: /run/secrets/tokenhub-profile
+      TOKENHUB_API_KEY_FILE: /run/secrets/tokenhub-key
+    secrets: [tokenhub-profile, tokenhub-key]
+secrets:
+  tokenhub-profile: {file: '${RP1_TOKENHUB_PROFILE_FILE:?reviewed server profile required}'}
+  tokenhub-key: {file: '${RP1_TOKENHUB_KEY_FILE:?server key file required}'}

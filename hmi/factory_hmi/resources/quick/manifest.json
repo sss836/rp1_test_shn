@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "trajectories": [
     {
       "limb": "left_arm",
@@ -15,15 +15,25 @@
     },
     {
       "limb": "left_short_arm",
-      "file": "left_short_arm_joint_1.npz",
-      "sha256": "85bd3dc12293f4d0ecb66971e1f3af37c315e1c412db54b37fe5c99f6ac566eb",
-      "source_name": "left_short_arm_joint_1.npz"
+      "file": "left_short_arm_joint_inspect.npz",
+      "sha256": "24f44bf9f112788c700c4f189379403476d76e4f43678ee0c6af934426f5227c",
+      "source_name": "left_short_arm_joint_inspect.npz",
+      "source_path": "user-supplied/motion/arm/left_short_arm_joint_inspect.npz",
+      "source_sha256": "24f44bf9f112788c700c4f189379403476d76e4f43678ee0c6af934426f5227c",
+      "selection_basis": "user_explicit_selection_2026-10-28",
+      "resource_revision": 2,
+      "supersedes_sha256": "85bd3dc12293f4d0ecb66971e1f3af37c315e1c412db54b37fe5c99f6ac566eb"
     },
     {
       "limb": "right_short_arm",
       "file": "right_short_arm_joint_inspect.npz",
-      "sha256": "6b5b447399d48233c5c27571c67cbc7c0ef6a984a954f34e27b1cd1434945a84",
-      "source_name": "right_short_arm_joint_inspect.npz"
+      "sha256": "d9bdeda272e073146b3b8597fadc9b90a05731c40e8470ad3226587d48a7e7be",
+      "source_name": "right_short_arm_joint_inspect.npz",
+      "source_path": "user-supplied/motion/arm/right_short_arm_joint_inspect.npz",
+      "source_sha256": "d9bdeda272e073146b3b8597fadc9b90a05731c40e8470ad3226587d48a7e7be",
+      "selection_basis": "user_explicit_selection_2026-10-28",
+      "resource_revision": 2,
+      "supersedes_sha256": "6b5b447399d48233c5c27571c67cbc7c0ef6a984a954f34e27b1cd1434945a84"
     },
     {
       "limb": "left_short_leg",

@@ -19,7 +19,7 @@ export const setupApi = {
   campaigns: (signal?: AbortSignal) => apiRequest<Campaign[]>("/api/v1/setup/campaigns", { signal }),
   contexts: (id: string, signal?: AbortSignal) => apiRequest<PlannedContext[]>(`/api/v1/setup/campaigns/${encodeURIComponent(id)}/contexts`, { signal }),
   versions: (id: string, signal?: AbortSignal) => apiRequest<CaseVersions>(`/api/v1/setup/cases/${encodeURIComponent(id)}/versions`, { signal }),
-  create: (path: string, payload: Record<string, unknown>, key = requestId(), method = "POST") => apiRequest<{ id: string }>(`/api/v1/setup/${path}`, {
+  create: (path: string, payload: Record<string, unknown>, key = requestId(), method = "POST") => apiRequest<{ id: string; code?: string; creation_scenario?: "PRODUCTION" | "RND_TEST" }>(`/api/v1/setup/${path}`, {
     method, headers: { "Idempotency-Key": key, "X-Change-Reason": String(payload.reason ?? "") }, body: JSON.stringify(payload)
   })
 };

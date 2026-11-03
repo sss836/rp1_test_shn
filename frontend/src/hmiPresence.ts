@@ -1,6 +1,7 @@
 import { apiRequest } from "./client";
 
 export type HmiRun = {
+  data_domain?: "RESEARCH"|"FACTORY"|"UNCLASSIFIED"|null;
   session_key: string;
   state: "idle" | "armed" | "running" | "paused" | "stopping" | "fault" | "completed" | "unknown";
   test_id: string;

@@ -133,7 +133,8 @@ export type AssetSummary = {
   target_part_name: string | null;
   product_family: string;
   batch_code: string | null;
-  serial_number: string;
+  serial_number: string | null;
+  creation_scenario?: "PRODUCTION" | "RND_TEST";
   lifecycle_status: string;
   current_test_case_code: string | null;
   current_execution_id: string | null;

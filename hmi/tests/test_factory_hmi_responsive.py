@@ -40,6 +40,9 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
         patcher.start()
         with mock.patch.object(FactoryMainWindow, "_run_rest"):
             self.window = FactoryMainWindow("http://127.0.0.1:65534")
+        # These cases exercise legacy/local context selection. Model-pose
+        # confirmation is covered separately by test_mujoco_completion_desktop.
+        self.window.mujoco_completion.setChecked(False)
         self.window._platform_stations = [{"code": "MP-02", "id": "11111111-1111-4111-8111-111111111111"}]
 
     def _online_upper_sample(self) -> None:
@@ -360,6 +363,9 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
             with self.subTest(diagnoses=diagnoses):
                 self.window._render_fault({"fault": {"message": "driver failed", "diagnoses": diagnoses}})
                 self.assertIn("driver failed", self.window.global_fault.text())
+                self.assertNotIn("疑似部件：未知", self.window.global_fault.text())
+                self.assertNotIn("证据：无", self.window.global_fault.text())
+                self.assertNotIn("置信度：未知", self.window.global_fault.text())
                 self.assertEqual(self.window.global_fault.objectName(), "faultBarError")
 
     def test_fault_banner_clears_after_fault_is_removed(self) -> None:

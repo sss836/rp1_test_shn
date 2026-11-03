@@ -1,3 +1,4 @@
+import type { ArchiveDataDomain } from "./archiveApi";
 import type { AssetKind, TargetPartCode } from "./types";
 
 export type View =
@@ -12,6 +13,7 @@ export type View =
   | "benches"
   | "submissions"
   | "archives"
+  | "factory"
   | "import"
   | "archive"
   | "curves"
@@ -27,6 +29,8 @@ export type LocationState = {
   kind: AssetKind;
   id: string | null;
   part: TargetPartCode | null;
+  domain?: ArchiveDataDomain;
+  section?: "test" | "production" | "showcase";
 };
 
 const views = new Set<View>([
@@ -41,6 +45,7 @@ const views = new Set<View>([
   "benches",
   "submissions",
   "archives",
+  "factory",
   "import",
   "archive",
   "curves",
@@ -58,12 +63,15 @@ const targetParts = new Set<TargetPartCode>([
 export function readLocation(search = window.location.search): LocationState {
   const params = new URLSearchParams(search);
   const candidate = params.get("view") as View | null;
+  const requestedDomain = params.get("domain");
   const requestedPart = params.get("part") as TargetPartCode | null;
   return {
     view: candidate && views.has(candidate) ? candidate : "home",
     kind: params.get("kind") === "module" ? "MODULE" : "WHOLE_MACHINE",
     id: params.get("id"),
-    part: requestedPart && targetParts.has(requestedPart) ? requestedPart : null
+    part: requestedPart && targetParts.has(requestedPart) ? requestedPart : null,
+    ...(["test","production","showcase"].includes(params.get("section")??"") ? {section: params.get("section") as "test"|"production"|"showcase"} : {}),
+    ...(["RESEARCH", "FACTORY", "UNCLASSIFIED"].includes(requestedDomain ?? "") ? { domain: requestedDomain as ArchiveDataDomain } : {})
   };
 }
 
@@ -72,7 +80,9 @@ export function locationHref(state: LocationState) {
     view: state.view,
     kind: state.kind === "MODULE" ? "module" : "whole"
   });
+  if (state.section) params.set("section",state.section);
   if (state.id) params.set("id", state.id);
+  if (state.domain) params.set("domain", state.domain);
   if (state.part) params.set("part", state.part);
   return `?${params.toString()}`;
 }
@@ -102,3 +112,5 @@ export function formatDate(value: string | null | undefined) {
 export function isShowcaseValue(value: string | null | undefined) {
   return Boolean(value && /^(SHOWCASE|DEMO)-/.test(value));
 }
+
+export function productSection(state: LocationState){return state.section ?? (state.view==="factory"||state.domain==="FACTORY"?"production":"test");}

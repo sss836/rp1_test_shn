@@ -2,7 +2,7 @@ import { useRef, useState, type CSSProperties, type FormEvent } from "react";
 import { useAssistantPageContext } from "../assistantContext";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { ArrowLeft, ChevronDown, History, Info, Plus, Search, X } from "lucide-react";
-import { archivesApi, archiveTitle, archiveStation, type Archive, type ArchiveCatalogItem, type ArchiveCurves } from "../archiveApi";
+import { archivesApi, archiveDomain, dataDomainLabels, archiveTitle, archiveStation, type Archive, type ArchiveCatalogItem, type ArchiveCurves } from "../archiveApi";
 import { EmptyState, ErrorState, LoadingState } from "../components/Workbench";
 import { TimeSeriesChart, type CurveViewport, type PlotSeries, type ReferenceLine } from "../components/TimeSeriesChart";
 import { ArchiveStatus } from "./ArchivesPage";
@@ -104,8 +104,8 @@ function Explorer({ item, navigate, initialViewport, initialAlignment, onViewpor
   const stages = choices(item.manifest?.stages ?? []);
   const cycles = choices(item.manifest?.cycles ?? []);
   const compareQuery = useQuery({
-    queryKey: ["archives", "compare", compareSearch],
-    queryFn: ({ signal }) => archivesApi.list({ q: compareSearch, processing_state: "READY" }, signal),
+    queryKey: ["archives", "compare", archiveDomain(item), compareSearch],
+    queryFn: ({ signal }) => archivesApi.list({ q: compareSearch, data_domain: archiveDomain(item), processing_state: "READY" }, signal),
     enabled: Boolean(compareSearch)
   });
   const allRecords: ComparedArchive[] = [item, ...compared];
@@ -213,6 +213,7 @@ function Explorer({ item, navigate, initialViewport, initialAlignment, onViewpor
     setCompareSubjects({}); setReferences([]); setShowTargets(false); setSelectionNote("参数已切换；保留当前时间区间，临时参考线已清空。");
   }
   function addRecord(record: Archive) {
+    if (archiveDomain(record) !== archiveDomain(item)) return;
     setCompared((current) => current.some((entry) => entry.id === record.id && !entry.comparison_id) || current.length >= 7 ? current : [...current, record]);
     setExcluded((current) => current.filter((key) => key !== record.id));
     setViewport(null);
@@ -262,9 +263,9 @@ function Explorer({ item, navigate, initialViewport, initialAlignment, onViewpor
         <form className="curve-execution-search" onSubmit={(event) => { event.preventDefault(); setCompareSearch(compareDraft.trim()); }}><input ref={searchInput} aria-label="查找测试记录" value={compareDraft} onChange={(event) => setCompareDraft(event.target.value)} placeholder="搜索执行编号" /><button className="curve-button" type="submit" disabled={!compareDraft.trim()} aria-label="查找对比记录"><Search aria-hidden="true" /></button></form>
         {compareQuery.isLoading && <LoadingState label="正在查找对比记录" />}
         {compareQuery.error && <ErrorState error={compareQuery.error} retry={() => void compareQuery.refetch()} />}
-        {compareQuery.data && <div className="curve-results" aria-label="对比搜索结果">{compareQuery.data.items.filter((entry) => entry.id !== item.id && !compared.some((added) => added.id === entry.id && !added.comparison_id)).map((entry) => {
+        {compareQuery.data && <div className="curve-results" aria-label="对比搜索结果">{compareQuery.data.items.filter((entry) => archiveDomain(entry) === archiveDomain(item) && entry.id !== item.id && !compared.some((added) => added.id === entry.id && !added.comparison_id)).map((entry) => {
           const compatible = !!chosen && (entry.manifest?.catalog ?? []).some((column) => column.metric === chosen.metric && column.unit === chosen.unit);
-          return <button key={entry.id} type="button" disabled={!compatible || compared.length >= 7 || entry.processing_state !== "READY"} onClick={() => addRecord(entry)}><span><strong>{readableName(entry)}</strong><small>{archiveTitle(entry)} · {compatible ? "添加叠加" : "缺少同参数、同单位的曲线"}</small></span><Plus aria-hidden="true" /></button>;
+          return <button key={entry.id} type="button" disabled={!compatible || compared.length >= 7 || entry.processing_state !== "READY"} onClick={() => addRecord(entry)}><span><strong>{readableName(entry)}</strong><small>{dataDomainLabels[archiveDomain(entry)]} · {archiveTitle(entry)} · {compatible ? "添加叠加" : "缺少同参数、同单位的曲线"}</small></span><Plus aria-hidden="true" /></button>;
         })}{compareQuery.data.items.length === 0 && <p className="curve-reference-help">没有找到记录。</p>}<button type="button" className="curve-record-link" onClick={() => { setCompareSearch(""); setCompareDraft(""); }}>收起搜索结果</button></div>}
         <ul className="curve-execution-list">{allRecords.map((record, index) => {
           const key = recordKey(record);
@@ -273,7 +274,7 @@ function Explorer({ item, navigate, initialViewport, initialAlignment, onViewpor
           const recordUnit = record.reference_unit ?? chosen?.unit;
           return <li key={key} className={`curve-execution-item${selected ? " selected" : ""}`}>
             <div className="curve-execution-row"><label><input aria-label={`参与对比 ${recordLabel(record)}`} type="checkbox" checked={selected} disabled={!compatible || !!record.comparison_id && !showHistory} onChange={() => toggleRecord(record)} /><span className="curve-series-dot" style={{ "--series-color": SERIES_COLORS[index % SERIES_COLORS.length] } as CSSProperties} /><strong title={readableName(record)}>{readableName(record)}</strong></label>{index === 0 ? <span className="curve-execution-badge">基准</span> : <><span className="curve-execution-badge">{record.comparison_id ? "固定" : record.origin === "HISTORY" ? "历史" : "对比"}</span><button className="curve-row-action" type="button" aria-label={`移除对比 ${recordLabel(record)}`} onClick={() => { setCompared((current) => current.filter((entry) => recordKey(entry) !== key)); setExcluded((current) => current.filter((entry) => entry !== key)); setViewport(null); }}><X aria-hidden="true" /></button></>}</div>
-            <div className="curve-execution-meta"><p title={archiveTitle(record)}>{shortCode(record)}</p><span>{recordSubjects(record).join(" / ").toUpperCase() || "未选对象"} · {recordUnit || "无单位"}</span>{record.comparison_id && <p>阶段 {record.reference_stage || "全部"} · 循环 {record.reference_cycle || "全部"}</p>}{!compatible && <p>当前选择不兼容</p>}
+            <div className="curve-execution-meta"><span>{dataDomainLabels[archiveDomain(record)]} · SN：{record.serial_number ?? "未记录"} · 台架：{record.bench_id ?? "未记录"}</span><p title={archiveTitle(record)}>{shortCode(record)}</p><span>{recordSubjects(record).join(" / ").toUpperCase() || "未选对象"} · {recordUnit || "无单位"}</span>{record.comparison_id && <p>阶段 {record.reference_stage || "全部"} · 循环 {record.reference_cycle || "全部"}</p>}{!compatible && <p>当前选择不兼容</p>}
               {index > 0 && !record.comparison_id && <details><summary>对比关节</summary><div className="curve-execution-subjects">{[...new Set((record.manifest?.catalog ?? []).filter((column) => chosen && column.metric === chosen.metric && column.unit === chosen.unit).map((column) => column.subject))].map((subject) => <label key={subject}><input type="checkbox" checked={recordSubjects(record).includes(subject)} disabled={!recordSubjects(record).includes(subject) && recordSubjects(record).length >= (showTargets ? 16 : 32)} onChange={() => setCompareSubjects((current) => ({ ...current, [key]: recordSubjects(record).includes(subject) ? recordSubjects(record).filter((value) => value !== subject) : [...recordSubjects(record), subject] }))} />{subject || "全局"}</label>)}</div><button className="curve-record-link" type="button" onClick={() => navigate("curves", record.id)}>打开此执行曲线</button></details>}
             </div>
           </li>;
@@ -318,5 +319,5 @@ export default function CurveAnalysisPage({ id, navigate }: { id: string; naviga
   if (query.isLoading) return <LoadingState label="正在加载曲线目录" />;
   if (query.error || !query.data) return <ErrorState error={query.error} retry={() => void query.refetch()} />;
   const item = query.data;
-  return <div className="curve-analysis-page"><nav className="curve-breadcrumb" aria-label="曲线页导航"><button type="button" onClick={() => navigate("archive", id)}><ArrowLeft aria-hidden="true" />数据归档</button><span>/</span><span>曲线分析</span></nav>{item.processing_state !== "READY" ? <><header className="curve-page-heading"><h1>{archiveTitle(item)}</h1><button className="curve-button" type="button" onClick={() => navigate("archive", id)}>返回归档详情</button></header><div className="curve-state-card"><EmptyState title="归档曲线尚未就绪" description={item.processing_error || "文件上传与解析完成后可在此查看详细曲线。"} /></div></> : <AnalysisModes key={`${userId}:${id}`} item={item} navigate={navigate} />}</div>;
+  return <div className="curve-analysis-page"><nav className="curve-breadcrumb" aria-label="曲线页导航"><button type="button" onClick={() => navigate("archive", id)}><ArrowLeft aria-hidden="true" />数据归档</button><span>/</span><span>{dataDomainLabels[archiveDomain(item)]}曲线分析</span></nav><p className="archive-scope-note">业务分区：{dataDomainLabels[archiveDomain(item)]} · SN：{item.serial_number ?? "未记录"} · 台架：{item.bench_id ?? "未记录"} · {item.submission_status === "APPROVED" ? "已批准记录" : "未批准记录，仅供核对，不计入正式统计"}</p>{item.processing_state !== "READY" ? <><header className="curve-page-heading"><h1>{archiveTitle(item)}</h1><button className="curve-button" type="button" onClick={() => navigate("archive", id)}>返回归档详情</button></header><div className="curve-state-card"><EmptyState title="归档曲线尚未就绪" description={item.processing_error || "文件上传与解析完成后可在此查看详细曲线。"} /></div></> : <AnalysisModes key={`${userId}:${id}`} item={item} navigate={navigate} />}</div>;
 }

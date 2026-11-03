@@ -5,8 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import HmiStationsPage, { HmiStationCard } from "./HmiStationsPage";
 import type { HmiStation } from "../hmiPresence";
 
-const query = vi.hoisted(() => ({ dataUpdatedAt: 0, data: { pages: [] as unknown[] }, isPending: false, isError: false, refetch: vi.fn() }));
-vi.mock("@tanstack/react-query", () => ({useInfiniteQuery: () => query}));
+const query = vi.hoisted(() => ({ dataUpdatedAt: 0, data: {items: [] as HmiStation[],as_of_at:"",next_cursor:null}, isPending: false, isError: false, refetch: vi.fn() }));
+vi.mock("@tanstack/react-query", () => ({useQuery: () => query}));
 vi.mock("../auth", () => ({useAuth: () => ({session: {user: {role: "SYSTEM_ADMIN"}}})}));
 
 const station: HmiStation = {
@@ -55,7 +55,7 @@ describe("workstation status", () => {
   it("stops claiming a live test when a browser refresh request hangs", () => {
     vi.useFakeTimers();
     query.dataUpdatedAt = Date.now();
-    query.data.pages = [{items: [station], as_of_at: station.last_seen_at}];
+    query.data = {items:[station],as_of_at:station.last_seen_at,next_cursor:null};
     render(<HmiStationsPage />);
     const card = within(screen.getByRole("article", {name: "QA 工作站"}));
     expect(card.getByText("测试运行中")).toBeTruthy();
@@ -67,7 +67,7 @@ describe("workstation status", () => {
 
   it("keeps an active parallel test visible in running filter when another session faults", () => {
     query.dataUpdatedAt = Date.now();
-    query.data.pages = [{items: [{...station, state: "fault", runs: [...station.runs, {...station.runs[0], session_key: "right", state: "fault", test_id: "FAULTED-TEST"}]}], as_of_at: station.last_seen_at}];
+    query.data = {items:[{...station,state:"fault",runs:[...station.runs,{...station.runs[0],session_key:"right",state:"fault",test_id:"FAULTED-TEST"}]}],as_of_at:station.last_seen_at,next_cursor:null};
     render(<HmiStationsPage />);
     fireEvent.change(screen.getByLabelText("显示工位"), {target: {value: "running"}});
     expect(screen.getByText("QA-TEST")).toBeTruthy();

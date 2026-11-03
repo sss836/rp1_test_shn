@@ -9,8 +9,10 @@ import json
 import re
 import logging
 import time
+import threading
+from types import SimpleNamespace
 from contextlib import contextmanager
-from datetime import datetime,timezone
+from datetime import datetime,timezone,timedelta
 from uuid import UUID,uuid4
 
 import httpx
@@ -33,6 +35,27 @@ TERMINAL={'COMPLETED','FAILED','TIMED_OUT','INTERRUPTED','CANCELLED'}
 logger=logging.getLogger('rp1.assistant.tasks')
 
 
+def attachment_model_payload(context, content, metadata=None):
+    """At most three visual files; provenance text belongs to data context.
+
+    An image plus its source receipt is two model blocks, not two files.
+    Keeping text in a separate data field preserves the original Pi contract
+    even for three images, and keeps the persisted/authorization context intact.
+    """
+    images=[part for part in content if part.get('type')=='image']
+    previews=[part['text'] for part in content if part.get('type')=='text']
+    if len(images)>3 or sum(map(len,previews))>24000 or len(images)+len(previews)!=len(content):
+        raise ApiError(422,'invalid_attachment_preview','附件预览超出本任务范围，请分批诊断。')
+    model_context=json.loads(canonical(context))
+    if previews:model_context['diagnostic_attachment_previews']=previews
+    if metadata:
+        from app.services.assistant_privacy import public_evidence
+        model_context['diagnostic_attachment_inventory']=public_evidence([
+            {key:item[key] for key in ('id','name','kind','sha256','size') if key in item}
+            for item in metadata])
+    return model_context,images
+
+
 def require_runtime(actor):
     settings=get_settings();require_pilot(settings,actor.public_id,actor.role,actor.principal_kind)
     if not settings.assistant_runtime_enabled: raise ApiError(503,"assistant_runtime_disabled","助手任务入口尚未启用。")
@@ -43,12 +66,15 @@ def actor_session(actor):
     with SessionLocal() as session:
         setup_flow.set_context(session,actor)
         session.execute(text("SELECT set_config('app.source_ip',coalesce(:ip,''),true)"),{"ip":actor.source_ip})
+        session.execute(text("SELECT set_config('app.session_public_id',:session_id,true)"),{'session_id':str(actor.session_public_id) if actor.session_public_id else ''})
         yield session
         session.commit()
 
 
 def own_job(session,identifier):
-    row=session.execute(text("SELECT * FROM integration.assistant_job WHERE id=:id AND user_id=iam.current_user_id()"),{"id":identifier}).mappings().first()
+    row=session.execute(text("""SELECT j.* FROM integration.assistant_job j
+      JOIN integration.assistant_thread t ON t.id=j.thread_id
+      WHERE j.id=:id AND j.user_id=iam.current_user_id() AND t.deleted_at IS NULL"""),{"id":identifier}).mappings().first()
     if row is None: raise ApiError(404,"assistant_job_not_found","任务不存在或不属于当前账号。")
     return dict(row)
 
@@ -77,9 +103,17 @@ def setup_cards(outcome):
     return cards
 
 
+def runtime_snapshot(item):
+    state={k:item.get(k,{}) for k in ('diagnosis_state','read_cache')}
+    state['cards']=item.get('cards',[])
+    state['write_count']=item.get('write_count',0)
+    state['attachment_read_state']={k:v for k,v in item.get('attachment_read_state',{}).items() if k!='_lock'}
+    return json.loads(canonical(state))
+
+
 class ChatRuntime:
     def __init__(self):
-        self.queue=None;self.workers=[];self.pending={};self.tokens={};self.running={};self.last_cleanup=0;self.maintenance_task=None
+        self.queue=None;self.workers=[];self.pending={};self.tokens={};self.running={};self.last_cleanup=0;self.maintenance_task=None;self.resume_after_pause={}
 
     async def start(self):
         if self.workers:return
@@ -102,7 +136,39 @@ class ChatRuntime:
         tasks=[*self.workers,*self.running.values(),*([self.maintenance_task] if self.maintenance_task else [])]
         for task in tasks:task.cancel()
         await asyncio.gather(*tasks,return_exceptions=True)
-        self.workers=[];self.pending.clear();self.tokens.clear();self.running.clear();self.queue=None
+        self.workers=[];self.pending.clear();self.tokens.clear();self.running.clear();self.resume_after_pause.clear();self.queue=None
+
+    async def resume(self,identifier,actor,request,request_key):
+        from app.services.assistant_permissions import _job
+        require_runtime(actor)
+        if self.queue is None:raise ApiError(503,'assistant_worker_unavailable','助手执行器未就绪。')
+        if self.queue.full():raise ApiError(429,'assistant_queue_full','等待队列已满，请稍后恢复。')
+        cookie=request.cookies.get(get_settings().auth_cookie_name,'')
+        with SessionLocal() as auth_session:
+            principal=AuthService(get_settings(),SecurityRepository(auth_session)).resolve(cookie)
+            if (principal is None or principal.id!=actor.public_id or principal.session_id!=actor.session_public_id
+                    or principal.role!=actor.role or principal.must_change_password):
+                raise ApiError(409,'original_execution_session_expired','原执行登录或角色已变化，请重新关联并另提诊断。')
+        with actor_session(actor) as session:
+            budget_job=own_job(session,identifier)
+            if budget_job.get('active_elapsed_ms',0)>=get_settings().assistant_task_seconds*1000:
+                raise ApiError(409,'assistant_budget_exhausted','本任务累计有效执行已达上限，不能继续读取或调用模型；已有真实证据保留。')
+            job,_=_job(session,actor,identifier,executor=True)
+            session.execute(text('SELECT pg_advisory_xact_lock(hashtextextended(:key,0))'),{'key':'permission-resume:'+str(identifier)})
+            job=own_job(session,identifier)
+            if job['state'] in {'QUEUED','RUNNING'}:return {'id':str(identifier),'state':job['state'],'replayed':True}
+            if job['state']!='WAITING_PERMISSION':raise ApiError(409,'assistant_not_waiting','任务当前不可恢复。')
+            pending=session.execute(text("SELECT 1 FROM integration.assistant_read_permission WHERE job_id=:id AND state IN ('pending','approved') LIMIT 1"),{'id':identifier}).first()
+            if pending:raise ApiError(409,'permission_evidence_pending','尚有申请待决定或等待上位机真实读取回执。')
+            if job['active_elapsed_ms']>=get_settings().assistant_task_seconds*1000:
+                raise ApiError(409,'assistant_budget_exhausted','本任务有效执行预算已用尽；不会因恢复重置。')
+            if str(identifier) in self.running:
+                self.resume_after_pause[str(identifier)]=(actor,cookie,request_key)
+                return {'id':str(identifier),'state':'WAITING_PERMISSION','deferred':True,'accepted':True}
+            session.execute(text("UPDATE integration.assistant_job SET state='QUEUED',resume_count=resume_count+1 WHERE id=:id"),{'id':identifier})
+        self.pending[str(identifier)]=(actor,cookie)
+        self.queue.put_nowait(str(identifier))
+        return {'id':str(identifier),'state':'QUEUED','replayed':False,'request_key':str(request_key)}
 
     async def submit(self,payload,request,actor):
         require_runtime(actor)
@@ -112,26 +178,37 @@ class ChatRuntime:
             raise ApiError(422,"assistant_secret_rejected","请勿在助手对话中发送密钥或登录凭据。")
         if self.queue is None: raise ApiError(503,"assistant_worker_unavailable","助手任务执行器未就绪。")
         if self.queue.full(): raise ApiError(429,"assistant_queue_full","站点等待队列已满，请稍后提交。")
-        digest=hashlib.sha256(canonical(payload.model_dump(mode='json',exclude={'request_key'})).encode()).hexdigest()
+        from app.services.assistant_workspace import request_digest_payload,context_payload
+        digest=hashlib.sha256(canonical(request_digest_payload(payload)).encode()).hexdigest()
         with actor_session(actor) as session:
             session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key,0))"),{'key':'chat:'+str(payload.request_key)})
             previous=session.execute(text("SELECT id,request_hash,thread_id,state FROM integration.assistant_job WHERE id=:id"),{'id':payload.request_key}).mappings().first()
             if previous:
                 if previous['request_hash']!=digest:raise ApiError(409,"idempotency_conflict","同一请求标识内容已改变，请换新请求标识。")
                 return {**dict(previous),'replayed':True}
+            from app.services.assistant_workspace import validate_references,thread_title
+            validate_references(session,payload.context.references)
             thread=payload.thread_id
+            if payload.after_job_id:
+                parent=own_job(session,payload.after_job_id)
+                if str(payload.request_key)==str(payload.after_job_id) or (thread and str(parent['thread_id'])!=str(thread)):
+                    raise ApiError(409,'assistant_queue_parent','下一条任务必须关联当前会话的前序任务。')
+                thread=parent['thread_id']
             if thread:
-                if session.execute(text("SELECT id FROM integration.assistant_thread WHERE id=:id FOR UPDATE"),{'id':thread}).first() is None:raise ApiError(404,"assistant_thread_not_found","会话不存在或不属于当前账号。")
+                if session.execute(text("SELECT id FROM integration.assistant_thread WHERE id=:id AND deleted_at IS NULL FOR UPDATE"),{'id':thread}).first() is None:raise ApiError(404,"assistant_thread_not_found","会话不存在或不属于当前账号。")
             else:
-                thread=uuid4();session.execute(text("INSERT INTO integration.assistant_thread(id,user_id) VALUES(:id,iam.current_user_id())"),{'id':thread})
-            session.execute(text("INSERT INTO integration.assistant_job(id,thread_id,user_id,request_hash,context) VALUES(:id,:thread,iam.current_user_id(),:hash,CAST(:context AS jsonb))"),{'id':payload.request_key,'thread':thread,'hash':digest,'context':canonical(payload.context.model_dump(mode='json',exclude_none=True))})
-            message_id=session.execute(text("INSERT INTO integration.assistant_message(thread_id,user_id,job_id,role,body,context) VALUES(:thread,iam.current_user_id(),:job,'user',:body,CAST(:context AS jsonb)) RETURNING id"),{'thread':thread,'job':payload.request_key,'body':payload.message,'context':canonical(payload.context.model_dump(mode='json',exclude_none=True))}).scalar_one()
+                thread=uuid4();session.execute(text("INSERT INTO integration.assistant_thread(id,user_id,title) VALUES(:id,iam.current_user_id(),:title)"),{'id':thread,'title':thread_title(payload.message)})
+            session.execute(text("""INSERT INTO integration.assistant_job(id,thread_id,user_id,request_hash,context,origin_session_id,after_job_id)
+                VALUES(:id,:thread,iam.current_user_id(),:hash,CAST(:context AS jsonb),:origin_session,:after_job)"""),
+                {'id':payload.request_key,'thread':thread,'hash':digest,'context':canonical(context_payload(payload.context)),
+                 'origin_session':actor.session_public_id,'after_job':payload.after_job_id})
+            message_id=session.execute(text("INSERT INTO integration.assistant_message(thread_id,user_id,job_id,role,body,context) VALUES(:thread,iam.current_user_id(),:job,'user',:body,CAST(:context AS jsonb)) RETURNING id"),{'thread':thread,'job':payload.request_key,'body':payload.message,'context':canonical(context_payload(payload.context))}).scalar_one()
             # Freeze what actually exists at submission, under the thread lock.
             # Neither a later message nor a later tool result may enter this job.
             messages=[dict(x) for x in session.execute(text("SELECT id,role,body FROM integration.assistant_message WHERE thread_id=:thread AND id<=:boundary AND created_at>=now()-interval '30 days' ORDER BY id DESC LIMIT 20"),{'thread':thread,'boundary':message_id}).mappings()][::-1]
             authority=setup_flow.command_messages([m['body'] for m in messages if m['role']=='user'][-12:])
             choices=setup_flow.matching_choices(session,authority)
-            snapshot={'messages':messages,'authorization_messages':authority,'choices':choices,'context':payload.context.model_dump(mode='json',exclude_none=True)}
+            snapshot={'messages':messages,'authorization_messages':authority,'choices':choices,'context':context_payload(payload.context)}
             snapshot["attachments"]=attachments
             encoded=canonical(snapshot)
             session.execute(text("UPDATE integration.assistant_job SET input_message_id=:message,input_snapshot=CAST(:snapshot AS jsonb),input_hash=:hash WHERE id=:id"),{'id':payload.request_key,'message':message_id,'snapshot':encoded,'hash':hashlib.sha256(encoded.encode()).hexdigest()})
@@ -145,75 +222,187 @@ class ChatRuntime:
             identifier=await self.queue.get()
             pair=self.pending.pop(identifier,None)
             if pair:
+                try:
+                    ready=self.dependency_ready(identifier,pair[0])
+                except Exception:
+                    # run() records the final authorization/not-found failure.
+                    ready=True
+                if not ready:
+                    self.pending[identifier]=pair
+                    self.queue.put_nowait(identifier)
+                    self.queue.task_done()
+                    await asyncio.sleep(.1)
+                    continue
                 task=asyncio.create_task(self.run(identifier,*pair));self.running[identifier]=task
                 try:await task
                 except asyncio.CancelledError:
                     if asyncio.current_task().cancelling():raise
                 except Exception as exc:logger.error('assistant_task_metadata_failed job=%s kind=%s sqlstate=%s',identifier,type(exc).__name__,getattr(getattr(exc,'orig',None),'sqlstate',None))
-                finally:self.running.pop(identifier,None)
+                finally:
+                    self.running.pop(identifier,None)
+                    deferred=self.resume_after_pause.pop(identifier,None)
+                    if deferred:
+                        who,cookie,key=deferred
+                        try:await self.resume(identifier,who,SimpleNamespace(cookies={get_settings().auth_cookie_name:cookie}),key)
+                        except ApiError:pass
             self.queue.task_done()
             if asyncio.current_task().cancelling():return
 
+    def dependency_ready(self,identifier,actor):
+        with actor_session(actor) as session:
+            job=own_job(session,identifier)
+            if job['state']!='QUEUED' or not job.get('after_job_id'):return True
+            return own_job(session,job['after_job_id'])['state'] in TERMINAL
+
     async def run(self,identifier,actor,cookie):
-        settings=get_settings();token=None;intent=None;state='FAILED';reply='助手未完成，请核对真实回执。';cards=[];outcome=None;started=time.monotonic();termination='tool_failed';completion='failed'
+        settings=get_settings();token=None;intent=None;state='FAILED';reply='助手未完成，请核对真实回执。';cards=[];outcome=None;started=time.monotonic();termination='tool_failed';completion='failed';token_item=None;resume_snapshot={}
         try:
+            # A queued follow-up waits without a DB transaction or model usage.
+            # Its own timeout starts when it actually runs; prior writes are not replayed.
+            while True:
+                with actor_session(actor) as session:
+                    queued=own_job(session,identifier)
+                    if queued['state']!='QUEUED':
+                        state=queued['state'];reply='任务已取消，未发起模型。';return
+                    parent=own_job(session,queued['after_job_id']) if queued.get('after_job_id') else None
+                if parent is None or parent['state'] in TERMINAL:break
+                await asyncio.sleep(.2)
+            started=time.monotonic()
             with actor_session(actor) as session:
                 job=own_job(session,identifier)
                 if job['state']!='QUEUED':
                     state=job['state'];reply='任务已取消，未发起模型。';return
-                session.execute(text("UPDATE integration.assistant_job SET state='RUNNING',started_at=now(),deadline=now()+:seconds*interval '1 second' WHERE id=:id"),{'id':identifier,'seconds':settings.assistant_task_seconds})
+                remaining_seconds=max(.001,settings.assistant_task_seconds-job.get('active_elapsed_ms',0)/1000)
+                session.execute(text("UPDATE integration.assistant_job SET state='RUNNING',started_at=coalesce(started_at,now()),active_started_at=clock_timestamp(),deadline=now()+:seconds*interval '1 second',waiting_elapsed_ms=waiting_elapsed_ms+coalesce(greatest(0,extract(epoch FROM(clock_timestamp()-permission_wait_started_at))*1000)::bigint,0),permission_wait_started_at=NULL WHERE id=:id"),{'id':identifier,'seconds':remaining_seconds})
                 snapshot=job.get('input_snapshot')
                 if not snapshot or hashlib.sha256(canonical(snapshot).encode()).hexdigest()!=job.get('input_hash'):
                     state='INTERRUPTED';reply='任务缺少可信输入快照，请重新提交；已有业务回执保留。';return
                 messages=[{'role':m['role'],'body':m['body']} for m in snapshot['messages']]
                 user_messages=snapshot.get('authorization_messages') or [m['body'] for m in messages if m['role']=='user'][-12:]
                 choices=snapshot['choices']
-            token,grant=grants.issue(cookie,actor,scope='setup',ttl=settings.assistant_task_seconds)
+                resume_snapshot=job.get('resume_state') or {}
+                from app.services.assistant_permissions import resume_evidence
+                local_cards=resume_evidence(session,job)
+                local_ids={c['data']['request_id'] for c in local_cards}
+                cards[:]=[c for c in resume_snapshot.get('cards',[]) if not(c.get('type')=='local_diagnostic' and str((c.get('data') or {}).get('request_id')) in local_ids)]+local_cards
+                actual_receipt=receipt(session,identifier)
+            token,grant=grants.issue(cookie,actor,scope='setup',ttl=max(1,int(remaining_seconds)))
             intent=setup_flow.Intent(actor.public_id,actor.session_public_id,user_messages,UUID(identifier),choices,job_id=UUID(identifier),input_hash=job['input_hash'])
             with setup_flow.lock:setup_flow.intents[grants.key(token)]=intent
-            self.tokens[grants.key(token)]={'id':identifier,'actor':actor,'context':job['context'],'cards':cards,'write_count':0,'reads':0}
-            async with asyncio.timeout(max(.001,settings.assistant_task_seconds-(time.monotonic()-started))):
-                async with httpx.AsyncClient(timeout=settings.assistant_task_seconds,trust_env=False,follow_redirects=False) as client:
+            token_item={'id':identifier,'actor':actor,'context':job['context'],'cards':cards,'write_count':1 if actual_receipt else resume_snapshot.get('write_count',0),'reads':job.get('read_count',0),
+                        'durable_permissions':True,'resumed':job.get('resume_count',0)>0,
+                        'diagnostic_question':next((m['body'] for m in reversed(snapshot['messages']) if m['role']=='user'),''),
+                        'diagnosis_state':resume_snapshot.get('diagnosis_state',{}),'read_cache':resume_snapshot.get('read_cache',{}),
+                        'deadline':datetime.now(timezone.utc)+timedelta(seconds=max(.001,remaining_seconds-(time.monotonic()-started))),
+                        'attachment_metadata':json.loads(canonical(snapshot.get('attachments',[]))),
+                        'attachment_read_state':resume_snapshot.get('attachment_read_state',{}),'attachment_lock':threading.RLock()}
+            self.tokens[grants.key(token)]=token_item
+            async with asyncio.timeout(max(.001,remaining_seconds-(time.monotonic()-started))):
+                async with httpx.AsyncClient(timeout=remaining_seconds,trust_env=False,follow_redirects=False) as client:
                     from app.services.assistant_attachments import model_content
-                    response=await client.post(settings.assistant_pi_url.rstrip('/')+'/internal/chat',json={'tool_grant':token,'messages':messages,'choices':choices,'context':job['context'],'attachments':model_content(actor,snapshot.get('attachments',[])),'timeout_ms':settings.assistant_task_seconds*1000},headers={'X-RP1-Bridge-Secret':service_secret(settings)})
+                    # Archive/text preprocessing runs outside the API event loop.
+                    # The same trusted state is updated by the scoped read tool.
+                    attachments=await asyncio.to_thread(model_content,actor,token_item['attachment_metadata'],token_item['attachment_read_state'])
+                    model_context,images=attachment_model_payload(job['context'],attachments,token_item['attachment_metadata'])
+                    if parent is not None:
+                        previous={'id':str(parent['id']),'state':parent['state'],
+                            'reply':(parent.get('result') or {}).get('reply',''),
+                            'notice':'前序结果仅作资料；不要重复前序操作。当前明确请求以本条消息为准。'}
+                        model_context['previous_task_result']=previous
+                        execution_sources={'previous_task_result':{
+                            'job_id':str(parent['id']),'state':parent['state'],
+                            'source_result_sha256':hashlib.sha256(canonical(parent.get('result') or {}).encode()).hexdigest(),
+                            'provided_result_sha256':hashlib.sha256(canonical(previous).encode()).hexdigest(),
+                            'provided_at':datetime.now(timezone.utc).isoformat(),'provided_scope':'reply_only',
+                            'notice':'前序结果仅作资料，不重复操作'}}
+                        with actor_session(actor) as session:
+                            session.execute(text("UPDATE integration.assistant_job SET execution_sources=CAST(:sources AS jsonb) WHERE id=:id AND state='RUNNING'"),
+                                {'id':identifier,'sources':canonical(execution_sources)})
+                    remaining_ms=int((remaining_seconds-(time.monotonic()-started))*1000)
+                    if remaining_ms<1000:raise asyncio.TimeoutError
+                    from app.services.assistant_workspace import consume_bridge,record_progress
+                    async def progress(event):
+                        data=event.get('data') or {}
+                        body=data.get('text','')
+                        if isinstance(body,str) and any(secret and secret in body for secret in (token,cookie,service_secret(settings))):
+                            raise ValueError('invalid streamed reply')
+                        await asyncio.to_thread(record_progress,actor,identifier,event)
+                    async with client.stream('POST',settings.assistant_pi_url.rstrip('/')+'/internal/chat',
+                        json={'tool_grant':token,'messages':messages,'choices':choices,'context':model_context,'attachments':images,'timeout_ms':remaining_ms,
+                              'resume':{'rounds_used':job.get('rounds',0),'reads_used':job.get('read_count',0),
+                                        'writes_used':token_item['write_count'],'active_elapsed_ms':job.get('active_elapsed_ms',0),
+                                        'evidence':cards,'permissions':local_cards}},
+                        headers={'X-RP1-Bridge-Secret':service_secret(settings),'Accept':'application/x-ndjson'}) as response:
+                        response_status,data=await consume_bridge(response,progress)
             outcome=intent.outcome
-            if response.status_code!=200:
-                try:error_body=response.json()
-                except ValueError:error_body={}
-                termination=failure_reason(response.status_code,error_body)
+            if token_item.get('permission_waiting') or data.get('completion')=='awaiting_permission':
+                state='WAITING_PERMISSION';completion='awaiting_permission';termination='awaiting_permission'
+                reply=data.get('reply') or '正在等待本机读取授权或真实证据；等待时间不计入有效执行预算。'
+                return
+            if response_status!=200:
+                termination=failure_reason(response_status,data)
                 state='TIMED_OUT' if termination in {'deadline','provider_timeout'} else 'FAILED'
                 reply=partial_reply(termination,cards)
             else:
-                data=response.json();reply=data.get('reply','')
+                reply=data.get('reply','')
                 if not isinstance(reply,str) or not reply or len(reply)>16000 or any(v in reply for v in (token,cookie,service_secret(settings))):raise ValueError('invalid reply')
                 state='COMPLETED'
                 completion='partial' if data.get('completion')=='partial' else 'answered'
-                termination='round_limit' if completion=='partial' else 'complete'
-                if completion=='partial':reply='已达到本次交互上限，以下为已有结果，未完成部分仍待核实。\n'+reply
+                reason=data.get('termination_reason')
+                termination=(reason if reason in {'round_limit','read_limit','evidence_incomplete'} else 'evidence_incomplete') if completion=='partial' else 'complete'
+                if completion=='partial':
+                    prefix={'round_limit':'已达到本任务累计模型交互上限。','read_limit':'已达到本任务累计只读调用上限。','evidence_incomplete':'仍有证据缺口，以下结论仅基于实际已取得资料。'}[termination]
+                    reply=prefix+'\n'+reply
         except (httpx.TimeoutException,asyncio.TimeoutError):state='TIMED_OUT';termination='deadline';reply=partial_reply(termination,cards)
-        except asyncio.CancelledError:state='CANCELLED';termination='cancelled';reply=partial_reply(termination,cards)
+        except asyncio.CancelledError:
+            if token_item and token_item.get('permission_waiting'):
+                state='WAITING_PERMISSION';completion='awaiting_permission';termination='awaiting_permission';reply='等待本机读取授权或证据；重启后需原会话恢复。'
+            else:state='CANCELLED';termination='cancelled';reply=partial_reply(termination,cards)
         except Exception as exc:
             # Provider payloads and credentials are deliberately not logged.
             logger.warning('assistant_task_failed job=%s elapsed_ms=%d kind=%s',identifier,int((time.monotonic()-started)*1000),type(exc).__name__)
             state='FAILED';termination='provider_network' if isinstance(exc,httpx.NetworkError) else 'tool_failed';reply=partial_reply(termination,cards)
         finally:
+            attachment_coverage=None
             if token:
-                self.tokens.pop(grants.key(token),None);grants.revoke(token)
+                item=self.tokens.pop(grants.key(token),None)
+                if item is not None:
+                    from app.services.assistant_local_diagnostics import close as close_local_reads
+                    close_local_reads(item)
+                    resume_snapshot=runtime_snapshot(item)
+                    if item.get('attachment_metadata'):
+                        from app.services.assistant_attachments import attachment_read_summary
+                        with item['attachment_lock']:
+                            attachment_coverage=attachment_read_summary(item['attachment_metadata'],item['attachment_read_state'])
+                        cards.append({'type':'attachment_coverage','title':'附件证据已提供范围','source':'task_frozen_attachments',
+                                      'updated_at':datetime.now(timezone.utc).isoformat(),'data':attachment_coverage})
+                grants.revoke(token)
                 with setup_flow.lock:setup_flow.intents.pop(grants.key(token),None)
             if intent and intent.outcome:outcome=intent.outcome
             if outcome and outcome.get('receipt'):
                 if intent and intent.operation_kinds:outcome['receipt']['object_types']=intent.operation_kinds
                 reply=outcome.get('question','已核对实际回执。')+' '+reply
             if outcome:cards+=setup_cards(outcome)
-            if state!='COMPLETED':completion='partial' if any(c.get('type')!='query_issue' for c in cards) else 'failed'
+            if state not in {'COMPLETED','WAITING_PERMISSION'}:completion='partial' if any(c.get('type')!='query_issue' for c in cards) else 'failed'
             if state=='COMPLETED' and intent and setup_flow.explicit_intent(intent.messages) and not outcome:
                 outcome={'status':'needs_input','question':'本次未取得保存回执，尚未保存。请补充说明后重新提交，或使用普通建档页面。'}
                 reply=outcome['question']
-            business_status='saved' if outcome and outcome.get('receipt') else outcome.get('status') if outcome else 'answered' if state=='COMPLETED' else 'not_saved'
+            business_status='saved' if outcome and outcome.get('receipt') else outcome.get('status') if outcome else 'awaiting_permission' if state=='WAITING_PERMISSION' else 'answered' if state=='COMPLETED' else 'not_saved'
             result={'reply':reply,'setup':outcome,'cards':cards,'business_status':business_status,'completion':completion,'termination_reason':termination}
+            from app.services.assistant_presentation import presentation
+            result['presentation']=presentation(reply,state=state,completion=completion,outcome=outcome,cards=cards,termination=termination)
+            if attachment_coverage is not None:result['attachment_read_coverage']=attachment_coverage
             # Resolving the original login remains mandatory for tools, but final
             # metadata and receipt reconciliation must survive account revocation.
             with SessionLocal.begin() as session:
+                if state=='WAITING_PERMISSION':
+                    paused=session.execute(text('SELECT integration.assistant_pause(:id,:user,CAST(:result AS jsonb),CAST(:resume AS jsonb))'),
+                        {'id':identifier,'user':str(actor.public_id),'result':canonical(result),'resume':canonical(resume_snapshot)}).scalar_one()
+                    if paused:return
+                    state='CANCELLED'
+                    result={**result,'completion':'partial','termination_reason':'cancelled',
+                            'reply':'任务已停止；尚未读取的内容不会继续执行，已有实际回执保留。'}
+                session.execute(text("UPDATE integration.assistant_job SET active_elapsed_ms=least(120000,active_elapsed_ms+coalesce(greatest(0,extract(epoch FROM(clock_timestamp()-active_started_at))*1000)::int,0)),active_started_at=NULL WHERE id=:id"),{'id':identifier})
                 session.execute(text("SELECT integration.assistant_finish(:id,:user,:state,CAST(:result AS jsonb))"),{'id':identifier,'user':str(actor.public_id),'state':state,'result':canonical(result)})
             with SessionLocal.begin() as session:
                 session.execute(text("SELECT integration.assistant_abandon(:id)"),{'id':identifier})
@@ -243,14 +432,39 @@ class ChatRuntime:
             if arguments.get('target_part_code'):arguments['target_part_code']=canonical_part(arguments['target_part_code'])
         key=canonical({'tool':payload.tool,'arguments':arguments})
         cache=item.setdefault('read_cache',{})
+        if item.get('durable_permissions'):
+            try:
+                with actor_session(item['actor']) as session:item['reads']=session.execute(text('SELECT integration.assistant_take_read(:id)'),{'id':item['id']}).scalar_one()
+            except DBAPIError as exc:
+                sqlstate=getattr(getattr(exc,'orig',None),'sqlstate',None)
+                if sqlstate=='42501':raise ApiError(403,'assistant_read_forbidden','当前账号已无本任务读取权限。') from exc
+                if sqlstate=='P0001':raise ApiError(409,'assistant_tool_limit','本任务累计只读调用已达12次或有效执行已结束。') from exc
+                raise
         if stable and key in cache:
             logger.info('assistant_read_reused job=%s tool=%s',item['id'],payload.tool)
             return {**cache[key],'retrieval':{'reused':True,'instruction':'相同条件的目录/源码/知识库已在本任务提供；请使用已有证据，或沿next_cursor读取下一页。'}}
-        item['reads']+=1
+        if not item.get('durable_permissions'):item['reads']+=1
         if item['reads']>12:raise ApiError(409,"assistant_tool_limit","单任务工具调用过多。")
         from app.services.assistant_privacy import public_evidence
         try:
-            if payload.tool in {'search_project_source','read_project_source','search_web','read_web_page','search_knowledge'}:
+            if payload.tool=='prepare_diagnosis':
+                from app.services.assistant_diagnosis import prepare
+                card=prepare(item,payload.arguments)
+            elif payload.tool in {'search_shared_faq','propose_local_repair'}:
+                from app.services.assistant_support import search_shared_faq,propose_local_repair
+                data=(search_shared_faq(item['actor'],payload.arguments) if payload.tool=='search_shared_faq'
+                      else propose_local_repair(item['actor'],item['id'],payload.arguments))
+                card=data if isinstance(data,dict) and 'type' in data else {'type':'shared_faq' if payload.tool=='search_shared_faq' else 'local_repair',
+                    'title':'共享问题库' if payload.tool=='search_shared_faq' else '本机修复提议',
+                    'source':payload.tool,'updated_at':datetime.now(timezone.utc).isoformat(),'data':data}
+            elif payload.tool=='read_diagnostic_attachment':
+                with item.setdefault('attachment_lock',threading.RLock()):
+                    card=query(None,payload.tool,payload.arguments,item['context'],attachment_actor=item['actor'],
+                               attachment_metadata=item.get('attachment_metadata',[]),attachment_read_state=item.setdefault('attachment_read_state',{}))
+            elif payload.tool=='read_local_diagnostic':
+                from app.services.assistant_local_diagnostics import evidence
+                card=evidence(item,payload.arguments)
+            elif payload.tool in {'search_project_source','read_project_source','search_web','read_web_page','search_knowledge'}:
                 card=query(None,payload.tool,payload.arguments,item['context'])
             else:
                 with actor_session(item['actor']) as session:card=query(session,payload.tool,payload.arguments,item['context'])
@@ -260,19 +474,36 @@ class ChatRuntime:
         card=public_evidence(card)
         stored=json.loads(canonical(card))
         sources=stored.get('data',{}).pop('availability_sources',[])
+        if stored.get('type')=='diagnosis_preparation':
+            item['cards'][:]=[old for old in item['cards'] if old.get('type')!='diagnosis_preparation']
         item['cards'].append(stored)
         for source in sources:
             item['cards'].append({'type':'source_evidence','title':'候选用例规则源码','source':'版本化项目源码快照','updated_at':card['updated_at'],'data':source})
         if stable and card.get('type')!='query_issue':cache[key]=json.loads(canonical(card))
+        if item.get('durable_permissions'):
+            with actor_session(item['actor']) as session:
+                session.execute(text('UPDATE integration.assistant_job SET resume_state=CAST(:state AS jsonb) WHERE id=:id'),{'id':item['id'],'state':canonical(runtime_snapshot(item))})
         return card
 
     def meter(self,token,payload):
         item=self.authorize(token,allow_terminal=payload.phase=='settle')
         with actor_session(item['actor']) as session:
-            return billing.reserve(session,item['id'],payload.sequence,get_settings()) if payload.phase=='reserve' else billing.settle(session,item['id'],payload.sequence,payload.usage)
+            if payload.phase=='reserve':
+                session.execute(text('SELECT pg_advisory_xact_lock(hashtextextended(:key,0))'), {'key':'assistant-input:'+str(item['id'])})
+                result=billing.reserve(session,item['id'],payload.sequence,get_settings(),payload.model)
+                # Delivery to Pi alone is insufficient: no budget/next request
+                # leaves the input available in the terminal recovery card.
+                session.execute(text('UPDATE integration.assistant_input SET consumed_at=now() WHERE job_id=:id AND delivered_at IS NOT NULL AND consumed_at IS NULL'),{'id':item['id']})
+                return result
+            return billing.settle(session,item['id'],payload.sequence,payload.usage)
 
     def allow_write(self,token):
         item=self.authorize(token)
+        if item.get('resumed'):raise ApiError(409,'assistant_resume_read_only','续查只使用已有证据，不会重放业务写入；如需新操作请另提明确任务。')
+        from app.services.assistant_workspace import has_steering
+        with actor_session(item['actor']) as session:
+            if has_steering(session,item['id']):
+                raise ApiError(409,'assistant_steering_read_only','运行中补充仅用于诊断；请在下一条独立任务明确确认业务写入。')
         with setup_flow.lock:intent=setup_flow.intents.get(grants.key(token))
         if intent is None or not setup_flow.explicit_intent(intent.messages):raise ApiError(422,"explicit_action_required","建档需要当前用户明确指令。")
         return item
@@ -281,16 +512,20 @@ class ChatRuntime:
 runtime=ChatRuntime()
 
 
-def list_threads(actor):
+def list_threads(actor,q=''):
     require_runtime(actor)
     with actor_session(actor) as session:
-        return [dict(x) for x in session.execute(text("SELECT id,created_at,updated_at FROM integration.assistant_thread WHERE updated_at>=now()-interval '30 days' ORDER BY updated_at DESC LIMIT 50")).mappings()]
+        return [dict(x) for x in session.execute(text("""SELECT t.id,t.title,t.created_at,t.updated_at FROM integration.assistant_thread t
+            WHERE t.deleted_at IS NULL AND t.updated_at>=now()-interval '30 days'
+              AND (t.title ILIKE :q OR EXISTS(SELECT 1 FROM integration.assistant_message m
+                WHERE m.thread_id=t.id AND m.created_at>=now()-interval '30 days' AND m.body ILIKE :q))
+            ORDER BY t.updated_at DESC LIMIT 50"""),{'q':'%'+q.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'%'}).mappings()]
 
 
 def history(actor,thread):
     require_runtime(actor)
     with actor_session(actor) as session:
-        if session.execute(text("SELECT id FROM integration.assistant_thread WHERE id=:id"),{'id':thread}).first() is None:raise ApiError(404,"assistant_thread_not_found","会话不存在或不可访问。")
+        if session.execute(text("SELECT id FROM integration.assistant_thread WHERE id=:id AND deleted_at IS NULL"),{'id':thread}).first() is None:raise ApiError(404,"assistant_thread_not_found","会话不存在或不可访问。")
         rows=[dict(x) for x in session.execute(text("SELECT m.id,m.job_id,m.role,m.body,m.context,m.cards,m.created_at,coalesce(j.input_snapshot->'attachments','[]'::jsonb) AS attachments FROM integration.assistant_message m LEFT JOIN integration.assistant_job j ON j.id=m.job_id WHERE m.thread_id=:id AND m.created_at>=now()-interval '30 days' ORDER BY m.id DESC LIMIT 200"),{'id':thread}).mappings()][::-1]
         jobs=[dict(x) for x in session.execute(text("SELECT id,state,created_at FROM integration.assistant_job WHERE thread_id=:id AND created_at>=now()-interval '30 days' ORDER BY created_at DESC LIMIT 10"),{'id':thread}).mappings()]
         return {'messages':rows,'jobs':jobs}
@@ -317,7 +552,8 @@ def cancel_job(actor,identifier):
     with actor_session(actor) as session:
         job=own_job(session,identifier)
         if job['state'] not in TERMINAL:
-            session.execute(text("UPDATE integration.assistant_job SET cancel_requested=true,state=CASE WHEN state='QUEUED' THEN 'CANCELLED' ELSE state END,finished_at=CASE WHEN state='QUEUED' THEN now() ELSE finished_at END WHERE id=:id"),{'id':identifier})
+            session.execute(text("UPDATE integration.assistant_job SET cancel_requested=true,result=CASE WHEN state='WAITING_PERMISSION' THEN coalesce(result,'{}'::jsonb)||CAST(:cancel AS jsonb) ELSE result END,state=CASE WHEN state IN ('QUEUED','WAITING_PERMISSION') THEN 'CANCELLED' ELSE state END,finished_at=CASE WHEN state IN ('QUEUED','WAITING_PERMISSION') THEN now() ELSE finished_at END WHERE id=:id"),{'id':identifier,'cancel':canonical({'reply':'任务已停止；尚未读取的内容不会继续执行，已有实际回执保留。','completion':'partial','termination_reason':'cancelled'})})
+            session.execute(text("UPDATE integration.assistant_read_permission SET state='cancelled' WHERE job_id=:id AND state IN ('pending','approved')"),{'id':identifier})
     task=runtime.running.get(str(identifier))
     if task:task.get_loop().call_soon_threadsafe(task.cancel)
     return {'id':identifier,'cancel_requested':True,'receipt':job_status(actor,identifier).get('receipt')}

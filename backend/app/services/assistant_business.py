@@ -244,6 +244,7 @@ def query(session,tool,args,context):
         if not q or len(q)>150:raise ApiError(422,"history_query","请输入1—150字历史检索词。")
         rows=session.execute(text("""SELECT thread_id,role,body,created_at FROM integration.assistant_message
           WHERE user_id=iam.current_user_id() AND created_at>=now()-interval '30 days'
+          AND EXISTS(SELECT 1 FROM integration.assistant_thread t WHERE t.id=thread_id AND t.deleted_at IS NULL)
           AND body ILIKE :q ORDER BY id DESC LIMIT 15"""),{"q":"%"+q.replace("%","\\%").replace("_","\\_")+"%"}).mappings().all()
         return card("history_evidence","本人近30天聊天检索",{"items":[dict(r) for r in rows]},"本账号聊天历史",scope="只读取当前账号自己的聊天，其他账号聊天不开放")
     raise ApiError(422,"unknown_assistant_tool","查询工具未实现，不能伪装成查询成功。")

@@ -23,7 +23,10 @@ def catalog() -> list[dict]:
     assets = {item['limb']: item for item in manifest['trajectories']}
     return [dict(id=key, label=label, motor_count=count, interfaces=list(interfaces),
                  config_path=key + '_motors.yaml', trajectory=assets[key]['file'],
-                 sha256=assets[key]['sha256'], speed=1.0)
+                 sha256=assets[key]['sha256'], speed=1.0, bundle_version=manifest['version'],
+                 resource_revision=assets[key].get('resource_revision', 1),
+                 source_name=assets[key].get('source_name'),
+                 source_sha256=assets[key].get('source_sha256', assets[key]['sha256']))
             for key, (label, count, interfaces) in PRESETS.items()]
 
 

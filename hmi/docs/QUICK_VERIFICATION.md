@@ -24,7 +24,7 @@
 | --- | --- | --- |
 | 左臂 7 DOF | left_arm_joint_inspect.npz | can0 |
 | 右臂 7 DOF | right_arm_joint_inspect.npz | can1 |
-| 左臂 5 DOF | left_short_arm_joint_1.npz | can0 |
+| 左臂 5 DOF | left_short_arm_joint_inspect.npz | can0 |
 | 右臂 5 DOF | right_short_arm_joint_inspect.npz | can1 |
 | 左腿 5 DOF | left_short_leg_flow.npz | can0 |
 | 右腿 5 DOF | right_short_leg_flow.npz | can1 |
@@ -32,7 +32,7 @@
 
 腰胯 NPZ 的四列顺序沿用原文件：右侧腰 roll ID1、左侧腰 yaw ID1、右髋 pitch ID2、左髋 pitch ID2。因此配置分组 CAN 为 `[can1, can0, can1, can0]`。同侧两个电机必须在同一总线，左右总线必须不同。界面可以选择 CAN；修改后点击“重新读取配置与轨迹”才生效，避免把尚未应用的映射直接用于运行。
 
-七个用户指定原始 NPZ 未改写，使用 `factory_hmi/resources/quick/manifest.json` 记录 SHA256，运行前校验完整性。只允许通过预设 ID 读取这些固定资源，不放宽普通轨迹导入的目录限制。源码和本地 DEB 均包含轨迹；Python 包的 package-data 也包含相应资源。
+七条工厂资源均原样保存所选源文件内容，使用 `factory_hmi/resources/quick/manifest.json` 记录 SHA256，运行前校验完整性。只允许通过预设 ID 读取这些固定资源，不放宽普通轨迹导入的目录限制。源码和本地 DEB 均包含轨迹；Python 包的 package-data 也包含相应资源。
 
 ## 实现与生命周期
 
@@ -57,3 +57,6 @@ PLC 心跳/反馈轮询、窗口租约心跳、快速页状态轮询和平台心
 ## quick2 修正
 
 quick1 曾将 PLC 供电作为所有快速验证的必经步骤，外部供电场景也会因 PLC 不可控制而被拒绝；同时界面把明确拒绝再次转成结束请求，覆盖了失败原因。quick2 增加外部供电选项并修正失败显示，原始 failure 和 failed_phase 会保留到下一次重新准备。
+
+
+2026-10-28 工厂资源清单升级为 v2。按用户明确指定，左右5DOF资源分别原样取自 `user-supplied/motion/arm/left_short_arm_joint_inspect.npz` 与 `right_short_arm_joint_inspect.npz`；来源路径、来源SHA256、资源修订和被替代SHA256保存在manifest，其余5条资源内容不变。两文件均633帧、50Hz、12.64秒、首尾电机命令全零。这只是文件事实，不证明全零是自然下垂或可安全撤力姿态。缺少精确核实停放参数时仍禁止arm/start。

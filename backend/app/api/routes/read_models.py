@@ -72,8 +72,8 @@ def test_case_detail(
 
 
 @router.get("/executions/live", response_model=DataEnvelope[ExecutionList])
-def live_executions(session: DbSession) -> DataEnvelope[ExecutionList]:
-    return DataEnvelope(data=ReadModelRepository(session).live_executions())
+def live_executions(session: DbSession, limit: PageLimit = 100, cursor: Cursor = None) -> DataEnvelope[ExecutionList]:
+    return DataEnvelope(data=ReadModelRepository(session).live_executions(limit=limit,cursor=cursor))
 
 
 @router.get("/executions/{identifier}", response_model=DataEnvelope[ExecutionDetail])

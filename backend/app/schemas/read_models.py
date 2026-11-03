@@ -163,7 +163,8 @@ class AssetSummary(BaseModel):
     target_part_name: str | None = None
     product_family: str
     batch_code: str | None = None
-    serial_number: str
+    serial_number: str | None = None
+    creation_scenario: Literal["PRODUCTION", "RND_TEST"] = "RND_TEST"
     lifecycle_status: str
     current_test_case_code: str | None = None
     current_execution_id: UUID | None = None

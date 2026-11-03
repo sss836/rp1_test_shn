@@ -11,7 +11,11 @@ from app.services.archive_storage import ArchiveStorage
 from app.services.curve_analysis import CurveAnalysisService
 
 
-def query(session,tool,arguments,context):
+def query(session,tool,arguments,context,*,attachment_actor=None,attachment_metadata=None,attachment_read_state=None):
+    if tool == 'read_diagnostic_attachment':
+        from app.services.assistant_attachment_queries import read_diagnostic_attachment
+        return read_diagnostic_attachment(attachment_actor, attachment_metadata, arguments,
+                                          read_state=attachment_read_state)
     if tool not in {"get_curve_statistics","get_test_progress","list_hmi_stations"}:
         from app.services.assistant_business import query as business_query
         return business_query(session,tool,arguments,context)

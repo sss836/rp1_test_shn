@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { Download, Maximize2, Minimize2, Table2, X } from "lucide-react";
-import { archivesApi, type Archive, type ArchiveCurves } from "../../archiveApi";
+import { archivesApi, archiveDomain, dataDomainLabels, type Archive, type ArchiveCurves } from "../../archiveApi";
 import { TimeSeriesChart, type CurveViewport, type PlotSeries, type ReferenceLine } from "../../components/TimeSeriesChart";
 import { ErrorState } from "../../components/Workbench";
 import { workspaceApi, downloadBlob, type RawFilters, type StatisticsResponse } from "./api";
@@ -36,12 +36,12 @@ function RawInspector({ record, panel, filters, scope, onClose }: { record: Arch
     setDownloading(true); setDownloadError("");
     try {
       const blob = await workspaceApi.exportCsv(record.id, filters, controller.signal);
-      if (!controller.signal.aborted) downloadBlob(blob, `${record.execution_code || record.archive_code}-${panel.metric}-${filters.start}-${filters.end}s.csv`);
+      if (!controller.signal.aborted) downloadBlob(blob, `${dataDomainLabels[archiveDomain(record)]}-${record.execution_code || record.archive_code}-${panel.metric}-${filters.start}-${filters.end}s.csv`);
     } catch (error) { if (!controller.signal.aborted) setDownloadError(error instanceof Error ? error.message : "CSV 下载失败。"); }
     finally { if (!controller.signal.aborted) setDownloading(false); }
   }
   return <section className="wb-inspector" aria-label={`${metricNames[panel.metric] ?? panel.metric} 原始数据检查`}>
-    <div className="wb-inspector-heading"><div><h3>原始数据 · 当前区间</h3><p>{readableName(record)} · {shortCode(record)} · {filters.start}–{filters.end} s</p></div><button type="button" className="curve-row-action" aria-label="关闭数据检查" onClick={onClose}><X /></button></div>
+    <div className="wb-inspector-heading"><div><h3>原始数据 · 当前区间</h3><p>{dataDomainLabels[archiveDomain(record)]} · SN：{record.serial_number ?? "未记录"} · 台架：{record.bench_id ?? "未记录"} · {readableName(record)} · {shortCode(record)} · {filters.start}–{filters.end} s</p></div><button type="button" className="curve-row-action" aria-label="关闭数据检查" onClick={onClose}><X /></button></div>
     <p className="wb-data-note">原始分辨率 · 空值显示为 —，CSV 保留空字段 · 每页 100 行 · 单次导出最多 250,000 行</p>
     <div className="wb-inspector-actions"><span>{query.data && !query.isError ? `区间 ${query.data.total_rows.toLocaleString("zh-CN")} 行 · 已显示 ${query.data.rows.length ? offset + 1 : 0}–${offset + query.data.rows.length}` : query.isError ? "原始数据不可用" : "正在读取原始行…"}</span><button className="curve-button" type="button" disabled={downloading || query.isFetching || !!query.error || !query.data?.total_rows} onClick={() => void download()}><Download />{downloading ? "正在下载…" : "下载区间原始 CSV"}</button></div>
     {downloadError && <p role="alert" className="curve-error">{downloadError}</p>}

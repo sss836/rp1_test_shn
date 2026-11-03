@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 import hmac
+import re
 from typing import Annotated
 from urllib.parse import unquote
 from uuid import UUID
@@ -52,12 +53,24 @@ class RequestActor:
     source_code: str | None = None
 
 
+
+def factory_route_allowed(method: str, path: str) -> bool:
+    """The factory reviewer is an evidence reviewer, never an HMI operator."""
+    if path in {"/api/v1/auth/me", "/api/v1/auth/logout", "/api/v1/auth/change-password"}:
+        return True
+    if method.upper() in SAFE_METHODS:
+        return path.startswith("/api/v1/factory/") or path == "/api/v1/archives" or path.startswith("/api/v1/archives/") or path == "/api/v1/archive-ledger.csv"
+    return method.upper() == "POST" and re.fullmatch(r"/api/v1/archives/[^/]+/factory-review", path) is not None
+
+
 def get_request_actor(
     request: Request,
     x_user_public_id: Annotated[str | None, Header(alias="X-User-Public-Id")] = None,
     x_request_id: Annotated[str | None, Header(alias="X-Request-Id")] = None,
     x_change_reason: Annotated[str | None, Header(alias="X-Change-Reason")] = None,
 ) -> RequestActor:
+    if request.cookies.get("rp1_showcase") and not request.url.path.startswith("/api/v1/showcase/"):
+        raise ApiError(403,"showcase_read_only","展示会话只可读取获准展示；进入内部页面需重新登录")
     settings = get_settings()
     request_id = x_request_id or getattr(request.state, "request_id", "api-request")
     source_ip = request.client.host if request.client else None
@@ -163,6 +176,8 @@ def get_request_actor(
             "password_change_required",
             "必须修改初始密码后才能访问该接口。",
         )
+    if principal.role == "FACTORY_REVIEWER" and not factory_route_allowed(request.method, request.url.path):
+        raise ApiError(403, "factory_scope_required", "工厂审批账号仅可查看工厂状态、记录并审批工厂数据。")
     return RequestActor(
         public_id=principal.id,
         request_id=request_id,

@@ -5,7 +5,7 @@ from unittest import mock
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import pytest
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWebSockets import QWebSocket
 from factory_hmi.desktop.sample_selector import SampleSelector, sample_choices
 from factory_hmi.desktop.app import FactoryMainWindow
@@ -29,7 +29,7 @@ def test_online_part_choices_busy_disabled_and_free_text_rejected(application):
     widget.update_choices(SAMPLES, 'left_arm', True)
     assert not widget.isEditable()
     assert [widget.itemText(i) for i in range(1, widget.count())] == ['RP1.3-ARM-001', 'RP1.3-ARM-002 在运行']
-    assert not widget.model().item(2).isEnabled()
+    assert not widget.model().flags(widget.model().index(2, 0)) & Qt.ItemFlag.ItemIsEnabled
     widget.setText('RP1.3-ARM-001')
     widget.setText('RP1.3-ARM-002')
     assert widget.text() == 'RP1.3-ARM-001'
@@ -66,6 +66,7 @@ def window(application):
         target.websocket = QWebSocket()
     with mock.patch.object(FactoryMainWindow, '_setup_network', network), mock.patch.object(FactoryMainWindow, '_run_rest'):
         value = FactoryMainWindow('http://127.0.0.1:65534')
+    value.mujoco_completion.setChecked(False)
     value.sample_timer.stop()
     yield value
     value.deleteLater()
@@ -141,4 +142,17 @@ def test_unchanged_refresh_preserves_offline_edit_cursor(application):
     widget.update_choices(SAMPLES, 'right_leg', False)
     assert widget.lineEdit().cursorPosition() == 2
     assert widget.text() == '离线样机-编辑中'
+    widget.deleteLater()
+
+
+def test_repeated_catalog_changes_keep_busy_flags_and_identity_without_native_items(application):
+    widget = SampleSelector()
+    for n in range(100):
+        samples = [dict(item, running=n%2==0) if item['code']=='RP1.3-ARM-001' else item for item in SAMPLES]
+        widget.update_choices(samples, 'left_arm', True)
+        index = widget.findData('RP1.3-ARM-001')
+        assert widget.itemData(index) == 'RP1.3-ARM-001'
+        assert bool(widget.model().flags(widget.model().index(index,0)) & Qt.ItemFlag.ItemIsEnabled) == (n%2!=0)
+        widget.setCurrentIndex(index)
+        assert widget.selection_allowed() == (n%2!=0)
     widget.deleteLater()

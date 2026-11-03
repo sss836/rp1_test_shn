@@ -1,10 +1,10 @@
 """Typed, bounded archive metadata; raw CSV is accepted only by the byte endpoint."""
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 
 class ArchiveModel(BaseModel):
@@ -61,6 +61,9 @@ class ArchiveContext(ArchiveModel):
 
 
 class ArchiveCreate(ArchiveModel):
+    data_domain: Literal["RESEARCH", "FACTORY"] | None = None
+    serial_number: Annotated[str, StringConstraints(strip_whitespace=False, min_length=1, max_length=200)] | None = None
+    bench_id: str | None = Field(default=None, min_length=1, max_length=100)
     execution_uuid: UUID
     test_name: str = Field(min_length=1, max_length=200)
     actual_object: str = Field(min_length=1, max_length=200)
@@ -75,6 +78,8 @@ class ArchiveCreate(ArchiveModel):
 
     @model_validator(mode="after")
     def file_metadata(self):
+        if self.data_domain == "FACTORY" and (self.serial_number is None or not self.serial_number.strip()):
+            raise ValueError("工厂归档必须提供本次原始SN")
         if (PurePosixPath(self.filename).name != self.filename
                 or PureWindowsPath(self.filename).name != self.filename
                 or not self.filename.lower().endswith(".csv")
@@ -142,6 +147,9 @@ class ArchiveAnalysisCreate(ArchiveModel):
 
 
 class ArchiveImportCreate(ArchiveModel):
+    data_domain: Literal["RESEARCH", "FACTORY"] | None = None
+    serial_number: Annotated[str, StringConstraints(strip_whitespace=False, min_length=1, max_length=200)] | None = None
+    bench_id: str | None = Field(default=None, min_length=1, max_length=100)
     """Historical CSV import metadata. Acquisition facts are server-owned unknowns."""
     filename: str = Field(min_length=5, max_length=200)
     size_bytes: int = Field(ge=1, le=50 * 1024**3)
@@ -161,3 +169,61 @@ class ArchiveImportCreate(ArchiveModel):
         if self.classification and self.classification.station_id != self.station_id:
             raise ValueError("正式关联工位必须与补录工位一致")
         return self
+
+
+class ArchiveFactoryReview(ArchiveModel):
+    expected_submission_revision: int = Field(ge=1)
+    decision: Literal["APPROVE", "REJECT"]
+    reason: str = Field(min_length=1, max_length=300)
+
+
+class ArchiveDomainClassification(ArchiveModel):
+    expected_revision: int = Field(ge=0)
+    data_domain: Literal["RESEARCH", "FACTORY", "UNCLASSIFIED"]
+    serial_number: Annotated[str, StringConstraints(strip_whitespace=False, min_length=1, max_length=200)] | None = None
+    bench_id: str | None = Field(default=None, min_length=1, max_length=100)
+    reason: str = Field(min_length=1, max_length=300)
+
+class RunSegment(ArchiveModel):
+    sequence: int = Field(ge=0,lt=4096)
+    size_bytes: int = Field(ge=1,le=128*1024**2+16384)
+    sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+    previous_sha256: str = Field(max_length=64)
+    sample_count: int = Field(ge=0)
+    first_time_s: float | None = None
+    last_time_s: float | None = None
+    first_sequence: int | None = Field(default=None,ge=0)
+    last_sequence: int | None = Field(default=None,ge=0)
+
+class RunManifest(ArchiveModel):
+    schema_version: Literal['run-segments-v1']
+    execution_uuid: UUID
+    logical_size_bytes: int = Field(ge=1,le=50*1024**3)
+    logical_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+    policy_sha256: str | None = Field(default=None,pattern=r'^[0-9a-f]{64}$')
+    segments: list[RunSegment] = Field(min_length=1,max_length=4096)
+
+    @model_validator(mode='after')
+    def chain(self):
+        previous='';last_sequence=None
+        for n,part in enumerate(self.segments):
+            if part.sequence!=n or part.previous_sha256!=previous:
+                raise ValueError('分段顺序或哈希链不连续')
+            if last_sequence is not None and part.first_sequence!=last_sequence+1:
+                raise ValueError('分段采样序号不连续')
+            if part.first_sequence is not None and part.last_sequence is not None and part.last_sequence-part.first_sequence+1!=part.sample_count:
+                raise ValueError('分段采样数量不一致')
+            previous=part.sha256;last_sequence=part.last_sequence
+        return self
+
+class ArchiveLedgerFilters(ArchiveModel):
+    q: str | None = Field(default=None,max_length=200)
+    sn: str | None = Field(default=None,max_length=200)
+    bench: str | None = Field(default=None,max_length=100)
+    data_domain: Literal['RESEARCH','FACTORY','UNCLASSIFIED'] | None = None
+    submission_status: Literal['PENDING','APPROVED','REJECTED'] | None = None
+    origin: Literal['HMI','HISTORY','OTHER'] | None = None
+    classification_state: Literal['UNCLASSIFIED','CLASSIFIED'] | None = None
+    processing_state: Literal['WAITING','QUEUED','PROCESSING','READY','FAILED'] | None = None
+    started_from: AwareDatetime | None = None
+    started_to: AwareDatetime | None = None

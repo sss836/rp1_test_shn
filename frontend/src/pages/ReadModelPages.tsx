@@ -37,6 +37,7 @@ import { JointAnalysisPanel } from "../components/JointAnalysisPanel";
 import { JointRecordPanel } from "../components/JointRecordPanel";
 import { MODULE_DIRECTORY } from "../homeCarousel";
 import { AssetCreateForm } from "./SetupPages";
+import { creationScenarioName } from "../assetRegistration";
 import { StatusMark } from "../components/StatusMark";
 
 type Navigate = (view: "asset" | "test-case" | "execution" | "assets" | "curves", id?: string) => void;
@@ -463,7 +464,7 @@ function AssetWall({ items, navigate }: { items: AssetSummary[]; navigate: Navig
       {items.map((asset) => (
         <article key={asset.id} data-risk={asset.health_status === "ABNORMAL" || asset.lifecycle_status === "MAINTENANCE" ? "high" : asset.health_status === "ATTENTION" ? "medium" : "normal"}>
           <header><button className="link-button asset-code" type="button" onClick={() => navigate("asset", asset.code)}>{asset.code}<ExternalLink aria-hidden="true" /></button><StatusMark tone={asset.lifecycle_status === "ACTIVE" ? "normal" : asset.lifecycle_status === "MAINTENANCE" ? "warning" : "muted"} label={asset.lifecycle_status} /></header>
-          <p>{asset.name}</p>
+          <p>{asset.name} · {creationScenarioName(asset.creation_scenario ?? "RND_TEST")}</p>
           <dl><div><dt>当前用例</dt><dd>{asset.current_test_case_code ?? "无"}</dd></div><div><dt>累计 / 有效</dt><dd>{formatDuration(asset.durations.total_duration_seconds)} / {formatDuration(asset.durations.effective_exposure_seconds)}</dd></div><div><dt>健康</dt><dd>{asset.health_status ?? "证据不足"}</dd></div><div><dt>数据</dt><dd>{asset.freshness.status}</dd></div></dl>
           <footer><span>风险级别</span><strong>{asset.health_status === "ABNORMAL" ? "需立即复核" : asset.health_status === "ATTENTION" ? "持续观察" : "当前稳定"}</strong></footer>
         </article>
@@ -498,7 +499,7 @@ export function AssetDetailPage({ id, navigate }: { id: string; navigate: Naviga
   return (
     <>
       <BackButton onClick={() => navigate("assets")} />
-      <PageTitle eyebrow="ASSET DOSSIER" title={`${data.asset.code} · ${data.asset.name}`} description={`${data.asset.asset_kind === "MODULE" ? "模块" : "整机"} · ${data.asset.product_family} · ${data.asset.serial_number}`} trailing={<div className="title-status">{(isShowcaseValue(data.asset.batch_code) || isShowcaseValue(data.asset.current_execution_code)) && <ShowcaseBadge />}<StatusMark tone={data.asset.lifecycle_status === "ACTIVE" ? "normal" : "muted"} label={data.asset.lifecycle_status} /></div>} />
+      <PageTitle eyebrow="ASSET DOSSIER" title={`${data.asset.code} · ${data.asset.name}`} description={[data.asset.asset_kind === "MODULE" ? "模块" : "整机", data.asset.product_family, creationScenarioName(data.asset.creation_scenario ?? "RND_TEST"), data.asset.serial_number].filter(Boolean).join(" · ")} trailing={<div className="title-status">{(isShowcaseValue(data.asset.batch_code) || isShowcaseValue(data.asset.current_execution_code)) && <ShowcaseBadge />}<StatusMark tone={data.asset.lifecycle_status === "ACTIVE" ? "normal" : "muted"} label={data.asset.lifecycle_status} /></div>} />
       <DurationBand totals={data.asset.durations} />
       <Cutoff value={data.data_cutoff_at} asOf={data.as_of_at} />
       <div className="detail-columns">
@@ -510,7 +511,7 @@ export function AssetDetailPage({ id, navigate }: { id: string; navigate: Naviga
           )}
         </Panel>
         <Panel title="配置 / 健康 / 证据" eyebrow="TRACEABILITY">
-          <dl className="fact-grid"><div><dt>配置指纹</dt><dd>{data.configuration.fingerprint ?? "未冻结"}</dd></div><div><dt>可靠性影响</dt><dd>{data.configuration.reliability_impact ?? "未知"}</dd></div><div><dt>执行 / 事件</dt><dd>{data.execution_count} / {data.event_count}</dd></div><div><dt>证据可用</dt><dd>{data.evidence_summary.available_count} / {data.evidence_summary.total_count}</dd></div></dl>
+          <dl className="fact-grid"><div><dt>配置记录</dt><dd>{data.configuration.fingerprint?.startsWith("registration:") ? "系统登记版本（未采集设备配置）" : data.configuration.fingerprint ?? "未冻结"}</dd></div><div><dt>可靠性影响</dt><dd>{data.configuration.reliability_impact ?? "未知"}</dd></div><div><dt>执行 / 事件</dt><dd>{data.execution_count} / {data.event_count}</dd></div><div><dt>证据可用</dt><dd>{data.evidence_summary.available_count} / {data.evidence_summary.total_count}</dd></div></dl>
         </Panel>
       </div>
       <PerformanceTrendPanel

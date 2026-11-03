@@ -72,6 +72,11 @@ def build_presence_snapshot(runtimes: Mapping[str, Mapping[str, Any]], plc: Mapp
             "configuration_id": _text(platform.get("configuration_id"), 36),
             "test_case_version_id": _text(platform.get("test_case_version_id"), 36),
             "station_id": _text(platform.get("station_id"), 36),
+            "data_domain": platform.get("data_domain") or None,
+            "data_domain_source": _text(platform.get("data_domain_source"), 32),
+            "serial_number": _text(platform.get("serial_number"), 200),
+            "bench_id": _text(platform.get("bench_id"), 64),
+            "operator_id": _text(platform.get("operator_id"), 255),
         })
     status = plc.get("status") or {}
     channels = status.get("ChannelPermit") or []

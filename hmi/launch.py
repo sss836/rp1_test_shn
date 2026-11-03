@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import time
 from urllib.request import urlopen
+from urllib.parse import urlsplit
 
 PROGRAM_ROOT = Path(__file__).resolve().parent
 SOURCE_ROOT = PROGRAM_ROOT / "hmi" if (PROGRAM_ROOT / "hmi").is_dir() else PROGRAM_ROOT
@@ -22,9 +24,8 @@ SOURCE_ROOT = PROGRAM_ROOT / "hmi" if (PROGRAM_ROOT / "hmi").is_dir() else PROGR
 if (PROGRAM_ROOT / "runtime").is_dir():
     sys.path.insert(0, str(PROGRAM_ROOT / "runtime"))
 
-import yaml
-
 stopping = False
+update_stopping = False
 
 
 def process_start(pid: int) -> str:
@@ -50,6 +51,12 @@ def request_stop(_signum=None, _frame=None):
     stopping = True
 
 
+def request_update_stop(_signum=None, _frame=None):
+    global stopping, update_stopping
+    update_stopping = True
+    stopping = True
+
+
 def raise_existing(root: Path, data: dict) -> bool:
     """Only send a window request to this verified launcher's private socket."""
     address = data.get("activation_socket")
@@ -66,6 +73,7 @@ def raise_existing(root: Path, data: dict) -> bool:
 
 
 def seed_configs(root: Path, *, offline: bool, offline_access: str) -> None:
+    import yaml
     for directory in ("run", "logs", "data", "config/stations", "data/trajectories"):
         (root / directory).mkdir(parents=True, exist_ok=True, mode=0o700)
     seeds = {
@@ -94,6 +102,8 @@ def gateway_environment(root: Path, runtime: Path | None, *, offline: bool, driv
            if not key.startswith(("RP1_FACTORY_", "RP1_RELIABILITY_"))}
     env.pop("PYTHONPATH", None)
     for setting in (
+        "RP1_FACTORY_LEASE_TIMEOUT_S",
+        "RP1_FACTORY_RECORD_RESERVE_BYTES",
         "RP1_FACTORY_TRAJECTORY_MAX_BYTES",
         "RP1_FACTORY_TRAJECTORY_UPLOAD_TIMEOUT_S",
     ):
@@ -114,10 +124,33 @@ def gateway_environment(root: Path, runtime: Path | None, *, offline: bool, driv
         "RP1_FACTORY_BENCH_ID": "",
         "RP1_RELIABILITY_PROFILES": "config/reliability_platform.yaml",
         "PYTHONPATH": str(SOURCE_ROOT),
+        "RP1_HMI_STATE_ROOT": str(root),
     })
+    # Keep the workstation's selected platform across software upgrades. The
+    # package default remains usable for a local platform; factory deployment
+    # can provision this non-secret URL once without rebuilding the package.
+    if not offline:
+        platform_file = root / "config/platform-url.txt"
+        platform_url = os.environ.get("RP1_FACTORY_PLATFORM_URL", "").strip()
+        if not platform_url and platform_file.is_file():
+            platform_url = platform_file.read_text(encoding="utf-8").strip()
+        if platform_url:
+            parsed = urlsplit(platform_url)
+            if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+                    or parsed.password is not None or parsed.query or parsed.fragment):
+                raise ValueError("平台地址须为不含凭据或查询参数的 HTTPS 地址。")
+            env["RP1_FACTORY_PLATFORM_URL"] = platform_url.rstrip("/")
     ca = root / "config/platform-ca.crt"
     if ca.is_file():
         env["SSL_CERT_FILE"] = str(ca)
+    # The first trusted key is provisioned by an administrator separately. Do
+    # not seed it from a download or silently trust a key next to a release.
+    update_key = root / "config/update-public-key.pem"
+    if update_key.is_file():
+        env.setdefault("RP1_HMI_UPDATE_PUBLIC_KEY", str(update_key))
+    motor_key = root / "config/motor-firmware-public-key.pem"
+    if motor_key.is_file():
+        env.setdefault("RP1_MOTOR_FIRMWARE_PUBLIC_KEY", str(motor_key))
     if runtime is not None:
         env["PYTHONPATH"] += os.pathsep + str(runtime)
         library_paths = [runtime]
@@ -145,27 +178,46 @@ def wait_health(process: subprocess.Popen, url: str, driver: str, mode: str) -> 
     raise RuntimeError("网关启动失败，请检查用户状态目录 logs/gateway.log")
 
 
-def finish(process: subprocess.Popen | None) -> None:
+def finish(process: subprocess.Popen | None, *, allow_kill: bool = True) -> bool:
     if process is not None and process.poll() is None:
         process.terminate()
         try:
             process.wait(timeout=8)
         except subprocess.TimeoutExpired:
+            if not allow_kill:
+                return False
             process.kill()
             process.wait(timeout=3)
+    return True
 
 
 def main() -> int:
+    # Dispatch before loading desktop/gateway dependencies or taking their lock.
+    # check/stage are also usable from a terminal on a machine without Qt.
+    if len(sys.argv) > 1 and sys.argv[1] in {"update", "check-update"}:
+        import runpy
+        update_main = runpy.run_path(str(SOURCE_ROOT / "factory_hmi/updates.py"))["main"]
+        arguments = sys.argv[2:]
+        if sys.argv[1] == "check-update":
+            arguments = ["check", *arguments]
+        elif not arguments or arguments[0].startswith("-"):
+            arguments = ["check", *arguments]
+        return update_main(arguments)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", nargs="?", choices=("start", "stop", "status"), default="start")
     parser.add_argument("--runtime-dir", type=Path, help="Optional offline Python 3.12 release runtime")
     parser.add_argument("--state-dir", type=Path, help="Writable state root; defaults to XDG_STATE_HOME/rp1-test-hmi")
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--lease-timeout", type=float,
+                        default=os.environ.get("RP1_FACTORY_LEASE_TIMEOUT_S", "30"))
     parser.add_argument("--gateway-only", action="store_true")
+    parser.add_argument("--update-monitor", action="store_true", help="Post-update monitor only; disables CAN/control without changing saved config")
     parser.add_argument("--duration", type=float, default=0)
     parser.add_argument("--offline-check", action="store_true", help="Dedicated mock PLC; no hardware or platform connection")
     parser.add_argument("--offline-access", choices=("control", "monitor"), default="control")
     args = parser.parse_args()
+    if not math.isfinite(args.lease_timeout) or not 0 < args.lease_timeout <= 300:
+        parser.error("--lease-timeout must be finite and in (0, 300] seconds")
     if not 1024 <= args.port <= 65535:
         raise RuntimeError("gateway port must be in [1024, 65535]")
     state_home = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))).expanduser()
@@ -212,6 +264,7 @@ def main() -> int:
                   else "HMI 已在运行，窗口尚未就绪或该旧实例不支持窗口恢复。")
             return 0
         seed_configs(root, offline=args.offline_check, offline_access=args.offline_access)
+        import yaml
         config = yaml.safe_load((root / "config/plc_cabinet.yaml").read_text())
         driver, mode = config.get("driver"), config.get("access_mode")
         if driver not in {"mock", "modbus_tcp"} or mode not in {"monitor", "control"}:
@@ -222,15 +275,24 @@ def main() -> int:
             check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             check.bind(("127.0.0.1", args.port))
         env = gateway_environment(root, runtime, offline=args.offline_check, driver=driver, mode=mode)
+        if args.update_monitor:
+            monitor_config = dict(config, access_mode="monitor")
+            monitor_path = root / "run/update-monitor-plc.yaml"
+            monitor_path.write_text(yaml.safe_dump(monitor_config, sort_keys=False))
+            mode = "monitor"
+            env.update({"RP1_FACTORY_PLC_CONFIG": str(monitor_path), "RP1_FACTORY_CAN_DISABLED": "1",
+                        "RP1_FACTORY_CAN_HELPER_PATH": str(root / "config/can-disabled"),
+                        "RP1_HMI_UPDATE_MONITOR_ONLY": "1"})
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGUSR1, request_update_stop)
         gateway = desktop = None
         url = f"http://127.0.0.1:{args.port}"
         activation_socket = str(root / f"run/desktop-{os.getpid()}.sock")
         with (root / "logs/gateway.log").open("a") as glog, (root / "logs/desktop.log").open("a") as dlog:
             try:
-                gateway = subprocess.Popen([sys.executable, "-m", "factory_hmi.gateway", "--host", "127.0.0.1", "--port", str(args.port), "--data-root", "data"], cwd=root, env=env, stdout=glog, stderr=subprocess.STDOUT)
-                state.write_text(json.dumps({"pid": os.getpid(), "start": process_start(os.getpid()), "gateway_pid": gateway.pid, "gateway": url, "driver": driver, "access_mode": mode, "read_only": mode == "monitor", "activation_socket": activation_socket}))
+                gateway = subprocess.Popen([sys.executable, "-m", "factory_hmi.gateway", "--host", "127.0.0.1", "--port", str(args.port), "--data-root", "data", "--lease-timeout", str(args.lease_timeout)], cwd=root, env=env, stdout=glog, stderr=subprocess.STDOUT)
+                state.write_text(json.dumps({"pid": os.getpid(), "start": process_start(os.getpid()), "gateway_pid": gateway.pid, "gateway": url, "driver": driver, "access_mode": mode, "read_only": mode == "monitor", "activation_socket": activation_socket, "update_safe_exit": True}))
                 wait_health(gateway, url, driver, mode)
                 if not args.gateway_only:
                     desktop = subprocess.Popen([sys.executable, "-m", "factory_hmi.desktop", "--gateway-url", url], cwd=root, env=dict(env, RP1_HMI_ACTIVATION_SOCKET=activation_socket, RP1_HMI_STATION_CONFIG_DIR=str(root / "config/stations")), stdout=dlog, stderr=subprocess.STDOUT)
@@ -247,8 +309,14 @@ def main() -> int:
                         break
                     time.sleep(0.2)
             finally:
-                finish(desktop)
-                finish(gateway)
+                finish(desktop, allow_kill=not update_stopping)
+                finish(gateway, allow_kill=not update_stopping)
+                if update_stopping:
+                    # Keep the real launcher identity and the same inode lock
+                    # while a child has not exited. The installer times out;
+                    # it cannot turn this into permission to kill or install.
+                    while any(process is not None and process.poll() is None for process in (desktop, gateway)):
+                        time.sleep(.2)
                 state.unlink(missing_ok=True)
     return 0
 

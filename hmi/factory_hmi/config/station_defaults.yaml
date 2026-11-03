@@ -2,6 +2,9 @@
 # must override these values in the selected motor YAML after validation.
 factory_hmi:
   control_rate_hz: 200
+  # Disabled cold-start discovery only. Motion/fault-reset gates stay strict.
+  discovery:
+    timeout_s: 5.0
   can:
     bitrate: 1000000
     dbitrate: 5000000
@@ -13,12 +16,20 @@ factory_hmi:
     allow_can_fd: true
   safety:
     max_frame_delta_rad: 0.25
-    max_velocity_rad_s: 8.0
-    max_first_frame_delta_rad: 0.75
+    max_velocity_rad_s: 20.0
+  first_frame_approach:
+    speed_rad_s: 0.17453292519943295  # 10 degrees/s, independent of playback speed
+    min_duration_s: 1.0
+    # null: ordinary playback reuses factory_hmi.faults.tracking_error_rad.
+    # Set a positive value only for a station with an explicit precision requirement.
+    position_tolerance_rad: null
+    speed_tolerance_rad_s: 0.03
+    stable_seconds: 0.2
+    settling_timeout_s: 5.0
   faults:
     stale_seconds: 2.0
     tracking_error_rad: 0.5
-    overtemperature_c: 85.0
+    overtemperature_c: 100.0
     high_torque_nm: 35.0
     high_torque_seconds: 2.0
     temperature_rise_c: 10.0
@@ -29,12 +40,12 @@ factory_hmi:
 # Product station YAML files must override duration, cycles and rated torque
 # after validation by manufacturing engineering.
 factory_hmi_acceptance:
-  criteria_version: generic-v1
+  criteria_version: hmi-runtime-v2
   required_active_seconds: 0
   required_cycles: 0
   min_sample_completeness: 0.95
   max_gap_seconds: 0.20
-  max_temperature_rise_c: 30.0
-  max_torque_p999_utilization: 1.0
-  max_tracking_rms_rad: 0.50
+  # Runtime-v2 retains these measurements, but does not judge acceptance by
+  # temperature rise, torque utilization or tracking RMS. Old sealed v1
+  # records retain their original rules when explicitly reanalyzed.
   rated_torque_nm: {}

@@ -6,6 +6,8 @@ import { runProbe } from "./probe.mjs";
 import { runSetup } from "./setup.mjs";
 import { runChat } from "./chat.mjs";
 import { safeFailure } from "./chat-errors.mjs";
+import { validModelAttachments } from "./diagnostic-attachments.mjs";
+import {once} from 'node:events';
 
 function secretMatches(provided, expected) {
   const left = Buffer.from(typeof provided === "string" ? provided : "");
@@ -16,6 +18,14 @@ function secretMatches(provided, expected) {
 function send(response, status, data) {
   response.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
   response.end(JSON.stringify(data));
+}
+
+function validResume(value){
+  if(value===undefined)return true;
+  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!['rounds_used','reads_used','writes_used','active_elapsed_ms','evidence','permissions'].includes(k)))return false;
+  for(const [key,max] of [['rounds_used',6],['reads_used',12],['writes_used',1],['active_elapsed_ms',120000]])
+    if(!Number.isInteger(value[key])||value[key]<0||value[key]>max)return false;
+  return ['evidence','permissions'].every(k=>Array.isArray(value[k])&&value[k].length<=200&&value[k].every(c=>c&&typeof c==='object'&&!Array.isArray(c)));
 }
 
 export function buildServer(config, probe = runProbe, chat = runChat) {
@@ -42,16 +52,27 @@ export function buildServer(config, probe = runProbe, chat = runChat) {
         chunks.push(chunk);
       }
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      if (!body || typeof body !== "object" || Array.isArray(body) || (isChat?![5,6].includes(Object.keys(body).length):Object.keys(body).length !== (isSetup ? 3 : 1)) || typeof body.tool_grant !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(body.tool_grant)) {
+      if (!body || typeof body !== "object" || Array.isArray(body) || (isChat?Object.keys(body).some(k=>!['tool_grant','messages','context','choices','timeout_ms','attachments','resume'].includes(k)):Object.keys(body).length !== (isSetup ? 3 : 1)) || typeof body.tool_grant !== "string" || !/^[A-Za-z0-9_-]{32,128}$/.test(body.tool_grant)) {
         return send(response, 422, { error: "invalid_probe" });
       }
       if(isSetup && (!Array.isArray(body.messages)||body.messages.length>12||!body.messages.every((m)=>typeof m==="string"&&m.length<=8000)||!body.choices||typeof body.choices!=="object"))return send(response,422,{error:"invalid_setup"});
       if(isChat&&(!Array.isArray(body.messages)||body.messages.length>20||!body.context||!body.choices||!Number.isInteger(body.timeout_ms)||body.timeout_ms<1000||body.timeout_ms>120000))return send(response,422,{error:"invalid_chat"});
-      if(isChat&&body.attachments!==undefined&&(!Array.isArray(body.attachments)||body.attachments.length>3||body.attachments.some(a=>!a||!["text","image"].includes(a.type)||(a.type==="image"&&(!["image/png","image/jpeg"].includes(a.mimeType)||typeof a.data!=="string"||a.data.length>5700000))||(a.type==="text"&&(typeof a.text!=="string"||a.text.length>25000)))))return send(response,422,{error:"invalid_attachment"});
-      send(response, 200, isChat?await chat(config,body,controller.signal):isSetup ? await runSetup(config, body, controller.signal) : await probe(config, body.tool_grant, controller.signal));
+      if(isChat&&!validModelAttachments(body.attachments))return send(response,422,{error:"invalid_attachment"});
+      if(isChat&&!validResume(body.resume))return send(response,422,{error:'invalid_resume'});
+      if(isChat&&request.headers.accept==='application/x-ndjson'){
+        response.writeHead(200,{'Content-Type':'application/x-ndjson','Cache-Control':'no-store','X-Accel-Buffering':'no'});
+        const emit=async(event)=>{
+          if(controller.signal.aborted||response.destroyed)throw new Error('stream closed');
+          if(!response.write(JSON.stringify(event)+'\n'))await once(response,'drain',{signal:controller.signal});
+        };
+        const result=await chat(config,body,controller.signal,emit);
+        await emit({kind:'result',data:result});response.end();
+      }else send(response, 200, isChat?await chat(config,body,controller.signal):isSetup ? await runSetup(config, body, controller.signal) : await probe(config, body.tool_grant, controller.signal));
     } catch(error) {
       // Never return or log provider errors, prompts, tokens or raw payloads.
-      if(isChat){const failure=safeFailure(error,controller.signal.aborted);console.log(JSON.stringify({event:"assistant_request_failed",reason:failure.body.error}));send(response,failure.status,failure.body);}
+      if(isChat){const failure=safeFailure(error,controller.signal.aborted);console.log(JSON.stringify({event:"assistant_request_failed",reason:failure.body.error}));
+        if(response.headersSent){if(!response.destroyed)response.end(JSON.stringify({kind:'error',data:failure.body})+'\n');}
+        else send(response,failure.status,failure.body);}
       else send(response, controller.signal.aborted ? 504 : 502, { error: "probe_failed" });
     } finally {
       active--;

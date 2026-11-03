@@ -22,6 +22,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from factory_hmi.execution_history import select_history, history_csv
+from factory_hmi.data_domain import domain_metadata
+
 import yaml
 
 
@@ -491,29 +494,19 @@ def _build_verdict(
     if non_monotonic:
         blocked_names.add("monotonic_time")
 
+    runtime_v2 = criteria_version == "hmi-runtime-v2"
     for joint in joints:
         name = str(joint["joint_name"])
-        maximum(
-            f"{name}.temperature_peak_rise_c",
-            joint["temperature_peak_rise_c"],
-            "max_temperature_rise_c",
-            "°C",
-            product_failure=True,
-        )
-        maximum(
-            f"{name}.torque_p999_utilization",
-            joint["torque_utilization"],
-            "max_torque_p999_utilization",
-            "ratio",
-            product_failure=True,
-        )
-        maximum(
-            f"{name}.tracking_rms_rad",
-            joint["tracking_rms_rad"],
-            "max_tracking_rms_rad",
-            "rad",
-            product_failure=True,
-        )
+        # Keep historical v1 semantics when reanalyzing an old sealed context.
+        # New runtime-v2 still calculates every measurement, but the operator
+        # explicitly removed these three acceptance rules.
+        if not runtime_v2:
+            maximum(f"{name}.temperature_peak_rise_c", joint["temperature_peak_rise_c"],
+                "max_temperature_rise_c", "°C", product_failure=True)
+            maximum(f"{name}.torque_p999_utilization", joint["torque_utilization"],
+                "max_torque_p999_utilization", "ratio", product_failure=True)
+            maximum(f"{name}.tracking_rms_rad", joint["tracking_rms_rad"],
+                "max_tracking_rms_rad", "rad", product_failure=True)
         fault_name = f"{name}.fault_intervals"
         no_faults = int(joint["fault_count"]) == 0
         rules.append(
@@ -641,42 +634,18 @@ def _build_summary(
     csv_path: Path,
     context: Mapping[str, Any],
 ) -> dict[str, Any]:
-    fields, rows, times, non_monotonic = _read_csv(csv_path)
+    from .streaming_metrics import analyze
+    valid_time_rows, non_monotonic, max_gap, expected, joints = analyze(csv_path, context)
     active_seconds = max(0.0, float(context.get("active_seconds") or 0.0))
     record_rate_hz = max(0.0, float(context.get("record_rate_hz") or 0.0))
-    expected = math.floor(active_seconds * record_rate_hz) + 1
-    valid_time_rows = len(times)
-    completeness = min(
-        1.0,
-        valid_time_rows / expected if expected > 0 else 0.0,
-    )
-    ordered_times = sorted(times)
-    max_gap = max(
-        (
-            max(0.0, current - previous)
-            for previous, current in zip(ordered_times, ordered_times[1:])
-        ),
-        default=0.0,
-    )
-    quality = {
-        "sample_count": valid_time_rows,
-        "expected_sample_count": expected,
-        "sample_completeness": completeness,
-        "max_gap_seconds": max_gap,
-    }
-    joints = _joint_metrics(
-        fields,
-        rows,
-        times,
-        context,
-        expected,
-        max_gap,
-    )
+    completeness = min(1.0, valid_time_rows / expected if expected > 0 else 0.0)
+    quality = {"sample_count": valid_time_rows, "expected_sample_count": expected,
+               "sample_completeness": completeness, "max_gap_seconds": max_gap}
     verdict = _build_verdict(
         context,
         {**quality, "sample_completeness": completeness if context.get("active_seconds") is not None and record_rate_hz > 0 else None},
         joints,
-        non_monotonic=non_monotonic or not times,
+        non_monotonic=non_monotonic or not valid_time_rows,
     )
     acceptance = context.get("acceptance")
     if not isinstance(acceptance, Mapping):
@@ -684,7 +653,7 @@ def _build_summary(
     minimum = _finite(acceptance.get("min_sample_completeness"))
     maximum_gap = _finite(acceptance.get("max_gap_seconds"))
     quality_acceptable = (
-        bool(times)
+        bool(valid_time_rows)
         and not non_monotonic
         and minimum is not None
         and completeness >= minimum
@@ -748,6 +717,8 @@ def _render_report(summary: Mapping[str, Any], manifest_identity: Mapping[str, A
         f"- Local record ID: `{summary['test_id']}`",
         f"- Test case: `{manifest_identity['test_case_id']}`",
         f"- Sample: `{manifest_identity['sample_id']}`",
+        f"- Data domain: `{manifest_identity.get('data_domain', 'UNCLASSIFIED')}` ({manifest_identity.get('data_domain_source', 'NO_EVIDENCE')})",
+        f"- Factory SN: `{manifest_identity.get('serial_number', '')}`",
         f"- Bench/station: `{manifest_identity['bench_id']}` / `{manifest_identity.get('station_id', '')}`",
         f"- Operator: `{manifest_identity.get('operator_id', '')}`",
         f"- Started: {'未记录（历史 CSV 缺少绝对时间）' if clock_missing else timing['started_at']}",
@@ -802,30 +773,26 @@ def _render_report(summary: Mapping[str, Any], manifest_identity: Mapping[str, A
 
 
 def _deterministic_tar_gz(source: Path, destination: Path) -> None:
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        for path in sorted(item for item in source.rglob("*") if item.is_file()):
-            relative = path.relative_to(source).as_posix()
-            info = tarfile.TarInfo(relative)
-            info.size = path.stat().st_size
-            info.mode = 0o640
-            info.uid = 0
-            info.gid = 0
-            info.uname = ""
-            info.gname = ""
-            info.mtime = 0
-            with path.open("rb") as handle:
-                archive.addfile(info, handle)
-    compressed = io.BytesIO()
-    with gzip.GzipFile(
-        filename="",
-        mode="wb",
-        fileobj=compressed,
-        mtime=0,
-        compresslevel=9,
-    ) as handle:
-        handle.write(buffer.getvalue())
-    _write_fsynced(destination, compressed.getvalue())
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name("." + destination.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with temporary.open("xb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=9) as compressed:
+                with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.USTAR_FORMAT) as archive:
+                    for path in sorted(item for item in source.rglob("*") if item.is_file()):
+                        if path.is_symlink(): raise ValueError("bundle must not contain symbolic links")
+                        info = tarfile.TarInfo(path.relative_to(source).as_posix())
+                        info.size = path.stat().st_size
+                        info.mode = 0o640
+                        info.mtime = info.uid = info.gid = 0
+                        info.uname = info.gname = ""
+                        with path.open("rb") as handle: archive.addfile(info, handle)
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class ReportManager:
@@ -837,6 +804,10 @@ class ReportManager:
         self.exports_root = self.data_root / "exports"
         self.executions_root.mkdir(parents=True, exist_ok=True)
         self.exports_root.mkdir(parents=True, exist_ok=True)
+        from .history_index import HistoryIndex
+        self.history_index = HistoryIndex(self.data_root / "history.sqlite3")
+        if not self.history_index.initialized():
+            self.rebuild_history_index()
         self._review_lock = threading.RLock()
 
     @contextmanager
@@ -881,7 +852,32 @@ class ReportManager:
         try:
             telemetry = temporary / TELEMETRY_PATH
             telemetry.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, telemetry)
+            from .recording.segments import copy_logical_csv
+            copy_logical_csv(source, telemetry)
+            segment_manifest = source.with_suffix(".segments.json")
+            if segment_manifest.exists():
+                from .recording.segments import sources
+                parts = sources(source)
+                original = json.loads(segment_manifest.read_text())
+                segment_root = temporary / "telemetry/segments"
+                segment_root.mkdir()
+                descriptors = []
+                for index, part in enumerate(parts):
+                    target = segment_root / f"{index:06d}.csv"
+                    shutil.copyfile(part, target)
+                    with target.open("rb") as handle: os.fsync(handle.fileno())
+                    descriptors.append({key: value for key, value in original["segments"][index].items() if key not in {"path", "sealed"}})
+                run_manifest = {"schema_version": "run-segments-v1", "execution_uuid": normalized["execution_uuid"],
+                    "logical_sha256": _sha256(telemetry), "logical_size_bytes": telemetry.stat().st_size,
+                    "policy_sha256": (normalized.get("recording_policy") or {}).get("sha256"), "segments": descriptors}
+                _write_fsynced(segment_root / "manifest.json", _json_bytes(run_manifest))
+                for companion in ("windows.jsonl", "events.jsonl", "fault-evidence.csv"):
+                    companion_source=source.with_suffix(".segments")/companion
+                    if companion_source.is_file():
+                        shutil.copyfile(companion_source,segment_root/companion)
+                        with (segment_root/companion).open("rb") as handle: os.fsync(handle.fileno())
+
+
             with telemetry.open("rb") as handle:
                 os.fsync(handle.fileno())
 
@@ -933,7 +929,7 @@ class ReportManager:
             for path in sorted(
                 item
                 for item in temporary.rglob("*")
-                if item.is_file() and item.name != "manifest.json"
+                if item.is_file() and item != temporary / "manifest.json"
             ):
                 if path.is_symlink():
                     raise ValueError("bundle must not contain symbolic links")
@@ -960,6 +956,8 @@ class ReportManager:
             os.rename(temporary_bundle, bundle_path)
             _fsync_directory(self.executions_root)
             _fsync_directory(self.exports_root)
+            self.refresh_history_index(test_id)
+            self.write_ledger(self.iter_history())
             return ReportResult(
                 execution_dir=destination,
                 manifest_path=destination / "manifest.json",
@@ -1035,7 +1033,9 @@ class ReportManager:
 
     def recover_orphans(self, record_root: Path | str) -> list[ReportResult]:
         results: list[ReportResult] = []
-        for csv_path in sorted(Path(record_root).glob("*.csv")):
+        for csv_path in Path(record_root).glob("*.csv"):
+            if csv_path.with_suffix(".checkpoint.json").exists() and not csv_path.with_suffix(".segments.json").exists():
+                continue  # An unfinished segmented run must never be treated as one legacy CSV.
             test_id = csv_path.stem
             if (self.executions_root / test_id / "manifest.json").is_file():
                 continue
@@ -1133,6 +1133,18 @@ class ReportManager:
             )
         )
 
+    def local_correction_store(self, test_id: str):
+        from .local_corrections import LocalCorrections
+        execution = self.execution_dir(test_id)
+        manifest = execution / 'manifest.json'
+        if manifest.is_symlink() or not (execution / SUMMARY_PATH).is_file():
+            raise ValueError('请选择已完成并有本地报告的记录')
+        return LocalCorrections(self.data_root, test_id, manifest.read_bytes())
+
+    def local_corrections(self, test_id: str) -> dict[str, Any]:
+        with self.evidence_lock():
+            return self.local_correction_store(test_id).state()
+
     def report_path(self, test_id: str) -> Path:
         path = self.execution_dir(test_id) / "analysis/report.md"
         if not path.is_file():
@@ -1145,10 +1157,35 @@ class ReportManager:
             raise FileNotFoundError(f"bundle not found: {test_id}")
         return path
 
-    def history(self, limit: int = 100) -> list[dict[str, Any]]:
+    def history(self, limit: int | None = 100, *, start_at: str = "", end_at: str = "") -> list[dict[str, Any]]:
+        if not self.history_index.initialized():
+            self.rebuild_history_index()
+        if limit is None:
+            return list(self.iter_history(start_at=start_at, end_at=end_at))
+        result = self.history_index.page(limit=min(500, limit), start_at=start_at, end_at=end_at)
+        return result["items"]
+
+    def iter_history(self, **filters):
+        cursor = None
+        while True:
+            page = self.history_index.page(limit=500, cursor=cursor, **filters)
+            yield from page["items"]
+            cursor = page["next_cursor"]
+            if not cursor: break
+
+    def rebuild_history_index(self) -> None:
+        for item in self._scan_history():
+            self.history_index.put(item)
+        self.history_index.finish_rebuild()
+
+    def refresh_history_index(self, test_id: str) -> None:
+        for item in self._scan_history(test_id):
+            self.history_index.put(item)
+
+    def _scan_history(self, test_id: str | None = None):
         items = []
         for path in sorted(
-            self.executions_root.glob("*/manifest.json"),
+            self.executions_root.glob(f"{_safe_test_id(test_id) if test_id else '*'}/manifest.json"),
             key=lambda item: item.stat().st_mtime,
             reverse=True,
         ):
@@ -1161,6 +1198,7 @@ class ReportManager:
                 continue
             items.append(
                 {
+                    **domain_metadata(manifest),
                     "execution_uuid": manifest["execution_uuid"],
                     "test_id": manifest["test_id"],
                     "execution_code": manifest.get("execution_code", ""),
@@ -1172,6 +1210,8 @@ class ReportManager:
                     "actual_object": manifest.get("actual_object", ""),
                     "bench_id": manifest.get("bench_id", ""),
                     "origin": manifest.get("origin", "HMI"),
+                    "record_directory": str(path.parent.resolve()),
+                    "raw_csv_path": str((path.parent / TELEMETRY_PATH).resolve()),
                     "started_at": "" if manifest.get("timestamp_provenance") == "missing" else manifest["started_at"],
                     "ended_at": "" if manifest.get("timestamp_provenance") == "missing" else manifest["ended_at"],
                     "verdict": "未配置判据" if summary["verdict"].get("criteria_version") == "UNCONFIGURED" or summary["verdict"]["status"] == "unconfigured" else summary["verdict"]["status"],
@@ -1180,9 +1220,31 @@ class ReportManager:
                     ),
                 }
             )
-            if len(items) >= max(1, int(limit)):
-                break
-        return items
+        from .local_corrections import apply_to_history
+        for item in items:
+            try:
+                apply_to_history(item, self.local_correction_store(item['test_id']).state())
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                # Evidence remains visible with its original metadata. A broken
+                # correction journal must never silently look like a valid edit.
+                item['local_correction_error'] = str(exc)
+        yield from items
+
+    def write_ledger(self, items: list[dict[str, Any]]) -> Path:
+        """Caller holds evidence_lock so multi-window refreshes cannot regress."""
+        target = self.executions_root / "执行台账.csv"
+        descriptor, temporary = tempfile.mkstemp(prefix=".ledger-", dir=self.executions_root)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                for chunk in history_csv(items):
+                    stream.write(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            _fsync_directory(self.executions_root)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return target
 
     @staticmethod
     def _normalize_context(context: Mapping[str, Any]) -> dict[str, Any]:
@@ -1202,6 +1264,7 @@ class ReportManager:
             or (value.get("station_id") if value.get("recording_scope") != "local" else None)
             or "unknown"
         )
+        value.update(domain_metadata(value))
         value["started_at"] = _utc_iso(value.get("started_at"))
         value["ended_at"] = _utc_iso(
             value.get("ended_at") or value["started_at"]
@@ -1221,9 +1284,11 @@ class ReportManager:
     @staticmethod
     def _rebuild_context(context: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {
+            "capacity_admission", "recording_policy",
             "execution_uuid",
             "test_id",
             "recording_scope",
+            "data_domain", "data_domain_source", "serial_number",
             "execution_code",
             "campaign_id",
             "cycle_id",
@@ -1258,6 +1323,7 @@ class ReportManager:
             "calibration_version",
             "test_name", "actual_object", "origin", "machine_status", "timestamp_provenance",
             "acceptance", "history_declared_context", "history_context_sha256",
+            "preparation",
         }
         return {
             key: value
@@ -1283,6 +1349,7 @@ class ReportManager:
         )
         identity: dict[str, Any] = {
             "bundle_format": BUNDLE_FORMAT,
+            **{key: str(context.get(key) or "") for key in ("data_domain", "data_domain_source", "serial_number")},
             "schema_version": SCHEMA_VERSION,
             "execution_uuid": str(context["execution_uuid"]),
             "test_id": str(context["test_id"]),

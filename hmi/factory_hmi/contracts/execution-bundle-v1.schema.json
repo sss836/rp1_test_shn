@@ -11,6 +11,9 @@
   ],
   "properties": {
     "bundle_format": {"const": "rp1-execution-bundle"},
+    "data_domain": {"enum": ["RESEARCH", "FACTORY", "UNCLASSIFIED"]},
+    "data_domain_source": {"enum": ["EXPLICIT", "HISTORICAL_BENCH", "NO_EVIDENCE"]},
+    "serial_number": {"type": "string", "maxLength": 255},
     "schema_version": {"const": "1.0"},
     "execution_uuid": {"type": "string", "format": "uuid"},
     "test_id": {"type": "string", "minLength": 1, "maxLength": 255},

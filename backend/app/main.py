@@ -15,18 +15,26 @@ from app.api.routes import (
     archives,
     assistant,
     assistant_chat,
+    assistant_local_diagnostics,
+    assistant_permissions,
     archive_imports,
     auth,
     dashboard,
     health,
     hmi_presence,
+    factory_monitor,
+    hmi_updates,
+    motor_firmware,
+    motor_firmware_resources,
+    motor_parameters,
     mtbf,
     read_models,
     setup,
     submissions,
 )
+from app.core.auth import RequestActorDep
 from app.core.config import get_settings
-from app.core.db import SessionLocal
+from app.core.db import SessionLocal, DbSession
 from app.core.errors import ApiError
 from app.repositories.security import SecurityRepository
 from app.services.auth import AuthService
@@ -81,6 +89,9 @@ app.add_middleware(
         "X-Request-Id",
         "X-Change-Reason",
         "X-CSRF-Token",
+        "X-HMI-Release",
+        "X-Filename",
+        "X-Filename-UTF8",
         *(["X-User-Public-Id"] if settings.auth_mode == "development" else []),
     ],
 )
@@ -152,7 +163,16 @@ async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResp
 app.include_router(health.router)
 app.include_router(assistant.router)
 app.include_router(assistant_chat.router)
+app.include_router(assistant_local_diagnostics.router)
+app.include_router(assistant_permissions.router)
+from app.api.routes import assistant_support
+app.include_router(assistant_support.router)
 app.include_router(hmi_presence.router)
+app.include_router(factory_monitor.router)
+app.include_router(hmi_updates.router)
+app.include_router(motor_firmware.router)
+app.include_router(motor_firmware_resources.router)
+app.include_router(motor_parameters.router)
 app.include_router(auth.router)
 app.include_router(access.router)
 app.include_router(admin.router)
@@ -162,4 +182,35 @@ app.include_router(mtbf.router)
 app.include_router(setup.router)
 app.include_router(submissions.router)
 app.include_router(archives.router)
+app.include_router(archives.factory_router)
 app.include_router(archive_imports.router)
+
+@app.get("/api/v1/archive-capabilities")
+def archive_capabilities(actor: RequestActorDep):
+    from app.schemas.common import DataEnvelope
+    return DataEnvelope(data={"run_segments":True,"schema_version":"run-segments-v1","max_segments":4096})
+
+from app.api.routes import showcase
+app.include_router(showcase.router)
+
+@app.get("/api/v1/archive-ledger.csv")
+def archive_ledger(actor: RequestActorDep, session: DbSession, request: Request):
+    import csv,io,json
+    from app.repositories.archives import ArchiveRepository
+    from app.schemas.archives import ArchiveLedgerFilters
+    from fastapi.responses import StreamingResponse
+    filters=ArchiveLedgerFilters.model_validate(dict(request.query_params))
+    def chunks():
+        yield b"\xef\xbb\xbf"
+        buffer=io.StringIO(newline="");writer=csv.writer(buffer)
+        writer.writerow(['执行编号','测试','SN或对象','台架','审批状态','开始时间','分区'])
+        before=None
+        while True:
+            page=ArchiveRepository(session).list(**{("query" if k=="q" else k):v for k,v in filters.model_dump(exclude_none=True).items()},before=before,limit=100)
+            for item in page['items']:
+                cells=[item.get('execution_code') or item['archive_code'],item['test_name'],item.get('serial_number') or item['actual_object'],item.get('bench_id') or '',item.get('submission_status') or '未送审',(item.get('facts') or {}).get('started_at') or '',item.get('data_domain') or 'UNCLASSIFIED']
+                writer.writerow(["'"+str(v) if str(v).lstrip().startswith(('=','+','-','@')) else str(v) for v in cells])
+            yield buffer.getvalue().encode('utf-8');buffer.seek(0);buffer.truncate(0)
+            before=page['next_cursor']
+            if before is None:break
+    return StreamingResponse(chunks(),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="archive-ledger.csv"','Cache-Control':'no-store'})

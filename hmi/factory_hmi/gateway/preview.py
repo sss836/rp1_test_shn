@@ -1,0 +1,143 @@
+"""Loopback-only preview sessions, deliberately separate from control leases."""
+from __future__ import annotations
+import asyncio, json, secrets, threading, time
+from pathlib import Path
+from urllib.parse import urlsplit
+from fastapi import HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from starlette.staticfiles import StaticFiles
+
+class PreviewSessions:
+ def __init__(self,hub):self.hub=hub;self.tickets={};self.sessions={};self.lock=threading.Lock();self.sockets=0
+ def cleanup(self):
+  now=time.monotonic()
+  self.tickets={k:v for k,v in self.tickets.items() if v[1]>now};self.sessions={k:v for k,v in self.sessions.items() if v[1]>now}
+ def issue(self,key,run_id):
+  with self.lock:
+   self.cleanup()
+   if len(self.tickets)+len(self.sessions)>=8:raise HTTPException(429,"预览会话已达8个，请关闭旧窗口后重试")
+   ticket=secrets.token_urlsafe(32);self.tickets[ticket]=(key,time.monotonic()+30,run_id);return ticket
+ def exchange(self,ticket):
+  with self.lock:
+   self.cleanup();value=self.tickets.pop(ticket,None)
+   if value is None:raise HTTPException(401,"预览票据已过期，请从上位机重新打开")
+   token=secrets.token_urlsafe(32);self.sessions[token]=(value[0],time.monotonic()+3600,value[2]);return token
+ def runtime(self,token):
+  with self.lock:
+   self.cleanup();value=self.sessions.get(token or "")
+  if value is None:raise HTTPException(401,"预览会话过期")
+  with self.hub._lock:runtime=self.hub._sessions.get(value[0])
+  if runtime is None:raise HTTPException(410,"原工位会话已关闭")
+  service=runtime.controller;controller=getattr(service,"_controller",None)
+  if controller is None and hasattr(service,"telemetry_hub"):controller=service
+  if controller is None or controller.telemetry_hub.run_id!=value[2]:raise HTTPException(410,"执行已切换，请从上位机重新打开曲线")
+  with self.lock:
+   if token in self.sessions:self.sessions[token]=(value[0],time.monotonic()+3600,value[2])
+  return runtime
+ def allowed_run(self,token):
+  self.runtime(token)
+  with self.lock:return self.sessions[token][2]
+
+def local(request):
+ host=urlsplit("http://"+request.headers.get("host","")).hostname
+ if host not in {"127.0.0.1","localhost","::1"}:raise HTTPException(403,"仅允许本机预览")
+ peer=request.client.host if request.client else ""
+ if peer not in {"127.0.0.1","::1","testclient"}:raise HTTPException(403,"仅允许本机预览")
+ origin=request.headers.get("origin")
+ if origin and origin!=str(request.base_url).rstrip("/"):raise HTTPException(403,"预览来源不匹配")
+
+def attach_preview(app,hub,require_token,owner_id):
+ preview=PreviewSessions(hub);app.state.preview=preview
+ def runtime(request):
+  local(request);return preview.runtime(request.cookies.get("rp1_preview"))
+ def cache(rt):
+  service=rt.controller;controller=getattr(service,"_controller",None)
+  if controller is None and hasattr(service,"telemetry_hub"):controller=service
+  if controller is None:raise HTTPException(409,"尚无测量缓存，请先在上位机准备任务")
+  return controller.telemetry_hub
+ @app.post("/api/v1/preview/launch")
+ def launch(request:Request):
+  local(request);require_token(request.headers.get("x-rp1-operator-token"));owner=owner_id(request,request.headers.get("x-rp1-client-id"));key=hub._key(owner)
+  with hub._lock:rt=hub._sessions.get(key)
+  if rt is None:raise HTTPException(409,"尚无当前执行，不会为预览创建设备会话")
+  c=cache(rt);ticket=preview.issue(key,c.run_id)
+  return dict(url=str(request.base_url).rstrip("/")+"/preview/#ticket="+ticket,run_id=c.run_id)
+ @app.post("/api/v1/preview/session")
+ async def session(request:Request):
+  local(request)
+  if int(request.headers.get("content-length","0"))>512:raise HTTPException(413,"票据过大")
+  body=bytearray()
+  async for chunk in request.stream():
+   if len(body)+len(chunk)>512:raise HTTPException(413,"票据过大")
+   body.extend(chunk)
+  try:ticket=json.loads(body).get("ticket","")
+  except (ValueError,AttributeError):raise HTTPException(400,"无效票据")
+  from fastapi.responses import JSONResponse
+  response=JSONResponse({"read_only":True,"expires_in_s":3600});response.set_cookie("rp1_preview",preview.exchange(ticket),httponly=True,samesite="strict",max_age=3600,path="/")
+  response.headers["Cache-Control"]="no-store";return response
+ @app.get("/api/v1/preview/capabilities")
+ def capabilities(request:Request):return cache(runtime(request)).capabilities()
+ @app.get("/api/v1/preview/state")
+ def state(request:Request,response:Response,after:int=0,limit:int=600):
+  if after<0:raise HTTPException(422,"无效序号")
+  try:
+   data=cache(runtime(request)).read(after=after,limit=limit)
+   response.set_cookie('rp1_preview',request.cookies.get('rp1_preview'),httponly=True,samesite='strict',max_age=3600,path='/')
+   response.headers['Cache-Control']='no-store';return data
+  except ValueError as exc:raise HTTPException(422,str(exc))
+ @app.get("/api/v1/preview/runs/{run_id}/curves")
+ def historical(run_id:str,request:Request,metrics:str="",start:str="",end:str="",view:str="归档",window:str=""):
+  from .local_curves import curves
+  if len(metrics)>2000:raise HTTPException(422,"通道参数过长")
+  rt=runtime(request)
+  if run_id!=preview.allowed_run(request.cookies.get("rp1_preview")):raise HTTPException(403,"超出本次预览执行范围")
+  return curves(rt.controller,run_id,metrics,start,end,view,window)
+ @app.get("/api/v1/preview/runs/{run_id}/events")
+ def events(run_id:str,request:Request,offset:int=0):
+  from .local_curves import events
+  rt=runtime(request)
+  if run_id!=preview.allowed_run(request.cookies.get("rp1_preview")):raise HTTPException(403,"超出本次预览执行范围")
+  return events(rt.controller,run_id,offset)
+ @app.get("/api/v1/preview/runs/{run_id}/export.csv")
+ def export(run_id:str,request:Request):
+  rt=runtime(request)
+  if run_id!=preview.allowed_run(request.cookies.get("rp1_preview")):raise HTTPException(403,"超出本次预览执行范围")
+  manager=getattr(rt.controller,"report_manager",None)
+  if manager is None:raise HTTPException(404,"尚无已封存记录")
+  with manager.history_index.connect() as db:
+   row=db.execute("SELECT payload FROM runs WHERE json_extract(payload,'$.execution_uuid')=? LIMIT 1",(run_id,)).fetchone()
+  if row is None:raise HTTPException(409,"请等待记录封存；不会因下载触发测试或报告重算")
+  path=manager.execution_dir(json.loads(row[0])["test_id"])/"telemetry/raw.csv"
+  return FileResponse(path,filename="sealed-telemetry.csv",media_type="text/csv",headers={"Cache-Control":"no-store"})
+ @app.post("/api/v1/preview/close")
+ def close(request:Request):
+  local(request)
+  with preview.lock:preview.sessions.pop(request.cookies.get("rp1_preview"),None)
+  return {"closed":True}
+ @app.websocket("/ws/preview")
+ async def websocket(ws:WebSocket):
+  try:
+   # WebSocket exposes URL instead of base_url; same-origin validation is explicit.
+   host=ws.headers.get("host","");origin=ws.headers.get("origin","")
+   if ws.client is None or ws.client.host not in {"127.0.0.1","::1","testclient"} or urlsplit("http://"+host).hostname not in {"localhost","127.0.0.1","::1"} or origin not in {"http://"+host,"https://"+host}:raise HTTPException(403,"仅允许同源本机预览")
+   rt=preview.runtime(ws.cookies.get("rp1_preview"));hubcache=cache(rt)
+   with preview.lock:
+    if preview.sockets>=8:raise HTTPException(429,"预览连接已满")
+    preview.sockets+=1
+  except HTTPException:await ws.close(code=1008);return
+  try:
+   await ws.accept();after=0;stream=None
+   while True:
+    preview.runtime(ws.cookies.get("rp1_preview"))
+    payload=hubcache.read(after=after,limit=600)
+    if payload["stream_id"]!=stream:stream=payload["stream_id"];payload=hubcache.read();after=0
+    await asyncio.wait_for(ws.send_json(payload),timeout=1.)
+    after=payload["last_sequence"];await asyncio.sleep(.1)
+  except (WebSocketDisconnect,asyncio.TimeoutError,RuntimeError,HTTPException):pass
+  finally:
+   with preview.lock:preview.sockets-=1
+ root=Path(__file__).resolve().parents[1]/"resources/local-preview"
+ if root.is_dir():
+  app.mount("/preview/assets",StaticFiles(directory=root/"assets"),name="preview-assets")
+  @app.get("/preview/")
+  def page(request:Request):local(request);return FileResponse(root/"index.html",headers={"Cache-Control":"no-store","Referrer-Policy":"no-referrer","Content-Security-Policy":"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self' data:"})

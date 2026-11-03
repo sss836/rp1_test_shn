@@ -1,0 +1,495 @@
+{
+  "status": "candidate_unconfirmed",
+  "warnings": [
+    "CAN超时0关闭保护；不能据此发布",
+    "Pn响应未回显编号；实机适用性待核实",
+    "编码范围KP/KD不等于运行增益"
+  ],
+  "templates": [
+    {
+      "schema": "rp1-motor-parameters-v1",
+      "template_id": "e6949859c47321b1b787bb75cbbd3cbf",
+      "version": "candidate-1",
+      "model": "LRO_5550",
+      "source_sha256": "34f2214d52cf5e879e9ec169ec91725b22cdc99228a47d2671a491c9c85b0f3c",
+      "source": "user-supplied/deploy_motorlro_params.py",
+      "applicability": [],
+      "entries": [
+        {
+          "key": "kt",
+          "expected_raw": [
+            174
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "kp",
+          "expected_raw": [
+            0,
+            500
+          ],
+          "tolerance_raw": 5
+        },
+        {
+          "key": "kd",
+          "expected_raw": [
+            0,
+            50
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "pos",
+          "expected_raw": [
+            -1250,
+            1250
+          ],
+          "tolerance_raw": 12
+        },
+        {
+          "key": "spd",
+          "expected_raw": [
+            -2000,
+            2000
+          ],
+          "tolerance_raw": 20
+        },
+        {
+          "key": "tor",
+          "expected_raw": [
+            -300,
+            300
+          ],
+          "tolerance_raw": 3
+        },
+        {
+          "key": "cur",
+          "expected_raw": [
+            -180,
+            180
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "can_timeout",
+          "expected_raw": [
+            0
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0401",
+          "expected_raw": [
+            200
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0402",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0403",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e71",
+          "expected_raw": [
+            75
+          ],
+          "tolerance_raw": 0
+        }
+      ],
+      "confirmation": null
+    },
+    {
+      "schema": "rp1-motor-parameters-v1",
+      "template_id": "458a91d5d5203906c668bda37fb80449",
+      "version": "candidate-1",
+      "model": "LRO_6562",
+      "source_sha256": "34f2214d52cf5e879e9ec169ec91725b22cdc99228a47d2671a491c9c85b0f3c",
+      "source": "user-supplied/deploy_motorlro_params.py",
+      "applicability": [],
+      "entries": [
+        {
+          "key": "kt",
+          "expected_raw": [
+            162
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "kp",
+          "expected_raw": [
+            0,
+            500
+          ],
+          "tolerance_raw": 5
+        },
+        {
+          "key": "kd",
+          "expected_raw": [
+            0,
+            50
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "pos",
+          "expected_raw": [
+            -1250,
+            1250
+          ],
+          "tolerance_raw": 12
+        },
+        {
+          "key": "spd",
+          "expected_raw": [
+            -4000,
+            4000
+          ],
+          "tolerance_raw": 40
+        },
+        {
+          "key": "tor",
+          "expected_raw": [
+            -400,
+            400
+          ],
+          "tolerance_raw": 4
+        },
+        {
+          "key": "cur",
+          "expected_raw": [
+            -320,
+            320
+          ],
+          "tolerance_raw": 3
+        },
+        {
+          "key": "can_timeout",
+          "expected_raw": [
+            0
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0401",
+          "expected_raw": [
+            200
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0402",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0403",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0407",
+          "expected_raw": [
+            10000
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e05",
+          "expected_raw": [
+            56
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0eb2",
+          "expected_raw": [
+            45
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0f09",
+          "expected_raw": [
+            65
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0f0a",
+          "expected_raw": [
+            287
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e71",
+          "expected_raw": [
+            75
+          ],
+          "tolerance_raw": 0
+        }
+      ],
+      "confirmation": null
+    },
+    {
+      "schema": "rp1-motor-parameters-v1",
+      "template_id": "23fa8d19e913d8f10ad86066ca7a64d6",
+      "version": "candidate-1",
+      "model": "LRO_8462",
+      "source_sha256": "34f2214d52cf5e879e9ec169ec91725b22cdc99228a47d2671a491c9c85b0f3c",
+      "source": "user-supplied/deploy_motorlro_params.py",
+      "applicability": [],
+      "entries": [
+        {
+          "key": "kt",
+          "expected_raw": [
+            231
+          ],
+          "tolerance_raw": 2
+        },
+        {
+          "key": "kp",
+          "expected_raw": [
+            0,
+            500
+          ],
+          "tolerance_raw": 5
+        },
+        {
+          "key": "kd",
+          "expected_raw": [
+            0,
+            50
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "pos",
+          "expected_raw": [
+            -1250,
+            1250
+          ],
+          "tolerance_raw": 12
+        },
+        {
+          "key": "spd",
+          "expected_raw": [
+            -3500,
+            3500
+          ],
+          "tolerance_raw": 35
+        },
+        {
+          "key": "tor",
+          "expected_raw": [
+            -650,
+            650
+          ],
+          "tolerance_raw": 6
+        },
+        {
+          "key": "cur",
+          "expected_raw": [
+            -350,
+            350
+          ],
+          "tolerance_raw": 3
+        },
+        {
+          "key": "can_timeout",
+          "expected_raw": [
+            0
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0401",
+          "expected_raw": [
+            200
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0402",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0403",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0407",
+          "expected_raw": [
+            10000
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e05",
+          "expected_raw": [
+            56
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0eb2",
+          "expected_raw": [
+            39
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e71",
+          "expected_raw": [
+            75
+          ],
+          "tolerance_raw": 0
+        }
+      ],
+      "confirmation": null
+    },
+    {
+      "schema": "rp1-motor-parameters-v1",
+      "template_id": "d4ee27dfaa351dfda1daeeed6381f758",
+      "version": "candidate-1",
+      "model": "LRO_10062",
+      "source_sha256": "34f2214d52cf5e879e9ec169ec91725b22cdc99228a47d2671a491c9c85b0f3c",
+      "source": "user-supplied/deploy_motorlro_params.py",
+      "applicability": [],
+      "entries": [
+        {
+          "key": "kt",
+          "expected_raw": [
+            238
+          ],
+          "tolerance_raw": 2
+        },
+        {
+          "key": "kp",
+          "expected_raw": [
+            0,
+            500
+          ],
+          "tolerance_raw": 5
+        },
+        {
+          "key": "kd",
+          "expected_raw": [
+            0,
+            50
+          ],
+          "tolerance_raw": 1
+        },
+        {
+          "key": "pos",
+          "expected_raw": [
+            -1250,
+            1250
+          ],
+          "tolerance_raw": 12
+        },
+        {
+          "key": "spd",
+          "expected_raw": [
+            -1600,
+            1600
+          ],
+          "tolerance_raw": 16
+        },
+        {
+          "key": "tor",
+          "expected_raw": [
+            -1650,
+            1650
+          ],
+          "tolerance_raw": 16
+        },
+        {
+          "key": "cur",
+          "expected_raw": [
+            -900,
+            900
+          ],
+          "tolerance_raw": 9
+        },
+        {
+          "key": "can_timeout",
+          "expected_raw": [
+            0
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0401",
+          "expected_raw": [
+            200
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0402",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0403",
+          "expected_raw": [
+            300
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0407",
+          "expected_raw": [
+            5000
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e05",
+          "expected_raw": [
+            56
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0eb2",
+          "expected_raw": [
+            40
+          ],
+          "tolerance_raw": 0
+        },
+        {
+          "key": "pn_0e71",
+          "expected_raw": [
+            75
+          ],
+          "tolerance_raw": 0
+        }
+      ],
+      "confirmation": null
+    }
+  ]
+}

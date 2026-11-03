@@ -58,7 +58,8 @@ def station():
     backend = ObservedBackend()
     config = StationConfig(
         limb="left_arm", entries=backend.entries,
-        raw={"factory_hmi_faults": {"stale_seconds": 0.08}},
+        raw={"factory_hmi_faults": {"stale_seconds": 0.08},
+             "factory_hmi": {"discovery": {"timeout_s": 0.08}}},
         control_rate_hz=100.0, safety_limits=SafetyLimits(),
     )
     controller = FactoryController(config, backend, enable_watchdog=False)
@@ -250,7 +251,7 @@ def test_sequence_capable_sdk_cannot_use_zero_response_counter_as_new_reply():
         backend._connected = False
 
 
-def test_position_hold_rejects_stale_feedback_before_sending_target(station):
+def test_position_hold_stale_feedback_stops_position_servo_and_requests_only_passive_damping(station):
     controller, backend, hold = station
     controller.connect()
     backend.set_stale([0, 1])
@@ -258,8 +259,15 @@ def test_position_hold_rejects_stale_feedback_before_sending_target(station):
     controller._position_hold_stop = threading.Event()
     controller._position_hold_loop(np.zeros(2), controller._position_hold_stop)
     assert controller.state is StationState.FAULT
-    assert not backend.motors_enabled
-    assert not backend.command_history
+    deadline=time.monotonic()+2
+    while (controller._protective_damping is None or not controller._protective_damping.snapshot()['active']) and time.monotonic()<deadline:time.sleep(.005)
+    assert controller._protective_damping.snapshot()['active']
+    assert controller._protective_damping.snapshot()['safe_confirmed'] is False
+    assert backend.commands_inhibited
+    assert backend.motors_enabled
+    assert backend.command_history
+    assert all(item.get('mode')=='protective_damping' for item in backend.command_history)
+    assert all(np.all(item['kp']==0) and np.all(item['kd']==1) for item in backend.command_history)
 
 
 def test_sdk_without_receive_counters_cannot_refresh_cached_sample_age():

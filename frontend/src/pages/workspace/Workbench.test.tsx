@@ -291,3 +291,17 @@ it("keeps access errors and missing trusted-start restrictions outside narrow fo
   expect(document.getElementById("wb-selected-executions")!.hidden).toBe(true);
   expect(document.getElementById("wb-global-settings")!.hidden).toBe(true);
 });
+
+it("excludes a restored execution from a different business partition before querying its curves or raw statistics", async () => {
+  const factory = { ...archive(), data_domain: "FACTORY" as const, serial_number: "000aZ", bench_id: "B-1" };
+  const config = defaultConfig(factory); config.comparisons = ["research"];
+  window.history.replaceState({}, "", shareUrl(config));
+  vi.mocked(archivesApi.detail).mockImplementation(async (id) => id === "base" ? factory : { ...archive(id), data_domain: "RESEARCH" });
+  mount(); await ready();
+  await screen.findByText("第 2 个执行属于研发分区，已从当前分区曲线排除。");
+  expect(vi.mocked(archivesApi.curves).mock.calls.some(([id]) => id === "research")).toBe(false);
+  expect(vi.mocked(workspaceApi.statistics).mock.calls.some(([id]) => id === "research")).toBe(false);
+  change("工作台查找测试记录", "同一SN复测");
+  fireEvent.click(screen.getByRole("button", { name: "工作台查找对比记录" }));
+  await waitFor(() => expect(archivesApi.list).toHaveBeenCalledWith({ q: "同一SN复测", data_domain: "FACTORY", processing_state: "READY" }, expect.any(AbortSignal)));
+});

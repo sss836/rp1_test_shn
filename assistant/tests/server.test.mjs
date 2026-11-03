@@ -49,3 +49,36 @@ test("private server rejects unauthenticated, arbitrary input and oversized bodi
   assert.equal((await send({ tool_grant: "g".repeat(64) })).status, 200);
   assert.equal(calls, 1);
 });
+
+test('private chat accepts bounded diagnostic previews and rejects invalid attachment blocks before model',async(t)=>{
+  const secret='d'.repeat(48);const calls=[];
+  const server=buildServer({bridgeSecret:secret},async()=>{},async(_config,body)=>{calls.push(body);return {reply:'isolated'};});
+  server.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));
+  t.after(()=>new Promise(resolve=>server.close(resolve)));
+  const base={tool_grant:'g'.repeat(64),messages:[{role:'user',body:'分析附件'}],context:{},choices:{},timeout_ms:120000};
+  const send=attachments=>fetch(`http://127.0.0.1:${server.address().port}/internal/chat`,{method:'POST',headers:{'X-RP1-Bridge-Secret':secret},body:JSON.stringify({...base,attachments})});
+  assert.equal((await send([{type:'text',text:'资料预览；未读正文请按附件ID分块读取。'},{type:'image',mimeType:'image/png',data:'YWJj'}])).status,200);
+  for(const items of [Array(4).fill({type:'text',text:'x'}),[{type:'text',text:'x'.repeat(25001)}],
+    [{type:'image',mimeType:'image/png',data:'http://host/private'}],[{type:'toolResult',text:'execute'}]])assert.equal((await send(items)).status,422);
+  assert.equal(calls.length,1);
+});
+
+test('two images, three images and mixed previews use six body fields without widening image block count',async(t)=>{
+  const secret='e'.repeat(48);const calls=[];
+  const server=buildServer({bridgeSecret:secret},async()=>{},async(_config,body)=>{calls.push(body);return {reply:'isolated'};});
+  server.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));
+  t.after(()=>new Promise(resolve=>server.close(resolve)));
+  for(const count of [2,3,1]){
+    const previews=['图片来源metadata','CSV初始分块，剩余内容未读','包目录未读成员正文'];
+    const body={tool_grant:'g'.repeat(64),messages:[{role:'user',body:'诊断资料'}],choices:{},
+      context:{diagnostic_attachment_previews:previews},attachments:Array.from({length:count},()=>({type:'image',mimeType:'image/png',data:'YWJj'})),timeout_ms:120000};
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/internal/chat`,{method:'POST',headers:{'X-RP1-Bridge-Secret':secret},body:JSON.stringify(body)});
+    assert.equal(response.status,200);assert.equal(Object.keys(calls.at(-1)).length,6);
+    assert.equal(calls.at(-1).attachments.length,count);assert.deepEqual(calls.at(-1).context.diagnostic_attachment_previews,previews);
+    if(count>=2){
+      const legacy={...body,attachments:body.attachments.flatMap(image=>[image,{type:'text',text:'image provenance'}])};
+      assert.equal((await fetch(`http://127.0.0.1:${server.address().port}/internal/chat`,{method:'POST',headers:{'X-RP1-Bridge-Secret':secret},body:JSON.stringify(legacy)})).status,422);
+      assert.equal(calls.at(-1).attachments.length,count);
+    }
+  }
+});

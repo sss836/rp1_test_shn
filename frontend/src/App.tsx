@@ -27,6 +27,7 @@ import {
   type LocationState,
   type View
 } from "./navigation";
+import type { ArchiveDataDomain } from "./archiveApi";
 import type { AssetKind, TargetPartCode } from "./types";
 import { adminApi } from "./securityApi";
 import { roleLabels } from "./security";
@@ -48,6 +49,7 @@ const LiveRunsPage = lazy(() => import("./pages/LiveRunsPage"));
 const HmiStationsPage = lazy(() => import("./pages/HmiStationsPage"));
 const BenchOverviewPage = lazy(() => import("./pages/BenchOverviewPage"));
 const SubmissionsPage = lazy(() => import("./pages/SubmissionsPage"));
+const FactoryPage = lazy(() => import("./pages/FactoryPage"));
 const CsvImportPage = lazy(() => import("./pages/CsvImportPage"));
 const ArchivesPage = lazy(() => import("./pages/ArchivesPage"));
 const ArchiveDetailPage = lazy(() => import("./pages/ArchivesPage").then((module) => ({ default: module.ArchiveDetailPage })));
@@ -58,7 +60,7 @@ const navItems: Array<{ view: View; label: string; icon: typeof LayoutDashboard 
   { view: "planning", label: "测试计划", icon: Clock3 },
   { view: "home", label: "测试总控", icon: LayoutDashboard },
   { view: "durations", label: "时长台账", icon: Clock3 },
-  { view: "mtbf", label: "MTBF 结论", icon: Gauge },
+  { view: "mtbf", label: "研发 MTBF 结论", icon: Gauge },
   { view: "assets", label: "样品中心", icon: Boxes },
   { view: "live", label: "正在运行", icon: Activity },
   { view: "benches", label: "台架总览", icon: Boxes },
@@ -66,6 +68,7 @@ const navItems: Array<{ view: View; label: string; icon: typeof LayoutDashboard 
 ];
 
 const dataNavItems: typeof navItems = [
+  { view: "factory", label: "工厂", icon: ArchiveIcon },
   { view: "archives", label: "数据归档", icon: ArchiveIcon },
   { view: "curves", label: "曲线分析", icon: ChartNoAxesCombined }
 ];
@@ -80,7 +83,11 @@ function initialTheme(): "day" | "night" {
 
 export default function App() {
   const { status, session, logout, logoutPending } = useAuth();
-  const [location, setLocation] = useState<LocationState>(() => readLocation());
+  const [requestedLocation, setLocation] = useState<LocationState>(() => readLocation());
+  const factoryOnly = session?.user.role === "FACTORY_REVIEWER";
+  const location: LocationState = factoryOnly
+    ? { ...requestedLocation, view: ["factory", "archive", "curves", "account"].includes(requestedLocation.view) ? requestedLocation.view : "factory", domain: "FACTORY" }
+    : requestedLocation;
   const assistantPage=useAssistantContext();
   const [theme, setTheme] = useState<"day" | "night">(initialTheme);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
@@ -148,9 +155,10 @@ export default function App() {
     view: View,
     id: string | null = null,
     kind = location.kind,
-    part: TargetPartCode | null = null
+    part: TargetPartCode | null = null,
+    domain: ArchiveDataDomain | undefined = location.domain
   ) {
-    const next = { view, id, kind, part };
+    const next = { view, id, kind, part, ...(view === "factory" ? { domain: "FACTORY" as const } : domain ? { domain } : {}) };
     window.history.pushState({ rp1Navigation: true }, "", locationHref(next));
     setLocation(next);
   }
@@ -172,7 +180,7 @@ export default function App() {
     }
   }
 
-  const navView = location.view === "asset" ? "assets" : ["archive", "import"].includes(location.view) ? "archives" : location.view;
+  const navView = location.domain === "FACTORY" && ["factory", "archives", "archive", "import", "curves"].includes(location.view) ? "factory" : location.view === "asset" ? "assets" : ["archive", "import"].includes(location.view) ? location.domain === "FACTORY" ? "factory" : "archives" : location.view;
 
   if (status === "booting") return <AuthLoading />;
   if (status === "unavailable") return <AuthUnavailable />;
@@ -183,28 +191,29 @@ export default function App() {
     <div className="app-shell">
       <a className="skip-link" href="#main-content">跳到主要内容</a>
       <header className="app-header">
-        <button className="brand" type="button" onClick={() => go("home")} aria-label="返回测试总控首页">
+        <button className="brand" type="button" onClick={() => go(factoryOnly ? "factory" : "home", null, location.kind, null, factoryOnly ? "FACTORY" : "RESEARCH")} aria-label={factoryOnly ? "返回工厂" : "返回测试总控首页"}>
           <img src="/assets/roboparty-logo.png" alt="RoboParty" width="122" height="42" />
           <span><strong>RP1 可靠性测试平台</strong><small>RELIABILITY CONTROL</small></span>
         </button>
-        <div className="object-switch" role="group" aria-label="测试对象类型">
+        {factoryOnly && <div className="object-switch" aria-label="账号范围"><span>工厂审批</span></div>}
+        {!factoryOnly && <div className="object-switch" role="group" aria-label="测试对象类型">
           <button type="button" className={location.kind === "WHOLE_MACHINE" ? "active" : ""} aria-pressed={location.kind === "WHOLE_MACHINE"} onClick={() => switchKind("WHOLE_MACHINE")}>整机</button>
           <button type="button" className={location.kind === "MODULE" ? "active" : ""} aria-pressed={location.kind === "MODULE"} onClick={() => switchKind("MODULE")}>模块</button>
-        </div>
+        </div>}
         <nav className="primary-nav" aria-label="主要页面">
           <div className="primary-nav-scroll" role="group" aria-label="其他主要页面，可横向滚动" tabIndex={0}>
-          {[...navItems, ...(session?.user.role !== "VIEWER" ? [{ view: "submissions" as View, label: "测试数据审批", icon: ShieldCheck }] : [])].map((item) => {
+          {[...(factoryOnly ? [] : navItems), ...(!factoryOnly && session?.user.role !== "VIEWER" ? [{ view: "submissions" as View, label: "测试数据审批", icon: ShieldCheck }] : [])].map((item) => {
             const Icon = item.icon;
             const active = navView === item.view;
-            return <button key={item.view} type="button" className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => go(item.view)}><Icon aria-hidden="true" />{item.label}</button>;
+            return <button key={item.view} type="button" className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => go(item.view, null, location.kind, null, item.view === "factory" ? "FACTORY" : "RESEARCH")}><Icon aria-hidden="true" />{item.label}</button>;
           })}
           </div>
           <span className="primary-nav-scroll-hint" title="横向滚动查看更多页面" aria-hidden="true">↔</span>
           <div className="primary-nav-data">
-            {dataNavItems.map((item) => {
+            {dataNavItems.filter(item => !factoryOnly || item.view === "factory").map((item) => {
               const Icon = item.icon;
               const active = navView === item.view;
-              return <button key={item.view} type="button" className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => go(item.view)}><Icon aria-hidden="true" />{item.label}</button>;
+              return <button key={item.view} type="button" className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => go(item.view, null, location.kind, null, item.view === "factory" ? "FACTORY" : "RESEARCH")}><Icon aria-hidden="true" />{item.label}</button>;
             })}
           </div>
         </nav>
@@ -266,7 +275,7 @@ export default function App() {
               >
                 <div role="presentation"><strong>{session?.user.display_name}</strong><span>@{session?.user.username}</span><small>{roleLabels[session!.user.role]}</small></div>
                 <button role="menuitem" type="button" onClick={() => go("account")}>账户设置</button>
-                <button role="menuitem" type="button" onClick={() => go("access-request")}>权限申请</button>
+                {!factoryOnly && <button role="menuitem" type="button" onClick={() => go("access-request")}>权限申请</button>}
                 <button role="menuitem" type="button" disabled={logoutPending} onClick={() => void logout()}><LogOut aria-hidden="true" />{logoutPending ? "正在退出…" : "退出"}</button>
               </div>
             )}
@@ -290,10 +299,11 @@ export default function App() {
         {location.view === "stations" && <HmiStationsPage />}
         {location.view === "benches" && <BenchOverviewPage key={location.id??"all"} initialStationId={location.id??undefined} navigate={(view) => go(view)} />}
         {location.view === "submissions" && <SubmissionsPage navigate={(id) => go("execution", id)} navigateArchive={(id) => go("archive", id)} />}
-        {location.view === "archives" && <ArchivesPage navigate={(view, id) => go(view, id ?? null)} />}
-        {location.view === "import" && <CsvImportPage navigate={(view, id) => go(view, id ?? null)} />}
-        {location.view === "archive" && location.id && <ArchiveDetailPage id={location.id} navigate={(view, id) => go(view, id ?? null)} />}
-        {location.view === "curves" && !location.id && <ArchivesPage mode="curves" navigate={(view, id) => go(view, id ?? null)} />}
+        {(location.view === "factory" || location.view === "archives" && location.domain === "FACTORY") && <FactoryPage navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}
+        {location.view === "archives" && location.domain !== "FACTORY" && <ArchivesPage key={location.domain} domain={location.domain === "UNCLASSIFIED" ? "UNCLASSIFIED" : "RESEARCH"} onDomainChange={(domain) => go("archives", null, location.kind, null, domain)} navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}
+        {location.view === "import" && <CsvImportPage key={location.domain} domain={location.domain === "FACTORY" ? "FACTORY" : "RESEARCH"} navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}
+        {location.view === "archive" && location.id && <ArchiveDetailPage id={location.id} navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}
+        {location.view === "curves" && !location.id && <ArchivesPage key={location.domain} mode="curves" domain={location.domain ?? "RESEARCH"} onDomainChange={(domain) => go("curves", null, location.kind, null, domain)} navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}
         {location.view === "curves" && location.id && <CurveAnalysisPage id={location.id} navigate={(view, id) => go(view, id)} />}
         {location.view === "access-request" && <AccessRequestPage />}
         {location.view === "admin" && <AdminWorkspace />}

@@ -181,6 +181,9 @@ class ManualControlSession:
             self._speed_rad_s = speed
             self._moving = self._move_duration_s > 0.0
 
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
     def stop(self, timeout: float = 2.0) -> list[MotorSample]:
         self._stop_event.set()
         with self._lock:

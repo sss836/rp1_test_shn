@@ -27,6 +27,19 @@ OUTBOX_STATES = {
 TERMINAL_STATES = {"approved", "uploaded", "rejected", "archived", "awaiting_classification", "needs_verification", "processing_failed"}
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """SQLite's normal context manager commits/rolls back but does not close.
+
+    All short-lived outbox transactions must release DB/WAL/SHM handles before
+    their owner returns; explicit attach/import callers can still close normally.
+    """
+    def __exit__(self, *exc):
+        try:
+            return super().__exit__(*exc)
+        finally:
+            self.close()
+
+
 @dataclass(frozen=True)
 class OutboxItem:
     execution_uuid: str
@@ -68,11 +81,15 @@ class Outbox:
         self._initialize(recover_interrupted=recover_interrupted)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA foreign_keys=ON")
+        connection = sqlite3.connect(self.path, timeout=30.0, factory=_ClosingConnection)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA foreign_keys=ON")
+        except Exception:
+            connection.close()
+            raise
         return connection
 
     def _initialize(self, *, recover_interrupted: bool) -> None:
@@ -383,6 +400,19 @@ class Outbox:
                 (max(1, min(int(limit), 1000)),),
             ).fetchall()
         return [self._item(row) for row in rows]
+
+    def for_test_ids(self, test_ids: list[str]) -> dict[str, OutboxItem]:
+        """Read states for the requested page/export without the recent-1000 cap."""
+        result: dict[str, OutboxItem] = {}
+        with self._connect() as connection:
+            for offset in range(0, len(test_ids), 900):
+                batch = test_ids[offset:offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"SELECT * FROM execution_outbox WHERE test_id IN ({placeholders}) ORDER BY updated_at ASC", batch
+                ).fetchall()
+                result.update((str(row["test_id"]), self._item(row)) for row in rows)
+        return result
 
     def due(self, *, now: float | None = None, limit: int = 10, owner: str | None = None) -> list[OutboxItem]:
         current = time.time() if now is None else float(now)

@@ -18,19 +18,26 @@ from fastapi import (
     FastAPI,
     Header,
     HTTPException,
+    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from factory_hmi.plc.service import PlcCabinetService, PlcControlDisabledError
 from factory_hmi.plc.coordination import PlcRequestConflict
 from factory_hmi.sync.outbox import Outbox
+from factory_hmi.version import process_identity
+from factory_hmi.execution_history import history_csv
 
-from .lease import ControlLease, LeaseConflict
+from .lease import ControlLease, LeaseConflict, DEFAULT_LEASE_TIMEOUT_S, validate_lease_timeout
 from .trajectory_upload import configured_trajectory_limit, receive_trajectory
+from .software_updates import SoftwareUpdates, installation_readiness
+from .motor_firmware import MotorFirmwareDownloads
+from .motor_firmware_resources import MotorFirmwareResourceDownloads
+from .diagnostics import DiagnosticBridge
 from .schemas import (
     BenchCodeRequest,
     CanConnectRequest,
@@ -39,6 +46,7 @@ from .schemas import (
     EnableMotorsRequest,
     ExecutionActionRequest,
     HistoryImportRequest,
+    LocalCorrectionRequest,
     ManualMoveRequest,
     PlatformLoginRequest,
     PlaybackStartRequest,
@@ -152,11 +160,19 @@ class _PlatformCoordinator:
         yaml_profiles = load_test_profiles(path)
         live: list[dict[str, Any]] = []
         context_error = ""
+        cases: list[dict[str, Any]] = []
+        case_error = ""
+        case_catalog_available = False
         stations: list[dict[str, Any]] = []
         with self._lock:
             uploader = self._uploader
             identity = self._identity
         if uploader is not None and identity:
+            try:
+                cases = uploader.case_options()
+                case_catalog_available = True
+            except (PlatformError, TimeoutError, OSError) as exc:
+                case_error = str(exc)
             try:
                 live = uploader.context_profiles()
                 stations = uploader.station_options()
@@ -170,6 +186,9 @@ class _PlatformCoordinator:
             "mode": self._mode,
             "profiles": profiles,
             "context_error": context_error,
+            "cases": cases,
+            "case_error": case_error,
+            "case_catalog_available": case_catalog_available,
             "stations": stations,
         }
 
@@ -193,6 +212,7 @@ class _PlatformCoordinator:
                         snapshot_provider=self._snapshot_provider,
                         on_execution=self._on_execution,
                     )
+                self._identity = ""
                 grant = self._uploader.authenticate(
                     request.username,
                     request.password,
@@ -304,7 +324,7 @@ class GatewayRuntime:
         self,
         controller: Any,
         *,
-        lease_timeout_s: float = 2.0,
+        lease_timeout_s: float = DEFAULT_LEASE_TIMEOUT_S,
         status_rate_hz: float = 10.0,
         data_root: Path | None = None,
         outbox: Outbox,
@@ -337,6 +357,9 @@ class GatewayRuntime:
         self._motion_epoch_guard = threading.Lock()
         self._motion_epoch = 0
         self._motion_interrupts_pending = 0
+        self._cleanup_error: str | None = None
+        self._cleanup_job: dict[str, Any] | None = None
+        self._cleanup_timeout_s = 2.0
         self.quick = None
         self.outbox = outbox
         self._platform = platform
@@ -365,15 +388,31 @@ class GatewayRuntime:
             self._invoke(("disconnect",))
         except Exception:
             pass
+        # The facade owns recovery/finalization workers in addition to motor
+        # transport. Disconnect alone does not drain their filesystem writes.
+        close_service = getattr(self.controller, "close", None)
+        if callable(close_service):
+            try:
+                close_service()
+            except Exception as exc:
+                self._cleanup_error = f"service shutdown failed: {exc}"
+                raise RuntimeError(self._cleanup_error) from exc
 
     def lease_snapshot(self) -> dict[str, Any]:
         """Read liveness without polling hardware, reports, or the platform."""
         lease = self.lease.snapshot()
+        observe = getattr(self.controller,"protective_damping_snapshot",None)
+        protection = observe() if callable(observe) else None
         return {
             "owner": lease.owner,
             "age_s": lease.age_s,
             "timeout_s": lease.timeout_s,
             "expired": lease.expired,
+            "generation": lease.generation,
+            "revoked": lease.revoked,
+            "quarantined": self._cleanup_error is not None,
+            "cleanup_error": self._cleanup_error,
+            "protective_damping": protection if isinstance(protection,dict) else None,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -389,7 +428,7 @@ class GatewayRuntime:
         if "state" not in value and isinstance(station, dict):
             value["state"] = station.get("state")
         if "connected" not in value and isinstance(station, dict):
-            value["connected"] = bool(station.get("backend_connected", False))
+            value["connected"] = bool(station.get("motors_discovered", station.get("backend_connected", False)))
         value["lease"] = self.lease_snapshot()
         platform = self._platform.snapshot()
         if platform["uploader_running"]:
@@ -458,6 +497,16 @@ class GatewayRuntime:
     def rebuild_execution(self, test_id: str, reason: str) -> Any:
         return self._platform.analyze(lambda actor: self._invoke(
             ("rebuild_report",), test_id, actor=actor, reason=reason))
+
+    def correct_execution_locally(self, test_id: str, body: LocalCorrectionRequest, client_id: str) -> Any:
+        # Capture the login identity without making a network/permission query.
+        # Offline callers are explicitly identified as a local window, not a
+        # fabricated authenticated human. This never starts the upload worker.
+        with self._platform._lock:
+            actor = self._platform._identity or f"本机窗口:{client_id}"
+            return self._invoke(('correct_execution_locally',), test_id, body.changes,
+                                reason=body.reason, actor=actor,
+                                expected_revision=body.expected_revision, request_id=body.request_id)
 
     def configure(self, request: ConfigureRequest) -> Any:
         if self.quick is not None:
@@ -655,34 +704,67 @@ class GatewayRuntime:
     def _monitor_lease(self) -> None:
         while not self._stop.wait(0.1):
             with self._lease_guard:
-                lease = self.lease.snapshot()
-                if not lease.expired:
+                lease = self.lease.revoke_expired()
+                if lease is None:
                     continue
                 logger.warning(
                     "operator lease expired: owner=%s age_s=%.3f timeout_s=%.3f",
                     lease.owner, lease.age_s, lease.timeout_s,
                 )
-                try:
-                    state = str(self.snapshot().get("state", ""))
-                except Exception:
-                    state = ""
-                if state in {"armed", "running", "paused", "stopping"}:
-                    self._safe_stop("operator lease expired")
                 self._safe_release()
 
-    def _safe_release(self) -> None:
-        for names in (
-            ("disable_motors", "disable", "emergency_disable"),
-            ("disconnect",),
-            ("can_disconnect",),
-        ):
-            try:
-                self._invoke(names)
-            except Exception:
-                pass
+    def _safe_release(self) -> bool:
+        """Keep ownership quarantined unless every cleanup step succeeds."""
+        job = getattr(self, "_cleanup_job", None)
+        if job is not None and job.get("protection") is not None:
+            observe = getattr(self.controller, "protective_damping_snapshot", None)
+            status = observe() if callable(observe) else job["protection"]
+            if isinstance(status, dict) and status.get("active") is True:
+                self._cleanup_error = "保护阻尼中 Kd=1；控制权已撤销，承重未确认；支撑机构后显式失能"
+                return False
+            self._cleanup_job = job = None
+        if job is None or (job["done"].is_set() and job["error"] is not None):
+            job = {"done": threading.Event(), "error": None}
+            self._cleanup_job = job
+            def cleanup() -> None:
+                stage = "stop"
+                try:
+                    protective = getattr(self.controller, "enter_protective_damping", None)
+                    if callable(protective):
+                        stage = "protective_damping"
+                        status = protective("operator lease expired")
+                        if isinstance(status, dict) and status.get("active") is True:
+                            job["protection"] = status
+                            logger.warning("operator loss: protective damping requested Kp=0 Kd=1 owner=%s safe_confirmed=false",self.lease.snapshot().owner)
+                            return
+                    control = getattr(self.controller, "_controller", self.controller)
+                    state = getattr(control, "state", "")
+                    if str(getattr(state, "value", state)) in {"armed", "running", "paused", "stopping"}:
+                        self._safe_stop("operator lease expired")
+                    for names in (("disable_motors", "disable", "emergency_disable"),
+                                  ("disconnect",), ("can_disconnect",)):
+                        stage = "/".join(names)
+                        self._invoke(names)
+                except Exception as exc:
+                    job["error"] = f"{stage}: {exc}"
+                finally:
+                    job["done"].set()
+            threading.Thread(target=cleanup, name="factory-safe-cleanup", daemon=True).start()
+        if not job["done"].wait(getattr(self, "_cleanup_timeout_s", 2.0)):
+            self._cleanup_error = "cleanup deadline exceeded; device state unknown, cleanup still pending"
+        else:
+            self._cleanup_error = ("保护阻尼中 Kd=1；控制权已撤销，承重未确认；支撑机构后显式失能"
+                                   if job.get("protection") is not None else job["error"])
+        if self._cleanup_error is not None:
+            logger.error("operator cleanup quarantined: owner=%s error=%s",
+                         self.lease.snapshot().owner, self._cleanup_error)
+            return False
+        self._cleanup_job = None
+        self._cleanup_error = None
         self.lease.release()
         if self._expiry_callback is not None:
             self._expiry_callback()
+        return True
 
 
 _SAFE_SESSION_NAME = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -724,6 +806,10 @@ class GatewayHub:
             snapshot_provider=self.presence_snapshot,
             on_execution=self.apply_live_execution_code,
         )
+        self.software_updates = SoftwareUpdates(self._platform, self.data_root)
+        self.motor_firmware = MotorFirmwareDownloads(self.software_updates, self.data_root)
+        self.motor_firmware_resources = MotorFirmwareResourceDownloads(self.software_updates, self.data_root)
+        self.diagnostics = DiagnosticBridge(self.data_root)
         plc_config = os.environ.get("RP1_FACTORY_PLC_CONFIG", "").strip() or None
         self.plc = PlcCabinetService(
             config_path=plc_config,
@@ -798,17 +884,37 @@ class GatewayHub:
             self.plc.start()
             if self.shared:
                 self.session("shared")
+            # A paired session may have been prepared before lifespan starts.
+            # Its lease monitor must still start exactly once.
+            for runtime in self._sessions.values():
+                if runtime._lease_thread is None or not runtime._lease_thread.is_alive():
+                    runtime.start()
 
     def close(self) -> None:
         with self._lock:
-            runtimes = list(self._sessions.values())
+            runtimes = list(self._sessions.items())
+            owners = dict(self._interface_owners)
             self._sessions.clear()
             self._interface_owners.clear()
             self._started = False
-        for runtime in runtimes:
-            runtime.close()
-        self.plc.close()
-        self._platform.close()
+        errors = []
+        for key, runtime in runtimes:
+            try:
+                runtime.close()
+            except Exception as exc:
+                errors.append(str(exc))
+                # Keep the failed owner reachable for a later close retry.
+                # A timeout is not permission to discard its worker/ownership.
+                with self._lock:
+                    self._sessions[key] = runtime
+                    self._interface_owners.update({bus: owner for bus, owner in owners.items() if owner == key})
+        for close in (self.plc.close, self._platform.close):
+            try:
+                close()
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError("gateway shutdown incomplete: " + "; ".join(errors))
 
     def _key(self, owner: str) -> str:
         return "shared" if self.shared else owner
@@ -949,11 +1055,12 @@ class GatewayHub:
 def create_app(
     controller: Any | None = None,
     *,
-    lease_timeout_s: float = 2.0,
+    lease_timeout_s: float = DEFAULT_LEASE_TIMEOUT_S,
     status_rate_hz: float = 10.0,
     data_root: Path | None = None,
     trajectory_max_bytes: int | None = None,
 ) -> FastAPI:
+    lease_timeout_s = validate_lease_timeout(lease_timeout_s)
     trajectory_limit = configured_trajectory_limit(trajectory_max_bytes)
     resolved_data_root = (
         (
@@ -989,7 +1096,9 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.runtime = hub
+    app.state.software_identity = process_identity()
     app.state.trajectory_max_bytes = trajectory_limit
+    monitor_only = os.environ.get("RP1_HMI_UPDATE_MONITOR_ONLY") == "1"
 
     def owner_id(request: Request, explicit: str | None) -> str:
         if explicit and explicit.strip():
@@ -1014,10 +1123,14 @@ def create_app(
         motion_command: bool = False,
     ) -> dict[str, Any]:
         require_token(token)
+        if monitor_only and not preempt_motion:
+            raise HTTPException(status_code=403, detail="更新后的监控实例禁止控制设备；请正常退出后启动常规实例。")
         owner = owner_id(request, client_id)
         runtime = hub.session(owner)
         interrupt_registered = False
         try:
+            if runtime._cleanup_error is not None:
+                raise LeaseConflict("device cleanup quarantined; retry /api/v1/lease/recover before configuring")
             with runtime._motion_epoch_guard:
                 motion_epoch = runtime._motion_epoch
             if preempt_motion:
@@ -1048,7 +1161,8 @@ def create_app(
                 else:
                     runtime.lease.refresh(owner)
                 result = operation(runtime)
-                runtime.lease.refresh(owner)
+                # The guard excludes expiry cleanup for this accepted command.
+                runtime.lease.refresh(owner, command_completed=True)
             return {
                 "ok": True,
                 "result": _json_result(result),
@@ -1084,6 +1198,7 @@ def create_app(
         return {
             "ok": True,
             "service": "rp1-factory-gateway",
+            "software": dict(app.state.software_identity),
             "snapshot": runtime.snapshot(),
             "sessions": len(hub._sessions),
             "outbox": {
@@ -1117,6 +1232,276 @@ def create_app(
         require_token(x_rp1_operator_token)
         return {"ok": True, "result": hub._platform.samples()}
 
+    @app.get("/api/v1/software-updates/check")
+    def software_update_check(x_rp1_operator_token: str | None = Header(default=None)) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        try:
+            return {"ok": True, "result": hub.software_updates.check()}
+        except Exception as exc:
+            # A separate optional channel: unavailable updates must not fail
+            # platform login, presence, or any control operation.
+            return {"ok": False, "result": {"available": False, "reason": str(exc)}}
+
+    def motor_observation(request: Request, client_id: str | None, index: int):
+        runtime = hub.session(owner_id(request, client_id))
+        snapshot = runtime._invoke(("snapshot", "get_snapshot"))
+        if hasattr(snapshot, "to_dict"):
+            snapshot = snapshot.to_dict()
+        for row in snapshot.get("motor_versions", []):
+            if row.get("index") == index:
+                return row
+        raise ValueError("当前窗口未读取到所选电机实际版本")
+
+    def maintenance(request, client_id):
+        from factory_hmi.core.motor_maintenance import ModuleFirmwareMaintenance
+        from factory_hmi.core.motor_ota_transport import write_firmware, read_version
+        from .motor_maintenance import authorize, artifact
+        runtime = hub.session(owner_id(request, client_id))
+        service = runtime.controller
+        if not hasattr(service, "maintenance_targets"):
+            raise ValueError("当前服务不支持模块固件维护")
+        with service._lifecycle_lock:
+            service._require_open()
+            if service._maintenance is None:
+                class Reservation:
+                    def __init__(self):
+                        self.guard_owned = False
+                        self.transport = None
+
+                    def __enter__(self):
+                        if not app.state.motor_maintenance_guard.acquire(blocking=False):
+                            raise RuntimeError("本机已有另一个模块固件维护任务")
+                        self.guard_owned = True
+                        service.maintenance_ready()
+                        self.transport = service.controller.backend.maintenance_transport()
+                        self.transport.__enter__()
+                        return self
+
+                    def close(self):
+                        # A failed transport close retains both claims for an
+                        # explicit cancel/close retry; no finally-release here.
+                        if self.transport is not None:
+                            self.transport.close()
+                            self.transport = None
+                        if self.guard_owned:
+                            app.state.motor_maintenance_guard.release()
+                            self.guard_owned = False
+
+                    def __exit__(self, exc_type, exc, traceback):
+                        self.close()
+
+                service._maintenance = ModuleFirmwareMaintenance(
+                    service.data_root / "motor-maintenance", service.maintenance_targets,
+                    lambda: service.controller.backend.motor_versions(),
+                    lambda: authorize(hub.motor_firmware),
+                    lambda release_id, row: artifact(hub.motor_firmware, release_id, row),
+                    Reservation, write_firmware, read_version)
+        return runtime, service, service._maintenance
+
+    app.state.motor_maintenance_guard = threading.Lock()
+
+    @app.get("/api/v1/motor-maintenance")
+    def maintenance_status(request: Request, x_rp1_client_id: str | None = Header(default=None),
+                           x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        try:
+            runtime, service, task = maintenance(request, x_rp1_client_id)
+            actor = task.authorize()
+            from .motor_maintenance import visible_job
+            job = visible_job(task, actor)
+            from .motor_maintenance import cached_releases
+            observed = {r["index"]: r for r in service.controller.backend.motor_versions()}
+            targets = service.maintenance_targets()
+            for row in targets:
+                try:
+                    row["cached_releases"] = cached_releases(hub.motor_firmware, observed.get(row["index"], {}))
+                except ValueError as exc:
+                    row.update(cached_releases=[], eligibility_error=str(exc))
+            return {"ok": True, "result": {"targets": targets, "job": job}}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/motor-maintenance/{action}")
+    def maintenance_action(action: str, payload: dict, request: Request,
+                           x_rp1_client_id: str | None = Header(default=None),
+                           x_rp1_operator_token: str | None = Header(default=None)):
+        def perform(runtime):
+            _, service, task = maintenance(request, x_rp1_client_id)
+            with service._lifecycle_lock:
+                service._require_open()
+                if action in {"preview", "start"} and service._parameters is not None and service._parameters.active:
+                    raise RuntimeError("当前实例正在维护参数")
+                if action == "preview":
+                    service.maintenance_ready()
+                    return task.preview(payload["selections"])
+                if action == "start":
+                    service.maintenance_ready()
+                    return task.start(payload["preview_id"], payload.get("confirmed"))
+                if action == "acknowledge":
+                    if payload.get("confirmed") is not True:
+                        raise ValueError("需人工明确确认已重新上下电")
+                    return task.acknowledge(payload["job_id"])
+                if action == "readback":
+                    return task.readback(payload["job_id"])
+                if action == "cancel":
+                    task._require_job(payload["job_id"])
+                    return task.cancel()
+                raise ValueError("未知的固件维护动作")
+        try:
+            # Lock order: account transition -> lease -> service -> task.
+            # Login/logout use this same outer boundary before cancellation and
+            # revocation. The worker never takes it, so cancellation can join.
+            # Heartbeat uses neither this boundary nor the service/task locks.
+            with hub.diagnostics.login_lock:
+                return mutate(request, x_rp1_client_id, x_rp1_operator_token, perform)
+        except (KeyError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail="维护请求字段不完整") from exc
+
+    def parameters(request, client_id):
+        from factory_hmi.core.motor_parameters import ModuleParameterMaintenance
+        from factory_hmi.core.motor_parameter_transport import read_parameter, write_parameter
+        from factory_hmi.core.motor_ota_transport import read_version
+        from .motor_parameters import Templates
+        from .motor_maintenance import authorize
+        runtime = hub.session(owner_id(request, client_id))
+        service = runtime.controller
+        if not hasattr(service, "maintenance_targets"):
+            raise ValueError("当前实例不支持参数维护")
+        with service._lifecycle_lock:
+            service._require_open()
+            if service._parameters is None:
+                class Reservation:
+                    def __init__(self):
+                        self.guard_owned = False
+                        self.transport = None
+                    def __enter__(self):
+                        if not app.state.motor_maintenance_guard.acquire(blocking=False):
+                            raise RuntimeError("本机已有固件或参数维护任务")
+                        self.guard_owned = True
+                        service.maintenance_ready()
+                        self.transport = service.controller.backend.maintenance_transport()
+                        self.transport.__enter__()
+                        return self
+                    def close(self):
+                        if self.transport is not None:
+                            self.transport.close()
+                            self.transport = None
+                        if self.guard_owned:
+                            app.state.motor_maintenance_guard.release()
+                            self.guard_owned = False
+                    def __exit__(self, *args):
+                        self.close()
+                templates = Templates(hub.motor_firmware)
+                service._parameters = ModuleParameterMaintenance(
+                    service.data_root / "motor-parameters", service.maintenance_targets,
+                    lambda: service.controller.backend.motor_versions(),
+                    lambda: authorize(hub.motor_firmware), templates.get,
+                    Reservation, write_parameter, read_parameter, read_version,
+                    pn_quarantine_root=service.report_manager.data_root / 'pn-quarantine')
+        return runtime, service, service._parameters
+
+    @app.get("/api/v1/motor-parameters")
+    def parameters_status(request: Request, x_rp1_client_id: str | None = Header(default=None),
+                          x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        try:
+            _, service, task = parameters(request, x_rp1_client_id)
+            from .motor_maintenance import visible_job
+            return {"ok": True, "result": {"targets": service.maintenance_targets(),
+                                            "job": visible_job(task, task.authorize())}}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/motor-parameters/{index}/templates")
+    def parameter_templates(index: int, request: Request, x_rp1_client_id: str | None = Header(default=None),
+                            x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        from .motor_parameters import Templates
+        try:
+            return {"ok": True, "result": {"templates": Templates(hub.motor_firmware).query(motor_observation(request, x_rp1_client_id, index))}}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/motor-parameters/{action}")
+    def parameter_action(action: str, payload: dict, request: Request,
+                         x_rp1_client_id: str | None = Header(default=None),
+                         x_rp1_operator_token: str | None = Header(default=None)):
+        def perform(runtime):
+            _, service, task = parameters(request, x_rp1_client_id)
+            with service._lifecycle_lock:
+                service._require_open()
+                if action in {"read", "preview", "start"}:
+                    service.maintenance_ready()
+                    if service._maintenance is not None and service._maintenance.active:
+                        raise RuntimeError("当前实例正在维护固件")
+                if action == "read": return task.read(payload["selections"])
+                if action == "preview": return task.preview(payload["read_job_id"])
+                if action == "start": return task.start(payload["preview_id"], payload.get("confirmed"))
+                if action == "acknowledge":
+                    if payload.get("confirmed") is not True: raise ValueError("需人工明确确认重新上下电")
+                    return task.acknowledge(payload["job_id"])
+                if action == "readback": return task.readback(payload["job_id"])
+                if action == "cancel":
+                    task._require_job(payload["job_id"])
+                    return task.cancel()
+                raise ValueError("未知参数维护动作")
+        try:
+            with hub.diagnostics.login_lock:
+                return mutate(request, x_rp1_client_id, x_rp1_operator_token, perform)
+        except (KeyError, TypeError) as exc:
+            raise HTTPException(status_code=422, detail="参数维护请求字段不完整") from exc
+
+    @app.get("/api/v1/motor-firmware/{index}/releases")
+    def motor_releases(index: int, request: Request, x_rp1_client_id: str | None = Header(default=None),
+                       x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        try:
+            return {"ok": True, "result": hub.motor_firmware.check(motor_observation(request, x_rp1_client_id, index))}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/motor-firmware/{index}/{release_id}/download")
+    def motor_download(index: int, release_id: str, request: Request, x_rp1_client_id: str | None = Header(default=None),
+                       x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        try:
+            return {"ok": True, "result": hub.motor_firmware.download(release_id, motor_observation(request, x_rp1_client_id, index))}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/motor-firmware-resources/releases")
+    def motor_resource_releases(x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        try:
+            return {"ok": True, "result": hub.motor_firmware_resources.check()}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/motor-firmware-resources/{release_id}/download")
+    def motor_resource_download(release_id: str, x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        try:
+            return {"ok": True, "result": hub.motor_firmware_resources.download(release_id)}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/software-updates/{release_id}/download")
+    def software_update_download(release_id: str, x_rp1_operator_token: str | None = Header(default=None)) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        try:
+            return {"ok": True, "result": hub.software_updates.download(release_id)}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/software-updates/installation-readiness")
+    def software_update_readiness(x_rp1_operator_token: str | None = Header(default=None)) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        try:
+            hub.software_updates._session()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, "result": installation_readiness(hub)}
+
     @app.exception_handler(PlcRequestConflict)
     async def plc_request_conflict(_request: Request, exc: PlcRequestConflict) -> JSONResponse:
         snapshot = await asyncio.to_thread(hub.plc.snapshot)
@@ -1127,6 +1512,8 @@ def create_app(
     def plc_mutate(operation: str, body: PlcOperatorRequest, client_id: str | None,
                    token: str | None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         require_token(token)
+        if monitor_only and operation not in {"stop", "all-stop", "disconnect"}:
+            raise HTTPException(status_code=403, detail="更新后的监控实例禁止控制设备；请正常退出后启动常规实例。")
         return hub.plc.coordination.execute(
             operation, payload or {}, user=body.user, client_id=client_id,
             request_id=body.request_id, expected_epoch=body.expected_epoch,
@@ -1331,7 +1718,10 @@ def create_app(
                     x_rp1_operator_token: str | None = Header(default=None)):
         owner = owner_id(request, x_rp1_client_id)
         return mutate(request, x_rp1_client_id, x_rp1_operator_token,
-            lambda runtime: quick_for(runtime, owner).start(body.duration_hours, body.physical_estop_confirmed, body.sample_id, power_source=body.power_source),
+            lambda runtime: quick_for(runtime, owner).start(body.duration_hours, body.physical_estop_confirmed, body.sample_id,
+                power_source=body.power_source, completion_mode=body.completion_mode,
+                parking_pose_confirmed=body.parking_pose_confirmed, data_domain=body.data_domain,
+                bench_id=body.bench_id, operator_id=body.operator_id),
             motion_command=True)
 
     @app.post("/api/v1/quick/end")
@@ -1340,7 +1730,15 @@ def create_app(
                   x_rp1_operator_token: str | None = Header(default=None)):
         owner = owner_id(request, x_rp1_client_id)
         return mutate(request, x_rp1_client_id, x_rp1_operator_token,
-            lambda runtime: quick_for(runtime, owner).end(), preempt_motion=True)
+            lambda runtime: quick_for(runtime, owner).end(), motion_command=True)
+
+    @app.post("/api/v1/quick/abort")
+    def quick_abort(request: Request,
+                    x_rp1_client_id: str | None = Header(default=None),
+                    x_rp1_operator_token: str | None = Header(default=None)):
+        owner = owner_id(request, x_rp1_client_id)
+        return mutate(request, x_rp1_client_id, x_rp1_operator_token,
+            lambda runtime: quick_for(runtime, owner).abort(), preempt_motion=True)
 
     @app.post("/api/v1/configure")
     def configure(
@@ -1408,7 +1806,7 @@ def create_app(
     simple_route("/api/v1/arm", ("arm",))
     simple_route("/api/v1/playback/pause", ("pause",))
     simple_route("/api/v1/playback/resume", ("resume",))
-    simple_route("/api/v1/playback/stop", ("stop",))
+    simple_route("/api/v1/playback/stop", ("finish",))
     simple_route("/api/v1/playback/next", ("prepare_next_run",))
     simple_route("/api/v1/playback/reset", ("reset", "reset_to_default"))
     simple_route("/api/v1/playback/disable", ("disable", "emergency_disable"), preempt_motion=True)
@@ -1531,6 +1929,15 @@ def create_app(
             "snapshot": snapshot,
         }
 
+    @app.get("/api/v1/playback/commands/{command_id}")
+    def start_receipt(command_id: str, request: Request,
+                      x_rp1_client_id: str | None = Header(default=None),
+                      x_rp1_operator_token: str | None = Header(default=None)) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        # Read-only lookup in the caller's own station; no lease claim/refresh.
+        runtime = hub.session(owner_id(request, x_rp1_client_id))
+        return runtime._invoke(("start_receipt",), command_id)
+
     @app.post("/api/v1/playback/start")
     def start(
         body: PlaybackStartRequest,
@@ -1606,6 +2013,14 @@ def create_app(
         path.write_text(code + "\n", encoding="utf-8")
         return {"ok": True, "bench_code": code}
 
+    def cancel_account_maintenance():
+        with hub._lock:
+            services = [r.controller for r in hub._sessions.values()]
+        for service in services:
+            for task in (getattr(service, "_maintenance", None), getattr(service, "_parameters", None)):
+                if task is not None and task.active:
+                    task.cancel()
+
     @app.post("/api/v1/platform/login")
     def platform_login(
         body: PlatformLoginRequest,
@@ -1614,8 +2029,17 @@ def create_app(
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         require_token(x_rp1_operator_token)
-        runtime = hub.session(owner_id(request, x_rp1_client_id))
-        return {"ok": True, "result": runtime.platform_login(body)}
+        owner = owner_id(request, x_rp1_client_id)
+        runtime = hub.session(owner)
+        with hub.diagnostics.login_lock:
+            cancel_account_maintenance()
+            hub.diagnostics.revoke()
+            result = runtime.platform_login(body)
+            with hub._platform._lock:
+                uploader = hub._platform._uploader
+                if hub._platform._mode == "reliability_v1" and uploader is not None:
+                    hub.diagnostics.bind(uploader.client, owner, result["operator"], body.station_id or "")
+        return {"ok": True, "result": result}
 
     @app.post("/api/v1/platform/logout")
     def platform_logout(
@@ -1625,23 +2049,119 @@ def create_app(
     ) -> dict[str, Any]:
         require_token(x_rp1_operator_token)
         runtime = hub.session(owner_id(request, x_rp1_client_id))
-        return {"ok": True, "result": runtime.platform_logout()}
+        with hub.diagnostics.login_lock:
+            cancel_account_maintenance()
+            hub.diagnostics.revoke()
+            result = runtime.platform_logout()
+        return {"ok": True, "result": result}
+
+    @app.post("/api/v1/diagnostics/{action}")
+    async def diagnostic_action(
+        action: str, request: Request,
+        x_rp1_client_id: str | None = Header(default=None),
+        x_rp1_operator_token: str | None = Header(default=None),
+        x_rp1_diagnostic_generation: str | None = Header(default=None),
+        x_rp1_diagnostic_upload_id: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        owner = owner_id(request, x_rp1_client_id)
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > (32 * 1024**2 if action == "upload" else 128000):
+                raise HTTPException(413, "诊断请求过大。")
+        try:
+            if action == "upload":
+                from urllib.parse import unquote
+                encoded = request.headers.get("x-filename-utf8")
+                filename = unquote(encoded, encoding="utf-8", errors="strict") if encoded is not None else None
+                payload = {"generation": x_rp1_diagnostic_generation}
+                if x_rp1_diagnostic_upload_id is not None: payload["upload_id"] = x_rp1_diagnostic_upload_id
+                result = await run_in_threadpool(hub.diagnostics.call, owner, action, payload,
+                                                bytes(raw), request.headers.get("content-type", ""), filename)
+            else:
+                import json
+                payload = json.loads(raw or b"{}")
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid diagnostic payload")
+                result = await run_in_threadpool(hub.diagnostics.call, owner, action, payload)
+            return {"ok": True, "result": result}
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, "诊断请求格式无效。") from exc
 
     @app.get("/api/v1/executions")
     def execution_history(
         request: Request,
-        limit: int = 100,
+        limit: int = Query(default=100, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        start_at: str = "",
+        end_at: str = "",
+        sn: str = Query(default="", max_length=200),
+        data_domain: str = "",
+        bench: str = Query(default="", max_length=64),
         x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
     ) -> dict[str, Any]:
         require_token(x_rp1_operator_token)
         runtime = hub.session(owner_id(request, x_rp1_client_id))
-        return {
-            "items": runtime._invoke(
-                ("execution_history",),
-                max(1, min(limit, 1000)),
-            )
-        }
+        try:
+            return runtime._invoke(("execution_history_page",), limit, offset=offset,
+                                   start_at=start_at, end_at=end_at, sn=sn, data_domain=data_domain, bench=bench)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/executions/export.csv")
+    def export_execution_history(
+        request: Request, start_at: str = "", end_at: str = "", sn: str = Query(default="", max_length=200),
+        data_domain: str = "", bench: str = Query(default="", max_length=64),
+        x_rp1_client_id: str | None = Header(default=None),
+        x_rp1_operator_token: str | None = Header(default=None),
+    ) -> StreamingResponse:
+        require_token(x_rp1_operator_token)
+        runtime = hub.session(owner_id(request, x_rp1_client_id))
+        try:
+            items = runtime._invoke(("iter_execution_history",), start_at=start_at, end_at=end_at, sn=sn, data_domain=data_domain, bench=bench)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return StreamingResponse(history_csv(items), media_type="text/csv; charset=utf-8",
+                                 headers={"Content-Disposition": 'attachment; filename="local-execution-records.csv"',
+                                          "Cache-Control": "no-store"})
+
+    @app.get("/api/v1/records/location")
+    def execution_location(
+        request: Request, test_id: str = "",
+        x_rp1_client_id: str | None = Header(default=None),
+        x_rp1_operator_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        runtime = hub.session(owner_id(request, x_rp1_client_id))
+        try:
+            return {"result": runtime._invoke(("execution_location",), test_id)}
+        except (ValueError, RuntimeError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/v1/executions/{test_id}/local-corrections")
+    def execution_local_corrections(test_id: str, request: Request,
+        x_rp1_client_id: str | None = Header(default=None),
+        x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        runtime = hub.session(owner_id(request, x_rp1_client_id))
+        try:
+            return {'ok': True, 'result': runtime._invoke(('execution_local_corrections',), test_id)}
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/v1/executions/{test_id}/local-corrections")
+    def save_local_correction(test_id: str, body: LocalCorrectionRequest, request: Request,
+        x_rp1_client_id: str | None = Header(default=None),
+        x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        owner = owner_id(request, x_rp1_client_id)
+        runtime = hub.session(owner)
+        try:
+            return {'ok': True, 'result': runtime.correct_execution_locally(test_id, body, owner)}
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/v1/executions/{test_id}/summary")
     def execution_summary(
@@ -1817,14 +2337,55 @@ def create_app(
         request: Request,
         x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
+        x_rp1_lease_generation: int | None = Header(default=None),
     ) -> dict[str, Any]:
         require_token(x_rp1_operator_token)
         owner = owner_id(request, x_rp1_client_id)
         runtime = hub.session(owner)
         try:
-            runtime.lease.refresh(owner)
+            if x_rp1_lease_generation is None:
+                raise LeaseConflict("lease heartbeat requires generation; update the desktop client")
+            runtime.lease.refresh(owner, generation=x_rp1_lease_generation, require_active=True)
         except LeaseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, "lease": runtime.lease_snapshot()}
+
+    @app.post("/api/v1/lease/protective-stop/disable")
+    def disable_protective_stop(request: Request, body: dict[str, Any],
+                               x_rp1_client_id: str | None = Header(default=None),
+                               x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        if monitor_only:raise HTTPException(403, "监控实例禁止设备控制")
+        if body.get("mechanical_support_confirmed") is not True:
+            raise HTTPException(422, "请先确认机构已可靠支撑，失能将撤去阻尼")
+        owner = owner_id(request, x_rp1_client_id)
+        runtime = hub.session(owner, create=False)
+        with runtime._lease_guard:
+            lease = runtime.lease.snapshot()
+            generation = body.get("generation")
+            if (lease.owner != owner or not lease.revoked or isinstance(generation,bool)
+                    or not isinstance(generation,int) or generation != lease.generation):
+                raise HTTPException(409, "保护停止身份或控制代次不匹配")
+            observe = getattr(runtime.controller,"protective_damping_snapshot",None)
+            status = observe() if callable(observe) else None
+            if not isinstance(status,dict) or status.get("active") is not True:
+                raise HTTPException(409, "当前没有活动的保护阻尼")
+            runtime._invoke(("disable_motors",))
+            runtime._cleanup_job = None
+            if not runtime._safe_release():raise HTTPException(409, runtime._cleanup_error)
+        return {"ok":True,"lease":runtime.lease_snapshot()}
+
+    @app.post("/api/v1/lease/recover")
+    def recover_lease(request: Request,
+                      x_rp1_client_id: str | None = Header(default=None),
+                      x_rp1_operator_token: str | None = Header(default=None)) -> dict[str, Any]:
+        require_token(x_rp1_operator_token)
+        runtime = hub.session(owner_id(request, x_rp1_client_id), create=False)
+        with runtime._lease_guard:
+            if runtime._cleanup_error is None:
+                raise HTTPException(status_code=409, detail="no quarantined cleanup to retry")
+            if not runtime._safe_release():
+                raise HTTPException(status_code=409, detail=runtime._cleanup_error)
         return {"ok": True, "lease": runtime.lease_snapshot()}
 
     @app.post("/api/v1/zero/prepare")
@@ -1894,4 +2455,14 @@ def create_app(
         except WebSocketDisconnect:
             return
 
+    @app.post("/api/v1/report-jobs/{job_id}/cancel")
+    def cancel_report(job_id: str, request: Request, x_rp1_client_id: str | None = Header(default=None), x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        runtime = hub.session(owner_id(request, x_rp1_client_id), create=False)
+        from factory_hmi.core.report_jobs import cancel_report_job
+        try:return cancel_report_job(runtime.controller.report_manager.data_root, job_id)
+        except ValueError as exc:raise HTTPException(404,str(exc)) from exc
+
+    from .preview import attach_preview
+    attach_preview(app, hub, require_token, owner_id)
     return app

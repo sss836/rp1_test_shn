@@ -1,4 +1,4 @@
-export type Role = "VIEWER" | "TEST_EXECUTOR" | "SYSTEM_ADMIN";
+export type Role = "VIEWER" | "TEST_EXECUTOR" | "SYSTEM_ADMIN" | "FACTORY_REVIEWER";
 export type AccessLevel = "VIEW" | "EDIT";
 export type AccessRequestStatus = "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
 
@@ -73,11 +73,13 @@ export type AuditEvent = {
 export const roleLabels: Record<Role, string> = {
   VIEWER: "查看者",
   TEST_EXECUTOR: "测试执行者",
-  SYSTEM_ADMIN: "系统管理员"
+  SYSTEM_ADMIN: "系统管理员",
+  FACTORY_REVIEWER: "工厂审批员"
 };
 
 export const capabilities: Record<Role, { view: boolean; edit: boolean; admin: boolean }> = {
   VIEWER: { view: true, edit: false, admin: false },
   TEST_EXECUTOR: { view: true, edit: true, admin: false },
-  SYSTEM_ADMIN: { view: true, edit: true, admin: true }
+  SYSTEM_ADMIN: { view: true, edit: true, admin: true },
+  FACTORY_REVIEWER: { view: true, edit: false, admin: false }
 };

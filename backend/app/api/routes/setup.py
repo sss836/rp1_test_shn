@@ -72,7 +72,8 @@ RequestKey = Annotated[UUID | None, Header(alias="Idempotency-Key")]
 def single(session, kind, value, key, **identifiers):
     if kind in {"case_revision","configuration"} and key is None:
         raise ApiError(422,"idempotency_key_required","追加版本或配置必须提供Idempotency-Key，以便重试取得原回执。")
-    bundle = SetupBundle(request_key=key or uuid4(), operations=[SetupOperation(kind=kind, alias="object", data={**value.model_dump(mode="json"), **identifiers})])
+    exclude = {"auto_number", "creation_scenario"} if isinstance(value, AssetCreate) and value.legacy_input else set()
+    bundle = SetupBundle(request_key=key or uuid4(), operations=[SetupOperation(kind=kind, alias="object", data={**value.model_dump(mode="json", exclude=exclude), **identifiers})])
     result = apply_bundle(session, bundle)
     return DataEnvelope(data={**result["objects"]["object"], "request_key": result["request_key"], "replayed": result["replayed"]})
 

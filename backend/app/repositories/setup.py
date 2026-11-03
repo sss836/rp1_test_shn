@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.errors import ApiError
-from app.schemas.setup import AssetCreate, CampaignCreate, ContextCreate, ProgramCreate, StationCreate, CaseCreate, CaseDefinition, CaseRevision, ConfigurationCreate, MetadataChange
+from app.schemas.setup import AssetCreate, CampaignCreate, ContextCreate, ProgramCreate, StationCreate, CaseCreate, CaseDefinition, CaseRevision, ConfigurationCreate, MetadataChange, asset_identity
 
 
 def _parts_match(case_part: str | None, asset_part: str | None) -> bool:
@@ -54,7 +54,7 @@ class SetupRepository:
             "parts": self.rows("SELECT part_code AS code,name,asset_kind FROM catalog.test_target_part WHERE enabled ORDER BY part_code"),
             "programs": self.rows("SELECT public_id AS id,program_code AS code,name,status,true AS can_edit FROM test.test_program WHERE iam.owns_setup('program',id) ORDER BY id DESC"),
             "stations": self.rows("SELECT s.public_id AS id,s.station_code AS code,s.name,s.station_type,iam.owns_setup('station',s.id) AS can_edit FROM test.station s JOIN test.lab l ON l.id=s.lab_id JOIN test.site t ON t.id=l.site_id WHERE s.enabled AND l.enabled AND t.enabled ORDER BY s.station_code"),
-            "assets": self.rows("SELECT a.public_id AS id,a.asset_code AS code,a.display_name AS name,a.asset_kind,iam.can_access_asset(a.id,true) AS can_edit,CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN 'SYS' ELSE m.target_part_code END AS target_part_code FROM test.asset a LEFT JOIN test.module_profile m ON m.asset_id=a.id WHERE NOT a.voided ORDER BY a.asset_code"),
+            "assets": self.rows("SELECT a.public_id AS id,a.asset_code AS code,a.display_name AS name,a.asset_kind,a.creation_scenario,iam.can_access_asset(a.id,true) AS can_edit,CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN 'SYS' ELSE m.target_part_code END AS target_part_code FROM test.asset a LEFT JOIN test.module_profile m ON m.asset_id=a.id WHERE NOT a.voided ORDER BY a.asset_code"),
             "configurations": self.rows("SELECT c.public_id AS id,a.public_id AS asset_id,c.fingerprint,c.reliability_impact FROM test.configuration_snapshot c JOIN test.asset a ON a.id=c.asset_id WHERE NOT a.voided ORDER BY c.effective_from DESC,c.id DESC"),
         }
 
@@ -88,17 +88,31 @@ class SetupRepository:
     def create_asset(self, value: AssetCreate):
         self.reason(value.reason)
         data = value.model_dump()
-        asset = self.one("""INSERT INTO test.asset(asset_code,asset_kind,product_family,serial_number,display_name,notes)
-            VALUES (:asset_code,:asset_kind,:product_family,:serial_number,:display_name,:notes) RETURNING id,public_id""", data)
+        code = self.session.execute(text("SELECT test.allocate_asset_code(:code,:auto)"), {"code": value.asset_code, "auto": value.auto_number}).scalar_one()
+        if code is None:
+            raise ApiError(409, "asset_sequence_exhausted", "该产品前缀的三位编号已用尽（999），未创建样品。")
+        data["asset_code"] = code
+        data["display_name"] = value.display_name or asset_identity(code)[3]
+        asset = self.one("""INSERT INTO test.asset(asset_code,asset_kind,product_family,serial_number,display_name,notes,creation_scenario)
+            VALUES (:asset_code,:asset_kind,:product_family,:serial_number,:display_name,:notes,:creation_scenario) RETURNING id,public_id""", data)
         data["asset"] = asset["id"]
         if value.asset_kind == "MODULE":
             self.session.execute(text("INSERT INTO test.module_profile(asset_id,module_type,target_part_code) VALUES (:asset,:model,:target_part_code)"), data)
         else:
             self.session.execute(text("INSERT INTO test.whole_machine_profile(asset_id,model) VALUES (:asset,:model)"), data)
+        result = {"id": asset["public_id"], "code": code, "name": data["display_name"],
+                  "product_family": data["product_family"], "target_part_code": data["target_part_code"],
+                  "asset_kind": data["asset_kind"], "creation_scenario": data["creation_scenario"]}
+        # Preserve plan linkage without asking for a manufactured configuration.
+        # This is a record identifier for an explicitly UNKNOWN initial state,
+        # not a hardware/software content hash or a verified configuration.
+        data["configuration_fingerprint"] = value.configuration_fingerprint or "registration:" + str(asset["public_id"])
+        data["captured_from"] = "browser setup" if value.configuration_fingerprint else "sample registration; device configuration not captured"
         data.update({key: json.dumps(getattr(value, key)) for key in ("hardware_manifest", "software_manifest", "parameter_manifest")})
         config = self.one("""INSERT INTO test.configuration_snapshot(asset_id,fingerprint,hardware_manifest,software_manifest,parameter_manifest,reliability_impact,captured_from,captured_by,effective_from)
-            VALUES (:asset,:configuration_fingerprint,CAST(:hardware_manifest AS jsonb),CAST(:software_manifest AS jsonb),CAST(:parameter_manifest AS jsonb),'UNKNOWN','browser setup',iam.current_user_id(),now()) RETURNING public_id""", data)
-        return {"id": asset["public_id"], "configuration_id": config["public_id"]}
+            VALUES (:asset,:configuration_fingerprint,CAST(:hardware_manifest AS jsonb),CAST(:software_manifest AS jsonb),CAST(:parameter_manifest AS jsonb),'UNKNOWN',:captured_from,iam.current_user_id(),now()) RETURNING public_id""", data)
+        result["configuration_id"] = config["public_id"]
+        return result
 
     def create_program(self, value: ProgramCreate):
         self.reason(value.reason)

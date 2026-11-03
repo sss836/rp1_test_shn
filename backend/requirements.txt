@@ -10,3 +10,4 @@ argon2-cffi==25.1.0
 pyarrow==25.0.1
 duckdb==1.5.3
 Pillow==12.0.0
+PyYAML==6.0.3

@@ -1,5 +1,6 @@
 from typing import Annotated, Literal
 from uuid import UUID
+from pydantic import AwareDatetime
 
 import anyio
 from fastapi import APIRouter, Depends, Header, Query, Request
@@ -12,16 +13,18 @@ from app.core.config import get_settings
 from app.core.db import DbSession
 from app.core.errors import ApiError
 from app.repositories.archives import ArchiveRepository
-from app.schemas.archives import ArchiveAnalysisCreate, ArchiveClassification, ArchiveCreate, ArchiveIntakeSubmit, ArchiveSubmit, ArchiveVerification
+from app.schemas.archives import RunManifest, ArchiveAnalysisCreate, ArchiveDomainClassification, ArchiveFactoryReview, ArchiveClassification, ArchiveCreate, ArchiveIntakeSubmit, ArchiveSubmit, ArchiveVerification
 from app.schemas.common import DataEnvelope
 from app.services.archive_storage import ArchiveStorage
 from app.services.curve_analysis import CurveAnalysisService, MAX_TIME_SECONDS
 from app.services.curve_query import CurveQueryService
 
 
+factory_router = APIRouter(prefix="/api/v1/factory", tags=["factory-test-statistics"])
 router = APIRouter(prefix="/api/v1/archives", tags=["central-test-archives"])
 Operator = Annotated[RequestActor, Depends(require_roles("SYSTEM_ADMIN", "TEST_EXECUTOR"))]
-Reader = Annotated[RequestActor, Depends(require_roles("SYSTEM_ADMIN", "TEST_EXECUTOR", "VIEWER"))]
+Reader = Annotated[RequestActor, Depends(require_roles("SYSTEM_ADMIN", "TEST_EXECUTOR", "VIEWER", "FACTORY_REVIEWER"))]
+FactoryReviewer = Annotated[RequestActor, Depends(require_roles("SYSTEM_ADMIN", "TEST_EXECUTOR", "FACTORY_REVIEWER"))]
 Key = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)]
 Reference = Annotated[str, Query(min_length=1,max_length=300)]
 
@@ -48,8 +51,15 @@ def listing(_: Reader, session: DbSession, execution_uuid: UUID | None=None, exe
             origin: Literal["HMI","HISTORY","OTHER"] | None=None,
             classification_state: Literal["UNCLASSIFIED","CLASSIFIED"] | None=None,
             processing_state: Literal["WAITING","QUEUED","PROCESSING","READY","FAILED"] | None=None,
+            data_domain: Literal["RESEARCH","FACTORY","UNCLASSIFIED"] | None=None,
+            sn: Annotated[str | None,Query(min_length=1,max_length=200)]=None,
+            bench: Annotated[str | None,Query(min_length=1,max_length=100)]=None,
+            started_from: AwareDatetime | None=None, started_to: AwareDatetime | None=None,
+            submission_status: Literal["PENDING","APPROVED","REJECTED"] | None=None,
             before: Annotated[int | None,Query(ge=1)]=None,limit: Annotated[int,Query(ge=1,le=100)]=50):
-    return DataEnvelope(data=ArchiveRepository(session).list(execution_uuid,execution_id,q,origin,classification_state,processing_state,before,limit))
+    check_window(started_from, started_to)
+    return DataEnvelope(data=ArchiveRepository(session).list(execution_uuid,execution_id,q,origin,classification_state,processing_state,before,limit,
+        data_domain,sn,bench,started_from,started_to,submission_status))
 
 
 @router.get("/{reference}")
@@ -81,6 +91,8 @@ async def content(reference: str,request: Request, _: Operator,session: DbSessio
         storage = ArchiveStorage(settings.archive_root)
         with storage.lock(initial["execution_uuid"]):
             archive = repository.lock_upload(initial["id"])
+            if session.execute(__import__("sqlalchemy").text("SELECT EXISTS(SELECT 1 FROM integration.archive_run_manifest m JOIN integration.execution_archive a ON a.id=m.archive_id WHERE a.public_id=:id)"), {"id": archive["id"]}).scalar_one():
+                raise ApiError(409,"segmented_upload_required","该执行须通过分段接口续传，不能替换为单文件上传")
             received = storage.append(archive["execution_uuid"],archive["received_bytes"],archive["size_bytes"],offset,bytes(body),archive["upload_state"]=="COMPLETE")
             return repository.update_upload(archive["id"],received,"COMPLETE" if archive["upload_state"]=="COMPLETE" else "UPLOADING")
     return await run_in_threadpool(operation,append)
@@ -200,3 +212,86 @@ class ArchiveCsvResponse(StreamingResponse):
 def raw_export_csv(query: RawRequest):
     service, selection = query
     return ArchiveCsvResponse(service.export_csv(selection))
+
+
+def check_window(started_from, started_to):
+    if started_from is not None and started_to is not None and started_from >= started_to:
+        raise ApiError(422,"invalid_time_window","开始时间必须早于结束时间。")
+
+
+@factory_router.get("/statistics")
+def factory_statistics(_: Reader, session: DbSession,
+        sn: Annotated[str | None,Query(min_length=1,max_length=200)]=None,
+        bench: Annotated[str | None,Query(min_length=1,max_length=100)]=None,
+        started_from: AwareDatetime | None=None, started_to: AwareDatetime | None=None):
+    check_window(started_from, started_to)
+    return DataEnvelope(data=ArchiveRepository(session).factory_statistics(sn,bench,started_from,started_to))
+
+
+@router.post("/{reference}/factory-review")
+def factory_review(reference: str, payload: ArchiveFactoryReview, _: FactoryReviewer, session: DbSession, idempotency_key: Key):
+    return operation(lambda: ArchiveRepository(session).factory_review(reference,payload,idempotency_key))
+
+
+@router.post("/{reference}/domain-classification")
+def classify_domain(reference: str, payload: ArchiveDomainClassification, _: Operator, session: DbSession, idempotency_key: Key):
+    return operation(lambda: ArchiveRepository(session).classify_domain(reference,payload,idempotency_key))
+
+@router.post('/{reference}/segments')
+def register_segments(reference: str, payload: RunManifest, _: Operator, session: DbSession, idempotency_key: Key):
+    from app.services.run_segments import RunSegments
+    def register():
+        archive=ArchiveRepository(session).lock_upload(reference)
+        return RunSegments(session,ArchiveStorage(get_settings().archive_root)).register(archive,payload.model_dump(mode='json'))
+    return operation(register)
+
+@router.get('/{reference}/segments')
+def segment_status(reference: str, _: Reader, session: DbSession):
+    from app.services.run_segments import RunSegments
+    archive=ArchiveRepository(session).get(reference)
+    return DataEnvelope(data=RunSegments(session,ArchiveStorage(get_settings().archive_root)).status(archive))
+
+@router.put('/{reference}/segments/{sequence}')
+async def segment_content(reference: str, sequence: int, request: Request, _: Operator, session: DbSession, idempotency_key: Key, offset: Annotated[int,Query(ge=0)]):
+    from app.services.run_segments import RunSegments
+    settings=get_settings();body=bytearray()
+    if request.headers.get('content-type','').split(';')[0]!='application/octet-stream':raise ApiError(415,'invalid_content_type','分段须使用二进制上传')
+    async for chunk in request.stream():
+        if len(body)+len(chunk)>settings.archive_max_chunk_bytes:raise ApiError(413,'archive_chunk_too_large','上传块过大')
+        body.extend(chunk)
+    def append():
+        repository=ArchiveRepository(session);initial=repository.get(reference);storage=ArchiveStorage(settings.archive_root)
+        with storage.lock(initial['execution_uuid']):
+            archive=repository.lock_upload(reference)
+            return RunSegments(session,storage).append(archive,sequence,offset,bytes(body))
+    return await run_in_threadpool(operation,append)
+
+@router.post('/{reference}/segments-complete',status_code=202)
+def complete_segments(reference: str, _: Operator, session: DbSession, idempotency_key: Key):
+    from app.services.run_segments import RunSegments
+    def complete():
+        repository=ArchiveRepository(session);initial=repository.get(reference);storage=ArchiveStorage(get_settings().archive_root)
+        with storage.lock(initial['execution_uuid']):
+            archive=repository.lock_upload(reference);RunSegments(session,storage).materialize(archive)
+            return repository.update_upload(archive['id'],archive['size_bytes'],'COMPLETE')
+    return operation(complete)
+
+from pydantic import BaseModel,Field
+from sqlalchemy import text
+class FactoryHandoff(BaseModel):
+    kind: Literal['REWORK','HANDOFF','ACKNOWLEDGED']
+    note: str=Field(min_length=1,max_length=1000)
+    destination: str=Field(default='',max_length=100)
+    expected_revision:int=Field(ge=0)
+@router.get('/{reference}/handoffs')
+def handoffs(reference:str,_:Reader,session:DbSession):
+    archive=ArchiveRepository(session).get(reference)
+    rows=session.execute(text("SELECT h.revision,h.kind,h.note,h.destination,h.created_at,integration.archive_actor_name(h.archive_id,h.actor_id) AS actor FROM integration.factory_handoff h JOIN integration.execution_archive a ON a.id=h.archive_id WHERE a.public_id=:id ORDER BY h.revision DESC LIMIT 100"),{'id':archive['id']}).mappings()
+    return DataEnvelope(data={'items':[dict(row) for row in rows]})
+@router.post('/{reference}/handoffs')
+def add_handoff(reference:str,payload:FactoryHandoff,_:Operator,session:DbSession,idempotency_key:Key):
+    def save():
+        archive=ArchiveRepository(session).get(reference)
+        revision=session.execute(text('SELECT integration.factory_handoff(:id,:kind,:note,:destination,:expected_revision,:key)'),{'id':archive['id'],**payload.model_dump(),'key':idempotency_key}).scalar_one()
+        return {'revision':revision,'recorded':True,'formal_verdict_unchanged':True}
+    return operation(save)

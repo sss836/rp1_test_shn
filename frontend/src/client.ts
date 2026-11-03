@@ -156,3 +156,36 @@ export async function apiRequest<T>(
   }
   return parse ? parse(record.data) : record.data as T;
 }
+
+// XMLHttpRequest is used only for upload byte progress. Keep the same identity,
+// Cookie and CSRF rules as apiRequest, including ignoring a late 401 after logout.
+export function apiUpload<T>(path: string, file: File, signal: AbortSignal | undefined, onProgress: (loaded: number, total: number) => void): Promise<T> {
+  const epoch = authenticationEpoch, handler = unauthorizedHandler;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const abort = () => xhr.abort();
+    if (signal?.aborted) { reject(new DOMException("已取消", "AbortError")); return; }
+    xhr.open("POST", path); xhr.withCredentials = true;
+    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+    xhr.setRequestHeader("X-Filename-UTF8", encodeURIComponent(file.name));
+    xhr.setRequestHeader("X-Filename", encodeURIComponent(file.name));
+    xhr.setRequestHeader("X-Request-Id", requestId());
+    const csrf = cookieValue("rp1_csrf"); if (csrf) xhr.setRequestHeader("X-CSRF-Token", csrf);
+    const devId = import.meta.env.DEV ? import.meta.env.VITE_DEV_USER_PUBLIC_ID?.trim() : "";
+    if (devId) xhr.setRequestHeader("X-User-Public-Id", devId);
+    const done = () => signal?.removeEventListener("abort", abort);
+    xhr.upload.onprogress = (event) => { if (!signal?.aborted && epoch === authenticationEpoch) onProgress(event.loaded, event.lengthComputable ? event.total : file.size); };
+    xhr.onabort = () => { done(); reject(new DOMException("已取消", "AbortError")); };
+    xhr.onerror = () => { done(); reject(new ApiError("附件上传连接中断，可重试该文件。", 0, "upload_network")); };
+    xhr.onload = () => {
+      done();
+      if (signal?.aborted || epoch !== authenticationEpoch) { reject(new DOMException("登录身份已变更", "AbortError")); return; }
+      let body: { data?: T; error?: { code?: string; message?: string; details?: unknown } } | null = null;
+      try { body = JSON.parse(xhr.responseText); } catch { /* Stable error below. */ }
+      if (xhr.status >= 200 && xhr.status < 300 && body && "data" in body) { onProgress(file.size, file.size); resolve(body.data as T); return; }
+      if (xhr.status === 401 && body?.error?.code && SESSION_INVALIDATION_CODES.has(body.error.code) && handler === unauthorizedHandler) handler?.();
+      reject(new ApiError(body?.error?.message ?? `附件上传失败（HTTP ${xhr.status}）。`, xhr.status >= 200 && xhr.status < 300 ? 502 : xhr.status, body?.error?.code ?? "upload_failed", body?.error?.details));
+    };
+    signal?.addEventListener("abort", abort, { once: true }); xhr.send(file);
+  });
+}

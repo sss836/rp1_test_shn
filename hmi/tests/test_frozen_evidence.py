@@ -142,7 +142,9 @@ class ImportClient(ArchiveClient):
         raise AssertionError('incomplete history must not use strict /archives')
     def import_archive(self, payload, key):
         self.calls.append(('import', deepcopy(payload), key))
-        assert set(payload) == {'filename', 'size_bytes', 'sha256', 'test_name', 'actual_object', 'station_id', 'classification'}
+        required = {'filename', 'size_bytes', 'sha256', 'test_name', 'actual_object', 'station_id', 'classification'}
+        assert required <= set(payload) <= required | {'data_domain', 'serial_number', 'bench_id'}
+        assert payload.get('bench_id') == 'A10' and payload.get('serial_number') == '对象'
         reused = self.detail is not None
         if self.import_payload is not None:
             assert self.import_payload == (payload, key)

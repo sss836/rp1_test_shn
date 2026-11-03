@@ -87,6 +87,7 @@ def _interval_rows(
             JOIN test.asset a ON a.id = ri.asset_id
             WHERE ri.campaign_id = :campaign_id
               AND NOT ri.voided
+              AND integration.interval_data_domain(ri.id)='RESEARCH'
               AND ri.created_at <= :as_of
               AND (
                   (ri.ended_at IS NOT NULL AND ri.ended_at <= :cutoff)
@@ -129,6 +130,7 @@ def _failure_rows(
               ON isa.interruption_id = i.id AND isa.scope_id = :scope_id
             WHERE i.campaign_id = :campaign_id
               AND NOT i.voided
+              AND integration.interruption_data_domain(i.id)='RESEARCH'
               AND i.started_at <= :cutoff
               AND i.created_at <= :as_of
             ORDER BY i.started_at, i.id
@@ -176,6 +178,7 @@ def process_job(session: Session, job: dict[str, Any]) -> None:
         },
     ).mappings().one()
 
+    domain_epoch = session.execute(text("SELECT integration.campaign_domain_epoch(:id)"), {"id":campaign_id}).scalar_one()
     cutoff = datetime.now(timezone.utc)
     as_of = cutoff
     interval_rows = _interval_rows(session, campaign_id, scope_id, cutoff, as_of)
@@ -284,6 +287,8 @@ def process_job(session: Session, job: dict[str, Any]) -> None:
         for group in failure_groups.values()
     ]
     input_summary = {
+        "data_domain_policy_version": "research-only-v1",
+        "data_domain_epoch": domain_epoch,
         "campaign_id": str(context["campaign_public_id"]),
         "scope": context["scope_code"],
         "data_cutoff_at": cutoff.isoformat(),
@@ -359,13 +364,14 @@ def process_job(session: Session, job: dict[str, Any]) -> None:
         text(
             """
             INSERT INTO reliability.current_mtbf_result(
+                data_domain_policy_version,data_domain_epoch,
                 population_id, campaign_id, scope_id, calculation_run_id,
                 exposure_seconds, relevant_failure_count, pending_block_count,
                 pending_exposure_seconds, excluded_exposure_seconds,
                 point_estimate_hours, no_failure_exposure_hours,
                 lower_70_hours, lower_90_hours, result_payload,
                 data_cutoff_at
-            ) VALUES (
+            ) VALUES ('research-only-v1',:domain_epoch,
                 NULL, :campaign_id, :scope_id, :run_id,
                 :exposure_seconds, :failure_count, :pending_failure_count,
                 :pending_seconds, :excluded_seconds,
@@ -374,7 +380,7 @@ def process_job(session: Session, job: dict[str, Any]) -> None:
                 :cutoff
             )
             ON CONFLICT (campaign_id, scope_id) WHERE campaign_id IS NOT NULL
-            DO UPDATE SET
+            DO UPDATE SET data_domain_policy_version=EXCLUDED.data_domain_policy_version,data_domain_epoch=EXCLUDED.data_domain_epoch,
                 calculation_run_id = EXCLUDED.calculation_run_id,
                 exposure_seconds = EXCLUDED.exposure_seconds,
                 relevant_failure_count = EXCLUDED.relevant_failure_count,
@@ -392,6 +398,7 @@ def process_job(session: Session, job: dict[str, Any]) -> None:
             """
         ),
         {
+            "domain_epoch": domain_epoch,
             "campaign_id": campaign_id,
             "scope_id": scope_id,
             "run_id": run["id"],

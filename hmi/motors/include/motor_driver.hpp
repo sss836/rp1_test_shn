@@ -107,6 +107,9 @@ class MotorDriver {
      * @param param_cmd The command code specifying which parameter to retrieve.
      */
     virtual void get_motor_param(uint8_t param_cmd) = 0;
+    // Read-only version queries. Empty payload means pending/unsupported.
+    virtual bool request_version(uint8_t code) { return false; }
+    virtual std::vector<uint8_t> version_payload(uint8_t code) { return {}; }
     // to enum and union
 
     /**

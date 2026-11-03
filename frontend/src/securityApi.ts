@@ -10,7 +10,7 @@ import type {
   User
 } from "./security";
 
-const roles = new Set<Role>(["VIEWER", "TEST_EXECUTOR", "SYSTEM_ADMIN"]);
+const roles = new Set<Role>(["VIEWER", "TEST_EXECUTOR", "SYSTEM_ADMIN", "FACTORY_REVIEWER"]);
 const principalKinds = new Set<User["kind"]>(["HUMAN", "SERVICE"]);
 const sessionTypes = new Set<Session["session_type"]>(["BROWSER", "DEVELOPMENT", "SERVICE_API"]);
 const assetKinds = new Set<CampaignAccess["asset_kind"]>(["WHOLE_MACHINE", "MODULE"]);

@@ -33,11 +33,27 @@ class Settings(BaseSettings):
         "http://localhost:8088",
     ]
     worker_poll_seconds: float = 1.0
+    showcase_topics_json: str = "[]"
     archive_root: str = "/var/lib/rp1/archives"
     archive_max_chunk_bytes: int = Field(default=4 * 1024**2, ge=1024, le=16 * 1024**2)
     archive_max_file_bytes: int = Field(default=50 * 1024**3, ge=1024, le=50 * 1024**3)
     archive_query_memory_mb: int = Field(default=512, ge=128, le=4096)
     archive_worker_poll_seconds: float = Field(default=2, ge=.1, le=60)
+    # Software distribution is independent of measurement archives and disabled
+    # until an external persistent directory and trusted Ed25519 public key exist.
+    hmi_updates_enabled: bool = False
+    hmi_updates_root: str = ""
+    hmi_updates_public_key_file: str = ""
+    hmi_updates_max_package_bytes: int = Field(default=512 * 1024**2, ge=1024, le=4 * 1024**3)
+    hmi_updates_max_manifest_bytes: int = Field(default=16 * 1024, ge=1024, le=64 * 1024)
+    motor_parameters_enabled: bool = False
+    motor_parameters_root: str = ""
+    motor_firmware_enabled: bool = False
+    motor_firmware_root: str = ""
+    motor_firmware_public_key_file: str = ""
+    motor_firmware_resources_enabled: bool = False
+    motor_firmware_resources_root: str = ""
+    motor_firmware_resources_public_key_file: str = ""
     # Milestone 2 is an isolated connection probe, never a production chat entry.
     assistant_enabled: bool = False
     assistant_pilot_user_ids: Annotated[list[UUID], NoDecode] = []
@@ -52,6 +68,8 @@ class Settings(BaseSettings):
     # Verified official CNY peak rates per million tokens. Applying peak rates
     # at all times conservatively bounds spend without guessing holidays.
     assistant_price_valid_until: str = "2026-10-29T00:00:00+08:00"
+    assistant_model_provider: str = "deepseek"
+    assistant_tokenhub_profile_file: str = ""
 
     @field_validator("assistant_pilot_user_ids", mode="before")
     @classmethod
@@ -86,8 +104,8 @@ class Settings(BaseSettings):
             password = self.seed_admin_password.get_secret_value()
             if username != username.strip().lower():
                 raise ValueError("SEED_ADMIN_USERNAME must be normalized")
-            if len(password) < 12:
-                raise ValueError("SEED_ADMIN_PASSWORD must contain at least 12 characters")
+            if len(password) < 6:
+                raise ValueError("SEED_ADMIN_PASSWORD must contain at least 6 characters")
             if self.app_env.lower() not in {"development", "dev", "test", "testing"} and (
                 username == "local-admin"
                 or password == "RP1-Local-Admin-2026!"

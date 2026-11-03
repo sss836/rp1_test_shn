@@ -12,7 +12,8 @@ LRO_Limit_Param lro_limit_param[LRO_Num_Of_Motor] = {
 };
 
 LroMotorDriver::LroMotorDriver(uint16_t motor_id, const std::string& interface_type, const std::string& can_interface,
-                               LRO_Motor_Model motor_model, double motor_zero_offset)
+                               LRO_Motor_Model motor_model, double motor_zero_offset,
+                               std::shared_ptr<MotorsCANFD> transport)
     : MotorDriver(), motor_model_(motor_model) {
     if (interface_type != "canfd" && interface_type != "ethercanfd" && interface_type != "ethercat") {
         throw std::runtime_error("LRO driver only supports CAN-FD and Ethercat interfaces");
@@ -25,7 +26,7 @@ LroMotorDriver::LroMotorDriver(uint16_t motor_id, const std::string& interface_t
     if (interface_type == "canfd" || interface_type == "ethercanfd") {
         comm_type_ = CommType::CANFD;
         motor_index_ = (motor_id_ > 0 && motor_id_ <= 8) ? (motor_id_ - 1) : 0;
-        canfd_ = MotorsCANFD::get(can_interface);
+        canfd_ = transport ? transport : MotorsCANFD::get(can_interface);
 
         CanFdCbkFunc canfd_callback = std::bind(&LroMotorDriver::canfd_rx_cbk, this, std::placeholders::_1);
         canfd_->add_canfd_callback(canfd_callback, motor_id_);
@@ -148,6 +149,17 @@ bool LroMotorDriver::set_motor_zero() {
 }
 
 void LroMotorDriver::canfd_rx_cbk(const canfd_frame& rx_frame) {
+    if (rx_frame.can_id != motor_id_ || rx_frame.len < 2 || rx_frame.len > 64) return;
+    if ((rx_frame.data[0] & 0xE0) == 0xA0) {
+        std::lock_guard<std::mutex> guard(version_mutex_);
+        const uint8_t code = rx_frame.data[1];
+        if (pending_version_ == code && std::chrono::steady_clock::now() <= version_deadline_) {
+            versions_[code] = std::vector<uint8_t>(rx_frame.data, rx_frame.data + rx_frame.len);
+            pending_version_ = 0;
+        }
+        return; // Query replies are never position/temperature feedback.
+    }
+    if ((rx_frame.data[0] & 0xE0) != 0x20) return;
     {
         response_count_ = 0;
     }
@@ -195,6 +207,30 @@ void LroMotorDriver::get_motor_param(uint8_t param_cmd) {
     {
         response_count_++;
     }
+}
+
+bool LroMotorDriver::request_version(uint8_t code) {
+    if (comm_type_ != CommType::CANFD || (code != 0x31 && code != 0x1E)) return false;
+    {
+        std::lock_guard<std::mutex> guard(version_mutex_);
+        versions_.erase(code);
+        pending_version_ = code;
+        version_deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    }
+    canfd_frame query{};
+    query.can_id = motor_id_;
+    query.len = 2;
+    query.flags = CANFD_BRS;
+    query.data[0] = 0xE0;
+    query.data[1] = code;
+    canfd_->transmit(query); // No enable/motion or telemetry-watchdog counter.
+    return true;
+}
+
+std::vector<uint8_t> LroMotorDriver::version_payload(uint8_t code) {
+    std::lock_guard<std::mutex> guard(version_mutex_);
+    auto it = versions_.find(code);
+    return it == versions_.end() ? std::vector<uint8_t>{} : it->second;
 }
 
 void LroMotorDriver::motor_pos_cmd(float pos, float spd, bool ignore_limit) {

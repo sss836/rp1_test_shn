@@ -880,6 +880,7 @@ class MotorTelemetryRecorder:
         query: bool = False,
         get_cmd_pos: Any = None,
         sample_provider: Any = None,
+        sampling_gate: Any = None,
         print_status: bool = False,
         live_display: LiveBlockDisplay | None = None,
         quiet: bool = False,
@@ -889,6 +890,7 @@ class MotorTelemetryRecorder:
         controller_heartbeat: ControllerHeartbeat | None = None,
         controller_stale_sec: float = 0.5,
         platform_required: bool = True,
+        local_only: bool = False,
     ) -> None:
         self.motors = motors
         self.entries = entries
@@ -897,6 +899,7 @@ class MotorTelemetryRecorder:
         self.query = bool(query)
         self.get_cmd_pos = get_cmd_pos
         self.sample_provider = sample_provider
+        self.sampling_gate = sampling_gate
         self.print_status = bool(print_status)
         self.live_display = live_display
         self.quiet = bool(quiet)
@@ -907,10 +910,11 @@ class MotorTelemetryRecorder:
         self.controller_heartbeat = controller_heartbeat
         self.controller_stale_sec = float(controller_stale_sec)
         self.platform_required = bool(platform_required)
+        self.local_only = bool(local_only)
         self.platform_sync_errors: list[str] = []
         if self.controller_stale_sec <= 0.0:
             raise ValueError("controller_stale_sec must be positive")
-        self._influx_wanted = enabled
+        self._influx_wanted = enabled and not self.local_only
         self._fault_latch = FaultLatch()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -926,8 +930,18 @@ class MotorTelemetryRecorder:
         self.row_count = 0
         self.controller_timeout = False
         self.blocked_reason: str | None = None
+        self._closed = threading.Event()
+        self._csv_ready = threading.Event()
+        self._health_lock = threading.Lock()
+        self._last_write = 0.0
+        self._next_space_check = 0.0
+        self.reserve_bytes = int(os.environ.get("RP1_FACTORY_RECORD_RESERVE_BYTES", str(512 * 1024**2)))
+        if self.reserve_bytes < 0:
+            raise ValueError("record reserve bytes cannot be negative")
 
     def _update_platform_execution(self, **updates: Any) -> None:
+        if self.local_only:
+            return
         try:
             self._update_platform_execution_once(**updates)
         except Exception as exc:
@@ -973,11 +987,12 @@ class MotorTelemetryRecorder:
             last_data_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             telemetry_source="InfluxDB/joint_metrics",
         )
-        self.output.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.output.open("w", encoding="utf-8", newline="")
-        self._writer = csv.DictWriter(self._file, fieldnames=csv_fieldnames(self.entries))
-        self._writer.writeheader()
+        if not self.local_only:
+            self._open_csv()
         self._stop.clear()
+        self._closed.clear()
+        self._csv_ready.clear()
+        self._last_write = time.monotonic()
         self._stopped_elapsed_s = None
         self.controller_timeout = False
         self.blocked_reason = None
@@ -1020,17 +1035,46 @@ class MotorTelemetryRecorder:
         )
         return self.row_count
 
-    def stop_sampling(self) -> int:
-        """Stop CSV sampling without waiting on network post-processing."""
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join()
-            self._thread = None
+    def request_stop_sampling(self) -> None:
+        """Signal only. The CSV owner closes the file on its own thread."""
         if self._stopped_elapsed_s is None:
             self._stopped_elapsed_s = self._elapsed_s()
-        if self._file is not None:
-            self._file.close()
-            self._file = None
+        self._stop.set()
+
+    def wait_closed(self, timeout: float | None = None) -> bool:
+        return self._closed.wait(timeout)
+
+    def durability_status(self) -> dict:
+        writer = self._writer
+        return writer.status() if self.local_only and hasattr(writer, "status") else {"confirmed": False, "reason": "legacy writer has no durability checkpoint"}
+
+    def health_error(self) -> str | None:
+        if self.blocked_reason:
+            return self.blocked_reason
+        if self.local_only and self._writer is not None and hasattr(self._writer, "health_error"):
+            error = self._writer.health_error()
+            if error: return error
+        if self.sampling_gate is not None and not self.sampling_gate.is_set() and self._csv_ready.is_set():
+            return None  # Intentionally waiting for first-frame positioning.
+        if not self._stop.is_set() and time.monotonic() - self._last_write > max(2.0, 3 / self.rate_hz):
+            return "telemetry_stalled: no successful CSV write within recording budget"
+        return None
+
+    def begin_sampling(self) -> None:
+        """Open the sample gate with a fresh write budget, without doing I/O."""
+        with self._health_lock:
+            self._last_write = time.monotonic()
+            if self.sampling_gate is not None:
+                self.sampling_gate.set()
+
+    def stop_sampling(self, timeout: float | None = None) -> int:
+        """Legacy synchronous API; never called by the HMI control thread."""
+        self.request_stop_sampling()
+        if self._thread is not None:
+            self._thread.join(timeout)
+            if self._thread.is_alive():
+                raise TimeoutError("telemetry CSV is still closing")
+            self._thread = None
         return self.row_count
 
     def finalize(
@@ -1042,6 +1086,10 @@ class MotorTelemetryRecorder:
     ) -> None:
         """Flush remote sinks and update the platform after motors are safe."""
         self.stop_sampling()
+        if self.local_only:
+            if self.blocked_reason:
+                raise RuntimeError(self.blocked_reason)
+            return
         if self._influx is not None:
             duration_s = self._elapsed_s()
             self._enqueue_event(
@@ -1125,13 +1173,62 @@ class MotorTelemetryRecorder:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.stop()
 
+    def _open_csv(self) -> None:
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.output.open("x" if self.local_only else "w", encoding="utf-8", newline="")
+        if self.local_only:
+            from factory_hmi.core.recording.segments import SegmentedWriter
+            self._file.close()
+            self.output.unlink()
+            self._writer = SegmentedWriter(self.output, csv_fieldnames(self.entries))
+            self._file = self._writer
+        else:
+            self._writer = csv.DictWriter(self._file, fieldnames=csv_fieldnames(self.entries))
+            self._writer.writeheader()
+
+    def _block(self, exc: Exception) -> None:
+        with self._health_lock:
+            if self.blocked_reason is None:
+                self.blocked_reason = f"telemetry_io_error: {exc}"
+        self._stop.set()
+
     def _run(self) -> None:
+        try:
+            if self._writer is None:
+                self._open_csv()
+            self._csv_ready.set()
+            self._sample_loop()
+        except Exception as exc:
+            self._block(exc)
+        finally:
+            try:
+                if self._file is not None:
+                    self._file.close()
+                    self._file = None
+            except Exception as exc:
+                self._block(exc)
+            finally:
+                self._closed.set()
+
+    def _sample_loop(self) -> None:
         assert self._writer is not None
         period = 1.0 / self.rate_hz
+        # A controller may open a CSV before initial positioning. Keep the
+        # header and lifecycle real, but start the sample clock only when the
+        # test itself starts. Stop must also wake a gate that never opens.
+        if self.sampling_gate is not None:
+            while not self.sampling_gate.is_set():
+                if self._stop.wait(min(period, .05)):
+                    return
+            self._record_start_monotonic = time.monotonic()
         start = time.monotonic()
         sample_index = 0
         while not self._stop.is_set():
             loop_start = time.monotonic()
+            if self.local_only and loop_start >= self._next_space_check:
+                self._next_space_check = loop_start + 5.0
+                if shutil.disk_usage(self.output.parent).free < self.reserve_bytes:
+                    raise OSError("recording disk free space below configured reserve")
             if self.controller_heartbeat is not None:
                 touch_count, _ = self.controller_heartbeat.snapshot()
                 heartbeat_age = self.controller_heartbeat.age(loop_start)
@@ -1177,6 +1274,7 @@ class MotorTelemetryRecorder:
                     sample=sample_index,
                 )
             )
+            self._last_write = time.monotonic()
             if self._influx is not None:
                 self._influx.maybe_enqueue(
                     self.entries,

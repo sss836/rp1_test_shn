@@ -5,6 +5,7 @@ import { requestId } from "../client";
 import { useAssistantPageContext } from "../assistantContext";
 import { setupApi } from "../setupApi";
 import { displayPartName, partsCompatible } from "../homeCarousel";
+import { creationScenarioName, parseAssetNumber } from "../assetRegistration";
 import { formatDate } from "../navigation";
 import type { AssetKind } from "../types";
 import { EmptyState, ErrorState, LoadingState, PageTitle, Panel } from "../components/Workbench";
@@ -61,16 +62,45 @@ function CreateForm({ title, path, fields, values = {}, after, method = "POST", 
 export function AssetCreateForm({ assetKind }: { assetKind: AssetKind }) {
   const { session } = useAuth();
   const [open, setOpen] = useState(false);
-  const options = useQuery({ queryKey: ["setup-options"], queryFn: ({ signal }) => setupApi.options(signal), enabled: open });
+  const [code, setCode] = useState("");
+  const [numbering, setNumbering] = useState("");
+  const [scenario, setScenario] = useState("");
+  const [error, setError] = useState("");
+  const pendingKey = useRef<{ payload: string; key: string } | null>(null);
+  const cache = useQueryClient();
+  const parsed = parseAssetNumber(code);
+  const mutation = useMutation({
+    mutationFn: (payload: Record<string, unknown>) => {
+      const serialized = JSON.stringify(payload);
+      if (pendingKey.current?.payload !== serialized) pendingKey.current = { payload: serialized, key: requestId() };
+      return setupApi.create("assets", payload, pendingKey.current.key);
+    },
+    onSuccess: async () => { await cache.invalidateQueries(); }
+  });
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (mutation.isPending || mutation.isSuccess) return;
+    if (!parsed) { setError("请填写完整产品编号，例如 RP1.3-ARM-004。"); return; }
+    if (!numbering || !scenario) { setError("请选择是否向下编号和创建场景。"); return; }
+    setError("");
+    mutation.mutate({ asset_code: code.trim(), auto_number: numbering === "yes", creation_scenario: scenario });
+  }
   if (!(["SYSTEM_ADMIN", "TEST_EXECUTOR"].includes(session?.user.role ?? ""))) return null;
   return <section className="setup-section">
     <button className="primary-button" onClick={() => setOpen(!open)} type="button">{open ? "收起样品建档" : "新增样品"}</button>
-    {open && (options.isLoading ? <LoadingState /> : options.error ? <ErrorState error={options.error} retry={() => void options.refetch()} /> : <CreateForm key={assetKind} title="样品建档与初始配置" path="assets" values={{ asset_kind: assetKind }} fields={[
-      text("asset_code", "样品编号", "格式：RP1.3-SLEG-001；部位须与选择一致"),
-      { name: "target_part_code", label: "样品部位", options: (options.data?.parts ?? []).filter((p) => p.asset_kind === assetKind).map((p) => ({ value: p.code, label: `${p.code} · ${p.name}` })) },
-      text("display_name", "样品名称"), text("product_family", "产品系列"), text("serial_number", "序列号"), text("model", "型号或模块类型"), text("configuration_fingerprint", "配置标识", "填写可追溯的配置版本，配置影响初始化为未知"),
-      { name: "hardware_manifest", label: "硬件配置清单（JSON）", type: "json" }, { name: "software_manifest", label: "软件配置清单（JSON）", type: "json" }, { name: "parameter_manifest", label: "参数配置清单（JSON）", type: "json" }, reason
-    ]} />)}
+    {open && <form className="setup-form" onSubmit={submit}>
+      <h3>按产品编号创建样品</h3>
+      <div className="setup-fields">
+        <label>产品编号<input required value={code} disabled={mutation.isPending || mutation.isSuccess} onChange={(event) => setCode(event.target.value)} placeholder={assetKind === "MODULE" ? "RP1.3-ARM-004" : "RP1.3-SYS-004"} maxLength={100} /></label>
+        <label>是否向下编号<select required value={numbering} disabled={mutation.isPending || mutation.isSuccess} onChange={(event) => setNumbering(event.target.value)}><option value="">请选择</option><option value="yes">是，按同前缀已有最大号＋1</option><option value="no">否，使用输入编号</option></select></label>
+        <label>创建场景<select required value={scenario} disabled={mutation.isPending || mutation.isSuccess} onChange={(event) => setScenario(event.target.value)}><option value="">请选择</option><option value="PRODUCTION">生产</option><option value="RND_TEST">研发测试</option></select></label>
+      </div>
+      {parsed && <p>产品族：{parsed.family} · 部位：{parsed.partName} · 序号：{parsed.sequence}{numbering === "yes" && ` · 在 ${parsed.prefix} 下顺延，以保存回执中的编号为准`}</p>}
+      {(error || mutation.error) && <p role="alert">{error || (mutation.error instanceof Error ? mutation.error.message : "创建失败")}</p>}
+      {mutation.isSuccess && <p role="status">已创建：{mutation.data.code ?? "样品"} · {creationScenarioName(mutation.data.creation_scenario ?? (scenario as "PRODUCTION" | "RND_TEST"))}</p>}
+      <button className="primary-button" disabled={mutation.isPending || mutation.isSuccess}>{mutation.isPending ? "正在创建…" : "创建样品"}</button>
+      {mutation.isSuccess && <button type="button" onClick={() => { pendingKey.current = null; mutation.reset(); }}>再建一个样品</button>}
+    </form>}
   </section>;
 }
 

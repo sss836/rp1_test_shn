@@ -25,6 +25,15 @@ def ignored(_directory: str, names: list[str]) -> set[str]:
             or (name.endswith(".npz") and name not in approved_npz)}
 
 
+def stage_installer_helper(package_root: Path) -> Path:
+    """Stage the fixed helper only; never provision trust or authorize install."""
+    helper = package_root / "usr/lib/rp1-test-hmi/installer"
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(SOURCE / "packaging/installer-helper", helper)
+    helper.chmod(0o755)
+    return helper
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-dir", type=Path, required=True, help="Verified offline Python 3.12 release runtime")
@@ -80,13 +89,25 @@ def main() -> None:
     target_source = app / "hmi"
     for directory in ("factory_hmi", "scripts"):
         shutil.copytree(SOURCE / directory, target_source / directory, ignore=ignored)
+    # Checked-in protocol primitives; the HMI adapter disables retries/reset.
+    (target_source / "motors/scripts").mkdir(parents=True)
+    shutil.copy2(SOURCE / "motors/scripts/motor_ota.py", target_source / "motors/scripts/motor_ota.py")
     shutil.copy2(SOURCE / "pyproject.toml", target_source / "pyproject.toml")
     (target_source / "docs").mkdir()
     for name in ("NPZ_UPLOAD_LIMITS.md", "QUICK_VERIFICATION.md", "SAMPLE_SELECTION.md",
-                 "WAISTHIP_SUPPORT.md", "UBUNTU22_DEPLOYMENT.md"):
+                 "WAISTHIP_SUPPORT.md", "UBUNTU22_DEPLOYMENT.md", "LONG_RUN_SAFETY.md",
+                 "MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md", "MODULE_FIRMWARE_MAINTENANCE.md", "MODULE_PARAMETERS.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, target_source / "docs" / name)
+    (target_source / "config/examples").mkdir(parents=True)
+    shutil.copy2(SOURCE / "config/examples/motion_completion.unverified.yaml",
+                 target_source / "config/examples/motion_completion.unverified.yaml")
+    (target_source / "tools").mkdir()
+    shutil.copy2(SOURCE / "tools/prepare_update_release.py", target_source / "tools/prepare_update_release.py")
+    shutil.copy2(SOURCE / "tools/prepare_motor_firmware.py", target_source / "tools/prepare_motor_firmware.py")
+    shutil.copy2(SOURCE / "tools/prepare_motor_ota_policy.py", target_source / "tools/prepare_motor_ota_policy.py")
+    shutil.copy2(SOURCE / "tools/prepare_motor_parameters.py", target_source / "tools/prepare_motor_parameters.py")
     for name in ("can-disabled", "local-can-policy.yaml", "platform-ca.crt", "LOCAL_VERSION",
-                 "can-helper", "physical-can-policy.yaml", "com.rp1.test-hmi.can.policy",
+                 "can-helper", "installer-helper", "physical-can-policy.yaml", "com.rp1.test-hmi.can.policy",
                  "rp1-test-hmi.desktop", "native-sdk-runtime.json"):
         target = target_source / "packaging" / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +147,7 @@ def main() -> None:
     helper = package / "usr/lib/rp1-test-hmi/factory-hmi-can-helper"
     helper.parent.mkdir(parents=True)
     shutil.copy2(SOURCE / "packaging/can-helper", helper)
+    installer_helper = stage_installer_helper(package)
     if args.python_binary:
         for path in (helper, target_source / "packaging/can-helper"):
             body = path.read_text().split("\n", 1)[1]
@@ -144,6 +166,9 @@ def main() -> None:
     shutil.copytree(SOURCE / "third-party-licenses", doc / "third-party-licenses")
     shutil.copy2(SOURCE / "docs/LOCAL_CONTROL_BUILD.md", doc / "README.zh_CN.md")
     shutil.copy2(SOURCE / "docs/UBUNTU22_DEPLOYMENT.md", doc)
+    shutil.copy2(SOURCE / "docs/LONG_RUN_SAFETY.md", doc)
+    for name in ("MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
+        shutil.copy2(SOURCE / "docs" / name, doc / name)
     examples = doc / "examples"
     examples.mkdir()
     for name in ("10-rp1-test-hmi-local-admin.pkla", "49-rp1-test-hmi-local-admin.rules"):
@@ -154,6 +179,7 @@ def main() -> None:
     for name in ("HOST_MODBUS_TCP_PROTOCOL_V1.0.md", "HOST_MODBUS_TCP_PROTOCOL_V1.1.md",
                  "HOST_MODBUS_TCP_PROTOCOL_V1.2.md", "MOTOR_FAULT_RECOVERY.md"):
         shutil.copy2(SOURCE / "docs" / name, doc / name)
+    shutil.copy2(SOURCE / "docs/MODULE_PARAMETERS.md", doc)
     shutil.copy2(SOURCE / "docs/PLC_CONTRACT_CHECKLIST.md", doc)
     shutil.copy2(SOURCE.parent / "docs/TEST-DATA-APPROVAL.md", doc)
     manifest = {
@@ -178,7 +204,7 @@ Priority: optional
 Architecture: amd64
 Installed-Size: {installed_size}
 Maintainer: RP1 Test SHN
-Depends: {("iproute2, policykit-1, ca-certificates, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libdbus-1-3, fonts-noto-cjk, zlib1g, libexpat1, libbz2-1.0, liblzma5, libssl3, libffi8, libsqlite3-0, libreadline8, libncursesw6, libgdbm6, libgdbm-compat4, libuuid1, tk8.6" if args.depends_profile == "jammy" else "python3 (>= 3.12), python3 (<< 3.13), python3-yaml, iproute2, pkexec, polkitd, ca-certificates, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libdbus-1-3, fonts-noto-cjk")}
+Depends: {("openssl, iproute2, policykit-1, ca-certificates, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libdbus-1-3, libgssapi-krb5-2, fonts-noto-cjk, zlib1g, libexpat1, libbz2-1.0, liblzma5, libssl3, libffi8, libsqlite3-0, libreadline8, libncursesw6, libgdbm6, libgdbm-compat4, libuuid1, tk8.6" if args.depends_profile == "jammy" else "python3 (>= 3.12), python3 (<< 3.13), python3-yaml, openssl, iproute2, pkexec, polkitd, ca-certificates, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libdbus-1-3, libgssapi-krb5-2, fonts-noto-cjk")}
 Description: RP1 Modbus TCP PLC and physical SocketCAN HMI
  Protocol V1.2 control with V1.0 and V1.1 monitoring only.
  Motor fault reset requires fresh feedback and keeps motors disabled.
@@ -192,7 +218,7 @@ Description: RP1 Modbus TCP PLC and physical SocketCAN HMI
 """)
     (debian / "md5sums").write_text("".join(f"{hashlib.md5(p.read_bytes()).hexdigest()}  {p.relative_to(package)}\n" for p in files))
     executables = {binary, app / "launch.py", app / "python3.12", target_source / "packaging/can-disabled", helper,
-                   target_source / "packaging/can-helper"}
+                   target_source / "packaging/can-helper", installer_helper, target_source / "packaging/installer-helper"}
     for p in [package, *package.rglob("*")]:
         if p.is_symlink():
             continue

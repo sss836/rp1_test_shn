@@ -53,10 +53,11 @@ class CaseFilterTests(unittest.TestCase):
         row = profile("REL-CHEST-001", "RP1.3-CHEST-001")
         self.assertTrue(profile_matches_limb(row, "custom_module"))
 
-    def test_start_requires_a_case_sample_context_and_actual_bench(self) -> None:
+    def test_start_requires_a_case_and_actual_bench_but_not_sample_plan_binding(self) -> None:
         self.assertEqual(start_decision(saved_bench="", case_code=None, has_context=False), "need_case")
         self.assertEqual(start_decision(saved_bench="a10", case_code=OTHER_CASE, has_context=False), "local_other")
-        self.assertEqual(start_decision(saved_bench="a10", case_code="REL-ARM-002", has_context=False), "need_sample")
+        self.assertEqual(start_decision(saved_bench="a10", case_code="REL-ARM-002", has_context=False), "local_case")
+        self.assertEqual(start_decision(saved_bench="", case_code="REL-ARM-002", has_context=False), "need_bench")
         self.assertEqual(start_decision(saved_bench="", case_code="REL-ARM-002", has_context=True), "need_bench")
         self.assertEqual(start_decision(saved_bench="a10", case_code="REL-ARM-002", has_context=True), "ready")
 

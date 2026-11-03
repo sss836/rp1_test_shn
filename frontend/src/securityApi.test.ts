@@ -21,6 +21,12 @@ describe("session response validation", () => {
     expect(parseSession(session)).toEqual(session);
   });
 
+  it("accepts the fixed factory reviewer role without granting a research campaign", () => {
+    const scoped = { ...session, user: { ...session.user, role: "FACTORY_REVIEWER" } };
+    expect(parseSession(scoped).user.role).toBe("FACTORY_REVIEWER");
+    expect(parseSession(scoped).campaign_access).toEqual([]);
+  });
+
   it("rejects an unexpected role before it reaches the UI", () => {
     expect(() => parseSession({
       ...session,

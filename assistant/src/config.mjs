@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { loadTokenHub } from "./tokenhub.mjs";
 
 function secretFile(path) {
   if (!path) throw new Error("server secret file is required");
@@ -14,12 +15,16 @@ export function loadConfig(env = process.env) {
   const mode = env.PI_MODEL_MODE ?? "live";
   if (!["live", "mock"].includes(mode)) throw new Error("unsupported model mode");
   if (mode === "mock" && env.APP_ENV !== "test") throw new Error("mock requires test environment");
+  const modelProvider=env.PI_MODEL_PROVIDER??'deepseek';
+  if(!['deepseek','tokenhub'].includes(modelProvider))throw new Error('unsupported model provider');
+  const tokenhub=modelProvider==='tokenhub'?loadTokenHub(env.TOKENHUB_PROFILE_FILE):null;
   return Object.freeze({
     mode,
+    modelProvider,tokenhub,
     allowLegacy: env.APP_ENV === 'test',
     // There is no configurable arbitrary model URL or model-supplied URL tool.
-    modelUrl: mode === "live" ? "https://api.deepseek.com" : "http://model-mock:3100/v1",
-    apiKey: mode === "live" ? secretFile(env.DEEPSEEK_API_KEY_FILE) : "synthetic-model-key-for-isolated-test",
+    modelUrl: mode === "live" ? tokenhub?.base_url??"https://api.deepseek.com" : "http://model-mock:3100/v1",
+    apiKey: mode === "live" ? secretFile(tokenhub?env.TOKENHUB_API_KEY_FILE:env.DEEPSEEK_API_KEY_FILE) : "synthetic-model-key-for-isolated-test",
     bridgeSecret: secretFile(env.RP1_BRIDGE_SECRET_FILE),
     toolUrl: "http://api:8000/api/v1/assistant/tools/list_hmi_stations",
   });

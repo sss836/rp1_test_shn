@@ -1,0 +1,33 @@
+{
+  "region": "guangzhou",
+  "base_url": "https://tokenhub.tencentmaas.com/v1",
+  "key_type": "pay_as_you_go",
+  "currency": "CNY",
+  "revision": "SYNTHETIC-NOT-ACCOUNT-EVIDENCE",
+  "account_evidence": "synthetic fixture only; not the user account",
+  "price_source": "https://example.invalid/synthetic",
+  "verified_at": "2026-10-01T00:00:00+08:00",
+  "valid_until": "2099-01-01T00:00:00+08:00",
+  "text_model": "fixture-text",
+  "vision_model": "fixture-vision",
+  "models": {
+    "fixture-text": {
+      "tools": true,
+      "vision": false,
+      "input": "2",
+      "cache_hit": "1.0",
+      "output": "8",
+      "max_input_tokens": 32000,
+      "max_output_tokens": 4096
+    },
+    "fixture-vision": {
+      "tools": true,
+      "vision": true,
+      "input": "4",
+      "cache_hit": "2.0",
+      "output": "12",
+      "max_input_tokens": 64000,
+      "max_output_tokens": 4096
+    }
+  }
+}
