@@ -102,7 +102,7 @@ from factory_hmi.desktop.plc_page import PlcCabinetPage
 from factory_hmi.desktop.theme import apply_theme, set_tone
 from factory_hmi.desktop.update_commands import package_install_command
 from factory_hmi.plc.faults import cabinet_fault_messages
-from factory_hmi.execution_history import SYNC_LABELS, instant
+from factory_hmi.execution_history import SYNC_LABELS, display_code, instant
 
 
 class WorkerSignals(QObject):
@@ -5010,7 +5010,7 @@ class FactoryMainWindow(QMainWindow):
             started = instant(item.get("started_at"))
             correction = item.get('local_correction') or {}
             values = (
-                item.get("execution_code") or item.get("test_id", ""),
+                display_code(item),
                 item.get("sample_id", ""),
                 item.get("verdict", ""),
                 sync_label,
@@ -5035,6 +5035,9 @@ class FactoryMainWindow(QMainWindow):
                 + f"\n本地记录：{item.get('test_id', '')}"
                 if item.get("execution_code") else f"本地记录：{item.get('test_id', '')}"
             )
+            if 'display_test_code' in item:
+                code_item.setToolTip('本地更正显示单号：' + str(item['display_test_code'])
+                    + '\n' + code_item.toolTip() + '\n内部记录ID及平台正式单号未被替换。')
             if item.get("test_id") == self.test_id.property("record_id"):
                 self.test_id.setText(str(item.get("execution_code") or item.get("test_id") or ""))
                 self.test_id.setToolTip(code_item.toolTip())

@@ -804,11 +804,11 @@ class ReportManager:
         self.exports_root = self.data_root / "exports"
         self.executions_root.mkdir(parents=True, exist_ok=True)
         self.exports_root.mkdir(parents=True, exist_ok=True)
+        self._review_lock = threading.RLock()
         from .history_index import HistoryIndex
         self.history_index = HistoryIndex(self.data_root / "history.sqlite3")
         if not self.history_index.initialized():
             self.rebuild_history_index()
-        self._review_lock = threading.RLock()
 
     @contextmanager
     def evidence_lock(self):
@@ -1137,9 +1137,15 @@ class ReportManager:
         from .local_corrections import LocalCorrections
         execution = self.execution_dir(test_id)
         manifest = execution / 'manifest.json'
-        if manifest.is_symlink() or not (execution / SUMMARY_PATH).is_file():
+        summary = execution / SUMMARY_PATH
+        if manifest.is_symlink() or summary.is_symlink() or not summary.is_file():
             raise ValueError('请选择已完成并有本地报告的记录')
-        return LocalCorrections(self.data_root, test_id, manifest.read_bytes())
+        context = execution / 'config/execution.json'
+        if summary.stat().st_size > 16 * 1024 * 1024 or (context.exists() and (context.is_symlink() or context.stat().st_size > 2 * 1024 * 1024)):
+            raise ValueError('本地业务摘要或执行上下文无效')
+        return LocalCorrections(self.data_root, test_id, manifest.read_bytes(),
+            summary=json.loads(summary.read_text(encoding='utf-8')),
+            context=json.loads(context.read_text(encoding='utf-8')) if context.is_file() else {})
 
     def local_corrections(self, test_id: str) -> dict[str, Any]:
         with self.evidence_lock():
@@ -1174,61 +1180,53 @@ class ReportManager:
             if not cursor: break
 
     def rebuild_history_index(self) -> None:
-        for item in self._scan_history():
-            self.history_index.put(item)
-        self.history_index.finish_rebuild()
+        with self.evidence_lock():
+            for item in self._scan_history():
+                self.history_index.put(item)
+            self.history_index.finish_rebuild()
 
     def refresh_history_index(self, test_id: str) -> None:
         for item in self._scan_history(test_id):
             self.history_index.put(item)
 
     def _scan_history(self, test_id: str | None = None):
-        items = []
-        for path in sorted(
-            self.executions_root.glob(f"{_safe_test_id(test_id) if test_id else '*'}/manifest.json"),
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
-        ):
+        from .local_corrections import apply_to_history, view_values
+        pattern = f"{_safe_test_id(test_id) if test_id else '*'}/manifest.json"
+        # The persistent index supplies ordering. Rebuild one sealed record at
+        # a time instead of retaining every expanded business view in memory.
+        for path in self.executions_root.glob(pattern):
             try:
                 manifest = json.loads(path.read_text(encoding="utf-8"))
-                summary = json.loads(
-                    (path.parent / SUMMARY_PATH).read_text(encoding="utf-8")
-                )
+                summary = json.loads((path.parent / SUMMARY_PATH).read_text(encoding="utf-8"))
             except (OSError, ValueError, KeyError):
                 continue
-            items.append(
-                {
-                    **domain_metadata(manifest),
-                    "execution_uuid": manifest["execution_uuid"],
-                    "test_id": manifest["test_id"],
-                    "execution_code": manifest.get("execution_code", ""),
-                    "sample_id": manifest["sample_id"],
-                    "recording_scope": manifest.get("recording_scope", "platform"),
-                    "station_id": manifest.get("station_id", ""),
-                    "operator_id": manifest.get("operator_id", ""),
-                    "test_name": manifest.get("test_name", ""),
-                    "actual_object": manifest.get("actual_object", ""),
-                    "bench_id": manifest.get("bench_id", ""),
-                    "origin": manifest.get("origin", "HMI"),
-                    "record_directory": str(path.parent.resolve()),
-                    "raw_csv_path": str((path.parent / TELEMETRY_PATH).resolve()),
-                    "started_at": "" if manifest.get("timestamp_provenance") == "missing" else manifest["started_at"],
-                    "ended_at": "" if manifest.get("timestamp_provenance") == "missing" else manifest["ended_at"],
-                    "verdict": "未配置判据" if summary["verdict"].get("criteria_version") == "UNCONFIGURED" or summary["verdict"]["status"] == "unconfigured" else summary["verdict"]["status"],
-                    "bundle_path": str(
-                        self.exports_root / f"{manifest['test_id']}.tar.gz"
-                    ),
-                }
-            )
-        from .local_corrections import apply_to_history
-        for item in items:
+            item = {
+                **domain_metadata(manifest),
+                "execution_uuid": manifest["execution_uuid"],
+                "test_id": manifest["test_id"],
+                "execution_code": manifest.get("execution_code", ""),
+                "sample_id": manifest["sample_id"],
+                "recording_scope": manifest.get("recording_scope", "platform"),
+                "station_id": manifest.get("station_id", ""),
+                "operator_id": manifest.get("operator_id", ""),
+                "test_name": manifest.get("test_name", ""),
+                "actual_object": manifest.get("actual_object", ""),
+                "bench_id": manifest.get("bench_id", ""),
+                "origin": manifest.get("origin", "HMI"),
+                "record_directory": str(path.parent.resolve()),
+                "raw_csv_path": str((path.parent / TELEMETRY_PATH).resolve()),
+                "started_at": "" if manifest.get("timestamp_provenance") == "missing" else manifest["started_at"],
+                "ended_at": "" if manifest.get("timestamp_provenance") == "missing" else manifest["ended_at"],
+                "verdict": "未配置判据" if summary["verdict"].get("criteria_version") == "UNCONFIGURED" or summary["verdict"]["status"] == "unconfigured" else summary["verdict"]["status"],
+                "bundle_path": str(self.exports_root / f"{manifest['test_id']}.tar.gz"),
+            }
             try:
-                apply_to_history(item, self.local_correction_store(item['test_id']).state())
+                store = self.local_correction_store(item['test_id'])
+                item.update(view_values(store.original))
+                apply_to_history(item, store.state())
             except (OSError, ValueError, KeyError, TypeError) as exc:
-                # Evidence remains visible with its original metadata. A broken
-                # correction journal must never silently look like a valid edit.
                 item['local_correction_error'] = str(exc)
-        yield from items
+            yield item
 
     def write_ledger(self, items: list[dict[str, Any]]) -> Path:
         """Caller holds evidence_lock so multi-window refreshes cannot regress."""

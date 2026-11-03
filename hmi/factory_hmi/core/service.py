@@ -1097,8 +1097,7 @@ class FactoryService:
             result = self.report_manager.local_correction_store(test_id).save(
                 changes, reason=reason, actor=actor, expected_revision=expected_revision, request_id=request_id)
             self.report_manager.refresh_history_index(test_id)
-            items = self.report_manager.history(limit=None)
-            self._annotate_execution_history(items)
+            items = self.iter_execution_history()
             ledger_error = ''
             try:
                 self.report_manager.write_ledger(items)

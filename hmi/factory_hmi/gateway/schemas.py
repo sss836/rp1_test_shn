@@ -205,7 +205,7 @@ class ExecutionActionRequest(BaseModel):
 
 class LocalCorrectionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    changes: dict[str, str] = Field(min_length=1, max_length=6)
+    changes: dict[str, str] = Field(min_length=1, max_length=48)
     reason: str = Field(min_length=1, max_length=500)
     expected_revision: int = Field(ge=0, strict=True)
     request_id: str = Field(pattern=r"^[0-9a-f]{32}$")

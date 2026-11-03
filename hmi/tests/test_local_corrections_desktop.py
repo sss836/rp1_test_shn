@@ -5,6 +5,7 @@ from unittest.mock import patch
 from PySide6.QtWidgets import QDialog, QLabel, QMessageBox, QPushButton, QComboBox, QTextEdit
 
 from factory_hmi.desktop.local_correction_dialog import LocalCorrectionDialog
+from factory_hmi.core.local_corrections import FIELDS
 from test_execution_history_desktop import app, window
 
 
@@ -13,10 +14,10 @@ def state():
     return dict(test_id='test', revision=0, original=deepcopy(values), values=values, records=[], local_only=True)
 
 
-def test_editor_requires_reason_and_cannot_edit_verdict(app):
+def test_editor_has_grouped_business_fields_and_requires_reason(app):
     d = LocalCorrectionDialog(state())
     try:
-        assert set(d.editors) == {'sample_id','operator_id','bench_id','test_name','actual_object','notes'}
+        assert set(d.editors) == set(FIELDS)
         d.editors['sample_id'].setText('000123')
         with patch.object(QMessageBox, 'warning') as warning:
             d.save(); assert warning.called and d.payload is None
@@ -90,3 +91,30 @@ def test_later_submission_shows_original_sn_and_rechecks_changed_bench(window):
     with patch('factory_hmi.desktop.app.measured_lines',return_value='facts'), patch('factory_hmi.desktop.app.analysis_text',return_value='analysis'), patch.object(QDialog,'exec',inspect), patch.object(window.client,'submit_execution') as submit:
         window._open_submission_review('test',{'timing':{}})
         assert seen and not submit.called
+
+
+def test_grouped_editor_scrolls_and_edits_typed_business_fields(app):
+    from PySide6.QtWidgets import QScrollArea, QTabWidget
+    d = LocalCorrectionDialog(state())
+    try:
+        tabs = d.findChild(QTabWidget, 'local_correction_tabs')
+        assert tabs.count() == 4
+        assert all(isinstance(tabs.widget(i), QScrollArea) and tabs.widget(i).widgetResizable() for i in range(3))
+        assert not {'test_id', 'execution_uuid', 'sync_state', 'submission_id'} & set(d.editors)
+        d.editors['display_test_code'].setText('LOCAL-DISPLAY')
+        d.editors['verdict'].setCurrentIndex(d.editors['verdict'].findData('passed'))
+        d.editors['completed_cycles'].setText('0')
+        d.editors['data_domain'].setCurrentIndex(d.editors['data_domain'].findData('FACTORY'))
+        d.reason.setPlainText('本地复核录入')
+        d.save()
+        assert d.payload['changes'] == dict(display_test_code='LOCAL-DISPLAY', verdict='passed', completed_cycles='0', data_domain='FACTORY')
+    finally: d.close()
+
+
+def test_display_alias_does_not_replace_selected_internal_record_id(window):
+    window._execution_history_received({'items':[dict(test_id='real-id', execution_uuid='real-uuid',
+        execution_code='PLATFORM-OFFICIAL', display_test_code='LOCAL-ALIAS', sample_id='SN', verdict='passed')]})
+    window.execution_history_table.selectRow(0)
+    assert window.execution_history_table.item(0,0).text() == 'LOCAL-ALIAS'
+    assert window._selected_test_id() == 'real-id'
+    assert 'PLATFORM' not in window._selected_test_id()

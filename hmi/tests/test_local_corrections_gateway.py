@@ -31,7 +31,7 @@ def test_local_endpoints_offline_auth_validation_identity_and_no_upload(service,
                 for invalid in [dict(body, actor='forged'), dict(body, expected_revision=True)]:
                     r = await c.post('/api/v1/executions/test/local-corrections', json=invalid, headers=headers)
                     assert r.status_code == 422, r.text
-                r = await c.post('/api/v1/executions/test/local-corrections', json=dict(body, changes={'verdict': 'passed'}), headers=headers)
+                r = await c.post('/api/v1/executions/test/local-corrections', json=dict(body, changes={'execution_uuid': 'forged'}), headers=headers)
                 assert r.status_code == 409 and '只允许' in r.text
                 saved = await c.post('/api/v1/executions/test/local-corrections', json=body, headers=headers)
                 assert saved.status_code == 200, saved.text

@@ -86,8 +86,8 @@ def test_two_service_instances_cannot_overwrite_the_same_revision(service):
         other.close()
 
 
-@pytest.mark.parametrize('key', ['verdict', 'active_seconds', 'raw_csv_path', 'data_domain', 'station_id', 'sync_state', 'approved'])
-def test_measurements_verdict_partition_and_approval_cannot_be_corrected(service, key):
+@pytest.mark.parametrize('key', ['test_id', 'execution_uuid', 'raw_csv_path', 'submission_id', 'station_id', 'sync_state', 'approved'])
+def test_internal_identity_raw_files_and_true_platform_state_cannot_be_corrected(service, key):
     seed(service, 'test', '2026-10-28T00:00:00Z')
     with pytest.raises(ValueError, match='只允许'):
         save(service, changes={key: 'changed'})
@@ -108,7 +108,10 @@ def test_atomic_save_failure_and_ledger_failure_are_reported_truthfully(service,
         assert result['revision'] == 1 and 'ledger failure' in result['ledger_error']
         assert save(service)['created'] is False
     page = service.execution_history_page()
-    assert not page['ledger_error'] and decode_csv(Path(page['ledger_path']).read_bytes())[0]['更正版本'] == '1'
+    assert not page['ledger_error']  # Cached history reads do not rewrite the ledger.
+    recovered = save(service)  # Explicit replay repairs the derived ledger only.
+    assert recovered['revision'] == 1 and recovered['created'] is False and not recovered['ledger_error']
+    assert decode_csv(Path(page['ledger_path']).read_bytes())[0]['更正版本'] == '1'
 
 
 def test_tampered_audit_is_visible_but_not_applied_or_extended(service):
@@ -116,12 +119,13 @@ def test_tampered_audit_is_visible_but_not_applied_or_extended(service):
     save(service)
     path = service.report_manager.data_root / 'local-corrections/test/v000001.json'
     value = json.loads(path.read_text()); value['values']['sample_id'] = 'tampered'; path.write_text(json.dumps(value))
+    service.report_manager.refresh_history_index('test')
     row = service.execution_history_page()['items'][0]
     assert row['sample_id'] == 'original' and row['local_correction_error']
     with pytest.raises(ValueError): save(service, revision=1, request='b' * 32)
 
 
-@pytest.mark.parametrize('changes', [{'sample_id':''}, {'notes':'x'*301}, {'operator_id':'bad\x00name'}, {'notes':True}])
+@pytest.mark.parametrize('changes', [{'sync_state':''}, {'notes':'x'*2001}, {'operator_id':'bad\x00name'}, {'notes':True}])
 def test_invalid_local_values_create_no_revision(service, changes):
     seed(service, 'test', '2026-10-28T00:00:00Z')
     with pytest.raises(ValueError): save(service, changes=changes)

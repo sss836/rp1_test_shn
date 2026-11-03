@@ -1,6 +1,7 @@
 """Persistent local read model; acquisition and sealed facts remain unchanged."""
 import json,sqlite3
 class HistoryIndex:
+ VIEW_VERSION='local-business-v2'
  def __init__(self,path):
   self.path=path
   with self.connect() as db:
@@ -14,9 +15,13 @@ class HistoryIndex:
   when=instant(item.get("started_at"));started=when.isoformat() if when is not None else ""
   with self.connect() as db:db.execute("INSERT OR REPLACE INTO runs VALUES (?,?,?,?,?,?)",(item["test_id"],started,item.get("sample_id",""),item.get("bench_id",""),item.get("data_domain","UNCLASSIFIED"),json.dumps(item,ensure_ascii=False)))
  def initialized(self):
-  with self.connect() as db:return db.execute("SELECT v FROM metadata WHERE k='initialized'").fetchone() is not None
+  with self.connect() as db:
+   values=dict(db.execute("SELECT k,v FROM metadata WHERE k IN ('initialized','view_version')"))
+  return values.get('initialized')=='1' and values.get('view_version')==self.VIEW_VERSION
  def finish_rebuild(self):
-  with self.connect() as db:db.execute("INSERT OR REPLACE INTO metadata VALUES ('initialized','1')")
+  with self.connect() as db:
+   db.execute("INSERT OR REPLACE INTO metadata VALUES ('initialized','1')")
+   db.execute("INSERT OR REPLACE INTO metadata VALUES ('view_version',?)",(self.VIEW_VERSION,))
  def page(self,*,limit=100,offset=0,start_at="",end_at="",sn="",data_domain="",bench="",cursor=None):
   if limit is None or not 1<=limit<=500 or offset<0:raise ValueError("history page limit must be 1..500")
   from factory_hmi.execution_history import history_bounds
