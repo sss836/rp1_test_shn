@@ -1,7 +1,7 @@
 import {FactoryHandoff} from "../components/FactoryHandoff";
 import { useRef, useState, type FormEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, ChartNoAxesCombined, ChevronDown, FileCheck2, FileUp, Search, Download } from "lucide-react";
+import { ArrowLeft, ArrowRight, ChartNoAxesCombined, ChevronDown, FileCheck2, FileUp, Search, Download } from "lucide-react";
 import { archivesApi, archiveDateFilters, archiveDomain, archiveStartedAt, dataDomainLabels, dataDomainSourceLabels, archiveTitle, archiveStation, formatArchiveTimestamp, missingArchiveSubmissionInfo, archiveProcessingLabels, archiveUploadLabels, verdictLabels, type Archive, type ArchiveContext, type ArchiveDataDomain, type ArchiveFilters, type ArchiveVerdict } from "../archiveApi";
 import { useAuth } from "../auth";
 import { setupApi } from "../setupApi";
@@ -290,6 +290,61 @@ export default function ArchivesPage({ navigate, mode = "archives", domain: cont
   const ledgerHref="/api/v1/archive-ledger.csv?"+ledgerParams.toString();
   const title = analysisEntry ? `${dataDomainLabels[domain]}曲线分析` : factory ? "工厂测试" : domain === "UNCLASSIFIED" ? "分区待归类台账" : "研发数据归档";
   const ledgerTitle = submission === "PENDING" ? "待审批台账" : submission === "APPROVED" ? "已批准台账" : submission === "REJECTED" ? "已驳回台账" : "归档台账";
+  // The factory console has its own compact read view. Shared archive pages,
+  // evidence editing and approval actions retain their existing presentation.
+  if (embedded && factory && !analysisEntry) {
+    return <section className="factory-ledger" aria-labelledby="factory-records-heading">
+      <header className="factory-ledger-header">
+        <div><h2 id="factory-records-heading">测试记录</h2>{!query.isLoading && !query.error && <span>当前页 {items.length} 条</span>}</div>
+        <div className="factory-ledger-tools">
+          <label><span>审批范围</span><select aria-label="台账范围" value={submission} onChange={(event) => { setBefore(null); setSubmission(event.target.value); }}>
+            <option value="">全部台账</option><option value="PENDING">待审批台账</option><option value="APPROVED">已批准台账</option><option value="REJECTED">已驳回台账</option>
+          </select></label>
+          <a role="button" className="factory-ledger-export" href={ledgerHref} aria-disabled={query.isLoading || !!query.error || !items.length} onClick={event => { if (query.isLoading || query.error || !items.length) event.preventDefault(); }}><Download aria-hidden="true" />导出台账 CSV</a>
+        </div>
+      </header>
+      <form className="factory-ledger-filters" role="search" aria-label="工厂测试记录查询" onSubmit={search}>
+        <label>SN<input type="text" maxLength={200} value={draft.sn} onChange={(event) => setDraft({ ...draft, sn: event.target.value })} placeholder="输入 SN" /></label>
+        <label>台架编号<input maxLength={100} value={draft.bench} onChange={(event) => setDraft({ ...draft, bench: event.target.value })} placeholder="输入台架编号" /></label>
+        <label>开始日期<input aria-label="开始日期（北京时间）" title="按北京时间查询" type="date" value={draft.from} onChange={(event) => setDraft({ ...draft, from: event.target.value })} /></label>
+        <label>结束日期<input aria-label="结束日期（含当天）" title="包含当天，按北京时间查询" type="date" min={draft.from || undefined} value={draft.to} onChange={(event) => setDraft({ ...draft, to: event.target.value })} /></label>
+        <button type="submit" className="factory-ledger-query"><Search aria-hidden="true" />查询</button>
+      </form>
+      {filterError != null && <ErrorState error={filterError} retry={() => setFilterError(null)} />}
+      <section className="factory-ledger-statistics" aria-label="工厂执行统计">
+        {statistics.isLoading ? <LoadingState label="正在加载工厂统计" /> : statistics.error || !statistics.data ? <ErrorState error={statistics.error} retry={() => void statistics.refetch()} /> : <dl>
+          <div><dt>台账记录</dt><dd>{statistics.data.total_count.toLocaleString("zh-CN")}</dd></div>
+          <div><dt>待审批</dt><dd><button type="button" className="link-button" onClick={() => { setBefore(null); setSubmission("PENDING"); }}>{statistics.data.pending_count.toLocaleString("zh-CN")}</button></dd></div>
+          <div><dt>已批准</dt><dd>{statistics.data.approved_count.toLocaleString("zh-CN")}</dd></div>
+          <div><dt>正式通过 / 失败 / 阻塞</dt><dd>{statistics.data.passed_count} / {statistics.data.failed_count} / {statistics.data.blocked_count}</dd></div>
+          <div><dt>正式运行时长</dt><dd>{formatDuration(statistics.data.active_seconds)}</dd></div>
+        </dl>}
+      </section>
+      <p className="factory-ledger-statistics-note">统计按 SN、台架与日期查询；审批范围只筛选下方台账。</p>
+      {query.isLoading ? <LoadingState label="正在读取工厂测试记录" /> : query.error ? <ErrorState error={query.error} retry={() => void query.refetch()} /> : !items.length ? <div className="factory-ledger-empty"><strong>暂无符合条件的测试记录</strong><p>上传后的工厂记录会显示在这里，也可清空查询条件后重试。</p></div> : <>
+        <div className="factory-ledger-table-scroll"><table className="factory-record-table"><thead><tr><th>SN / 测试</th><th>台架</th><th>采集时间</th><th>归档状态</th><th>审批状态</th><th>操作</th></tr></thead><tbody>
+          {items.map(item => {
+            const name = item.serial_number || item.actual_object || "SN 未记录";
+            const uploadLabel = item.upload_state === "CORRUPT" ? "文件校验失败" : item.upload_state !== "COMPLETE" ? "上传未完成" : item.processing_state === "FAILED" ? "解析失败" : item.processing_state === "READY" ? "文件就绪" : "正在解析";
+            const uploadTone = item.upload_state === "CORRUPT" || item.processing_state === "FAILED" ? "danger" : item.upload_state === "COMPLETE" && item.processing_state === "READY" ? "normal" : "warning";
+            const approvalLabel = item.submission_status === "APPROVED" ? "已批准" : item.submission_status === "PENDING" ? "待审批" : item.submission_status === "REJECTED" ? "已驳回" : "未送审";
+            return <tr key={item.id}>
+              <td><button type="button" className="factory-ledger-record-name" title={name} aria-label={`查看 ${name} 记录`} onClick={() => navigate("archive", item.id, "FACTORY")}>{name}</button><small className="factory-ledger-test-name" title={item.test_name}>{item.test_name}</small>
+                <details className="factory-ledger-identity"><summary>记录编号</summary><dl><div><dt>归档编号</dt><dd>{item.archive_code}</dd></div><div><dt>执行编号</dt><dd>{item.execution_code || "尚未生成"}</dd></div><div><dt>执行标识</dt><dd>{item.execution_uuid}</dd></div></dl></details>
+              </td>
+              <td><strong>{item.bench_id ?? "未记录"}</strong></td>
+              <td><time title={formatDate(archiveStartedAt(item))}>{formatDate(archiveStartedAt(item))}</time><small>{item.origin === "HISTORY" ? "历史补录" : "工位采集"}</small></td>
+              <td><StatusMark tone={uploadTone} label={uploadLabel} />{item.processing_error && <p className="factory-ledger-error" title={item.processing_error}>{item.processing_error}</p>}</td>
+              <td><StatusMark tone={item.submission_status === "APPROVED" ? "normal" : item.submission_status === "REJECTED" ? "danger" : item.submission_status === "PENDING" ? "warning" : "muted"} label={approvalLabel} /></td>
+              <td><div className="factory-ledger-record-actions"><button type="button" className="link-button" onClick={() => navigate("archive", item.id, "FACTORY")}>查看详情<ArrowRight aria-hidden="true" /></button><button type="button" className="factory-ledger-curve" title={item.processing_state === "READY" ? "查看曲线" : `${archiveProcessingLabels[item.processing_state]}，暂不可查看曲线`} aria-label={`查看 ${name} 曲线`} disabled={item.processing_state !== "READY"} onClick={() => navigate("curves", item.id, "FACTORY")}><ChartNoAxesCombined aria-hidden="true" /></button></div></td>
+            </tr>;
+          })}
+        </tbody></table></div>
+        {(before !== null || query.data?.next_cursor) && <nav className="factory-ledger-pages" aria-label="工厂记录分页">{before !== null && <button type="button" disabled={query.isFetching} onClick={() => setBefore(null)}>返回第一页</button>}{query.data?.next_cursor && <button type="button" disabled={query.isFetching} onClick={() => setBefore(query.data!.next_cursor)}>{query.isFetching ? "加载中…" : "下一页"}</button>}</nav>}
+      </>}
+      <p className="factory-ledger-footnote">正式结果仅包含已核实、已批准且原始文件校验通过的记录；工厂不计算 MTBF。台账导出包含当前查询的全部分页。</p>
+    </section>;
+  }
   return <div className="archives-page">{!embedded && <PageTitle eyebrow={factory ? "FACTORY TESTS" : analysisEntry ? "CURVE ANALYSIS" : "CENTRAL TEST ARCHIVE"} title={title} description={factory ? "按实际 SN、台架及采集日期查询独立工厂记录。相同 SN 的每次复测保留独立执行编号。" : "按分区查询归档、核实记录及曲线；正式数据须经核实和审批。"} trailing={!analysisEntry && domain !== "UNCLASSIFIED" && ["SYSTEM_ADMIN", "TEST_EXECUTOR"].includes(session?.user.role ?? "") ? <button type="button" onClick={() => navigate("import", undefined, domain)}><FileUp aria-hidden="true" />{factory ? "上传测试记录" : "数据补录"}</button> : undefined} />}
     {!factory && <nav className="archive-domain-switch" aria-label="数据业务分区">{(["RESEARCH", "UNCLASSIFIED"] as const).map((entry) => <button type="button" key={entry} aria-pressed={domain === entry} onClick={() => changeDomain(entry)}>{dataDomainLabels[entry]}</button>)}</nav>}
     {session?.user.role === "VIEWER" && <p className="archive-scope-note">显示你有计划权限的已批准记录。</p>}

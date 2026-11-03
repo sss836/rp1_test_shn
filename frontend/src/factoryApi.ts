@@ -36,7 +36,7 @@ export const factoryApi = {
 };
 export const receiptLabels: Record<ReceiptState, string> = {
   awaiting_upload: "已完成，平台未收到归档", identity_unknown: "执行身份未上报，待核对",
-  uploading: "上传中", upload_error: "文件校验失败", parsing: "正在解析", parse_error: "解析失败",
+  uploading: "上传未完成", upload_error: "文件校验失败", parsing: "正在解析", parse_error: "解析失败",
   awaiting_verification: "待核实", awaiting_context: "待补正式归属", ready_to_submit: "待送审",
   awaiting_review: "待审批", rejected: "已驳回，待处理", archived: "已批准归档"
 };
@@ -72,6 +72,12 @@ export function benchState(bench: FactoryBench, data: FactoryMonitorData, elapse
 }
 export function runReceipt(run: FactoryRun, receipts: FactoryReceipt[]): ReceiptState | null {
   if (!run.execution_uuid) return run.state === "completed" ? "identity_unknown" : null;
-  const record = receipts.find(item => item.execution_uuid.toLowerCase() === run.execution_uuid?.toLowerCase());
+  const record = receiptForRun(run, receipts);
   return record?.receipt_state ?? (run.state === "completed" ? "awaiting_upload" : null);
+}
+
+export function receiptForRun(run: FactoryRun, receipts: FactoryReceipt[]): FactoryReceipt | undefined {
+  const identity = run.execution_uuid?.toLowerCase();
+  if (!identity) return undefined;
+  return receipts.find(item => item.execution_uuid.toLowerCase() === identity);
 }
