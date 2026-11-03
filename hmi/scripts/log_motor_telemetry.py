@@ -1042,7 +1042,12 @@ class MotorTelemetryRecorder:
         self._stop.set()
 
     def wait_closed(self, timeout: float | None = None) -> bool:
-        return self._closed.wait(timeout)
+        return self._closed.wait(timeout) and not self.owner_alive()
+
+    def owner_alive(self) -> bool:
+        """Keep both CSV sampling and its segmented writer visible until exit."""
+        owners = (self._thread, getattr(self._writer, "_thread", None))
+        return any(owner is not None and owner.is_alive() for owner in owners)
 
     def durability_status(self) -> dict:
         writer = self._writer
@@ -1083,9 +1088,12 @@ class MotorTelemetryRecorder:
         final_status: str | None = None,
         final_summary: str | None = None,
         joint_metrics: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
     ) -> None:
         """Flush remote sinks and update the platform after motors are safe."""
-        self.stop_sampling()
+        self.stop_sampling(timeout)
+        if self.owner_alive():
+            raise TimeoutError("telemetry writer is still closing; original evidence retained")
         if self.local_only:
             if self.blocked_reason:
                 raise RuntimeError(self.blocked_reason)

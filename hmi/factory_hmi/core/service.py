@@ -113,6 +113,11 @@ class FactoryService:
         if self._closing.is_set():
             raise RuntimeError("station service is closing or closed")
 
+    def _require_recording_closed(self) -> None:
+        session = self._recording_session
+        if session is not None and session.recording_close_pending():
+            raise RuntimeError("记录文件仍在收尾或写线程尚未退出；保留当前记录与占用，请等待或检查记录错误")
+
     def _start_report_worker(self, target, name: str, args=()) -> None:
         with self._lock:
             self._require_open()
@@ -172,6 +177,7 @@ class FactoryService:
                     with self._lock:
                         self._report_errors["shutdown-disconnect"] = str(exc)
             self.wait_for_reports(timeout)
+            self._require_recording_closed()
             if disconnect_error is not None:
                 raise RuntimeError("station disconnect failed during close") from disconnect_error
             self._zeroing = None
@@ -202,6 +208,7 @@ class FactoryService:
         bus_bindings: Sequence[Mapping[str, Any]] | None = None,
         motor_overrides: Sequence[Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        self._require_recording_closed()
         self._require_protective_damping_released()
         backend = backend.strip().lower()
         if backend not in {"motors_py", "fake"}:
@@ -515,6 +522,7 @@ class FactoryService:
         # cannot start between cancellation and the explicit interface down.
         with self._lifecycle_lock:
             self._require_open()
+            self._require_recording_closed()
             for task in self.maintenance_tasks():
                 task.cancel()
             with self._lock:
@@ -735,6 +743,7 @@ class FactoryService:
         completion_mode: str = "configured",
         parking_pose_confirmed: bool = False,
     ) -> dict[str, Any]:
+        self._require_recording_closed()
         controller = self.controller
         automatic_completion_parameters(controller.config)
         report_context: dict[str, Any] | None = None
@@ -987,6 +996,7 @@ class FactoryService:
         return self.snapshot()
 
     def prepare_next_run(self) -> dict[str, Any]:
+        self._require_recording_closed()
         self.controller.prepare_next_run()
         return self.snapshot()
 
@@ -1295,7 +1305,13 @@ class FactoryService:
             # before this background finalizer gets CPU time.
             if playback_session is not None:
                 playback_session.wait()
-                playback_session.wait_recording()
+                # Reuse this execution's existing waiter, not a shared queue:
+                # another window's slow CSV/evidence must not block its close.
+                finalize_recording = getattr(playback_session, "finalize_recording", None)
+                if finalize_recording is not None:
+                    finalize_recording()
+                if not playback_session.wait_recording(timeout=7.0):
+                    raise TimeoutError("记录收尾超时；原始证据与仍活动的写线程保留，未生成完成报告")
                 playback = playback_session.snapshot()
                 if playback.get("record_error"):
                     raise RuntimeError(playback["record_error"])

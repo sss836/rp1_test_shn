@@ -51,6 +51,7 @@ class PlaybackError(RuntimeError):
 # Lightweight CSV close/finalize is serialized. Heavy report process isolation
 # and a durable task queue are a separate follow-up; never run them here.
 _RECORD_FINALIZER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="factory-record-close")
+RECORD_CLOSE_TIMEOUT_S = 5.0
 
 
 class _CommandPosition:
@@ -262,6 +263,7 @@ class PlaybackController:
         self._record_finished = False
         self._record_done = threading.Event()
         self._record_error: str | None = None
+        self._record_finalize_lock = threading.Lock()
         self._ended_at: str | None = None
         self._stop_reason: str | None = None
 
@@ -279,6 +281,8 @@ class PlaybackController:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 raise PlaybackError("playback is already running")
+            if self.recording_close_pending():
+                raise PlaybackError("previous recording still owns its CSV; wait for closure")
             if not self.backend.connected:
                 raise PlaybackError("backend must be connected before playback")
             self.state_machine.require(StationState.ARMED)
@@ -403,7 +407,25 @@ class PlaybackController:
         return not thread.is_alive()
 
     def wait_recording(self, timeout: float | None = None) -> bool:
-        return self._record_done.wait(timeout)
+        return self._record_done.wait(timeout) and not self.recording_owner_alive()
+
+    def recording_owner_alive(self) -> bool:
+        recorder = self._recorder
+        return bool(recorder is not None and recorder.owner_alive())
+
+    def recording_close_pending(self) -> bool:
+        return bool(self._recorder is not None and
+                    (not self._record_done.is_set() or self.recording_owner_alive()))
+
+    def finalize_recording(self, timeout: float | None = None) -> None:
+        """Let an existing report waiter close this run without a global queue wait."""
+        timeout = RECORD_CLOSE_TIMEOUT_S if timeout is None else timeout
+        if not np.isfinite(timeout) or timeout < 0:
+            raise ValueError("record close timeout must be finite and non-negative")
+        if self.running:
+            raise RuntimeError("playback must exit before closing its recording")
+        if self._recorder is not None:
+            self._finish_recording(self._recorder, timeout=timeout)
 
     def signal_fault(self, fault: FaultStatus) -> None:
         # Supervisor publication never waits for a command/snapshot lock.
@@ -448,7 +470,8 @@ class PlaybackController:
                         and not self._record_finished
                     ),
                     "finished": bool(self._record_finished),
-                    "closing": bool(self.enable_recording and not thread_alive and not self._record_done.is_set()),
+                    "closing": bool(self.enable_recording and not thread_alive and self.recording_close_pending()),
+                    "owner_alive": self.recording_owner_alive(),
                     "error": self._record_error,
                     "filename": record_path.name if record_path is not None else None,
                     "row_count": int(recorder.row_count) if recorder is not None else 0,
@@ -579,18 +602,32 @@ class PlaybackController:
                     self._completion["alarm"] = (self._completion.get("alarm") or "") + f"; 回位证据写入失败: {exc}"
         _RECORD_FINALIZER.submit(write)
 
-    def _finish_recording(self, recorder: MotorTelemetryRecorder) -> None:
+    def _finish_recording(self, recorder: MotorTelemetryRecorder, *, timeout: float | None = None) -> None:
+        if not self._record_finalize_lock.acquire(blocking=False):
+            return
         try:
-            recorder.finalize(final_status="blocked" if self._fault else None,
-                              final_summary=self._fault.message if self._fault else None)
             with self._lock:
-                self._record_finished = True
+                if recorder is not self._recorder or self._record_done.is_set():
+                    return
+            timeout = RECORD_CLOSE_TIMEOUT_S if timeout is None else timeout
+            recorder.finalize(final_status="blocked" if self._fault else None,
+                              final_summary=self._fault.message if self._fault else None,
+                              timeout=timeout)
+            with self._lock:
+                if recorder is self._recorder:
+                    self._record_finished = True
         except Exception as exc:
             with self._lock:
-                self._record_error = str(exc)
-            self._handle_fault(PlaybackError("记录封存失败: " + str(exc)))
+                if recorder is self._recorder:
+                    self._record_error = str(exc)
+                    # This is post-motion file ownership, not a new motor command.
+                    # Keep the existing verified stop/hold outcome and raw evidence.
+                    self._completion["alarm"] = "记录封存失败: " + str(exc)
         finally:
-            self._record_done.set()
+            with self._lock:
+                if recorder is self._recorder:
+                    self._record_done.set()
+            self._record_finalize_lock.release()
 
     def _control_loop(
         self, watchdog: MotorFeedbackWatchdog | None,
