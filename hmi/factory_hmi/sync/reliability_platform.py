@@ -36,6 +36,12 @@ _PROFILE_REQUIRED = (
     "station_id",
 )
 
+_ARCHIVE_UPLOAD_PATH = re.compile(
+    r"/api/v1/archives/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/(?:content|segments/(?P<sequence>0|[1-9][0-9]{0,3}))"
+    r"\?offset=(?:0|[1-9][0-9]*)"
+)
+
 
 def load_test_profiles(path: Path | str | None = None) -> list[dict[str, Any]]:
     profile_path = Path(path or DEFAULT_PROFILE_PATH).expanduser().resolve()
@@ -221,7 +227,9 @@ class ReliabilityPlatformClient:
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         if body is not None:
-            if not path.startswith("/api/v1/archives/") or "/content?offset=" not in path or method != "PUT":
+            upload = _ARCHIVE_UPLOAD_PATH.fullmatch(path)
+            if (method != "PUT" or upload is None
+                    or (upload.group("sequence") is not None and int(upload.group("sequence")) >= 4096)):
                 raise PlatformError("原始 CSV 仅允许使用专用归档分块接口")
             if len(body) > 4 * 1024 * 1024:
                 raise ValueError("归档块不得超过 4 MiB")
