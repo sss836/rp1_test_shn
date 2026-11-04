@@ -1,0 +1,1396 @@
+[
+  {
+    "case_code": "PERF-ARM-001",
+    "name": "PERF-SARM-001",
+    "target_part_code": "ARM",
+    "domain": "PERFORMANCE",
+    "version_id": "01a11aab-c9b9-733b-a98d-65aeb31ea62d",
+    "version": "LEGACY-IMPORT-20260918",
+    "procedure_spec": {
+      "source": "execution CSV",
+      "importOnly": true
+    },
+    "decision_rules": {},
+    "source_references": [
+      {
+        "file": "executions_202609181314.csv",
+        "source": "LEGACY-EXECUTION-CSV-20260918"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 性能"
+  },
+  {
+    "case_code": "REL-ARM-001",
+    "name": "单臂模块空载连续摆动老化测试",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbd9-7ce9-a846-1994a46e9721",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "单臂测试支架、可调直流源、自动化动作脚本、温度/电流采集、模拟负载、螺丝扭矩工具、视频记录设备",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-ARM-002",
+    "name": "单臂模块带载连续摆动老化测试",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbda-7ff4-94ff-47673fe9d3d3",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "单臂测试支架、末端模拟负载/砝码、法兰转接板、自动化动作脚本、温度/电流采集、模拟负载、螺丝扭矩工具、视频记录设备",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-ARM-003",
+    "name": "单臂高温运行测试",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbda-747b-bcf6-df57ccfc9532",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "高低温试验箱、单臂测试支架、末端模拟负载、法兰转接板、温度传感器、可调直流源、视频记录设备",
+      "expected_result": "高温下可启动/运行,温升受控,无热保护误触发或不可恢复故障。"
+    },
+    "decision_rules": {
+      "pass_criteria": "高温下可启动/运行,温升受控,无热保护误触发或不可恢复故障。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-ARM-004",
+    "name": "单臂低温启动测试",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbda-7399-a7f2-e98ff01096c7",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "高低温试验箱、单臂测试支架、末端模拟负载、法兰转接板、温度传感器、可调直流源、视频记录设备",
+      "expected_result": "低温可启动,动作无严重卡滞,恢复常温后无功能退化。"
+    },
+    "decision_rules": {
+      "pass_criteria": "低温可启动,动作无严重卡滞,恢复常温后无功能退化。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-ARM-005",
+    "name": "单臂高低温循环测试",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbda-7807-a7f5-eff318104ec5",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "高低温试验箱、单臂测试支架、末端模拟负载、法兰转接板、温度传感器、可调直流源、视频记录设备",
+      "expected_result": "无开裂、松动、凝露导致的短路或不可恢复功能异常。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无开裂、松动、凝露导致的短路或不可恢复功能异常。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-ARM-006",
+    "name": "单臂湿热测试",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbda-7215-a670-d8b9b6f07b38",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "高低温试验箱、单臂测试支架、末端模拟负载、法兰转接板、温湿度记录仪、可调直流源、视频记录设备",
+      "expected_result": "无进水/凝露导致的短路,无明显腐蚀,功能复测通过。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无进水/凝露导致的短路,无明显腐蚀,功能复测通过。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-ARM-007",
+    "name": "单臂高温存储后功能复测",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbda-7ce8-be23-27a372eae639",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-ARM-008",
+    "name": "单臂低温存储后功能复测",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdb-70e3-8a25-6169535e7100",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-ARM-009",
+    "name": "单臂振动测试",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdb-7d8e-b168-128d70486c1b",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-ARM-010",
+    "name": "单臂冲击测试",
+    "target_part_code": "ARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdb-79f6-b487-fd2930c7d29e",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "7自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-CHEST-001",
+    "name": "胸腔连续摆动老化测试",
+    "target_part_code": "CHEST",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe0-7ca1-857b-804f67af07c0",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "胸腔 / 可靠性"
+  },
+  {
+    "case_code": "REL-CHEST-003",
+    "name": "胸腔高温运行测试",
+    "target_part_code": "CHEST",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe0-76f0-91cb-b9bfc8c1b2d7",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "胸腔 / 可靠性"
+  },
+  {
+    "case_code": "REL-CHEST-004",
+    "name": "胸腔低温启动测试",
+    "target_part_code": "CHEST",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe1-7680-b201-a96762b92fa1",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "胸腔 / 可靠性"
+  },
+  {
+    "case_code": "REL-CHEST-005",
+    "name": "胸腔高低温循环测试",
+    "target_part_code": "CHEST",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdd-7387-b670-f66212f8552a",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "胸腔 / 可靠性"
+  },
+  {
+    "case_code": "REL-CHEST-006",
+    "name": "胸腔湿热测试",
+    "target_part_code": "CHEST",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe1-7279-a248-87e3ad2189dd",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "胸腔 / 可靠性"
+  },
+  {
+    "case_code": "REL-CHEST-007",
+    "name": "胸腔高温存储后功能复测",
+    "target_part_code": "CHEST",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe1-7aa3-a371-4d9027cf1c4b",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "胸腔 / 可靠性"
+  },
+  {
+    "case_code": "REL-CHEST-008",
+    "name": "胸腔低温存储后功能复测",
+    "target_part_code": "CHEST",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe1-79ec-b698-2c643a8af914",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "胸腔 / 可靠性"
+  },
+  {
+    "case_code": "REL-CHEST-009",
+    "name": "胸腔振动测试",
+    "target_part_code": "CHEST",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe1-7d11-b6f3-e12b1daf3f50",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "胸腔 / 可靠性"
+  },
+  {
+    "case_code": "REL-CHEST-010",
+    "name": "胸腔冲击测试",
+    "target_part_code": "CHEST",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe1-7d5e-9488-dbdabcbb7c66",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "胸腔 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-001",
+    "name": "单腿模块空载连续摆动老化测试",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdb-7035-922a-ad2dcd317803",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "单腿刚性测试台架、脚底力传感器、配重/电子负载、自动化动作脚本、温度/电流采集、模拟负载、螺丝扭矩工具、视频记录设备",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-002",
+    "name": "单腿模块带载连续摆动老化测试",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdb-78e6-88d2-34979c61f6d8",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "单腿刚性测试台架、脚底力传感器、配重/电子负载、自动化动作脚本、温度/电流采集、模拟负载、螺丝扭矩工具、视频记录设备",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-003",
+    "name": "单腿高温运行测试",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdb-7464-b5d0-d01cdaabf056",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-004",
+    "name": "单腿低温启动测试",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdc-7849-9557-992fe77376e0",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-005",
+    "name": "单腿高低温循环测试",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdc-7761-86da-16382e1d8bc3",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-006",
+    "name": "单腿湿热测试",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdc-7f81-a2ac-abb6e44fb52d",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-007",
+    "name": "单腿高温存储后功能复测",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdc-7b45-84e7-1d44bb8c4633",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-008",
+    "name": "单腿低温存储后功能复测",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdc-74b6-9dcf-a65da4e60611",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-009",
+    "name": "单腿振动测试",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdc-700e-b844-4fd07a484a88",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LEG-010",
+    "name": "单腿冲击测试",
+    "target_part_code": "LEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdd-7b13-8689-100f03057c0a",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "csv-import",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "6自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-001",
+    "name": "下肢模块（双腿+腰部）空载连续摆动老化测试",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdf-7440-9e9c-095659859a71",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "单腿刚性测试台架、脚底力传感器、配重/电子负载、自动化动作脚本、温度/电流采集、模拟负载、螺丝扭矩工具、视频记录设备",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-002",
+    "name": "下肢模块（双腿+腰部）带载连续摆动老化测试",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdf-75d0-a91a-f87315522e5f",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "单腿刚性测试台架、脚底力传感器、配重/电子负载、自动化动作脚本、温度/电流采集、模拟负载、螺丝扭矩工具、视频记录设备",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-003",
+    "name": "下肢高温运行测试",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdf-7f5e-8013-2b84bfd72caf",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-004",
+    "name": "下肢低温启动测试",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdf-7978-9866-ed13a49141f8",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-005",
+    "name": "下肢高低温循环测试",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdf-7c0e-ba54-bf7be658a826",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-006",
+    "name": "下肢湿热测试",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdf-789c-87c3-49a11a123d85",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-007",
+    "name": "下肢高温存储后功能复测",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe0-7bed-93d2-85a2271aedf7",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-008",
+    "name": "下肢低温存储后功能复测",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe0-7029-aa74-61ee55c2f00c",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-009",
+    "name": "下肢振动测试",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe0-7789-b684-ce1269c83b8b",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-LOWER-010",
+    "name": "下肢冲击测试",
+    "target_part_code": "LOWER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbe0-7960-8660-5b7b07b82044",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "下肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-SARM-001",
+    "name": "SARM 单臂模块空载连续摆动老化测试",
+    "target_part_code": "SARM",
+    "domain": "RELIABILITY",
+    "version_id": "01a1536b-8033-7677-b87b-125bdbaf0bcf",
+    "version": "V1-20261019",
+    "procedure_spec": {
+      "owner": "",
+      "source": "operator-request-20261019",
+      "priority": "P0",
+      "preconditions": "单臂测试支架、可调直流源、自动化动作脚本、温度/电流采集、螺丝扭矩工具、视频记录设备；SARM专用空载轨迹及实际执行参数经现场确认后使用。",
+      "load_condition": "NO_EXTERNAL_LOAD",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。",
+      "load_description": "空载，不额外施加配重、电子负载或模拟负载。",
+      "target_part_code": "SARM",
+      "execution_parameters_status": "REQUIRES_CONFIRMATION",
+      "pending_execution_parameters": [
+        "专用轨迹及关节映射",
+        "运行时长或循环数",
+        "速度与限位",
+        "数值保护与验收阈值"
+      ]
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      },
+      {
+        "date": "2026-10-19",
+        "scope": "复用空载方法；专用轨迹和数值参数未核实",
+        "source": "user-request",
+        "derived_from_case": "REL-ARM-001",
+        "derived_from_version": "CSV-20260918"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "5自由度手臂 / 可靠性"
+  },
+  {
+    "case_code": "REL-SLEG-001",
+    "name": "SLEG 单腿模块空载连续摆动老化测试",
+    "target_part_code": "SLEG",
+    "domain": "RELIABILITY",
+    "version_id": "01a1536b-8035-7f86-af6f-1fb4bfb8260f",
+    "version": "V1-20261019",
+    "procedure_spec": {
+      "owner": "",
+      "source": "operator-request-20261019",
+      "priority": "P0",
+      "preconditions": "单腿刚性测试台架、脚底力传感器、自动化动作脚本、温度/电流采集、螺丝扭矩工具、视频记录设备；SLEG专用空载轨迹及实际执行参数经现场确认后使用。",
+      "load_condition": "NO_EXTERNAL_LOAD",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。",
+      "load_description": "空载，不额外施加配重、电子负载或模拟负载。",
+      "target_part_code": "SLEG",
+      "execution_parameters_status": "REQUIRES_CONFIRMATION",
+      "pending_execution_parameters": [
+        "专用轨迹及关节映射",
+        "运行时长或循环数",
+        "速度与限位",
+        "数值保护与验收阈值"
+      ]
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "csv-import"
+      },
+      {
+        "date": "2026-10-19",
+        "scope": "复用空载方法；专用轨迹和数值参数未核实",
+        "source": "user-request",
+        "derived_from_case": "REL-LEG-001",
+        "derived_from_version": "CSV-20260918"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "5自由度腿部 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-001",
+    "name": "上肢模块（腰部+双臂）空载连续摆动老化测试",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdd-7112-9a48-7ef55deea841",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "单臂测试支架、可调直流源、自动化动作脚本、温度/电流采集、模拟负载、螺丝扭矩工具、视频记录设备",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-002",
+    "name": "上肢模块（腰部+双臂）带载连续摆动老化测试",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdd-74f4-a953-24d4cbac0c77",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "单臂测试支架、末端模拟负载/砝码、法兰转接板、自动化动作脚本、温度/电流采集、模拟负载、螺丝扭矩工具、视频记录设备",
+      "expected_result": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无结构损坏、无过温、无异常噪声、无通信丢包和紧固件松动。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-003",
+    "name": "上肢高温运行测试",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdd-772a-9909-bcc7adebbf03",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "高低温试验箱、单臂测试支架、末端模拟负载、法兰转接板、温度传感器、可调直流源、视频记录设备",
+      "expected_result": "高温下可启动/运行,温升受控,无热保护误触发或不可恢复故障。"
+    },
+    "decision_rules": {
+      "pass_criteria": "高温下可启动/运行,温升受控,无热保护误触发或不可恢复故障。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-004",
+    "name": "上肢低温启动测试",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbdd-7318-a5c0-527436d8af05",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "高低温试验箱、单臂测试支架、末端模拟负载、法兰转接板、温度传感器、可调直流源、视频记录设备",
+      "expected_result": "低温可启动,动作无严重卡滞,恢复常温后无功能退化。"
+    },
+    "decision_rules": {
+      "pass_criteria": "低温可启动,动作无严重卡滞,恢复常温后无功能退化。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-005",
+    "name": "上肢高低温循环测试",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbde-7600-bc32-ffbdcf9cdb7d",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "高低温试验箱、单臂测试支架、末端模拟负载、法兰转接板、温度传感器、可调直流源、视频记录设备",
+      "expected_result": "无开裂、松动、凝露导致的短路或不可恢复功能异常。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无开裂、松动、凝露导致的短路或不可恢复功能异常。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-006",
+    "name": "上肢湿热测试",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbde-7b5e-a5cc-c04361b382a5",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "高低温试验箱、单臂测试支架、末端模拟负载、法兰转接板、温湿度记录仪、可调直流源、视频记录设备",
+      "expected_result": "无进水/凝露导致的短路,无明显腐蚀,功能复测通过。"
+    },
+    "decision_rules": {
+      "pass_criteria": "无进水/凝露导致的短路,无明显腐蚀,功能复测通过。"
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-007",
+    "name": "上肢高温存储后功能复测",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbde-737a-ab46-0344ef51ee76",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-008",
+    "name": "上肢低温存储后功能复测",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbde-706c-866a-ce376e69c0ae",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P1",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-009",
+    "name": "上肢振动测试",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbde-708a-ad8f-817f326b943d",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-UPPER-010",
+    "name": "上肢冲击测试",
+    "target_part_code": "UPPER",
+    "domain": "RELIABILITY",
+    "version_id": "01a119e9-fbde-72e0-8337-b1aa08912fef",
+    "version": "CSV-20260918",
+    "procedure_spec": {
+      "owner": "",
+      "source": "platform-migration",
+      "priority": "P0",
+      "preconditions": "",
+      "expected_result": ""
+    },
+    "decision_rules": {
+      "pass_criteria": ""
+    },
+    "source_references": [
+      {
+        "file": "test_cases_202609181013.csv",
+        "source": "platform-migration"
+      }
+    ],
+    "test_system": "MOD",
+    "test_category": "上肢 / 可靠性"
+  },
+  {
+    "case_code": "REL-WAISTHIP-001",
+    "name": "WAISTHIP 腰胯模块空载连续摆动老化测试",
+    "target_part_code": "WAISTHIP",
+    "domain": "RELIABILITY",
+    "version_id": null,
+    "version": null,
+    "procedure_spec": null,
+    "decision_rules": null,
+    "source_references": null,
+    "test_system": "MOD",
+    "test_category": "腰髋 / 可靠性"
+  }
+]

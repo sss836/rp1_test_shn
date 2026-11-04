@@ -1441,9 +1441,9 @@ class FactoryMainWindow(QMainWindow):
         self.open_records_button.setObjectName("outlineButton")
         self.open_records_button.setToolTip("打开所选执行的本地目录；未选中时打开全部执行记录目录。原始采集 CSV 在 telemetry/raw.csv 中。")
         self.open_records_button.clicked.connect(self._open_execution_directory)
-        self.export_history_csv_button = QPushButton("导出记录 CSV…")
+        self.export_history_csv_button = QPushButton("导出标准记录 CSV…")
         self.export_history_csv_button.setObjectName("outlineButton")
-        self.export_history_csv_button.setToolTip("导出当前日期范围的全部执行记录清单，包含所有分页。SN 按文本写入；Excel 导入时请将 SN 列设为文本。")
+        self.export_history_csv_button.setToolTip("按RP1标准模板的17列导出筛选范围内全部执行记录，包含所有分页。原始采样与更正审计另行保留；Excel导入时将样品编号设为文本。")
         self.export_history_csv_button.clicked.connect(self._export_history_csv)
         history_filters.addWidget(self.open_records_button)
         history_filters.addWidget(self.export_history_csv_button)
@@ -1503,7 +1503,7 @@ class FactoryMainWindow(QMainWindow):
         self.import_history_button = QPushButton("补录历史 CSV…")
         self.import_history_button.setObjectName("outlineButton")
         self.import_history_button.clicked.connect(self._import_history_csv)
-        self.save_csv_button = QPushButton("保存 CSV…")
+        self.save_csv_button = QPushButton("保存原始采样 CSV…")
         self.save_csv_button.setObjectName("outlineButton")
         self.save_csv_button.setEnabled(False)
         self.save_csv_button.clicked.connect(self._save_current_csv)
@@ -5092,8 +5092,8 @@ class FactoryMainWindow(QMainWindow):
 
     def _export_history_csv(self) -> None:
         filters = dict(self._history_filters)
-        filename = "本地执行记录_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
-        destination, _ = QFileDialog.getSaveFileName(self, "导出筛选范围的全部执行记录", filename, "CSV 文件 (*.csv)")
+        filename = "RP1标准测试记录_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
+        destination, _ = QFileDialog.getSaveFileName(self, "按标准模板导出全部筛选记录", filename, "CSV 文件 (*.csv)")
         if not destination:
             return
         self._history_export_pending = True

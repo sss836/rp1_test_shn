@@ -63,10 +63,10 @@ it("keeps all factory filtering and pagination on the server and uses approved s
 it("streams the full pending ledger from the server without accumulating pages in the browser", async () => {
   vi.mocked(archivesApi.list).mockResolvedValue({items:[archive()],next_cursor:55});
   mount(<ArchivesPage domain="FACTORY" navigate={vi.fn()}/>);
-  await screen.findByRole("button",{name:"导出台账 CSV"});
+  await screen.findByRole("button",{name:"导出标准记录 CSV"});
   fireEvent.change(screen.getByLabelText("台账范围"),{target:{value:"PENDING"}});
-  await waitFor(()=>expect(screen.getByRole("button",{name:"导出台账 CSV"}).getAttribute("href")).toContain("submission_status=PENDING"));
-  expect(screen.getByRole("button",{name:"导出台账 CSV"}).getAttribute("href")).toContain("data_domain=FACTORY");
+  await waitFor(()=>expect(screen.getByRole("button",{name:"导出标准记录 CSV"}).getAttribute("href")).toContain("submission_status=PENDING"));
+  expect(screen.getByRole("button",{name:"导出标准记录 CSV"}).getAttribute("href")).toContain("data_domain=FACTORY");
   expect(archivesApi.list).not.toHaveBeenCalledWith(expect.objectContaining({before:55}),expect.any(AbortSignal));
 });
 

@@ -66,3 +66,6 @@ hmi/factory_hmi/resources/local-preview/
 /docs/PC3_CONVERSATION_INDEX_*.md
 /docs/PC3_PROJECT_CONTEXT_*.md
 /docs/handoff/
+
+# Approved empty standard record template; runtime CSV stays ignored.
+!docs/templates/RP1_测试记录标准模板_v3.csv

@@ -2123,8 +2123,10 @@ def create_app(
             items = runtime._invoke(("iter_execution_history",), start_at=start_at, end_at=end_at, sn=sn, data_domain=data_domain, bench=bench)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return StreamingResponse(history_csv(items), media_type="text/csv; charset=utf-8",
-                                 headers={"Content-Disposition": 'attachment; filename="local-execution-records.csv"',
+        from factory_hmi.standard_record_export import standard_history_csv
+        return StreamingResponse(standard_history_csv(items), media_type="text/csv; charset=utf-8",
+                                 headers={"Content-Disposition": 'attachment; filename="rp1-test-records.csv"',
+                                          "X-RP1-CSV-Schema": "rp1-test-record-v2",
                                           "Cache-Control": "no-store"})
 
     @app.get("/api/v1/records/location")

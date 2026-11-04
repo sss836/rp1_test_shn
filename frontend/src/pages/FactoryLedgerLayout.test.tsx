@@ -66,7 +66,7 @@ it("preserves opaque SN, date filters, full-ledger export and independent statis
   await waitFor(() => expect(archivesApi.list).toHaveBeenLastCalledWith(expect.objectContaining({ before: 99 }), expect.any(AbortSignal)));
   fireEvent.change(screen.getByLabelText("台账范围"), { target: { value: "PENDING" } });
   await waitFor(() => expect(archivesApi.list).toHaveBeenLastCalledWith({ ...physical, data_domain: "FACTORY", submission_status: "PENDING", before: null }, expect.any(AbortSignal)));
-  const href = screen.getByRole("button", { name: "导出台账 CSV" }).getAttribute("href")!;
+  const href = screen.getByRole("button", { name: "导出标准记录 CSV" }).getAttribute("href")!;
   const params = new URLSearchParams(href.split("?")[1]);
   expect(params.get("sn")).toBe("000aZ"); expect(params.get("data_domain")).toBe("FACTORY"); expect(params.get("submission_status")).toBe("PENDING"); expect(params.has("before")).toBe(false);
   expect(archivesApi.factoryStatistics).toHaveBeenLastCalledWith(physical, expect.any(AbortSignal));

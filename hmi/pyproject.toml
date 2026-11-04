@@ -34,6 +34,7 @@ include = ["factory_hmi*", "scripts"]
 
 [tool.setuptools.package-data]
 factory_hmi = [
+  "test_record_catalog.json",
   "config/*.yaml",
   "resources/local-preview/*",
   "resources/local-preview/assets/*",
