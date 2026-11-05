@@ -13,9 +13,9 @@ const clients: QueryClient[] = [];
 function record(overrides: Partial<RobotResultDetail> = {}): RobotResultDetail {
   return { id: "result-a", source_id: "PC-01", robot_id: "RP1-A", serial_number: "001aZ", model: "24轴", filename: "result.csv", size_bytes: 100, sha256: "a".repeat(64), status: "PENDING", revision: 1, source_kind: "real", verified: true, completed: true, reason: "人工核实", owner_name: "提交人甲", created_at: "2026-11-05T00:00:00Z", can_review: true, formal_statistics_eligible: false, columns: ["记录编号", "上位机编号", "样品编号", "机型", "测试体系", "测试分类", "记录层级", "测试项目编号", "原始检查ID", "测试内容", "开始时间", "结束时间", "测试人员", "实际结果", "通过标准", "是否通过", "备注"], rows: [{ record_id: "00001", version: 1, values: ["00001", "PC-01", "001aZ", "24轴", "SYS", "基础检查", "项目", "SYS-001", "", "基础自检", "", "", "执行员", "001.23000000000000000009", "原标准", "通过", "人工核实"], case_code: "SYS-001", test_name: "基础自检", level: "项目", verdict: "通过" }], review_history: [], ...overrides };
 }
-function mount() {
+function mount(initialArchiveId?: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } }); clients.push(client);
-  render(<QueryClientProvider client={client}><RobotFactoryResults robotId="RP1-A" sourceId="PC-01" /></QueryClientProvider>);
+  render(<QueryClientProvider client={client}><RobotFactoryResults robotId="RP1-A" sourceId="PC-01" initialArchiveId={initialArchiveId} /></QueryClientProvider>);
 }
 beforeEach(() => {
   identity.role = "TEST_EXECUTOR";
@@ -24,6 +24,15 @@ beforeEach(() => {
   vi.spyOn(robotFactoryApi, "review").mockResolvedValue(record({ status: "APPROVED", revision: 2, can_review: false }));
   vi.spyOn(robotFactoryApi, "upload").mockImplementation(async (_file, metadata) => ({ ...record({ id: "11111111-1111-4111-8111-111111111111" }), ...metadata }));
   vi.stubGlobal("crypto", { randomUUID: () => "11111111-1111-4111-8111-111111111111", subtle: { digest: vi.fn().mockResolvedValue(new Uint8Array(32).buffer) } });
+});
+
+it("opens the exact factory archive linked by the native app without approving it automatically", async () => {
+  mount("result-a");
+  await screen.findByRole("region", { name: "整机结果详情" });
+  await screen.findByText("001.23000000000000000009");
+  expect(robotFactoryApi.detail).toHaveBeenCalledWith("result-a", expect.any(AbortSignal));
+  expect(robotFactoryApi.review).not.toHaveBeenCalled();
+  expect(robotFactoryApi.upload).not.toHaveBeenCalled();
 });
 afterEach(() => { cleanup(); clients.splice(0).forEach(client => client.clear()); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 

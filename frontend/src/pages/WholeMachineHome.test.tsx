@@ -14,6 +14,7 @@ function mount() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } }); clients.push(client);
   const onRecords = vi.fn();
   render(<QueryClientProvider client={client}><WholeMachineHome onRecords={onRecords} navigate={vi.fn()} /></QueryClientProvider>);
+  fireEvent.click(screen.getByRole("button", { name: "工厂测试" }));
   return onRecords;
 }
 beforeEach(() => { vi.spyOn(robotFactoryApi, "robots").mockResolvedValue({ items: [robot("PC-01", true, "SN-A"), robot("PC-02", false, "SN-B")], as_of_at: "2026-11-05T00:00:01Z", offline_after_seconds: 45 }); });
@@ -59,10 +60,18 @@ it("removes online claims after a failed refresh and preserves historical cases"
 
 it("keeps the original system scope screen without pretending to bind it to one robot", async () => {
   mount(); await screen.findAllByRole("article");
-  fireEvent.click(screen.getByRole("button", { name: "单机聚焦" }));
+  fireEvent.click(screen.getByRole("button", { name: "研发测试" }));
   expect(screen.getByTestId("original-home").textContent).toBe("WHOLE_MACHINE");
   expect(screen.getByText(/按已关联的测试范围汇总/)).toBeTruthy();
   await waitFor(() => expect(screen.queryByRole("article")).toBeNull());
+});
+
+it("defaults to research and does not fetch factory data for the research dashboard", () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } }); clients.push(client);
+  render(<QueryClientProvider client={client}><WholeMachineHome navigate={vi.fn()} onRecords={vi.fn()} /></QueryClientProvider>);
+  expect(screen.getByTestId("original-home").textContent).toBe("WHOLE_MACHINE");
+  expect(robotFactoryApi.robots).not.toHaveBeenCalled();
+  expect(screen.queryByRole("article")).toBeNull();
 });
 
 it("labels truncated lists as a bounded page rather than a fleet total", async () => {

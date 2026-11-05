@@ -101,11 +101,11 @@ function ResultDetail({ id, onClose }: { id: string; onClose: () => void }) {
   </section>;
 }
 
-export function RobotFactoryResults({ robotId = "", sourceId = "" }: { robotId?: string; sourceId?: string }) {
+export function RobotFactoryResults({ robotId = "", sourceId = "", initialArchiveId = "" }: { robotId?: string; sourceId?: string; initialArchiveId?: string }) {
   const { session } = useAuth();
   const cache = useQueryClient();
   const [status, setStatus] = useState(""), [sn, setSn] = useState(""), [source, setSource] = useState(sourceId);
-  const [filters, setFilters] = useState({ serial_number: "", source_id: sourceId }), [before, setBefore] = useState<number | null>(null), [selected, setSelected] = useState("");
+  const [filters, setFilters] = useState({ serial_number: "", source_id: sourceId }), [before, setBefore] = useState<number | null>(null), [selected, setSelected] = useState(initialArchiveId);
   const [uploadOpen, setUploadOpen] = useState(false), [notice, setNotice] = useState("");
   const canUpload = ["SYSTEM_ADMIN", "TEST_EXECUTOR"].includes(session?.user.role ?? "");
   const query = useQuery({ queryKey: ["robot-result-archives", session?.user.id, robotId, filters, status, before], queryFn: ({ signal }) => robotFactoryApi.list({ ...filters, robot_id: robotId, status, before }, signal), refetchInterval: 15_000 });

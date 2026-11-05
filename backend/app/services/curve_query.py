@@ -16,6 +16,7 @@ import pyarrow.parquet as pq
 
 from app.core.errors import ApiError
 from app.services.archive_storage import ArchiveStorage, fsync_directory, sha256_file
+from app.services.monitor_recording_csv import MONITOR_JSON_FIELDS, MONITOR_JSON_LIMIT, MonitorRecordingCsv, check_field_sizes
 
 
 PROCESSOR_VERSION = "rp1-csv-analysis/1"
@@ -104,7 +105,7 @@ def connection(directory: Path, memory_mb: int = 512):
 
 def bounded_lines(handle, limit=2 * 1024**2):
     while line := handle.readline(limit + 1):
-        if len(line) > limit:
+        if len(line) > limit or len(line.encode("utf-8")) > limit:
             raise ValueError("CSV 单行过长，已保留原件；请检查格式")
         yield line
 
@@ -120,7 +121,7 @@ class CurveProcessor:
         raw = self.storage.path(execution_uuid, "raw.csv")
         if sha256_file(raw,heartbeat) != archive["sha256"]:
             raise ValueError("原始 CSV 哈希不符，拒绝生成查询副本")
-        csv.field_size_limit(4096)
+        csv.field_size_limit(max(csv.field_size_limit(), MONITOR_JSON_LIMIT))
         temporary = directory / "telemetry.parquet.tmp"
         if temporary.is_symlink():
             raise ValueError("派生文件路径不可是符号链接")
@@ -140,10 +141,11 @@ class CurveProcessor:
             time_key = next((key for key in ("time_s", "elapsed_s", "elapsed_seconds") if key in fields), None)
             if time_key is None:
                 raise ValueError("CSV 缺少 time_s、elapsed_s 或 elapsed_seconds 秒时间列；原件已保存")
+            monitor = MonitorRecordingCsv(fields) if MONITOR_JSON_FIELDS.intersection(fields) else None
             stage_key = next((key for key in ("stage", "stage_code") if key in fields), None)
             cycle_key = next((key for key in ("cycle", "cycle_no", "cycle_index") if key in fields), None)
-            metric_keys = [key for key in fields if key not in {time_key, stage_key, cycle_key, "sample"}]
-            tracking = {key[:-12]+"_tracking_error_rad": (key, key[:-12]+"_pos_rad") for key in metric_keys if key.endswith("_cmd_pos_rad") and key[:-12]+"_pos_rad" in fields}
+            metric_keys = [key for key in fields if key not in {time_key, stage_key, cycle_key, "sample", *MONITOR_JSON_FIELDS}]
+            tracking = {} if monitor else {key[:-12]+"_tracking_error_rad": (key, key[:-12]+"_pos_rad") for key in metric_keys if key.endswith("_cmd_pos_rad") and key[:-12]+"_pos_rad" in fields}
             # Do not silently replace an explicitly recorded tracking error.
             tracking = {key: sources for key, sources in tracking.items() if key not in fields}
             metric_keys.extend(tracking)
@@ -166,6 +168,9 @@ class CurveProcessor:
                     rows_seen += 1
                     if len(row) != len(fields):
                         raise ValueError(f"CSV 第 {rows_seen+1} 行列数与表头不一致")
+                    check_field_sizes(row, fields)
+                    if monitor:
+                        monitor.add(row)
                     timestamp = finite(row[indexes[time_key]])
                     if timestamp is None or timestamp < 0 or timestamp > 315360000:
                         invalid_time += 1
@@ -199,6 +204,7 @@ class CurveProcessor:
                     if len(buffer["time_s"]) >= batch_size:
                         flush()
                 flush()
+            monitor_validation = monitor.finish() if monitor else None
         if first_time is None or not metric_keys:
             temporary.unlink(missing_ok=True)
             raise ValueError("CSV 没有有效时间点或可绘制参数；原件已保留")
@@ -208,13 +214,15 @@ class CurveProcessor:
         os.replace(temporary, destination)
         quality = {"row_count": rows_seen, "valid_time_rows": rows_seen-invalid_time, "invalid_time_rows": invalid_time,
                    "non_monotonic": non_monotonic, "max_gap_seconds": max_gap}
+        if monitor_validation:
+            quality["monitor_missing_sequence_count"] = monitor_validation["missing_sequence_count"]
         rules = archive["acceptance"]
         rate = rules.get("record_rate_hz")
         active = archive["facts"].get("active_seconds")
         expected = math.floor(active * rate) + 1 if rate and active is not None else None
         quality["expected_sample_count"] = expected
         quality["sample_completeness"] = min(1.0, (rows_seen-invalid_time)/expected) if expected else None
-        catalog = [catalog_item(key) for key in metric_keys]
+        catalog = monitor.catalog() if monitor else [catalog_item(key) for key in metric_keys]
         analysis = self.analyze(archive["facts"], rules, quality, stats)
         gap_limit = rules.get("max_gap_seconds")
         with connection(directory, self.memory_mb) as conn:
@@ -228,8 +236,11 @@ class CurveProcessor:
                     "catalog": catalog, "time_range": {"start": first_time, "end": last_time}, "row_count": rows_seen-invalid_time,
                     "stages": sorted(stages), "cycles": sorted(cycles), "gap_threshold_seconds": gap_limit,
                     "gaps": [{"start": start, "end": end} for start, end in gaps[:500]], "gaps_truncated": len(gaps)>500,
-                    "quality_status": "INVALID" if invalid_time or non_monotonic else "PARTIAL" if any(s.missing for s in stats.values()) or (quality["sample_completeness"] is not None and quality["sample_completeness"]<.999) or max_gap>gap_limit else "VALID",
+                    "quality_status": "INVALID" if invalid_time or non_monotonic else "PARTIAL" if any(s.missing for s in stats.values()) or bool(monitor_validation and monitor_validation["missing_sequence_count"]) or (quality["sample_completeness"] is not None and quality["sample_completeness"]<.999) or max_gap>gap_limit else "VALID",
                     "analysis": analysis, "pyramids": pyramids}
+        if monitor:
+            manifest["monitor_recording"] = monitor.recording
+            manifest["monitor_validation"] = monitor_validation
         encoded = json.dumps(manifest, ensure_ascii=False, allow_nan=False).encode("utf-8")
         if len(encoded) > 2 * 1024**2:
             raise ValueError("分析目录超出受限元数据大小")

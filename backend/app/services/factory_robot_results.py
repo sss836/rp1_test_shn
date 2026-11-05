@@ -61,7 +61,7 @@ def parse_result_csv(body: bytes, source_id: str, source_kind: str) -> dict:
     # The original exporter keeps simulated provenance even after editing notes.
     if source_kind == "real" and SIMULATED.search(decoded):
         invalid("CSV含模拟来源标识，不能按实机来源提交。", "simulated_source_mismatch")
-    csv.field_size_limit(MAX_FIELD_CHARS)
+    csv.field_size_limit(max(csv.field_size_limit(), MAX_FIELD_CHARS))
     reader = csv.reader(io.StringIO(decoded, newline=""), strict=True)
     try:
         if next(reader, None) != list(FIELDS):

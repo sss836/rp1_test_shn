@@ -17,15 +17,22 @@ function RobotCard({ robot, online, onRecords }: { robot: FactoryRobot; online: 
   </article>;
 }
 
-export default function WholeMachineHome({ navigate, onRecords }: {
+export default function WholeMachineHome({ navigate, onRecords, dataDomain, onDomainChange }: {
   navigate: (view: "assets" | "test-case", id?: string, part?: TargetPartCode) => void;
   onRecords: (robotId: string, sourceId: string) => void;
+  dataDomain?: "RESEARCH" | "FACTORY";
+  onDomainChange?: (domain: "RESEARCH" | "FACTORY") => void;
 }) {
   const { session } = useAuth();
-  const [view, setView] = useState<"overview" | "focus">("overview");
+  const [localDomain, setLocalDomain] = useState<"RESEARCH" | "FACTORY">(dataDomain ?? "RESEARCH");
+  const domain = dataDomain ?? localDomain;
+  function changeDomain(next: "RESEARCH" | "FACTORY") {
+    setLocalDomain(next);
+    onDomainChange?.(next);
+  }
   const [filter, setFilter] = useState("all"), [search, setSearch] = useState("");
   const [now, setNow] = useState(Date.now);
-  const query = useQuery({ queryKey: ["factory-robots", session?.user.id], queryFn: ({ signal }) => robotFactoryApi.robots(signal), enabled: view === "overview", refetchInterval: 5000, retry: false });
+  const query = useQuery({ queryKey: ["factory-robots", session?.user.id], queryFn: ({ signal }) => robotFactoryApi.robots(signal), enabled: domain === "FACTORY", refetchInterval: 5000, retry: false });
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
   const elapsed = Math.max(0, now - query.dataUpdatedAt);
   const timeout = (query.data?.offline_after_seconds ?? 45) * 1000;
@@ -37,9 +44,9 @@ export default function WholeMachineHome({ navigate, onRecords }: {
   const robots = query.data?.items ?? [];
   const visible = robots.filter(robot => (filter === "all" || (filter === "online" ? online(robot) : !online(robot))) && [robot.robot_id, robot.serial_number, robot.station_name].some(value => (value ?? "").toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())));
   return <div className="whole-machine-home">
-    <nav className="whole-home-tabs" aria-label="整机总控视图"><button type="button" aria-pressed={view === "overview"} onClick={() => setView("overview")}>机器人总览</button><button type="button" aria-pressed={view === "focus"} onClick={() => setView("focus")}>单机聚焦</button></nav>
-    {view === "focus" ? <><p className="whole-focus-scope">以下沿用平台整机系统范围视图，数据按已关联的测试范围汇总；单台机器人的结果请从“机器人总览”进入测试记录。</p><HomePage assetKind="WHOLE_MACHINE" navigate={navigate} /></> : <section className="whole-robot-overview">
-      <PageTitle eyebrow="RELIABILITY TEST CONTROL" title="整机系统测试总控" trailing={<button type="button" className="whole-refresh" disabled={query.isFetching} onClick={() => void query.refetch()}><RefreshCw aria-hidden="true" />{query.isFetching ? "读取中" : "刷新"}</button>} />
+    <nav className="whole-home-tabs" aria-label="整机数据分区"><button type="button" aria-pressed={domain === "RESEARCH"} onClick={() => changeDomain("RESEARCH")}>研发测试</button><button type="button" aria-pressed={domain === "FACTORY"} onClick={() => changeDomain("FACTORY")}>工厂测试</button></nav>
+    {domain === "RESEARCH" ? <><p className="whole-focus-scope">研发可靠性测试按已关联的测试范围汇总。工厂整机结果在“工厂测试”中单独查看。</p><HomePage assetKind="WHOLE_MACHINE" navigate={navigate} /></> : <section className="whole-robot-overview">
+      <PageTitle eyebrow="FACTORY TEST CONTROL" title="整机工厂测试总控" trailing={<button type="button" className="whole-refresh" disabled={query.isFetching} onClick={() => void query.refetch()}><RefreshCw aria-hidden="true" />{query.isFetching ? "读取中" : "刷新"}</button>} />
       <div className="whole-overview-summary"><span>机器人总览</span><strong>本页 {robots.length} 台</strong><span>{robots.filter(online).length} 在线</span><span>{robots.filter(robot => !online(robot)).length} 离线</span></div>
       {query.data?.truncated && <p role="status" className="whole-connection-notice">当前仅显示来源接口返回的前 {robots.length} 台，搜索和连接状态筛选只作用于本页；更多历史请在工厂结果中按 SN 或上位机查询。</p>}
       <div className="whole-overview-filters"><div role="group" aria-label="机器人连接状态">{[["all", "全部"], ["online", "在线"], ["offline", "离线"]].map(([value, label]) => <button key={value} type="button" aria-pressed={filter === value} onClick={() => setFilter(value)}>{label}</button>)}</div><label><span>搜索机器人</span><input type="search" value={search} maxLength={200} placeholder="机器人 / SN / 工位" onChange={event => setSearch(event.target.value)} /></label></div>

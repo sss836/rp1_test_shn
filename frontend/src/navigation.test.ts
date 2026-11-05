@@ -69,6 +69,15 @@ describe("duration presentation", () => {
   });
 });
 
+it("keeps the native factory archive link distinct from robot and research execution IDs", () => {
+  const route = readLocation("?view=factory&kind=whole&domain=FACTORY&factory_archive=11111111-1111-4111-8111-111111111111");
+  expect(route.factoryArchive).toBe("11111111-1111-4111-8111-111111111111");
+  expect(route.id).toBeNull();
+  const params = new URLSearchParams(locationHref(route));
+  expect(params.get("factory_archive")).toBe(route.factoryArchive);
+  expect(params.get("domain")).toBe("FACTORY");
+});
+
 describe("showcase identity", () => {
   it("marks only explicitly prefixed demo records", () => {
     expect(isShowcaseValue("SHOWCASE-RP1-023")).toBe(true);
