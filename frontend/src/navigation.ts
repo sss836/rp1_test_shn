@@ -30,6 +30,7 @@ export type LocationState = {
   id: string | null;
   part: TargetPartCode | null;
   domain?: ArchiveDataDomain;
+  source?: string;
   section?: "test" | "production" | "showcase";
 };
 
@@ -69,6 +70,7 @@ export function readLocation(search = window.location.search): LocationState {
     view: candidate && views.has(candidate) ? candidate : "home",
     kind: params.get("kind") === "module" ? "MODULE" : "WHOLE_MACHINE",
     id: params.get("id"),
+    ...(params.get("source") ? { source: params.get("source")! } : {}),
     part: requestedPart && targetParts.has(requestedPart) ? requestedPart : null,
     ...(["test","production","showcase"].includes(params.get("section")??"") ? {section: params.get("section") as "test"|"production"|"showcase"} : {}),
     ...(["RESEARCH", "FACTORY", "UNCLASSIFIED"].includes(requestedDomain ?? "") ? { domain: requestedDomain as ArchiveDataDomain } : {})
@@ -82,6 +84,7 @@ export function locationHref(state: LocationState) {
   });
   if (state.section) params.set("section",state.section);
   if (state.id) params.set("id", state.id);
+  if (state.source) params.set("source", state.source);
   if (state.domain) params.set("domain", state.domain);
   if (state.part) params.set("part", state.part);
   return `?${params.toString()}`;

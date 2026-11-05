@@ -57,7 +57,7 @@ it.each(["network", "503", "malformed-envelope", "malformed-session"])("keeps st
   await waitFor(() => expect(latest.status).toBe("unavailable"));
   fireEvent.click(screen.getByRole("button", { name: "重试验证登录" }));
   await screen.findByRole("heading", { name: "账户设置" });
-  expect(latest.session?.user.id).toBe("reader-a");
+  await waitFor(() => expect(latest.session?.user.id).toBe("reader-a"));
   expect(latest.session?.expires_at).toBe(sessionA.expires_at);
   expect(cache.getQueryData(["previous-private-data"])).toBeUndefined();
   expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual(["/api/v1/auth/me", "/api/v1/auth/me"]);

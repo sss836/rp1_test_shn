@@ -20,6 +20,11 @@ describe("read-model navigation", () => {
     expect(readLocation("?view=archives&domain=invalid").domain).toBeUndefined();
   });
 
+  it("preserves source identity when robot IDs repeat across installations", () => {
+    const route = { view: "factory" as const, kind: "WHOLE_MACHINE" as const, id: "same-robot", part: null, source: "PC-02", domain: "FACTORY" as const };
+    expect(readLocation(locationHref(route))).toEqual(route);
+  });
+
   it("falls back to the home route for unknown views", () => {
     expect(readLocation("?view=fixture&kind=whole")).toEqual({
       view: "home",

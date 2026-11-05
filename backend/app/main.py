@@ -23,6 +23,7 @@ from app.api.routes import (
     health,
     hmi_presence,
     factory_monitor,
+    factory_robots,
     hmi_updates,
     motor_firmware,
     motor_firmware_resources,
@@ -169,6 +170,7 @@ from app.api.routes import assistant_support
 app.include_router(assistant_support.router)
 app.include_router(hmi_presence.router)
 app.include_router(factory_monitor.router)
+app.include_router(factory_robots.router)
 app.include_router(hmi_updates.router)
 app.include_router(motor_firmware.router)
 app.include_router(motor_firmware_resources.router)

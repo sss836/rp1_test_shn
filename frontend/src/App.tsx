@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive as ArchiveIcon,
   Boxes,
@@ -19,6 +19,7 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "./auth";
 import { HomePage } from "./pages/HomePage";
+import WholeMachineHome from "./pages/WholeMachineHome";
 import { AuthLoading, AuthUnavailable, LoginScreen, LogoutNotice, PasswordChangeScreen } from "./pages/AuthScreens";
 import { EmptyState, LoadingState } from "./components/Workbench";
 import {
@@ -85,9 +86,9 @@ export default function App() {
   const { status, session, logout, logoutPending } = useAuth();
   const [requestedLocation, setLocation] = useState<LocationState>(() => readLocation());
   const factoryOnly = session?.user.role === "FACTORY_REVIEWER";
-  const location: LocationState = factoryOnly
+  const location = useMemo<LocationState>(() => factoryOnly
     ? { ...requestedLocation, view: ["factory", "archive", "curves", "account"].includes(requestedLocation.view) ? requestedLocation.view : "factory", domain: "FACTORY" }
-    : requestedLocation;
+    : requestedLocation, [factoryOnly, requestedLocation]);
   const assistantPage=useAssistantContext();
   const [theme, setTheme] = useState<"day" | "night">(initialTheme);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
@@ -156,9 +157,10 @@ export default function App() {
     id: string | null = null,
     kind = location.kind,
     part: TargetPartCode | null = null,
-    domain: ArchiveDataDomain | undefined = location.domain
+    domain: ArchiveDataDomain | undefined = location.domain,
+    source?: string
   ) {
-    const next = { view, id, kind, part, ...(view === "factory" ? { domain: "FACTORY" as const } : domain ? { domain } : {}) };
+    const next = { view, id, kind, part, ...(view === "factory" ? { domain: "FACTORY" as const } : domain ? { domain } : {}), ...(source ? { source } : {}) };
     window.history.pushState({ rp1Navigation: true }, "", locationHref(next));
     setLocation(next);
   }
@@ -287,7 +289,7 @@ export default function App() {
         <Suspense fallback={<LoadingState label="正在加载页面" />}>
         {location.view === "catalog" && <CatalogPage assetKind={location.kind} navigate={(id) => go("test-case", id)} />}
         {location.view === "planning" && <PlanningPage key={location.kind+(location.id??"")} assetKind={location.kind} initialCampaignId={location.id??undefined} />}
-        {location.view === "home" && <HomePage assetKind={location.kind} navigate={(view, id, part) => go(view, id ?? null, location.kind, part ?? null)} />}
+        {location.view === "home" && (location.kind === "WHOLE_MACHINE" ? <WholeMachineHome navigate={(view, id, part) => go(view, id ?? null, location.kind, part ?? null)} onRecords={(robotId, sourceId) => go("factory", robotId, "WHOLE_MACHINE", null, "FACTORY", sourceId)} /> : <HomePage assetKind={location.kind} navigate={(view, id, part) => go(view, id ?? null, location.kind, part ?? null)} />)}
         {location.view === "durations" && <DurationsPage assetKind={location.kind} navigate={(view, id) => go(view, id ?? null)} />}
         {location.view === "mtbf" && <MtbfPage assetKind={location.kind} />}
         {location.view === "assets" && <AssetsPage assetKind={location.kind} part={location.part} selectPart={(nextPart) => go("assets", null, location.kind, nextPart)} clearPart={() => go("assets", null, location.kind)} navigate={(view, id) => go(view, id ?? null)} />}
@@ -299,7 +301,7 @@ export default function App() {
         {location.view === "stations" && <HmiStationsPage />}
         {location.view === "benches" && <BenchOverviewPage key={location.id??"all"} initialStationId={location.id??undefined} navigate={(view) => go(view)} />}
         {location.view === "submissions" && <SubmissionsPage navigate={(id) => go("execution", id)} navigateArchive={(id) => go("archive", id)} />}
-        {(location.view === "factory" || location.view === "archives" && location.domain === "FACTORY") && <FactoryPage navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}
+        {(location.view === "factory" || location.view === "archives" && location.domain === "FACTORY") && <FactoryPage key={`${location.id ?? ""}:${location.source ?? ""}`} robotId={location.id ?? undefined} sourceId={location.source} navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}
         {location.view === "archives" && location.domain !== "FACTORY" && <ArchivesPage key={location.domain} domain={location.domain === "UNCLASSIFIED" ? "UNCLASSIFIED" : "RESEARCH"} onDomainChange={(domain) => go("archives", null, location.kind, null, domain)} navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}
         {location.view === "import" && <CsvImportPage key={location.domain} domain={location.domain === "FACTORY" ? "FACTORY" : "RESEARCH"} navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}
         {location.view === "archive" && location.id && <ArchiveDetailPage id={location.id} navigate={(view, id, domain) => go(view, id ?? null, location.kind, null, domain)} />}

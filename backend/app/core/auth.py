@@ -60,7 +60,10 @@ def factory_route_allowed(method: str, path: str) -> bool:
         return True
     if method.upper() in SAFE_METHODS:
         return path.startswith("/api/v1/factory/") or path == "/api/v1/archives" or path.startswith("/api/v1/archives/") or path == "/api/v1/archive-ledger.csv"
-    return method.upper() == "POST" and re.fullmatch(r"/api/v1/archives/[^/]+/factory-review", path) is not None
+    return method.upper() == "POST" and (
+        re.fullmatch(r"/api/v1/archives/[^/]+/factory-review", path) is not None
+        or re.fullmatch(r"/api/v1/factory/robot-result-archives/[0-9a-fA-F-]{36}/review", path) is not None
+    )
 
 
 def get_request_actor(

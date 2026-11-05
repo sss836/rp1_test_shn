@@ -9,6 +9,9 @@ import { archivesApi, type Archive } from "./archiveApi";
 const auth = vi.hoisted(() => ({ user: { id: "reader-a", username: "reader", display_name: "测试用户", role: "TEST_EXECUTOR" as "TEST_EXECUTOR" | "VIEWER" | "FACTORY_REVIEWER", must_change_password: false } }));
 vi.mock("./auth", () => ({ useAuth: () => ({ status: "authenticated", session: { user: auth.user }, logout: vi.fn() }) }));
 vi.mock("./pages/HomePage", () => ({ HomePage: () => <h1>总控测试替身</h1> }));
+// The whole-machine overview and upload/review workflows have their own business suites.
+vi.mock("./pages/WholeMachineHome", () => ({ default: ({ onRecords }: { onRecords: (robotId: string, sourceId: string) => void }) => <><h1>总控测试替身</h1><button type="button" onClick={() => onRecords("same-robot", "PC-02")}>打开指定机器人记录</button></> }));
+vi.mock("./components/RobotFactoryResults", () => ({ RobotFactoryResults: ({ robotId, sourceId }: { robotId?: string; sourceId?: string }) => <div data-testid="robot-result-filter" data-robot={robotId} data-source={sourceId} /> }));
 vi.mock("./pages/CsvImportPage", () => ({ default: ({ domain }: { domain?: string }) => <h1 data-domain={domain}>补录测试替身</h1> }));
 // The route test keeps the real archive selector; chart rendering has its own regression suite.
 vi.mock("./pages/ArchivesPage", async (original) => ({
@@ -157,9 +160,9 @@ it("opens the factory view in the same platform and preserves its domain through
   vi.mocked(archivesApi.list).mockResolvedValue({ items: [{ ...ready, data_domain: "FACTORY", serial_number: "000aZ", bench_id: "B-1" }], next_cursor: null });
   mount("?view=factory&kind=whole");
   await screen.findByRole("heading", { name: "工厂测试" });
-  await screen.findByText("已批准测试数"); expectActive("工厂");
+  await screen.findByText("正式运行时长"); expectActive("工厂");
   expect(archivesApi.list).toHaveBeenCalledWith(expect.objectContaining({ data_domain: "FACTORY" }), expect.any(AbortSignal));
-  fireEvent.click(within(screen.getByRole("main")).getByRole("button", { name: "曲线" }));
+  fireEvent.click(within(screen.getByRole("main")).getByRole("button", { name: "查看 000aZ 曲线" }));
   await screen.findByTestId("curve-detail");
   expect(new URLSearchParams(window.location.search).get("domain")).toBe("FACTORY");
   fireEvent.click(nav().getByRole("button",{name:"数据归档"}));
@@ -209,4 +212,16 @@ it("restricts a factory reviewer to the factory console before any research page
   expect(screen.queryByRole("button", { name: "上传测试记录" })).toBeNull();
   expect(screen.queryByRole("button", { name: "模块" })).toBeNull();
   expect(archivesApi.list).toHaveBeenCalledWith(expect.objectContaining({ data_domain: "FACTORY" }), expect.any(AbortSignal));
+});
+
+it("carries both robot and source identity from the overview into the factory result filter", async () => {
+  vi.spyOn(archivesApi, "factoryStatistics").mockResolvedValue({ total_count: 0, pending_count: 0, approved_count: 0, passed_count: 0, failed_count: 0, blocked_count: 0, active_seconds: 0 });
+  mount("?view=home&kind=whole");
+  fireEvent.click(screen.getByRole("button", { name: "打开指定机器人记录" }));
+  const target = await screen.findByTestId("robot-result-filter");
+  expect(target.dataset.robot).toBe("same-robot");
+  expect(target.dataset.source).toBe("PC-02");
+  expect(new URLSearchParams(window.location.search).get("source")).toBe("PC-02");
+  expect(new URLSearchParams(window.location.search).get("domain")).toBe("FACTORY");
+  expect(fetch).not.toHaveBeenCalled();
 });
