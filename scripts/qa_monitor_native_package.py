@@ -19,6 +19,7 @@ VERSION = "0.4.1+platform.20261106.1"
 def main():
     if not Path("/.dockerenv").exists() or os.environ.get("RP1_DISPOSABLE_PACKAGE_QA") != "yes":
         raise RuntimeError("A disposable QA container is required; do not run on the host")
+    assert {path.name for path in Path("/sys/class/net").iterdir()} == {"lo"}, "use docker --network none"
     candidates = list(Path("/candidate").glob("rp1-monitor-app_*.deb"))
     if len(candidates) != 1:
         raise RuntimeError("Mount one candidate build directory")
@@ -40,16 +41,20 @@ def main():
         installed = subprocess.check_output(["dpkg-query", "-W", "-f=${Version} ${Status}", "rp1-monitor-app"], text=True)
         assert installed == VERSION + " install ok installed"
         python = "/opt/rp1-monitor-app/venv/bin/python"
-        probe = subprocess.check_output([python, "-c", "import importlib.metadata,json; from rp1_monitor import __version__; from PySide6.QtWidgets import QApplication; from rp1_monitor.desktop_platform import PlatformMonitorWindow; print(json.dumps([importlib.metadata.version('rp1-monitor-pc'),__version__]))"], text=True)
-        assert json.loads(probe) == [VERSION, VERSION]
+        runtime = home / "qt-runtime"
+        runtime.mkdir(mode=0o700)
+        os.chown(runtime, 1000, 1000)
+        environment = os.environ.copy()
+        environment.update(HOME=str(home), XDG_DATA_HOME=str(home / "data"),
+                           XDG_RUNTIME_DIR=str(runtime), QT_QPA_PLATFORM="offscreen", PYTHONDONTWRITEBYTECODE="1")
+        for key in ("PYTHONPATH", "PYTHONHOME", "RP1_PLATFORM_URL", "RP1_PLATFORM_CA", "LD_LIBRARY_PATH", "LD_PRELOAD",
+                    "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH", "QML2_IMPORT_PATH"):
+            environment.pop(key, None)
+        probe = json.loads(subprocess.check_output([python, "-c", "import importlib.metadata,json,rp1_monitor,hashlib; from pathlib import Path; import rp1_monitor.desktop_platform as ui; from PySide6.QtWidgets import QApplication; root=Path('/opt/rp1-monitor-app/venv').resolve(); paths=[Path(rp1_monitor.__file__).resolve(),Path(ui.__file__).resolve()]; assert all(p.is_relative_to(root) and 'site-packages' in p.parts for p in paths); gui_hash=hashlib.sha256(paths[1].read_bytes()).hexdigest(); assert gui_hash==hashlib.sha256(Path('/opt/rp1-monitor-app/source/src/rp1_monitor/desktop_platform.py').read_bytes()).hexdigest(); print(json.dumps({'versions':[importlib.metadata.version('rp1-monitor-pc'),rp1_monitor.__version__],'module_paths':[str(p) for p in paths],'gui_source_sha256':gui_hash}))"], env=environment, cwd=str(home), text=True))
+        assert probe["versions"] == [VERSION, VERSION]
         state = home / "station"
         factory = home / "factory"
         screenshot = home / "packaged-login.png"
-        environment = os.environ.copy()
-        environment.update(HOME=str(home), XDG_DATA_HOME=str(home / "data"),
-                           QT_QPA_PLATFORM="offscreen", PYTHONDONTWRITEBYTECODE="1")
-        for key in ("PYTHONPATH", "PYTHONHOME", "RP1_PLATFORM_URL", "RP1_PLATFORM_CA"):
-            environment.pop(key, None)
 
         def operator():
             os.setgroups([])
@@ -70,6 +75,8 @@ def main():
     print(json.dumps({"result": "PASS", "version": VERSION,
                       "installation": "disposable Ubuntu 24.04; bundled Python wheels; network=none",
                       "gui": "installed native Qt login, offscreen, unprivileged uid=1000",
+                      "installed_module_paths": probe["module_paths"],
+                      "installed_gui_source_sha256": probe["gui_source_sha256"],
                       "prelogin_station_started": False, "operator_file_preserved": True,
                       "real_devices": False}), flush=True)
 
