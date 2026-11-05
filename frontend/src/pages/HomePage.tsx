@@ -64,7 +64,8 @@ export function HomePage({
     queryKey: ["dashboard-home"],
     queryFn: ({ signal }) => getDashboardHome(signal),
     enabled: !projection,
-    refetchInterval: projection ? false : 30_000
+    retry: false,
+    refetchInterval: projection ? false : (query) => query.state.status === "error" ? false : 30_000
   });
   const query = projection ? {...fetched,data:projection,isLoading:false,isError:false} : fetched;
   const [index, setIndex] = useState(0);
@@ -171,10 +172,12 @@ export function HomePage({
   }
 
   if (query.isLoading) return <LoadingState label="正在加载总控首页" />;
-  if (query.isError || !query.data) {
+  if (!query.data) {
     return <ErrorState error={query.error} retry={() => query.refetch()} />;
   }
   const data = query.data;
+  const refreshFailed = !projection && fetched.isError;
+  const shownFreshness = refreshFailed ? { ...data.freshness, status: "STALE" as const } : data.freshness;
   const isShowcase = data.data_sources.sources.some((source) => isShowcaseValue(source.code));
 
   return (
@@ -182,12 +185,14 @@ export function HomePage({
       <PageTitle
         eyebrow="RELIABILITY TEST CONTROL"
         title={`${assetKind === "MODULE" ? "模块部位" : "整机系统"}测试总控`}
-        trailing={<div className="title-status">{isShowcase && <ShowcaseBadge />}<FreshnessMark freshness={data.freshness} /></div>}
+        trailing={<div className="title-status">{isShowcase && <ShowcaseBadge />}<FreshnessMark freshness={shownFreshness} /></div>}
       />
 
+      {refreshFailed && <p role="alert" className="home-refresh-error">总控刷新失败：{query.error instanceof Error ? query.error.message : "服务暂时不可用。"} 以下保留上次成功读取的历史快照，不代表当前设备状态。<button type="button" className="text-action" disabled={query.isFetching} onClick={() => void fetched.refetch()}>{query.isFetching ? "重试中…" : "重新加载"}</button></p>}
+
       <section className="metadata-strip" aria-label="数据状态摘要">
-        <span><b>DATA CUTOFF</b> {data.freshness.status === "FRESH" ? "新鲜" : data.freshness.status === "STALE" ? "延迟" : "尚无数据"} · {data.freshness.data_cutoff_at ? formatDate(data.freshness.data_cutoff_at) : formatDate(data.freshness.as_of_at)}</span>
-        <span><b>SOURCES</b> {data.data_sources.healthy_count}/{data.data_sources.sources.length} 健康 · {data.data_sources.warning_count} 需关注</span>
+        <span><b>DATA CUTOFF</b> {refreshFailed ? "历史快照" : data.freshness.status === "FRESH" ? "新鲜" : data.freshness.status === "STALE" ? "延迟" : "尚无数据"} · {data.freshness.data_cutoff_at ? formatDate(data.freshness.data_cutoff_at) : formatDate(data.freshness.as_of_at)}</span>
+        <span><b>SOURCES</b> {refreshFailed ? "历史快照 · 当前状态未知" : `${data.data_sources.healthy_count}/${data.data_sources.sources.length} 健康 · ${data.data_sources.warning_count} 需关注`}</span>
         <span className={data.anomaly_count ? "risk" : ""}>
           {data.anomaly_count > 0 && <AlertTriangle aria-hidden="true" />}
           <b>ANOMALIES</b> {data.anomaly_count} · {projection?"仅展示获准历史成果；当前设备状态未知":data.anomalies[0] ?? "未发现已记录异常"}
@@ -200,9 +205,9 @@ export function HomePage({
         ) : data.data_sources.sources.map((source) => (
           <StatusMark
             key={source.id}
-            tone={source.freshness_status === "FRESH" ? "normal" : source.freshness_status === "DISABLED" ? "muted" : "warning"}
-            label={`${source.code} · ${source.freshness_status}`}
-            shape={source.freshness_status === "FRESH" ? "circle" : "clock"}
+            tone={refreshFailed ? "muted" : source.freshness_status === "FRESH" ? "normal" : source.freshness_status === "DISABLED" ? "muted" : "warning"}
+            label={`${source.code} · ${refreshFailed ? "历史 " : ""}${source.freshness_status}`}
+            shape={!refreshFailed && source.freshness_status === "FRESH" ? "circle" : "clock"}
           />
         ))}
       </section>
@@ -346,9 +351,9 @@ export function HomePage({
                   <span>{String(activeIndex + 1).padStart(2, "0")} / {String(objects.length).padStart(2, "0")} · {assetKind}</span>
                   <h2>{current.target_part_name} / {current.code}</h2>
                   <StatusMark
-                    tone={current.status === "RUNNING" ? "normal" : current.status === "BLOCKED" || current.status === "FAILED" ? "danger" : "muted"}
-                    label={current.status}
-                    shape={current.status === "RUNNING" ? "circle" : "square"}
+                    tone={refreshFailed ? "muted" : current.status === "RUNNING" ? "normal" : current.status === "BLOCKED" || current.status === "FAILED" ? "danger" : "muted"}
+                    label={refreshFailed ? `历史 ${current.status}` : current.status}
+                    shape={!refreshFailed && current.status === "RUNNING" ? "circle" : "square"}
                   />
                 </div>
                 <dl className="object-facts">
@@ -493,9 +498,9 @@ export function HomePage({
                         >
                           <span className="case-code">{item.code}</span>
                           <StatusMark
-                            tone={item.status === "RUNNING" ? "normal" : item.status === "BLOCKED" || item.status === "FAILED" ? "danger" : "muted"}
-                            label={item.status}
-                            shape={item.status === "RUNNING" ? "circle" : "square"}
+                            tone={refreshFailed ? "muted" : item.status === "RUNNING" ? "normal" : item.status === "BLOCKED" || item.status === "FAILED" ? "danger" : "muted"}
+                            label={refreshFailed ? `历史 ${item.status}` : item.status}
+                            shape={!refreshFailed && item.status === "RUNNING" ? "circle" : "square"}
                           />
                           <strong>{item.name}</strong>
                           <span className="case-target-part">适用部位：{displayPartName(item.target_part_code, item.target_part_name)}</span>

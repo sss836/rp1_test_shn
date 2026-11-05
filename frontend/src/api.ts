@@ -25,7 +25,7 @@ function queryString(values: Record<string, string | number | null | undefined>)
 }
 
 export function getDashboardHome(signal?: AbortSignal) {
-  return apiRequest<DashboardHome>("/api/v1/dashboard/home", { signal });
+  return apiRequest<DashboardHome>("/api/v1/dashboard/home", { signal, timeoutMs: 12_000 });
 }
 
 export function getDataSourceHealth(signal?: AbortSignal) {

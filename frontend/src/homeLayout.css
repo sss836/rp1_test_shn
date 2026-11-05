@@ -239,3 +239,6 @@ main:has(> .home-page) {
 .showcase-view{max-width:1800px;margin:auto;padding:28px}.showcase-view>header{display:flex;align-items:center;gap:22px}.showcase-view>header h1{flex:1}.showcase-projection .metadata-strip,.showcase-projection .source-ribbon{display:none}.showcase-projection .link-button{pointer-events:none}.showcase-view .home-page{margin-top:24px}
 
 .showcase-projection .text-action,.showcase-projection .case-open,.showcase-projection .case-link{display:none}
+
+.home-refresh-error { margin: 0 0 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--warning-bg); color: var(--warning); font-size: 12px; line-height: 1.7; }
+.home-refresh-error .text-action { display: inline-flex; margin-left: 12px; color: inherit; }

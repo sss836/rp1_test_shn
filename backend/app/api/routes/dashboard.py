@@ -10,6 +10,7 @@ from app.repositories.read_models import ReadModelRepository
 from app.schemas.common import DataEnvelope
 from app.schemas.dashboard import DashboardOverview
 from app.schemas.read_models import DashboardHome
+from app.services.dashboard_queries import dashboard_home_deadline
 
 
 router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
@@ -18,7 +19,8 @@ AssetKindFilter = Annotated[Literal["WHOLE_MACHINE", "MODULE"] | None, Query()]
 
 @router.get("/home", response_model=DataEnvelope[DashboardHome])
 def home(session: DbSession) -> DataEnvelope[DashboardHome]:
-    return DataEnvelope(data=ReadModelRepository(session).dashboard_home())
+    with dashboard_home_deadline(session):
+        return DataEnvelope(data=ReadModelRepository(session).dashboard_home())
 
 
 @router.get("/overview", response_model=DataEnvelope[DashboardOverview])

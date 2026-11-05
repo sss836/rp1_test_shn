@@ -702,6 +702,13 @@ ledger AS (
 """
 
 
+# Home joins the per-execution ledger to the full case/asset catalog. Keep its
+# eligibility result and aggregate fixed so the planner cannot recompute the
+# security-aware disposition functions for every joined case/asset row. Other
+# read models retain their existing ledger and plans.
+HOME_LEDGER_CTE = LEDGER_CTE.replace("\nledger AS (", "\nledger AS MATERIALIZED (", 1)
+
+
 class ReadModelRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -880,8 +887,8 @@ class ReadModelRepository:
             case_rows = self.session.execute(
                 text(
                     f"""
-                    WITH {LEDGER_CTE},
-                    execution_ledger AS (
+                    WITH {HOME_LEDGER_CTE},
+                    execution_ledger AS MATERIALIZED (
                       SELECT execution_id,
                         sum(active_seconds) AS total_seconds,
                         sum(active_seconds) FILTER (WHERE disposition = 'INCLUDED') AS effective_seconds,
