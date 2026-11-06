@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 
 
-VERSION = "0.4.1+platform.20261106.1"
+VERSION = os.environ.get("RP1_QA_PACKAGE_VERSION", "0.4.1+platform.20261106.2")
 
 
 def main():
@@ -54,29 +54,62 @@ def main():
         assert probe["versions"] == [VERSION, VERSION]
         state = home / "station"
         factory = home / "factory"
-        screenshot = home / "packaged-login.png"
+        screenshot = home / "packaged-local-unlogged.png"
 
         def operator():
             os.setgroups([])
             os.setgid(1000)
             os.setuid(1000)
 
-        subprocess.run([python, "-m", "rp1_monitor.pc_cli", "desktop", "--quick-connect",
+        subprocess.run([python, "-m", "rp1_monitor.pc_cli", "desktop", "--factory",
                         "--station-dir", str(state), "--factory-dir", str(factory),
                         "--screenshot", str(screenshot), "--quit-after", "3"],
                        env=environment, cwd=str(home), preexec_fn=operator, check=True, timeout=30)
         assert screenshot.is_file() and screenshot.stat().st_size > 10000
-        assert not (state / "station-owner.json").exists(), "no station bootstrap before login"
+        assert not (state / "station-owner.json").exists(), "factory shortcut does not bootstrap station"
+        assert not state.with_name(state.name + "-platform").exists(), "local use must not initialize platform storage"
+        local_probe = r'''
+import json,sys,time
+from pathlib import Path
+from types import SimpleNamespace
+from PySide6.QtWidgets import QApplication,QLineEdit
+from rp1_monitor.desktop_platform import PlatformMonitorWindow
+home=Path(sys.argv[1])
+blocked=home/'unavailable-platform-storage'
+blocked.write_text('synthetic non-directory platform path')
+app=QApplication([])
+window=PlatformMonitorWindow('http://127.0.0.1:1',factory_directory=home/'probe-factory',platform_state_directory=blocked)
+window.show()
+window.start_initial_connection(SimpleNamespace(factory=True))
+app.processEvents()
+assert not window._valid_session()
+assert window.platform_stack.currentWidget() is window.local_workbench
+assert window.local_workbench.isEnabled() and window.factory_panel.isVisible()
+assert window.username_edit.isVisible() and window.password_edit.isVisible() and window.login_button.isVisible()
+assert window.password_edit.echoMode()==QLineEdit.EchoMode.Password
+assert blocked.read_text()=='synthetic non-directory platform path'
+window.close()
+end=time.monotonic()+5
+while window.isVisible() and time.monotonic()<end:
+ app.processEvents(); time.sleep(.01)
+assert not window.isVisible()
+window.finish_platform_workers()
+print(json.dumps({'local_without_login':True,'top_login_bar_visible':True,'unavailable_platform_storage_did_not_block_local':True}))
+'''
+        local_result = json.loads(subprocess.check_output([python, "-c", local_probe, str(home)],
+                                 env=environment, cwd=str(home), preexec_fn=operator, text=True, timeout=30))
         assert hashlib.sha256(preserved.read_bytes()).hexdigest() == original
         reports = Path("/reports")
         reports.mkdir(exist_ok=True)
-        shutil.copyfile(screenshot, reports / "packaged-login.png")
-        (reports / "packaged-login.png").chmod(0o644)
+        shutil.copyfile(screenshot, reports / "packaged-local-unlogged.png")
+        (reports / "packaged-local-unlogged.png").chmod(0o644)
     print(json.dumps({"result": "PASS", "version": VERSION,
                       "installation": "disposable Ubuntu 24.04; bundled Python wheels; network=none",
-                      "gui": "installed native Qt login, offscreen, unprivileged uid=1000",
+                      "gui": "installed native Qt local factory workbench without login; top platform login bar; uid=1000",
+                      "startup_mode": "factory", "platform_state_created": False,
                       "installed_module_paths": probe["module_paths"],
                       "installed_gui_source_sha256": probe["gui_source_sha256"],
+                      "optional_login_checks": local_result,
                       "prelogin_station_started": False, "operator_file_preserved": True,
                       "real_devices": False}), flush=True)
 
