@@ -56,9 +56,9 @@ function query(values: Record<string, string | number | boolean | null | undefin
 }
 
 export const robotFactoryApi = {
-  robots(signal?: AbortSignal) { return apiRequest<FactoryRobotList>("/api/v1/factory/robots", { signal }); },
-  list(filters: RobotResultFilters, signal?: AbortSignal) { return apiRequest<{ items: RobotResultArchive[]; next_cursor: number | null; as_of_at: string }>(`/api/v1/factory/robot-result-archives?${query({ ...filters, limit: 50 })}`, { signal }); },
-  detail(id: string, signal?: AbortSignal) { return apiRequest<RobotResultDetail>(`/api/v1/factory/robot-result-archives/${encodeURIComponent(id)}`, { signal }); },
+  robots(signal?: AbortSignal) { return apiRequest<FactoryRobotList>("/api/v1/factory/robots", { signal, timeoutMs: 12_000 }); },
+  list(filters: RobotResultFilters, signal?: AbortSignal) { return apiRequest<{ items: RobotResultArchive[]; next_cursor: number | null; as_of_at: string }>(`/api/v1/factory/robot-result-archives?${query({ ...filters, limit: 50 })}`, { signal, timeoutMs: 12_000 }); },
+  detail(id: string, signal?: AbortSignal) { return apiRequest<RobotResultDetail>(`/api/v1/factory/robot-result-archives/${encodeURIComponent(id)}`, { signal, timeoutMs: 12_000 }); },
   fileHref(id: string) { return `/api/v1/factory/robot-result-archives/${encodeURIComponent(id)}/file`; },
   async upload(file: File, metadata: RobotResultUpload, key: string, signal?: AbortSignal) {
     const receipt = await apiRequest<unknown>(`/api/v1/factory/robot-result-archives?${query(metadata)}`, { method: "POST", body: file, signal, headers: { "Content-Type": "text/csv", "Idempotency-Key": key } });

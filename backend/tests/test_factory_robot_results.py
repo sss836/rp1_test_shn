@@ -94,3 +94,16 @@ def test_reviewer_only_gets_new_review_write_route():
     assert factory_route_allowed("POST", path)
     assert not factory_route_allowed("POST", "/api/v1/factory/robots/presence")
     assert not factory_route_allowed("POST", "/api/v1/factory/robot-result-archives")
+
+
+@pytest.mark.parametrize("case", ["file_bytes", "row_count", "field_chars"])
+def test_derived_json_budget_never_relaxes_original_csv_limits(case):
+    if case == "file_bytes":
+        body = b"x" * (4 * 1024**2 + 1)
+    elif case == "row_count":
+        body = result_csv(*(result_row() for _ in range(1001)))
+    else:
+        body = result_csv(result_row(**{"实际结果": "x" * 65537}))
+    with pytest.raises(ApiError) as error:
+        parse_result_csv(body, "PC-QA", "real")
+    assert error.value.status_code == (413 if case == "file_bytes" else 422)

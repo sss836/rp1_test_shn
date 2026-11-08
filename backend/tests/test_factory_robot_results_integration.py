@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -12,7 +13,7 @@ from sqlalchemy import create_engine, text
 
 from app.core.config import get_settings
 from app.main import app
-from app.services.factory_robot_results import FactoryRobotResultStorage
+from app.services.factory_robot_results import FactoryRobotResultStorage, parse_result_csv
 from test_factory_robot_results import result_csv, result_row
 from test_hmi_presence_integration import PASSWORD, environment, signed_in
 
@@ -38,6 +39,60 @@ def do_review(client, archive_id, decision="APPROVE", revision=1, key=None):
     return client.post(f"/api/v1/factory/robot-result-archives/{archive_id}/review",
         json={"decision":decision,"expected_revision":revision,"reason":"隔离工厂汇总审核理由"},
         headers={"Idempotency-Key":key or str(uuid4())})
+
+
+@pytest.mark.parametrize("kind", ["real", "simulated"])
+def test_legal_four_mib_csv_with_expanded_json_keeps_approval_boundaries(environment, kind):
+    """The payload is synthetic and stays in the disposable integration DB."""
+    engine, users = environment
+    source = "PC-" + uuid4().hex[:12]
+    note = "Synthetic isolated budget fixture"
+    if kind == "simulated":
+        note += "; 数据来源：simulated（模拟数据，不代表实机验收）"
+    rows = [result_row(**{"上位机编号": source, "记录编号": f"budget-{index}",
+                         "实际结果": "\x01" * 65536, "备注": note}) for index in range(62)]
+    body = result_csv(*rows)
+    assert 3 * 1024**2 < len(body) <= 4 * 1024**2
+    parsed = parse_result_csv(body, source, kind)
+    metadata = {**parsed, "source_id": source, "robot_id": "qa-robot", "source_kind": kind,
+                "filename": "results.csv", "size_bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+                "verified": True, "completed": True, "reason": "Synthetic isolated budget fixture",
+                "protocol": "reliability_v1", "public_id": str(uuid4())}
+    with engine.connect() as db:
+        actual_bytes = db.execute(text("SELECT octet_length(CAST(:payload AS jsonb)::text)"),
+                                  {"payload": json.dumps(metadata, ensure_ascii=False)}).scalar_one()
+        assert 8 * 1024**2 < actual_bytes < 32 * 1024**2
+        original_counts = [db.execute(text("SELECT count(*) FROM " + table)).scalar_one()
+                           for table in ("test.test_execution", "test.runtime_interval",
+                                         "reliability.exposure_assessment", "reliability.interruption")]
+    with signed_in(users["first"]) as owner, signed_in(users["viewer"]) as viewer:
+        key = uuid4().hex
+        response = upload(owner, source, body, key, kind=kind)
+        assert response.status_code == 201, response.text
+        receipt = response.json()["data"]
+        assert receipt["status"] == "PENDING" and receipt["formal_statistics_eligible"] is False
+        assert "rows" not in receipt
+        assert upload(owner, source, body, key, kind=kind).json()["data"]["id"] == receipt["id"]
+        base = f"/api/v1/factory/robot-result-archives/{receipt['id']}"
+        assert viewer.get(base).status_code == 404
+        assert owner.get(base + "/file").content == body
+        reviewed = do_review(owner, receipt["id"])
+        if kind == "simulated":
+            assert reviewed.status_code == 422
+            assert owner.get(base).json()["data"]["status"] == "PENDING"
+            assert viewer.get(base).status_code == 404
+        else:
+            assert reviewed.status_code == 200, reviewed.text
+            detail = reviewed.json()["data"]
+            assert detail["status"] == "APPROVED" and detail["revision"] == 2
+            assert len(detail["rows"]) == 62 and detail["rows"][0]["values"] == rows[0]
+            assert detail["formal_statistics_eligible"] is False
+            assert viewer.get(base + "/file").content == body
+    with engine.connect() as db:
+        unchanged = [db.execute(text("SELECT count(*) FROM " + table)).scalar_one()
+                     for table in ("test.test_execution", "test.runtime_interval",
+                                   "reliability.exposure_assessment", "reliability.interruption")]
+        assert unchanged == original_counts
 
 
 def test_presence_binding_ttl_omissions_disabled_owner_and_no_poll_audit_growth(environment):

@@ -209,7 +209,12 @@ BEGIN
   OR p->'verified' IS DISTINCT FROM 'true'::jsonb OR p->'completed' IS DISTINCT FROM 'true'::jsonb
   OR p->>'source_kind' NOT IN ('real','simulated')
   OR jsonb_typeof(p->'rows') IS DISTINCT FROM 'array' OR jsonb_array_length(p->'rows') NOT BETWEEN 1 AND 1000
-  OR octet_length(p::text)>8388608
+  -- This unreleased migration still keeps the original CSV at 4 MiB. Its
+  -- parsed JSON needs a separate bound: cell control characters can expand
+  -- sixfold (<=24 MiB); duplicated record IDs add <=1000*200*4 bytes, and
+  -- bounded row/top-level structure stays below 1 MiB. Thus 32 MiB covers
+  -- every API-valid 4 MiB CSV without removing the derived-payload ceiling.
+  OR octet_length(p::text)>33554432
   OR p->'columns' IS DISTINCT FROM '["记录编号","上位机编号","样品编号","机型","测试体系","测试分类","记录层级","测试项目编号","原始检查ID","测试内容","开始时间","结束时间","测试人员","实际结果","通过标准","是否通过","备注"]'::jsonb THEN
   RAISE EXCEPTION '需核实已结束且符合17列的专用工厂结果归档' USING ERRCODE='22023'; END IF;
  PERFORM integration.bind_robot_result_source(source);

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 // Synthetic 17-column result and mock HTTP clients only.
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { RobotFactoryResults } from "./RobotFactoryResults";
@@ -13,8 +13,8 @@ const clients: QueryClient[] = [];
 function record(overrides: Partial<RobotResultDetail> = {}): RobotResultDetail {
   return { id: "result-a", source_id: "PC-01", robot_id: "RP1-A", serial_number: "001aZ", model: "24轴", filename: "result.csv", size_bytes: 100, sha256: "a".repeat(64), status: "PENDING", revision: 1, source_kind: "real", verified: true, completed: true, reason: "人工核实", owner_name: "提交人甲", created_at: "2026-11-05T00:00:00Z", can_review: true, formal_statistics_eligible: false, columns: ["记录编号", "上位机编号", "样品编号", "机型", "测试体系", "测试分类", "记录层级", "测试项目编号", "原始检查ID", "测试内容", "开始时间", "结束时间", "测试人员", "实际结果", "通过标准", "是否通过", "备注"], rows: [{ record_id: "00001", version: 1, values: ["00001", "PC-01", "001aZ", "24轴", "SYS", "基础检查", "项目", "SYS-001", "", "基础自检", "", "", "执行员", "001.23000000000000000009", "原标准", "通过", "人工核实"], case_code: "SYS-001", test_name: "基础自检", level: "项目", verdict: "通过" }], review_history: [], ...overrides };
 }
-function mount(initialArchiveId?: string) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } }); clients.push(client);
+function mount(initialArchiveId?: string, retry: boolean | number = false) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry, gcTime: 0 } } }); clients.push(client);
   render(<QueryClientProvider client={client}><RobotFactoryResults robotId="RP1-A" sourceId="PC-01" initialArchiveId={initialArchiveId} /></QueryClientProvider>);
 }
 beforeEach(() => {
@@ -138,4 +138,40 @@ it("separates the first approval state revision from original record content ver
   expect(within(evidence).getByText("00001")).toBeTruthy();
   expect(within(evidence).getByText("内容版本 1")).toBeTruthy();
   expect(screen.getByText("001.23000000000000000009")).toBeTruthy();
+});
+
+
+it.each(["list", "detail"] as const)("shows the first %s failure without inheriting the global retry", async target => {
+  vi.mocked(robotFactoryApi[target]).mockRejectedValue(new Error("整机读取暂不可用"));
+  mount(target === "detail" ? "result-a" : undefined, 1);
+  const region = target === "detail" ? within(screen.getByRole("region", { name: "整机结果详情" })) : screen;
+  expect((await region.findByRole("alert")).textContent).toContain("整机读取暂不可用");
+  expect(robotFactoryApi[target]).toHaveBeenCalledOnce();
+  expect(region.getByRole("button", { name: "重新加载" })).toBeTruthy();
+});
+
+it("labels a failed cached detail as history, suspends review and recovers only after an explicit successful read", async () => {
+  mount("result-a");
+  const detail = within(screen.getByRole("region", { name: "整机结果详情" }));
+  await detail.findByRole("button", { name: "批准整机工厂汇总" });
+  fireEvent.change(detail.getByLabelText("审核意见"), { target: { value: "已核实" } });
+  vi.mocked(robotFactoryApi.detail).mockRejectedValueOnce(new Error("中央服务暂不可用"));
+  await act(async () => { await clients[clients.length - 1].refetchQueries({ queryKey: ["robot-result-detail"] }); });
+  expect((await detail.findByRole("alert")).textContent).toContain("中央服务暂不可用");
+  expect(detail.getByRole("alert").textContent).toContain("历史快照，审批暂不可用");
+  expect(detail.getByText("001.23000000000000000009")).toBeTruthy();
+  expect(detail.queryByText("当前账号没有本记录的审核权限。")).toBeNull();
+  expect(detail.queryByRole("button", { name: "批准整机工厂汇总" })).toBeNull();
+  expect(robotFactoryApi.review).not.toHaveBeenCalled();
+  let finish!: (value: RobotResultDetail) => void;
+  vi.mocked(robotFactoryApi.detail).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  fireEvent.click(detail.getByRole("button", { name: "重新读取详情" }));
+  await waitFor(() => expect(robotFactoryApi.detail).toHaveBeenCalledTimes(3));
+  expect(detail.queryByRole("button", { name: "批准整机工厂汇总" })).toBeNull();
+  expect(detail.queryByText("当前账号没有本记录的审核权限。")).toBeNull();
+  await act(async () => { finish(record({ revision: 2 })); });
+  expect((await detail.findByRole("button", { name: "批准整机工厂汇总" })).getAttribute("disabled")).toBeNull();
+  expect(detail.queryByRole("alert")).toBeNull();
+  expect(detail.getByText(/审核状态版本 2/)).toBeTruthy();
+  expect(robotFactoryApi.review).not.toHaveBeenCalled();
 });

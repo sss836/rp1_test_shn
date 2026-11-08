@@ -18,6 +18,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--monitor-repo', type=Path, default=ROOT.parent / 'rp1-monitor-app')
     parser.add_argument('--tools-image', default='rp1-archive-qa:local')
+    parser.add_argument('--test-installed-app', action='store_true',
+                        help='Use app code inside the supplied QA image; mount only tests and pytest config')
     parser.add_argument('--skip-backend-tests', action='store_true', help='Only rerun the real native-service HTTP acceptance')
     args = parser.parse_args()
     monitor = args.monitor_repo.resolve()
@@ -57,17 +59,29 @@ def main():
             raise RuntimeError('Disposable PostgreSQL did not become ready')
         admin_url = f"postgresql+psycopg://postgres:{env['POSTGRES_PASSWORD']}@127.0.0.1:5432/{env['POSTGRES_DB']}"
         env['DATABASE_URL'] = admin_url
-        run(['docker', 'run', '--pull', 'never', '--rm', '--network', 'container:' + name, '-w', '/database',
+        migration_command = ['docker', 'run', '--pull', 'never', '--rm', '--network', 'container:' + name, '-w', '/database',
              '-v', str(ROOT / 'database') + ':/database:ro',
              *flags(('DATABASE_URL', 'RP1_APP_USER', 'RP1_READONLY_USER', 'IMPORT_LEGACY_HISTORY')),
-             args.tools_image, 'alembic', 'upgrade', 'head'])
+             args.tools_image, 'alembic', 'upgrade']
+        run([*migration_command, '20261103_0059'])
+        env['RP1_DISPOSABLE_UPGRADE_QA'] = 'yes'
+        upgrade_probe = ['docker', 'run', '--pull', 'never', '--rm', '--network', 'container:' + name,
+             '-v', str(ROOT / 'scripts/qa_factory_upgrade_probe.py') + ':/upgrade_probe.py:ro',
+             '-v', volume + ':/archive', *flags(('DATABASE_URL', 'RP1_DISPOSABLE_UPGRADE_QA')),
+             args.tools_image, 'python', '/upgrade_probe.py']
+        run([*upgrade_probe, 'snapshot', '/archive/upgrade-0059.json'])
+        run([*migration_command, 'head'])
+        run([*upgrade_probe, 'verify', '/archive/upgrade-0059.json'])
         env.update(HMI_TEST_ADMIN_URL=admin_url,
                    DATABASE_URL=f"postgresql+psycopg://rp1_app:{env['RP1_APP_PASSWORD']}@127.0.0.1:5432/{env['POSTGRES_DB']}",
                    APP_ENV='test', AUTH_MODE='session', AUTH_COOKIE_SECURE='false',
                    SEED_ADMIN_USERNAME='', ASSISTANT_ENABLED='false', ARCHIVE_ROOT='/archive',
                    PYTHONPATH='/app:/app/tests:/monitor/src', QA_NATIVE_PASSWORD=secrets.token_urlsafe(24))
+        backend_mounts = (['-v', str(ROOT / 'backend/tests') + ':/app/tests:ro',
+                           '-v', str(ROOT / 'backend/pytest.ini') + ':/app/pytest.ini:ro']
+                          if args.test_installed_app else ['-v', str(ROOT / 'backend') + ':/app:ro'])
         qa_command = ['docker', 'run', '--pull', 'never', '--rm', '--network', 'container:' + name, '-w', '/app',
-             '-v', str(ROOT / 'backend') + ':/app:ro',
+             *backend_mounts,
              '-v', str(ROOT / 'database') + ':/database:ro',
              '-v', str(ROOT / 'scripts/qa_native_platform_domains.py') + ':/qa.py:ro',
              '-v', str(monitor) + ':/monitor:ro', '-v', volume + ':/archive',
@@ -80,7 +94,11 @@ def main():
                  'tests/test_monitor_recording_csv.py', 'tests/test_monitor_recording_archive_integration.py',
                  'tests/test_archives.py', 'tests/test_curve_analysis.py', 'tests/test_curve_gaps.py',
                  'tests/test_factory_robot_results.py', 'tests/test_archive_imports_integration.py',
-                 'tests/test_archive_curve_inspection_integration.py', '-q', '--disable-warnings'])
+                 'tests/test_archive_curve_inspection_integration.py',
+                 'tests/test_factory_robot_results_integration.py', 'tests/test_factory_reviewer_routes.py',
+                 'tests/test_factory_console_permissions_integration.py',
+                 'tests/test_security_http.py', 'tests/test_archives_integration.py',
+                 'tests/test_submissions_integration.py', '-q', '--disable-warnings'])
         run([*qa_command, 'python', '/qa.py'])
     finally:
         if made:

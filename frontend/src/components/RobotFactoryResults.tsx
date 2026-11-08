@@ -66,12 +66,12 @@ function UploadForm({ initialRobot, initialSource, onUploaded }: { initialRobot:
 function ResultDetail({ id, onClose }: { id: string; onClose: () => void }) {
   const { session } = useAuth();
   const cache = useQueryClient();
-  const query = useQuery({ queryKey: ["robot-result-detail", session?.user.id, id], queryFn: ({ signal }) => robotFactoryApi.detail(id, signal) });
+  const query = useQuery({ queryKey: ["robot-result-detail", session?.user.id, id], queryFn: ({ signal }) => robotFactoryApi.detail(id, signal), retry: false });
   const [reason, setReason] = useState(""), [busy, setBusy] = useState(false), [notice, setNotice] = useState(""), [failure, setFailure] = useState("");
   const receipt = useRef({ signature: "", key: "" });
   const item = query.data;
   async function review(decision: "APPROVE" | "REJECT") {
-    if (!item || busy || !reason.trim() || item.can_review !== true) return;
+    if (!item || busy || query.isError || query.isFetching || !reason.trim() || item.can_review !== true) return;
     const signature = JSON.stringify([id, item.revision, decision, reason.trim()]);
     if (receipt.current.signature !== signature) receipt.current = { signature, key: requestId() };
     setBusy(true); setNotice(""); setFailure("");
@@ -84,17 +84,18 @@ function ResultDetail({ id, onClose }: { id: string; onClose: () => void }) {
     } catch (error) { setFailure(error instanceof Error ? error.message : "审核失败"); await query.refetch(); }
     finally { setBusy(false); }
   }
-  const canReview = !query.isError && item?.status === "PENDING" && item.can_review === true && ["SYSTEM_ADMIN", "TEST_EXECUTOR", "FACTORY_REVIEWER"].includes(session?.user.role ?? "");
+  const canReview = !query.isError && !query.isFetching && item?.status === "PENDING" && item.can_review === true && ["SYSTEM_ADMIN", "TEST_EXECUTOR", "FACTORY_REVIEWER"].includes(session?.user.role ?? "");
   return <section className="robot-result-detail" aria-label="整机结果详情">
     <header><h3>整机工厂结果详情</h3><button type="button" aria-label="关闭整机结果详情" disabled={busy} onClick={onClose}><X aria-hidden="true" /></button></header>
     {query.isPending ? <LoadingState label="正在读取整机结果详情" /> : !item ? <ErrorState error={query.error} retry={() => void query.refetch()} /> : <>
+      {query.isError && <p role="alert" className="robot-result-error">详情刷新失败：{query.error instanceof Error ? query.error.message : "服务暂时不可用。"} 当前显示上次收到的历史快照，审批暂不可用。<button type="button" disabled={query.isFetching} onClick={() => void query.refetch()}>{query.isFetching ? "重新读取中…" : "重新读取详情"}</button></p>}
       <dl className="robot-result-meta"><div><dt>机器人 / SN</dt><dd>{item.robot_id} / {item.serial_number}</dd></div><div><dt>机型 / 上位机</dt><dd>{item.model} / {item.source_id}</dd></div><div><dt>审批状态</dt><dd>{robotResultStatusLabels[item.status]} · 审核状态版本 {item.revision}</dd></div><div><dt>提交人</dt><dd>{item.owner_name || "未提供"}</dd></div><div><dt>提交时间</dt><dd>{formatDate(item.created_at)}</dd></div><div><dt>来源</dt><dd>{item.source_kind === "simulated" ? "模拟测试" : "真实测试"}</dd></div></dl>
       <p className="robot-result-scope">{item.status === "APPROVED" ? "已批准工厂结果，可按批准记录查询。" : "本记录尚未批准，仅供核实与审核。"}结果汇总不替代逐点采集证据，也不形成研发 MTBF 暴露资格。</p>
       <p>核实及提交说明：{item.reason}</p>
       <div className="robot-result-table-scroll"><table className="robot-result-values"><thead><tr>{item.columns.map((column, i) => <th key={`${i}:${column}`} scope="col">{column}</th>)}</tr></thead><tbody>{item.rows.map((row, i) => <tr key={`${row.record_id}:${row.version}:${i}`}>{row.values.map((value, j) => <td key={j}>{value || "—"}</td>)}</tr>)}</tbody></table></div>
       <details className="robot-result-evidence"><summary>原文件与校验信息</summary><p>{item.filename} · {item.size_bytes} 字节</p><code>SHA256 {item.sha256}</code><a href={robotFactoryApi.fileHref(item.id)}>下载原始结果 CSV</a><h4>各记录的内容版本</h4><p>按记录编号追踪内容版本，与审核状态版本分别保留；原始 17 列不作改写。</p><dl>{item.rows.map((row, i) => <div key={`${row.record_id}:${i}`}><dt>{row.record_id}</dt><dd>内容版本 {row.version}</dd></div>)}</dl></details>
       {canReview && <div className="robot-result-review"><label>审核意见<textarea value={reason} maxLength={300} disabled={busy} onChange={event => setReason(event.target.value)} /></label><div><button type="button" disabled={busy || !reason.trim() || item.source_kind === "simulated"} onClick={() => void review("APPROVE")}>批准整机工厂汇总</button><button type="button" disabled={busy || !reason.trim()} onClick={() => void review("REJECT")}>驳回整机工厂汇总</button></div>{item.source_kind === "simulated" && <p>模拟测试不能批准为正式工厂记录。</p>}</div>}
-      {item.status === "PENDING" && !canReview && <p>当前账号没有本记录的审核权限。</p>}
+      {item.status === "PENDING" && !canReview && !query.isError && !query.isFetching && <p>当前账号没有本记录的审核权限。</p>}
       {notice && <p role="status">{notice}</p>}{failure && <p role="alert" className="robot-result-error">{failure}</p>}
       <h4>审批记录</h4>{item.review_history.length ? item.review_history.map((entry, i) => <article className="robot-result-history" key={i}><strong>{entry.decision === "APPROVE" || entry.decision === "APPROVED" ? "批准" : "驳回"}</strong><span>{entry.reviewer_name || "审核人已留档"} · {formatDate(entry.reviewed_at || entry.created_at)}</span><p>{entry.reason}</p></article>) : <p>尚无审核结果。</p>}
     </>}
@@ -108,7 +109,7 @@ export function RobotFactoryResults({ robotId = "", sourceId = "", initialArchiv
   const [filters, setFilters] = useState({ serial_number: "", source_id: sourceId }), [before, setBefore] = useState<number | null>(null), [selected, setSelected] = useState(initialArchiveId);
   const [uploadOpen, setUploadOpen] = useState(false), [notice, setNotice] = useState("");
   const canUpload = ["SYSTEM_ADMIN", "TEST_EXECUTOR"].includes(session?.user.role ?? "");
-  const query = useQuery({ queryKey: ["robot-result-archives", session?.user.id, robotId, filters, status, before], queryFn: ({ signal }) => robotFactoryApi.list({ ...filters, robot_id: robotId, status, before }, signal), refetchInterval: 15_000 });
+  const query = useQuery({ queryKey: ["robot-result-archives", session?.user.id, robotId, filters, status, before], queryFn: ({ signal }) => robotFactoryApi.list({ ...filters, robot_id: robotId, status, before }, signal), refetchInterval: 15_000, retry: false });
   return <section className="robot-factory-results" aria-labelledby="robot-factory-heading">
     <header><div><small>WHOLE-MACHINE FACTORY RESULTS</small><h2 id="robot-factory-heading">整机工厂结果{robotId ? ` · ${robotId}` : ""}</h2><p>标准 17 列结果汇总 · 工厂分区 · 上传和审核分开处理</p></div>{canUpload && <button type="button" className="factory-upload-button" onClick={() => setUploadOpen(value => !value)}><FileUp aria-hidden="true" />{uploadOpen ? "收起提交" : "提交整机结果 CSV"}</button>}</header>
     {uploadOpen && canUpload && <UploadForm key={`${sourceId}:${robotId}`} initialRobot={robotId} initialSource={sourceId} onUploaded={record => { setNotice(record.status === "PENDING" ? "原始文件已接收，结果待审核；尚未成为已批准工厂汇总。" : `已找到同一文件的归档回执：${robotResultStatusLabels[record.status]}。`); setUploadOpen(false); setSelected(record.id); void cache.invalidateQueries({ queryKey: ["robot-result-archives"] }); void cache.invalidateQueries({ queryKey: ["factory-robots"] }); }} />}
