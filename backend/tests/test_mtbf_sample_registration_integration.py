@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from argon2 import PasswordHasher
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -13,7 +14,7 @@ from app.core.db import SessionLocal
 from app.core.errors import ApiError
 from app.repositories.setup import SetupRepository
 from app.schemas.setup import AssetCreate
-from test_hmi_presence_integration import environment
+from test_hmi_presence_integration import PASSWORD, environment, signed_in
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.skipif(not os.getenv("HMI_TEST_ADMIN_URL"), reason="disposable migrated database required")]
@@ -35,11 +36,12 @@ def manifest():
     return value
 
 
-def register(value, username, *, apply=False, reason=REASON):
+def register(value, username, *, apply=False, reason=REASON, owner_username=None):
     with SessionLocal.begin() as session:
         if not apply:
             session.execute(text("SET TRANSACTION READ ONLY"))
-        return registry.register_samples(session, value, username, reason, apply=apply)
+        return registry.register_samples(session, value, username, reason, apply=apply,
+                                         owner_username=owner_username)
 
 
 def counts(engine):
@@ -81,6 +83,7 @@ def test_readonly_preview_atomic_registration_replay_and_explicit_maintenance_ev
         evidence = db.execute(text("SELECT authorization_evidence FROM integration.setup_receipt WHERE request_key=:key"), {"key": value["request_key"]}).scalar_one()
         assert evidence["channel"] == "local_maintenance" and evidence["source_document_sha256"] == registry.SOURCE_SHA256
         assert evidence["maintenance_actor_username"] == users["admin"]
+        assert evidence["owner_selection"] == "maintenance_admin_default"
         assert db.execute(text("SELECT count(*) FROM audit.change_log WHERE change_reason=:reason AND request_id=:request AND actor_user_id IS NOT NULL"),
                           {"reason": REASON, "request": "mtbf-planned-samples:" + value["request_key"]}).scalar_one() >= 10
     assert register(value, users["admin"])["status"] == "WOULD_REPLAY"
@@ -147,3 +150,77 @@ def test_late_setup_failure_rolls_back_all_five_samples_and_receipt(environment,
         register(value, users["admin"], apply=True)
     assert failure.value.code == "synthetic_late_failure"
     assert counts(engine) == before
+
+
+def test_verified_admin_can_delegate_owner_without_grants_or_browser_impersonation(environment):
+    engine, users = environment
+    value = manifest()
+    before = counts(engine)
+    preview = register(value, users["admin"], owner_username=users["first"])
+    assert preview["status"] == "READY" and preview["delegated"] is True
+    assert preview["maintenance_admin_username"] == users["admin"]
+    assert preview["owner_username"] == users["first"]
+    assert preview["owner_user_public_id"] != preview["maintenance_admin_user_public_id"]
+    assert preview["owner_selection"] == "explicit_maintenance_cli_argument"
+    assert counts(engine) == before
+    with pytest.raises(ApiError) as refused:
+        register(value, users["first"], apply=True, owner_username=users["first"])
+    assert refused.value.code == "maintenance_actor_invalid"
+    with pytest.raises(ApiError) as refused:
+        register(value, users["admin"], apply=True, owner_username=users["viewer"])
+    assert refused.value.code == "registration_owner_invalid"
+    result = register(value, users["admin"], apply=True, owner_username=users["first"])
+    assert result["status"] == "REGISTERED" and result["delegated"] is True
+    identifiers = {entry["id"] for entry in result["objects"].values()}
+    with engine.connect() as db:
+        evidence = db.execute(text("SELECT authorization_evidence FROM integration.setup_receipt WHERE request_key=:key"),
+                              {"key": value["request_key"]}).scalar_one()
+        assert evidence["channel"] == "local_maintenance" and evidence["delegated"] is True
+        assert evidence["owner_selection"] == "explicit_maintenance_cli_argument"
+        assert evidence["maintenance_admin_username"] == users["admin"] and evidence["owner_username"] == users["first"]
+        assert evidence["maintenance_admin_user_public_id"] == preview["maintenance_admin_user_public_id"]
+        assert evidence["owner_user_public_id"] == preview["owner_user_public_id"]
+        assert evidence["audit_request_id"] == "mtbf-planned-samples:" + value["request_key"]
+        owners = db.execute(text("""SELECT DISTINCT u.username FROM test.asset a JOIN iam.app_user u ON u.id=a.created_by
+            WHERE a.product_family=:family"""), {"family": value["product_family"]}).scalars().all()
+        assert owners == [users["first"]]
+        assert db.execute(text("""SELECT count(*) FROM audit.change_log WHERE request_id=:request
+            AND actor_user_id=(SELECT id FROM iam.app_user WHERE username=:owner)"""),
+            {"request": evidence["audit_request_id"], "owner": users["first"]}).scalar_one() >= 10
+    # Actual authenticated readers see the normal owner/admin scopes; there is
+    # no grant broadening and a stranger cannot edit any of these samples.
+    with signed_in(users["first"]) as owner, signed_in(users["second"]) as stranger, signed_in(users["admin"]) as admin:
+        own_assets = owner.get("/api/v1/setup/options").json()["data"]["assets"]
+        assert identifiers.issubset({item["id"] for item in own_assets if item["can_edit"]})
+        assert identifiers.isdisjoint({item["id"] for item in stranger.get("/api/v1/setup/options").json()["data"]["assets"]})
+        assert identifiers.issubset({item["id"] for item in admin.get("/api/v1/setup/options").json()["data"]["assets"]})
+        target = result["objects"]["m1"]["id"]
+        update = {"serial_number": "SYNTHETIC-" + uuid4().hex, "reason": "isolated owner edit check"}
+        assert stranger.patch(f"/api/v1/setup/assets/{target}/identity",json=update,
+            headers={"Idempotency-Key":str(uuid4())}).status_code in {403,404}
+        response = owner.patch(f"/api/v1/setup/assets/{target}/identity",json=update,
+            headers={"Idempotency-Key":str(uuid4())})
+        assert response.status_code == 200, response.text
+    with engine.begin() as db:
+        alternate = "registry-maintainer-" + uuid4().hex[:12]
+        uid = db.execute(text("""INSERT INTO iam.app_user(username,display_name,role,principal_kind,must_change_password)
+            VALUES(:name,:name,'SYSTEM_ADMIN','HUMAN',false) RETURNING id"""), {"name":alternate}).scalar_one()
+        db.execute(text("INSERT INTO iam.user_credential(user_id,password_hash) VALUES(:id,:hash)"),
+                   {"id":uid,"hash":PasswordHasher().hash(PASSWORD)})
+    # The actor/key receipt belongs to the actual owner. A different verified
+    # administrator can recover it but cannot replace original authorization.
+    replay = register(value, alternate, apply=True, owner_username=users["first"])
+    assert replay["status"] == "REPLAYED" and replay["objects"] == result["objects"]
+    with engine.connect() as db:
+        assert db.execute(text("SELECT authorization_evidence FROM integration.setup_receipt WHERE request_key=:key"),
+                          {"key":value["request_key"]}).scalar_one() == evidence
+    after = counts(engine)
+    with pytest.raises(ApiError) as refused:
+        register(value, users["admin"], apply=True, owner_username=users["second"])
+    assert refused.value.code == "planned_sample_conflict"
+    assert counts(engine) == after
+    with engine.begin() as db:
+        db.execute(text("UPDATE iam.app_user SET enabled=false WHERE username=:name"), {"name":users["first"]})
+    with pytest.raises(ApiError) as refused:
+        register(value, users["admin"], apply=True, owner_username=users["first"])
+    assert refused.value.code == "registration_owner_invalid"
