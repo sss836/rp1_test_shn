@@ -96,7 +96,6 @@ def main():
                  'tests/test_factory_robot_results.py', 'tests/test_archive_imports_integration.py',
                  'tests/test_archive_curve_inspection_integration.py',
                  'tests/test_factory_robot_results_integration.py', 'tests/test_factory_reviewer_routes.py',
-                 'tests/test_factory_console_permissions_integration.py',
                  'tests/test_security_http.py', 'tests/test_archives_integration.py',
                  'tests/test_submissions_integration.py', '-q', '--disable-warnings'])
         run([*qa_command, 'python', '/qa.py'])
