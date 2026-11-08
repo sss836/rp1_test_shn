@@ -1,6 +1,6 @@
 # 首页长时间停留加载骨架：定位与修复
 
-日期：2026-11-05，时间说明使用北京时间。修复分支 `codex/fix-home-loading-20261105`，独立工作区 `/home/shn/.codex/worktrees/rp1-home-loading-20261105`，基于生产源码 `35cd7e70312f760a4c222475a4ea67d784c4ba71`。本轮不推送 GitHub，不合并整机工厂适配候选。
+日期：2026-11-05，时间说明使用北京时间。修复分支 `codex/fix-home-loading-20261105`，独立工作区 `rp1-home-loading-20261105`，基于生产源码 `35cd7e70312f760a4c222475a4ea67d784c4ba71`。本轮不推送 GitHub，不合并整机工厂适配候选。
 
 ## 现场证据与原因
 

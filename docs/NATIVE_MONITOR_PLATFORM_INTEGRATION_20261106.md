@@ -4,9 +4,9 @@
 
 ## 版本与改造边界
 
-2026-11-06 本地适配。整机仓库 `/home/shn/桌面/rp1-monitor-app`，基于上游 `main@7e48d867f881c93627dd3ae5e4de3f1314123f7e`，保留该版本新完成的工厂工作台、结果确认和采集器管理；先带入此前独立工厂桥接提交，再在 `codex/platform-login-domains-20261105` 实施本次原生界面接入。整机软件版本 `0.4.1+platform.20261106.1`。
+2026-11-06 本地适配。整机仓库 `../rp1-monitor-app`，基于上游 `main@7e48d867f881c93627dd3ae5e4de3f1314123f7e`，保留该版本新完成的工厂工作台、结果确认和采集器管理；先带入此前独立工厂桥接提交，再在 `codex/platform-login-domains-20261105` 实施本次原生界面接入。整机软件版本 `0.4.1+platform.20261106.1`。
 
-平台对应工作树 `/home/shn/.codex/worktrees/rp1-native-platform-domains-20261105`、分支 `codex/native-platform-domains-20261105`，同时包含工厂专用通道、首页加载修复和本次原始点解析／分区深链接。平台候选版本 `3.0.22-native1`。所有改动只在本地，不推送 GitHub，不创建 PR，不替其他正在测试的分支完成合并。
+平台对应工作树 `rp1-native-platform-domains-20261105`、分支 `codex/native-platform-domains-20261105`，同时包含工厂专用通道、首页加载修复和本次原始点解析／分区深链接。平台候选版本 `3.0.22-native1`。所有改动只在本地，不推送 GitHub，不创建 PR，不替其他正在测试的分支完成合并。
 
 本次用户已要求修改原生上位机，因此新增原生登录和平台业务页。原来的十个本地功能页、机器人 SSH／采集器管理、控制、Recorder／Store、工厂结果本地编辑和保存继续使用原实现。没有启动真实机器人、PLC、CAN 或测试策略，也没有把平台登录当作机器人控制授权。
 

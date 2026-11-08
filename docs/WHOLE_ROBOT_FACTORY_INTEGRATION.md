@@ -6,7 +6,7 @@
 
 本轮按用户确认的机器人卡片效果实施：保留 RP1 可靠性大屏原有品牌、浅蓝网格、机器人展示区与用例翻页布局，增加整机机器人总览。卡片显示在线／离线、机器人身份、工位，以及具体做过的工厂测试项目。卡片不展示电机温度、观测时长或据此推算 MTBF。
 
-整机上位机已下载在 `/home/shn/桌面/rp1-monitor-app`，来源为 `sss836/rp1-monitor-app` 的 `main@4b325a518b94859437cbed9bff9798b1db12f87c`，原版本 `0.4.0`。本地适配分支为 `codex/factory-platform-bridge-20261105`。平台改动分支为 `codex/factory-robots-20261105`，基于 `35cd7e70312f760a4c222475a4ea67d784c4ba71`。不修改整机 Qt、机器人连接／控制、采集策略、原有 SQLite／PostgreSQL 保存规则；不安装或重启正在工作的 PLC 上位机。
+整机上位机已下载在 `../rp1-monitor-app`，来源为 `sss836/rp1-monitor-app` 的 `main@4b325a518b94859437cbed9bff9798b1db12f87c`，原版本 `0.4.0`。本地适配分支为 `codex/factory-platform-bridge-20261105`。平台改动分支为 `codex/factory-robots-20261105`，基于 `35cd7e70312f760a4c222475a4ea67d784c4ba71`。不修改整机 Qt、机器人连接／控制、采集策略、原有 SQLite／PostgreSQL 保存规则；不安装或重启正在工作的 PLC 上位机。
 
 ## 为什么需要单独适配
 
@@ -85,8 +85,8 @@
 验证命令：
 
 ```bash
-cd /home/shn/桌面/rp1_test_shn-e56cabd
-python3 scripts/test-robot-factory-bridge.py --monitor-repo /home/shn/桌面/rp1-monitor-app
+cd /path/to/rp1_test_shn
+python3 scripts/test-robot-factory-bridge.py --monitor-repo ../rp1-monitor-app
 cd frontend
 npm run check
 ```
