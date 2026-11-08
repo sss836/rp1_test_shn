@@ -58,6 +58,19 @@ jobs:
       - working-directory: frontend
         run: npm ci && npm run check
       - run: python3 scripts/check-release.py
+  assistant-diagnosis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Run four diagnosis tests in the disposable assistant stack
+        run: python3 scripts/test-assistant-isolation.py --diagnosis-checks --report-dir "${RUNNER_TEMP}/rp1-assistant-diagnosis"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: assistant-diagnosis-checks
+          path: ${{ runner.temp }}/rp1-assistant-diagnosis
+          if-no-files-found: warn
   hmi:
     runs-on: ubuntu-24.04
     steps:

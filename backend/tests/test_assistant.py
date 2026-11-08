@@ -98,4 +98,6 @@ def test_same_origin_entry_reuses_cookie_csrf_and_rejects_identity_headers(monke
         client.cookies.set("rp1_csrf", "csrf")
         client.headers["X-CSRF-Token"] = "csrf"
         assert client.post("/api/v1/assistant/probe", json={"user_id": str(who.public_id)}).status_code == 422
-        assert client.post("/api/v1/assistant/probe", json={}).json()["code"] == "assistant_not_configured"
+        response = client.post("/api/v1/assistant/probe", json={})
+        assert response.status_code == 410
+        assert response.json()["code"] == "assistant_legacy_closed"

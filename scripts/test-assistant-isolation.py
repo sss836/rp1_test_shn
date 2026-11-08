@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Create and remove this task's own Docker stack, never read the site's .env."""
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import signal
 import subprocess
 import tempfile
 from uuid import uuid4
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,9 +28,13 @@ parser.add_argument("--deepseek-key-file", type=Path, help="optional server key 
 parser.add_argument("--setup-checks", action="store_true", help="run milestone 3 unified setup checks")
 parser.add_argument("--sample-checks", action="store_true", help="run simplified sample checks and migrate an existing synthetic sample from revision 50")
 parser.add_argument("--chat-checks", action="store_true", help="run milestone 4 runtime checks")
+parser.add_argument("--diagnosis-checks", action="store_true", help="run all four diagnosis integration tests on a disposable synthetic runtime stack")
 parser.add_argument("--production-checks", action="store_true", help="production API/Web settings on a disposable DB; requires server key file")
 parser.add_argument("--observe-seconds",type=int,help="continuous synthetic observation, 60..86400 seconds; no live API key")
 args = parser.parse_args()
+if args.diagnosis_checks and any((args.deepseek_key_file, args.setup_checks, args.sample_checks,
+                                 args.chat_checks, args.production_checks, args.observe_seconds)):
+    parser.error('--diagnosis-checks is an independent synthetic-only suite; do not combine with other modes or a live key')
 if args.production_checks and not args.deepseek_key_file:
     parser.error('--production-checks requires --deepseek-key-file')
 if args.observe_seconds:
@@ -41,7 +47,8 @@ project = "rp1-assistant-qa-" + uuid4().hex[:12]
 
 
 def run(command, name, *, capture=True):
-    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            env=command_environment)
     if capture:
         (report / (name + ".txt")).write_text(result.stdout)
     print(f"{name}: exit={result.returncode}", flush=True)
@@ -74,6 +81,20 @@ with tempfile.TemporaryDirectory(prefix="rp1-assistant-qa-") as directory:
         values["QA_DEEPSEEK_SECRET_FILE"] = str(live_secret)
     for key in ("QA_API_IMAGE", "QA_WEB_IMAGE", "QA_MIGRATE_IMAGE", "QA_PI_IMAGE"):
         if os.getenv(key): values[key] = os.environ[key]
+    if args.diagnosis_checks:
+        # Never retag images used by another QA run, much less a site release.
+        if not os.getenv("QA_API_IMAGE"):
+            values["QA_API_IMAGE"] = "rp1-assistant-qa:diagnosis-" + project.rsplit('-', 1)[-1]
+        values.setdefault("QA_MIGRATE_IMAGE", values["QA_API_IMAGE"])
+        values.setdefault("QA_PI_IMAGE", "rp1-pi-bridge:diagnosis-" + project.rsplit('-', 1)[-1])
+    command_environment = None
+    if args.diagnosis_checks:
+        # Compose gives exported values precedence over --env-file. Generated
+        # disposable paths and credentials must therefore win in both places.
+        command_environment = os.environ.copy()
+        command_environment.update(values)
+        for key in ("COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES"):
+            command_environment.pop(key, None)
     envfile = temp / "compose.env"
     envfile.write_text("\n".join(f"{key}={value}" for key, value in values.items()))
     envfile.chmod(0o600)
@@ -93,6 +114,23 @@ with tempfile.TemporaryDirectory(prefix="rp1-assistant-qa-") as directory:
         files='tests/test_assistant_runtime.py tests/test_assistant_runtime_live.py'
         override.write_text("services:\n  api:\n    environment:\n      ASSISTANT_RUNTIME_ENABLED: 'true'\n      ASSISTANT_LEGACY_PROBES: 'false'\n  checks:\n    environment:\n      ASSISTANT_RUNTIME_ENABLED: 'true'\n      ASSISTANT_LEGACY_PROBES: 'false'\n    command: [python, -m, pytest, -p, 'no:cacheprovider', "+', '.join(files.split())+", -q, '--junitxml=/reports/backend-junit.xml']\n")
         compose += ['-f',str(override)]
+    if args.diagnosis_checks:
+        override = temp / "diagnosis-checks.yml"
+        # These are synthetic billing fixtures, not a change to the site's
+        # current provider prices or its expired-price fail-closed protection.
+        synthetic_valid_until = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        test_command = ["python", "-m", "pytest", "-p", "no:cacheprovider",
+                        "tests/test_assistant_diagnosis_integration.py", "-q",
+                        "--junitxml=/reports/backend-junit.xml"]
+        override.write_text("services:\n  api:\n    environment:\n"
+            "      ASSISTANT_RUNTIME_ENABLED: 'true'\n      ASSISTANT_LEGACY_PROBES: 'false'\n"
+            f"      ASSISTANT_PRICE_VALID_UNTIL: '{synthetic_valid_until}'\n"
+            "  checks:\n    environment:\n      PYTHONPATH: '/app:/hmi'\n"
+            "      ASSISTANT_RUNTIME_ENABLED: 'true'\n      ASSISTANT_LEGACY_PROBES: 'false'\n"
+            f"      ASSISTANT_PRICE_VALID_UNTIL: '{synthetic_valid_until}'\n"
+            f"    volumes: [{json.dumps(str(ROOT / 'hmi') + ':/hmi:ro')}]\n"
+            f"    command: {json.dumps(test_command)}\n")
+        compose += ["-f", str(override)]
     if args.production_checks:
         override=temp/'production-checks.yml'
         override.write_text("""services:
@@ -128,7 +166,7 @@ secrets:
         compose+=['-f',str(override)]
     try:
         if not os.getenv("QA_API_IMAGE"):
-            run(["docker", "build", "-t", "rp1-assistant-qa:milestone2", "-f", str(ROOT / "deployment/ArchiveQa.Dockerfile"), str(ROOT)], "qa-image-build")
+            run(["docker", "build", "-t", values.get("QA_API_IMAGE", "rp1-assistant-qa:milestone2"), "-f", str(ROOT / "deployment/ArchiveQa.Dockerfile"), str(ROOT)], "qa-image-build")
         run(compose + ["build", "pi"], "pi-build")
         run(compose + ["up", "-d", "--wait", "--wait-timeout", "120", "api", "pi", "web", "model-mock"], "stack-start")
         containers = run(compose + ["ps", "-q", "pi", "postgres"], "qa-container-ids").split()
@@ -151,9 +189,16 @@ secrets:
         run(compose + ["exec", "-T", "pi", "node", "--input-type=module", "-e", "import dns from 'node:dns/promises'; import fs from 'node:fs'; try {await dns.lookup('postgres'); process.exit(1)} catch(e) {if(e.code!=='ENOTFOUND'&&e.code!=='EAI_AGAIN')throw e;} if(fs.existsSync('/var/run/docker.sock')||fs.existsSync('/var/lib/rp1/archives'))process.exit(1); console.log('postgres not resolvable; no Docker socket or archive mount');"], "network-boundary")
         run(compose + ["run", "--rm", "node-checks"], "node-tests")
         run(compose + ["run", "--rm", "checks"], "backend-tests")
+        if args.diagnosis_checks:
+            suites = ET.parse(report / "backend-junit.xml").getroot()
+            cases = suites.findall(".//testcase")
+            assert len(cases) == 4, "diagnosis suite must execute all four regression tests"
+            assert not suites.findall(".//skipped"), "diagnosis suite cannot pass by skipping its stack requirements"
+            assert not suites.findall(".//failure") and not suites.findall(".//error")
         run(compose + ["exec", "-T", "api", "python", "-c", "import fastapi, httpx, sqlalchemy; print('fastapi',fastapi.__version__,'httpx',httpx.__version__,'sqlalchemy',sqlalchemy.__version__)"], "python-versions")
         (report / "result.json").write_text(json.dumps({"status": "checks_passed", "project": project, "model": "DeepSeek official API, synthetic input" if args.deepseek_key_file else "SYNTHETIC SSE FIXTURE; no DeepSeek request", "database": "disposable tmpfs rp1_presence_assistant", "site_enabled": False}, indent=2))
     finally:
         # Metadata logs omit request payloads and credentials by design.
-        subprocess.run(compose + ["logs", "--no-color", "api", "pi", "migrate"], stdout=(report / "service-logs.txt").open("w"), stderr=subprocess.STDOUT)
+        subprocess.run(compose + ["logs", "--no-color", "api", "pi", "migrate"], stdout=(report / "service-logs.txt").open("w"), stderr=subprocess.STDOUT,
+                       env=command_environment)
         run(compose + ["down", "--volumes", "--remove-orphans"], "stack-cleanup")

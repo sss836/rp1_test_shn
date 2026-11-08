@@ -1,11 +1,23 @@
 """Original HMI transport -> API/Pi/mock -> native temporary CSV/log receipts."""
 import copy
 import hashlib
+import os
 import time
 from uuid import uuid4
+
+import pytest
 from sqlalchemy import text
-from tests.test_assistant_integration import signed_in
-from tests.test_assistant_runtime import control,submit,wait
+from tests.test_assistant_integration import environment, normal_model, signed_in
+from tests.test_assistant_runtime import clear_finance, control, submit, wait
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.getenv("ASSISTANT_QA_ADMIN_URL") or bool(os.getenv("ASSISTANT_QA_LIVE")),
+        reason="standalone synthetic assistant diagnosis stack required",
+    ),
+]
 
 
 def test_web_approval_then_original_hmi_actually_reads_external_temporary_file(environment,tmp_path):
