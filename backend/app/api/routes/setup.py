@@ -9,7 +9,7 @@ from app.core.db import DbSession
 from app.core.errors import ApiError
 from app.repositories.setup import SetupRepository
 from app.schemas.common import DataEnvelope
-from app.schemas.setup import (AssetCreate, CampaignCreate, Change, ContextCreate, ProgramCreate, StationCreate,
+from app.schemas.setup import (AssetCreate, AssetIdentity, CampaignCreate, Change, ContextCreate, ProgramCreate, StationCreate,
     CaseCreate, CaseRevision, ConfigurationCreate, MetadataChange, SetupBundle, SetupOperation)
 from app.services.setup import apply_bundle
 from sqlalchemy import text
@@ -70,10 +70,10 @@ RequestKey = Annotated[UUID | None, Header(alias="Idempotency-Key")]
 
 
 def single(session, kind, value, key, **identifiers):
-    if kind in {"case_revision","configuration"} and key is None:
-        raise ApiError(422,"idempotency_key_required","追加版本或配置必须提供Idempotency-Key，以便重试取得原回执。")
+    if kind in {"case_revision","configuration","asset_identity"} and key is None:
+        raise ApiError(422,"idempotency_key_required","追加版本、配置或补全身份必须提供Idempotency-Key，以便重试取得原回执。")
     exclude = {"auto_number", "creation_scenario"} if isinstance(value, AssetCreate) and value.legacy_input else set()
-    bundle = SetupBundle(request_key=key or uuid4(), operations=[SetupOperation(kind=kind, alias="object", data={**value.model_dump(mode="json", exclude=exclude), **identifiers})])
+    bundle = SetupBundle(request_key=key or uuid4(), operations=[SetupOperation(kind=kind, alias="object", data={**value.model_dump(mode="json", exclude=exclude, exclude_none=isinstance(value, AssetIdentity)), **identifiers})])
     result = apply_bundle(session, bundle)
     return DataEnvelope(data={**result["objects"]["object"], "request_key": result["request_key"], "replayed": result["replayed"]})
 
@@ -147,6 +147,11 @@ def publish_case(version_id: UUID, payload: Change, _: Editor, session: DbSessio
 @router.post("/assets/{asset_id}/configurations", status_code=201)
 def configuration(asset_id: UUID, payload: ConfigurationCreate, _: Editor, session: DbSession, key: RequestKey = None):
     return single_write(session,"configuration",payload,key,id=str(asset_id))
+
+
+@router.patch("/assets/{asset_id}/identity")
+def complete_asset_identity(asset_id: UUID, payload: AssetIdentity, _: Editor, session: DbSession, key: RequestKey = None):
+    return single_write(session,"asset_identity",payload,key,id=str(asset_id))
 
 
 @router.patch("/{kind}/{identifier}")

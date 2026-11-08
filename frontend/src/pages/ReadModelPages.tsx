@@ -39,6 +39,8 @@ import { MODULE_DIRECTORY } from "../homeCarousel";
 import { AssetCreateForm } from "./SetupPages";
 import { creationScenarioName } from "../assetRegistration";
 import { StatusMark } from "../components/StatusMark";
+import { AssetIdentityPanel, useAssetIdentityOptions } from "../components/AssetIdentityPanel";
+import type { SetupAsset } from "../setupApi";
 
 type Navigate = (view: "asset" | "test-case" | "execution" | "assets" | "curves", id?: string) => void;
 
@@ -374,6 +376,7 @@ export function AssetsPage({
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
   const showPartDirectory = assetKind === "MODULE" && !part;
+  const identities = useAssetIdentityOptions(assetKind === "WHOLE_MACHINE");
   const query = useInfiniteQuery({
     queryKey: paginationKey("assets", assetKind, part, status, search),
     initialPageParam: null as string | null,
@@ -412,6 +415,7 @@ export function AssetsPage({
     <>
       <PageTitle eyebrow="ASSET FLEET / STATUS WALL" title={part ? `${targetPartNames[part]} / ${part} 样品` : `${assetKind === "MODULE" ? "模块" : "整机"}样品中心`} trailing={data && <div className="title-status">{hasShowcase && <ShowcaseBadge />}<Cutoff value={data.data_cutoff_at} asOf={data.as_of_at} /></div>} />
       <AssetCreateForm key={assetKind} assetKind={assetKind} />
+      {assetKind === "WHOLE_MACHINE" && identities.isError && <p role="alert">样品身份资料读取失败，当前列表仍保留。<button type="button" onClick={() => void identities.refetch()}>重新读取身份资料</button></p>}
       {part && <div className="active-part-filter"><span>部位筛选：{targetPartNames[part]} / {part}</span><button type="button" onClick={clearPart}>清除筛选</button></div>}
       <form className="filter-bar" role="search" onSubmit={(event) => { event.preventDefault(); setSearch(draft.trim()); }}>
         <label>样品搜索<input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="编号、名称或序列号" /></label>
@@ -446,7 +450,7 @@ export function AssetsPage({
                     );
                   })}
                 </div>
-              ) : <AssetWall items={items} navigate={navigate} />}
+              ) : <AssetWall items={items} navigate={navigate} identities={identities.data?.assets} />}
               {!showPartDirectory && (
                 <LoadMore hasMore={Boolean(query.hasNextPage)} loading={query.isFetchingNextPage} failed={query.isFetchNextPageError} onLoad={() => void query.fetchNextPage()} />
               )}
@@ -458,17 +462,21 @@ export function AssetsPage({
   );
 }
 
-function AssetWall({ items, navigate }: { items: AssetSummary[]; navigate: Navigate }) {
+function AssetWall({ items, navigate, identities = [] }: { items: AssetSummary[]; navigate: Navigate; identities?: SetupAsset[] }) {
   return (
     <div className="asset-wall">
-      {items.map((asset) => (
+      {items.map((asset) => {
+        const identity = identities.find(entry => entry.id === asset.id);
+        const serial = identity ? identity.serial_number : asset.serial_number;
+        const planned = asset.asset_kind === "WHOLE_MACHINE" && !serial;
+        return (
         <article key={asset.id} data-risk={asset.health_status === "ABNORMAL" || asset.lifecycle_status === "MAINTENANCE" ? "high" : asset.health_status === "ATTENTION" ? "medium" : "normal"}>
-          <header><button className="link-button asset-code" type="button" onClick={() => navigate("asset", asset.code)}>{asset.code}<ExternalLink aria-hidden="true" /></button><StatusMark tone={asset.lifecycle_status === "ACTIVE" ? "normal" : asset.lifecycle_status === "MAINTENANCE" ? "warning" : "muted"} label={asset.lifecycle_status} /></header>
+          <header><button className="link-button asset-code" type="button" onClick={() => navigate("asset", asset.code)}>{asset.code}<ExternalLink aria-hidden="true" /></button><StatusMark tone={planned ? "muted" : asset.lifecycle_status === "ACTIVE" ? "normal" : asset.lifecycle_status === "MAINTENANCE" ? "warning" : "muted"} label={planned ? "计划档案" : asset.lifecycle_status} /></header>
           <p>{asset.name} · {creationScenarioName(asset.creation_scenario ?? "RND_TEST")}</p>
-          <dl><div><dt>当前用例</dt><dd>{asset.current_test_case_code ?? "无"}</dd></div><div><dt>累计 / 有效</dt><dd>{formatDuration(asset.durations.total_duration_seconds)} / {formatDuration(asset.durations.effective_exposure_seconds)}</dd></div><div><dt>健康</dt><dd>{asset.health_status ?? "证据不足"}</dd></div><div><dt>数据</dt><dd>{asset.freshness.status}</dd></div></dl>
-          <footer><span>风险级别</span><strong>{asset.health_status === "ABNORMAL" ? "需立即复核" : asset.health_status === "ATTENTION" ? "持续观察" : "当前稳定"}</strong></footer>
+          <dl>{asset.asset_kind === "WHOLE_MACHINE" && <><div><dt>实机 SN</dt><dd>{serial || "待绑定"}</dd></div><div><dt>机型</dt><dd>{identity ? identity.model || "待确认" : "尚未读取"}</dd></div></>}<div><dt>当前用例</dt><dd>{asset.current_test_case_code ?? "无"}</dd></div><div><dt>累计 / 有效</dt><dd>{formatDuration(asset.durations.total_duration_seconds)} / {formatDuration(asset.durations.effective_exposure_seconds)}</dd></div><div><dt>健康</dt><dd>{asset.health_status ?? "证据不足"}</dd></div><div><dt>数据</dt><dd>{asset.freshness.status}</dd></div></dl>
+          <footer><span>{planned ? "身份状态" : "风险级别"}</span><strong>{planned ? "待绑定实机" : asset.health_status === "ABNORMAL" ? "需立即复核" : asset.health_status === "ATTENTION" ? "持续观察" : "当前稳定"}</strong></footer>
         </article>
-      ))}
+      ); })}
     </div>
   );
 }
@@ -499,7 +507,8 @@ export function AssetDetailPage({ id, navigate }: { id: string; navigate: Naviga
   return (
     <>
       <BackButton onClick={() => navigate("assets")} />
-      <PageTitle eyebrow="ASSET DOSSIER" title={`${data.asset.code} · ${data.asset.name}`} description={[data.asset.asset_kind === "MODULE" ? "模块" : "整机", data.asset.product_family, creationScenarioName(data.asset.creation_scenario ?? "RND_TEST"), data.asset.serial_number].filter(Boolean).join(" · ")} trailing={<div className="title-status">{(isShowcaseValue(data.asset.batch_code) || isShowcaseValue(data.asset.current_execution_code)) && <ShowcaseBadge />}<StatusMark tone={data.asset.lifecycle_status === "ACTIVE" ? "normal" : "muted"} label={data.asset.lifecycle_status} /></div>} />
+      <PageTitle eyebrow="ASSET DOSSIER" title={`${data.asset.code} · ${data.asset.name}`} description={[data.asset.asset_kind === "MODULE" ? "模块" : "整机", data.asset.product_family, creationScenarioName(data.asset.creation_scenario ?? "RND_TEST"), data.asset.serial_number || "SN待绑定"].join(" · ")} trailing={<div className="title-status">{(isShowcaseValue(data.asset.batch_code) || isShowcaseValue(data.asset.current_execution_code)) && <ShowcaseBadge />}<StatusMark tone={data.asset.serial_number && data.asset.lifecycle_status === "ACTIVE" ? "normal" : "muted"} label={data.asset.asset_kind === "WHOLE_MACHINE" && !data.asset.serial_number ? "计划档案" : data.asset.lifecycle_status} /></div>} />
+      <AssetIdentityPanel asset={data.asset} />
       <DurationBand totals={data.asset.durations} />
       <Cutoff value={data.data_cutoff_at} asOf={data.as_of_at} />
       <div className="detail-columns">

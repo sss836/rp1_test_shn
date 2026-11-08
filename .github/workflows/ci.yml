@@ -54,7 +54,7 @@ jobs:
           DATABASE_URL: postgresql+psycopg://rp1_admin:isolated-ci-admin@127.0.0.1:5432/rp1_presence_ci
       - run: python -m pytest -c backend/pytest.ini backend/tests -m 'not integration' -q
       - run: python3 scripts/test-archive-deployment-guards.py
-      - run: python -m pytest -c backend/pytest.ini backend/tests/test_hmi_presence_integration.py backend/tests/test_setup_integration.py backend/tests/test_submissions_integration.py backend/tests/test_*archive*integration.py -q
+      - run: python -m pytest -c backend/pytest.ini backend/tests/test_hmi_presence_integration.py backend/tests/test_setup_integration.py backend/tests/test_submissions_integration.py backend/tests/test_asset_identity_integration.py backend/tests/test_mtbf_sample_registration_integration.py backend/tests/test_*archive*integration.py -q
       - working-directory: frontend
         run: npm ci && npm run check
       - run: python3 scripts/check-release.py

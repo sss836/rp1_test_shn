@@ -1,0 +1,61 @@
+{
+  "schema": "rp1.mtbf-planned-samples.v1",
+  "source_document": {
+    "title": "RP1人形机器人整机MTBF测试用例详细方案",
+    "version": "V1.1",
+    "sha256": "b4736a5c50383495f4c33521a70b448caf93f6e7e321ddcfc4360f0dbd4b05b8"
+  },
+  "request_key": "bc622f17-bb8e-59a8-9e38-cc723419dd15",
+  "product_family": "RP1.3",
+  "per_sample_hours": 480,
+  "group_total_hours": 1920,
+  "task_hours": {
+    "WALK_UNLOADED": 162,
+    "DYNAMIC_FAST": 60,
+    "STAND_IDLE": 222,
+    "DANCE": 33,
+    "STUNT_ACTION": 3
+  },
+  "scene_hours": {
+    "科研运动演示": 240,
+    "展演展示": 120,
+    "短距离移动展示": 120
+  },
+  "samples": [
+    {
+      "alias": "m1",
+      "plan_label": "M1",
+      "asset_code": "RP1.3-SYS-001",
+      "model": "24轴",
+      "included_in_mtbf_group": true
+    },
+    {
+      "alias": "m2",
+      "plan_label": "M2",
+      "asset_code": "RP1.3-SYS-002",
+      "model": "24轴",
+      "included_in_mtbf_group": true
+    },
+    {
+      "alias": "m3",
+      "plan_label": "M3",
+      "asset_code": "RP1.3-SYS-003",
+      "model": "24轴",
+      "included_in_mtbf_group": true
+    },
+    {
+      "alias": "m4",
+      "plan_label": "M4",
+      "asset_code": "RP1.3-SYS-004",
+      "model": "28轴",
+      "included_in_mtbf_group": true
+    },
+    {
+      "alias": "test_rd",
+      "plan_label": "test_RD",
+      "asset_code": "RP1.3-SYS-005",
+      "model": null,
+      "included_in_mtbf_group": false
+    }
+  ]
+}

@@ -11,7 +11,7 @@ from sqlalchemy import text
 from app.core.errors import ApiError
 from app.repositories.setup import SetupRepository
 from app.schemas.archives import AcceptanceRules
-from app.schemas.setup import (AssetCreate, CampaignCreate, CaseCreate, CaseDefinition, CaseRevision, Change,
+from app.schemas.setup import (AssetCreate, AssetIdentity, CampaignCreate, CaseCreate, CaseDefinition, CaseRevision, Change,
     ConfigurationCreate, ContextCreate, MetadataChange, ProgramCreate, SetupBundle, StationCreate)
 
 
@@ -88,6 +88,8 @@ def operation(repo, op, data):
         return repo.publish_case(identifier, value.reason, validate_definition)
     if op.kind == "configuration":
         return repo.append_configuration(identifier, ConfigurationCreate.model_validate(data))
+    if op.kind == "asset_identity":
+        return repo.complete_asset_identity(identifier, AssetIdentity.model_validate(data))
     if op.kind == "campaign_activate":
         return repo.activate_campaign(identifier, Change.model_validate(data).reason)
     return repo.update_metadata(op.kind.removesuffix("_update"), identifier, MetadataChange.model_validate(data))
@@ -131,7 +133,7 @@ def validate_bundle_shape(bundle):
     """Validate every operation before the first business mutation."""
     schemas = {"asset":AssetCreate,"program":ProgramCreate,"campaign":CampaignCreate,"station":StationCreate,
         "case":CaseCreate,"context":ContextCreate,"case_revision":CaseRevision,"case_publish":Change,
-        "configuration":ConfigurationCreate,"campaign_activate":Change}
+        "configuration":ConfigurationCreate,"asset_identity":AssetIdentity,"campaign_activate":Change}
     previous = {}
     for op in bundle.operations:
         data = resolve_refs(op.data, previous)

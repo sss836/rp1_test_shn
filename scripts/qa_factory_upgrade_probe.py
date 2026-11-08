@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify 0059 -> 0060 preserves existing rows, in the disposable runner only."""
+"""Verify 0059 -> current head preserves existing rows, in the disposable runner only."""
 
 import argparse
 import hashlib
@@ -58,12 +58,12 @@ def main():
                 json.dump(state, file, sort_keys=True)
             print(json.dumps({"result": "SNAPSHOT", "head": head, "existing_tables": len(state), "production": False}), flush=True)
         else:
-            assert head == "20261105_0060"
+            assert head == "20261108_0061"
             before = json.loads(args.snapshot.read_text(encoding="utf-8"))
             assert set(state) - set(before) == NEW_TABLES
             assert all(state.get(key) == value for key, value in before.items()), "Existing rows changed during upgrade"
             assert all(state[key]["rows"] == 0 for key in NEW_TABLES)
-            print(json.dumps({"result": "PASS", "upgrade": "0059 -> 0060", "existing_tables_preserved": len(before),
+            print(json.dumps({"result": "PASS", "upgrade": "0059 -> 0061", "existing_tables_preserved": len(before),
                               "new_empty_tables": len(NEW_TABLES), "production": False}), flush=True)
     finally:
         engine.dispose()

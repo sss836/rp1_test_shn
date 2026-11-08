@@ -159,6 +159,21 @@ class ConfigurationCreate(Change):
     parameter_manifest: dict[str, Any] = Field(default_factory=dict)
 
 
+class AssetIdentity(Change):
+    """Complete an unknown planned identity; never clear or replace a fact."""
+    serial_number: Name | None = None
+    model: Name | None = None
+
+    @model_validator(mode="after")
+    def at_least_one_value(self):
+        supplied = self.model_fields_set.intersection({"serial_number", "model"})
+        if not supplied or any(getattr(self, name) is None for name in supplied):
+            raise ValueError("请至少填写一个待补全的实机SN或机型，不能清空已有身份")
+        if any("\x00" in getattr(self, name) for name in supplied):
+            raise ValueError("实机SN和机型不能包含NUL字符")
+        return self
+
+
 class MetadataChange(Change):
     name: Name
     objective: str | None = Field(default=None, max_length=4096)
@@ -166,7 +181,7 @@ class MetadataChange(Change):
 
 class SetupOperation(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["asset", "program", "campaign", "station", "case", "context", "case_revision", "case_publish", "configuration", "asset_update", "program_update", "campaign_update", "station_update", "campaign_activate"]
+    kind: Literal["asset", "program", "campaign", "station", "case", "context", "case_revision", "case_publish", "configuration", "asset_identity", "asset_update", "program_update", "campaign_update", "station_update", "campaign_activate"]
     alias: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
     data: dict[str, Any]
 

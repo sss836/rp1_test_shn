@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.errors import ApiError
-from app.schemas.setup import AssetCreate, CampaignCreate, ContextCreate, ProgramCreate, StationCreate, CaseCreate, CaseDefinition, CaseRevision, ConfigurationCreate, MetadataChange, asset_identity
+from app.schemas.setup import AssetCreate, AssetIdentity, CampaignCreate, ContextCreate, ProgramCreate, StationCreate, CaseCreate, CaseDefinition, CaseRevision, ConfigurationCreate, MetadataChange, asset_identity
 
 
 def _parts_match(case_part: str | None, asset_part: str | None) -> bool:
@@ -54,9 +54,69 @@ class SetupRepository:
             "parts": self.rows("SELECT part_code AS code,name,asset_kind FROM catalog.test_target_part WHERE enabled ORDER BY part_code"),
             "programs": self.rows("SELECT public_id AS id,program_code AS code,name,status,true AS can_edit FROM test.test_program WHERE iam.owns_setup('program',id) ORDER BY id DESC"),
             "stations": self.rows("SELECT s.public_id AS id,s.station_code AS code,s.name,s.station_type,iam.owns_setup('station',s.id) AS can_edit FROM test.station s JOIN test.lab l ON l.id=s.lab_id JOIN test.site t ON t.id=l.site_id WHERE s.enabled AND l.enabled AND t.enabled ORDER BY s.station_code"),
-            "assets": self.rows("SELECT a.public_id AS id,a.asset_code AS code,a.display_name AS name,a.asset_kind,a.creation_scenario,iam.can_access_asset(a.id,true) AS can_edit,CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN 'SYS' ELSE m.target_part_code END AS target_part_code FROM test.asset a LEFT JOIN test.module_profile m ON m.asset_id=a.id WHERE NOT a.voided ORDER BY a.asset_code"),
+            "assets": self.assets(),
             "configurations": self.rows("SELECT c.public_id AS id,a.public_id AS asset_id,c.fingerprint,c.reliability_impact FROM test.configuration_snapshot c JOIN test.asset a ON a.id=c.asset_id WHERE NOT a.voided ORDER BY c.effective_from DESC,c.id DESC"),
         }
+
+    def assets(self):
+        rows = self.rows("""SELECT a.public_id AS id,a.asset_code AS code,a.display_name AS name,
+            a.asset_kind,a.creation_scenario,a.serial_number,
+            CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN w.model ELSE m.module_type END AS model,
+            iam.can_access_asset(a.id,true) AS can_edit,
+            CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN 'SYS' ELSE m.target_part_code END AS target_part_code,
+            CASE
+              WHEN a.serial_number IS NOT NULL AND
+                   CASE WHEN a.asset_kind='WHOLE_MACHINE' THEN w.model ELSE m.module_type END IS NOT NULL
+                THEN '样品实机身份已完整'
+              WHEN NOT iam.can_access_asset(a.id,true) OR NOT iam.can_write_business()
+                THEN '当前账号没有此样品的编辑权限'
+              ELSE test.asset_identity_blocked_reason(a.id)
+            END AS blocked_reason
+            FROM test.asset a LEFT JOIN test.module_profile m ON m.asset_id=a.id
+            LEFT JOIN test.whole_machine_profile w ON w.asset_id=a.id
+            WHERE NOT a.voided ORDER BY a.asset_code""")
+        for row in rows:
+            row["can_complete_identity"] = row["blocked_reason"] is None
+        return rows
+
+    def complete_asset_identity(self, identifier: UUID, value: AssetIdentity):
+        # FOR UPDATE also conflicts with FK key-share locks. New configuration,
+        # plan or execution references therefore serialize with this decision.
+        asset = self.one("""SELECT a.id,a.public_id,a.asset_code AS code,a.asset_kind,
+            a.serial_number,iam.can_access_asset(a.id,true) AS can_edit
+            FROM test.asset a WHERE a.public_id=:id AND NOT a.voided FOR UPDATE""", {"id": identifier})
+        if not asset["can_edit"]:
+            raise ApiError(403, "forbidden", "当前账号没有此样品的编辑权限。")
+        profile = "test.whole_machine_profile" if asset["asset_kind"] == "WHOLE_MACHINE" else "test.module_profile"
+        column = "model" if asset["asset_kind"] == "WHOLE_MACHINE" else "module_type"
+        current = self.one(f"SELECT {column} AS model FROM {profile} WHERE asset_id=:asset FOR UPDATE", {"asset": asset["id"]})
+        values = {"serial_number": asset["serial_number"], "model": current["model"]}
+        changes = {}
+        for field in ("serial_number", "model"):
+            incoming = getattr(value, field)
+            if incoming is None:
+                continue
+            if values[field] is not None and incoming != values[field]:
+                raise ApiError(409, "asset_identity_conflict", "已登记的实机SN或机型不能通过补全入口替换。")
+            if values[field] is None:
+                changes[field] = incoming
+        if changes:
+            # The definer helper checks all references, including campaigns
+            # hidden from the current editor by RLS. It reveals no object IDs.
+            blocked = self.session.execute(text("SELECT test.asset_identity_blocked_reason(:asset)"),
+                {"asset": asset["id"]}).scalar_one()
+            if blocked:
+                raise ApiError(409, "asset_identity_locked", blocked)
+            self.reason(value.reason)
+            if "serial_number" in changes:
+                self.session.execute(text("UPDATE test.asset SET serial_number=:serial WHERE id=:asset"),
+                    {"serial": changes["serial_number"], "asset": asset["id"]})
+            if "model" in changes:
+                self.session.execute(text(f"UPDATE {profile} SET {column}=:model WHERE asset_id=:asset"),
+                    {"model": changes["model"], "asset": asset["id"]})
+            values.update(changes)
+        return {"id": asset["public_id"], "code": asset["code"], **values,
+                "identity_completed": all(value is not None for value in values.values())}
 
     def stations(self, *, cursor: UUID | None, limit: int):
         """Read the registry, including disabled stations and disabled parents."""
