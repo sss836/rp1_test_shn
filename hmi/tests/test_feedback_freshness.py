@@ -10,7 +10,7 @@ import pytest
 from factory_hmi import FactoryController, MotorSample, StationConfig, StationState
 from factory_hmi.core.backend import FakeMotorBackend
 from factory_hmi.core.state_machine import StationStateMachine
-from factory_hmi.desktop.feedback_freshness import feedback_age_s
+from factory_hmi.desktop.feedback_freshness import DISPLAY_STALE_S, STATUS_SILENCE_S, feedback_age_s
 from test_motor_feedback_display import window, cell
 
 
@@ -156,6 +156,29 @@ def test_local_expiry_does_not_replay_old_login_or_control_state(window, monkeyp
     assert cell(window, 8) == "—"
 
 
+def test_local_expiry_repaints_once_per_motor_observation(window, monkeypatch):
+    clock = [100.]
+    monkeypatch.setattr("factory_hmi.desktop.app.time.monotonic", lambda: clock[0])
+    renders = []
+    render = window._render_snapshot
+
+    def observe(payload, *, refresh_state=True):
+        if not refresh_state:
+            renders.append(clock[0])
+        render(payload, refresh_state=refresh_state)
+
+    monkeypatch.setattr(window, "_render_snapshot", observe)
+    for count, temperature in enumerate((46., 47.), start=1):
+        window._render_snapshot(snapshot(clock[0], temperature=temperature))
+        assert cell(window, 8) == f"{temperature:.3f}"
+        clock[0] += DISPLAY_STALE_S + .01
+        for _ in range(8):
+            window._refresh_feedback_freshness()
+            clock[0] += .1
+        assert cell(window, 8) == "—"
+        assert len(renders) == count
+
+
 def test_silent_connected_websocket_uses_one_pending_fallback_and_recovers(window, monkeypatch):
     clock = [100.]
     calls = []
@@ -182,7 +205,7 @@ def test_silent_connected_websocket_uses_one_pending_fallback_and_recovers(windo
     assert len(calls) == 1
 
 
-def test_repeated_identical_cached_messages_do_not_count_as_new_status(window, monkeypatch):
+def test_repeated_identical_status_keeps_transport_live_without_renewing_motor_feedback(window, monkeypatch):
     clock = [100.]
     calls = []
     monkeypatch.setattr("factory_hmi.desktop.app.time.monotonic", lambda: clock[0])
@@ -192,8 +215,11 @@ def test_repeated_identical_cached_messages_do_not_count_as_new_status(window, m
     window._ws_message(message)
     clock[0] = 102.
     window._ws_message(message)
-    assert window._last_ws_snapshot_at == 100.
+    assert window._telemetry_received_at == 100.
     assert cell(window, 8) == "—"
+    window._poll_snapshot()
+    assert calls == []
+    clock[0] += STATUS_SILENCE_S + .01
     window._poll_snapshot()
     assert len(calls) == 1
 

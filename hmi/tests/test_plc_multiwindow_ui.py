@@ -16,7 +16,8 @@ from factory_hmi.plc.service import PlcCabinetService
 class OfflineClient:
     def __init__(self, service, client_id):
         self.service, self.client_id = service, client_id
-    def plc_snapshot(self): return self.service.snapshot()
+    def plc_snapshot(self, *, include_history=True):
+        return self.service.snapshot(include_history=include_history)
     def command(self, op, payload, user, ctx):
         try:
             return self.service.coordination.execute(op, payload, user=user, client_id=self.client_id,
@@ -25,6 +26,8 @@ class OfflineClient:
             raise GatewayError('PLC conflict', status_code=409, detail={
                 'code': exc.code, 'message': str(exc), 'snapshot': self.service.snapshot(),
             }) from exc
+    def plc_connect(self, user, *, context): return self.command('connect', {}, user, context)
+    def plc_disconnect(self, *, context): return self.command('disconnect', {}, 'offline', context)
     def plc_start(self, channels, user, voltage, current, *, context):
         return self.command('start', dict(channels=channels, voltage=voltage, current=current), user, context)
     def plc_all_stop(self, user, *, context): return self.command('all-stop', {}, user, context)
@@ -140,3 +143,26 @@ def test_foreign_confirmation_cannot_clear_a_rejected_local_setpoint_draft(pages
     b._receive(service.snapshot())
     assert b._setpoint_dirty
     assert b.voltage_setpoint.value() == 12.345
+
+
+def test_two_pages_share_explicit_communication_switch(tmp_path, monkeypatch, qapp):
+    monkeypatch.setattr('factory_hmi.plc.service.build_plc_client', lambda *a: MockPlcClient())
+    service = PlcCabinetService(load_plc_config(), data_root=tmp_path)
+    service.start()
+    runners = [Runner(), Runner()]
+    windows = [PlcCabinetPage(OfflineClient(service, f'switch-{i}'), runners[i], lambda:'offline') for i in range(2)]
+    try:
+        for page in windows:
+            page.stop(); page._receive(service.snapshot())
+            assert page.connect_button.text() == '启用 PLC 通信'
+        windows[0]._toggle_communication(); runners[0].finish()
+        windows[1].refresh()
+        assert all(page.connect_button.text() == '停用 PLC 通信' for page in windows)
+        windows[1]._toggle_communication(); runners[1].finish()
+        windows[0].refresh()
+        assert all(page.connect_button.text() == '启用 PLC 通信' for page in windows)
+        assert service.snapshot()['communication_state'] == 'DISABLED'
+    finally:
+        for page in windows:
+            page.stop(); page.close(); page.deleteLater()
+        service.close()

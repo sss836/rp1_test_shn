@@ -28,10 +28,11 @@ import uuid
 
 # Loading as a standalone privileged helper must not import the motion runtime.
 if __package__:
-    from . import updates
+    from . import updates, upgrade_backup
 else:
     from types import SimpleNamespace
     updates = SimpleNamespace(**runpy.run_path(str(Path(__file__).with_name("updates.py"))))
+    upgrade_backup = SimpleNamespace(**runpy.run_path(str(Path(__file__).with_name("upgrade_backup.py"))))
 
 POLICY_PATH = Path("/etc/rp1-test-hmi/installer-policy.json")
 PROOF_SCHEMA = "rp1-hmi-safe-stop-v2"
@@ -364,6 +365,10 @@ def execute_install_transaction(release_path: Path | str, *, state_dir: Path | s
                 # changes to their cache can no longer alter installation bytes.
                 updates._package(package, manifest)
                 executor.check_dependencies(package, directory / "dependencies-final.log")
+                event("backing_up_state")
+                receipt["state_backup"] = upgrade_backup.create_snapshot(root, directory / "state-backup")
+                event("state_backup_verified")
+                save()
                 event("installing")
                 save()
                 verify_safety_proof(proof, public_key_path=policy.safety_public_key, manifest=manifest,
@@ -537,15 +542,19 @@ class SystemExecutor:
     def verify_new_instance(self, policy, manifest, previous):
         deadline = time.monotonic() + 35
         while time.monotonic() < deadline:
-            status = self.status(policy)
-            pid = status.get("gateway_pid")
-            if status.get("running") is True and type(status.get("read_only")) is bool and type(pid) is int:
-                try:
+            try:
+                # A launcher can be alive before its gateway identity/health is
+                # published. Retry within the same bounded verification budget.
+                status = self.status(policy)
+                pid = status.get("gateway_pid")
+                if status.get("running") is True and type(status.get("read_only")) is bool and type(pid) is int and pid > 0:
                     raw = Path(f"/proc/{pid}/stat").read_text()
                     ticks = raw[raw.rfind(")") + 2:].split()[19]
                     address = status.get("gateway", "")
                     parsed = urlsplit(address)
-                    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.path or parsed.query or parsed.username:
+                    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1"
+                            or not parsed.port or parsed.path or parsed.query
+                            or parsed.fragment or parsed.username or parsed.password):
                         raise ValueError("新网关地址无效。")
                     with updates._download(address + "/api/v1/health") as stream:
                         health = updates._read_json(stream)
@@ -556,8 +565,10 @@ class SystemExecutor:
                             and self.installed_version() == manifest["version"]
                             and (health.get("snapshot") or {}).get("station", {}).get("motors_enabled") is False):
                         return software
-                except (OSError, IndexError, RuntimeError):
-                    pass
+            except (OSError, IndexError, RuntimeError, ValueError, TypeError, AttributeError):
+                # Invalid/stale responses never grant success. Do not restart
+                # again, downgrade, or enable hardware when verification fails.
+                pass
             time.sleep(.25)
         raise RuntimeError("安装后的实际新进程版本或健康身份核对超时；不自动重试启动或使能。")
 

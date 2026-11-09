@@ -57,6 +57,21 @@ def test_platform_url_survives_package_updates_without_rebuilding(tmp_path):
     assert env["RP1_FACTORY_PLATFORM_URL"] == "https://platform.example.invalid:8443"
 
 
+def test_package_platform_url_default_and_explicit_override(tmp_path):
+    source = (ROOT / "launch.py").read_text(encoding="utf-8")
+    original, default = builder.configure_launcher_platform_url(source, "")
+    assert original == source
+    assert default == "https://10.43.17.214:8443"
+    configured, url = builder.configure_launcher_platform_url(source, "https://platform.example.invalid:8443/")
+    assert url == "https://platform.example.invalid:8443"
+    launch = tmp_path / "launch.py"
+    launch.write_text(configured, encoding="utf-8")
+    launcher = runpy.run_path(str(launch))
+    with patch.dict(os.environ, {"RP1_FACTORY_PLATFORM_URL": ""}):
+        env = launcher["gateway_environment"](tmp_path, None, offline=False, driver="mock", mode="control")
+    assert env["RP1_FACTORY_PLATFORM_URL"] == url
+
+
 def test_offline_checks_cannot_reuse_the_saved_platform_connection(tmp_path):
     launcher = runpy.run_path(str(ROOT / "launch.py"))
     (tmp_path / "config").mkdir()

@@ -266,7 +266,7 @@ class QuickRun:
             self._state('fault', '结束清理未确认：'+'；'.join(errors), active=False)
             raise RuntimeError(self.snapshot()['detail'])
         failure = self.snapshot().get('failure')
-        detail = ('已结束，电机失能并断开 CAN；外部电源由现场管理' if self._power_source == 'external' else
+        detail = ('已结束，电机失能并断开 CAN；外部电源由现场管理，软件无法确认已断电' if self._power_source == 'external' else
                   '已结束，电机失能并断开 CAN；PLC 共用供电保持当前状态')
         self._state('ended', (failure + '；' if failure else '') + detail, active=False)
         return self.snapshot()

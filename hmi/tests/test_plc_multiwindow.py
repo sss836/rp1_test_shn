@@ -24,7 +24,11 @@ def service(tmp_path, monkeypatch):
     service = PlcCabinetService(load_plc_config(), data_root=tmp_path)
     service.controller.connect(user='offline')
     yield service
-    service.close()
+    # These arbitration tests deliberately leave fake feedback stuck/faulted.
+    # Tear down only the mock transport; shutdown verification has dedicated
+    # tests and must no longer silently succeed on these injected failures.
+    service.controller.disconnect()
+    service._log_writer.close()
 
 
 def context(service):
@@ -203,6 +207,10 @@ def test_api_both_windows_receive_shared_state_and_conflict_snapshot(tmp_path):
     with TestClient(app) as client:
         snapshot = client.get('/api/v1/plc/snapshot').json()
         ctx = snapshot['coordination']
+        enabled = client.post('/api/v1/plc/connect', headers={'X-RP1-Client-ID': 'window-a'},
+            json=dict(user='a', request_id='enable', expected_epoch=ctx['epoch'], expected_revision=ctx['revision']))
+        assert enabled.status_code == 200
+        ctx = client.get('/api/v1/plc/snapshot').json()['coordination']
         body = dict(user='a', request_id='a-1', expected_epoch=ctx['epoch'], expected_revision=ctx['revision'], voltage=12., current=1.)
         first = client.post('/api/v1/plc/setpoints', headers={'X-RP1-Client-ID': 'window-a'}, json=body)
         assert first.status_code == 200

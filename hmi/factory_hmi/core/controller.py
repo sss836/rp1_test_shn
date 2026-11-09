@@ -113,6 +113,9 @@ class FactoryController:
         self._protective_damping = None
         self._damping_transition = False
         self._damping_guard = threading.RLock()
+        self._shutdown_intent_guard = threading.RLock()
+        self._protective_requests = 0
+        self._shutdown_committed = False
         self._position_hold_stop = threading.Event()
         self._position_hold_thread: threading.Thread | None = None
         self._position_hold_target: np.ndarray | None = None
@@ -803,6 +806,17 @@ class FactoryController:
                 )
 
     def enter_protective_damping(self, reason: str, kd: float = 1.0, expected_generation=None):
+        # Register before waiting on the transition lock. Ordinary shutdown
+        # yields to any protection intent that precedes its final commit.
+        with self._shutdown_intent_guard:
+            self._protective_requests += 1
+        try:
+            return self._enter_protective_damping(reason, kd, expected_generation)
+        finally:
+            with self._shutdown_intent_guard:
+                self._protective_requests -= 1
+
+    def _enter_protective_damping(self, reason: str, kd: float = 1.0, expected_generation=None):
         from .protective_damping import ProtectiveDamping
         with self._damping_guard:
             origin_generation=self.backend.control_generation if expected_generation is None else expected_generation
@@ -847,7 +861,30 @@ class FactoryController:
             self.backend.cancel_protective_damping()
             if not request_only:session.stop()
 
+    def _require_no_shutdown_protection(self) -> None:
+        # Caller holds _damping_guard; intent lock never spans I/O or joins.
+        session = self._protective_damping
+        with self._shutdown_intent_guard:
+            if (self._damping_transition or self._protective_requests
+                    or getattr(self, "_protective_fault_pending", False)
+                    or session is not None and session.snapshot().get("active") is True):
+                raise FactoryControllerError("保护阻尼正在建立或运行；先可靠支撑机构并显式失能，再关闭服务")
+
+    def disconnect_for_shutdown(self) -> None:
+        """Order ordinary exit against active and pending protection, atomically."""
+        with self._damping_guard:
+            self._require_no_shutdown_protection()
+            try:
+                self._disconnect(shutdown=True)
+            finally:
+                with self._shutdown_intent_guard:
+                    self._shutdown_committed = False
+
     def disconnect(self) -> None:
+        # Existing explicit operator disconnect retains its semantics.
+        self._disconnect()
+
+    def _disconnect(self, *, shutdown: bool = False) -> None:
         self._stop_protective_damping(request_only=True)
         self.request_motion_stop()
         self._stop_manual_session()
@@ -869,6 +906,14 @@ class FactoryController:
             zeroing.abort("station disconnect")
 
         self._stop_position_hold()
+        if shutdown:
+            # Fault callbacks register without waiting for _damping_guard, so
+            # a fault during stop/join cannot deadlock and wins before commit.
+            with self._shutdown_intent_guard:
+                self._require_no_shutdown_protection()
+                self._shutdown_committed = True
+            # Later transitions wait for _damping_guard, then recheck backend
+            # generation/connected/enabled after this committed disconnect.
         disconnect_error: Exception | None = None
         try:
             if self.backend.connected:
@@ -1298,8 +1343,9 @@ class FactoryController:
         if self._damping_transition:return True
         if self._protective_damping is not None and self._protective_damping.snapshot()['active']:return True
         if self.backend.commands_inhibited:return False
-        if getattr(self, '_protective_fault_pending', False):return True
-        self._protective_fault_pending = True
+        with self._shutdown_intent_guard:
+            if getattr(self, '_protective_fault_pending', False):return True
+            self._protective_fault_pending = True
         origin_generation=self.backend.control_generation
         def transition():
             try:
@@ -1313,11 +1359,14 @@ class FactoryController:
                 request_fault_disable(self.backend,self._fault_response)
                 self._fault = FaultStatus(message=f'{fault.message}；保护阻尼不可用：{exc}',
                     kind='ProtectiveDampingFailed',timestamp_s=time.monotonic())
-            finally:self._protective_fault_pending = False
+            finally:
+                with self._shutdown_intent_guard:
+                    self._protective_fault_pending = False
         try:
             threading.Thread(target=transition,name='factory-protective-fault-transition',daemon=True).start()
         except Exception:
-            self._protective_fault_pending = False
+            with self._shutdown_intent_guard:
+                self._protective_fault_pending = False
             logger.exception('could not start protective fault transition')
             return False
         return True

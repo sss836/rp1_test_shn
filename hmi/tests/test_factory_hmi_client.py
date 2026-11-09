@@ -29,7 +29,7 @@ class GatewayClientTest(unittest.TestCase):
     def setUp(self) -> None:
         self.client = GatewayClient("http://127.0.0.1:8765/", timeout=3.5)
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_get_uses_expected_url_and_timeout(
         self, urlopen: mock.Mock
     ) -> None:
@@ -43,7 +43,7 @@ class GatewayClientTest(unittest.TestCase):
         self.assertEqual(request.method, "GET")
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 3.5)
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_post_serializes_json_and_headers(
         self, urlopen: mock.Mock
     ) -> None:
@@ -79,7 +79,7 @@ class GatewayClientTest(unittest.TestCase):
             f"wss://gateway.example.test/ws/status?client_id={secure.client_id}",
         )
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_standalone_can_and_enable_endpoints(self, urlopen: mock.Mock) -> None:
         urlopen.return_value = FakeResponse(b'{"ok":true}')
 
@@ -111,7 +111,7 @@ class GatewayClientTest(unittest.TestCase):
             self.client.base_url + "/api/v1/motors/reset-fault",
         )
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_configuration_upload_and_editable_overrides(self, urlopen: mock.Mock) -> None:
         urlopen.return_value = FakeResponse(b'{"ok":true}')
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -156,7 +156,7 @@ class GatewayClientTest(unittest.TestCase):
         self.assertEqual(payload["bus_bindings"], bindings)
         self.assertEqual(payload["motor_overrides"], motors)
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_http_error_exposes_status_and_service_detail(
         self, urlopen: mock.Mock
     ) -> None:
@@ -179,7 +179,7 @@ class GatewayClientTest(unittest.TestCase):
         self.assertIn("HTTP 409", str(caught.exception))
         self.assertIn("preflight", str(caught.exception))
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_empty_success_response_returns_empty_object(
         self, urlopen: mock.Mock
     ) -> None:
@@ -195,7 +195,7 @@ class GatewayClientTest(unittest.TestCase):
         )
         self.assertEqual(json.loads(request.data), {})
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_playback_start_uses_complete_gateway_contract(
         self, urlopen: mock.Mock
     ) -> None:
@@ -236,7 +236,7 @@ class GatewayClientTest(unittest.TestCase):
             },
         )
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_zero_confirm_never_implies_fault_override(
         self, urlopen: mock.Mock
     ) -> None:
@@ -247,7 +247,7 @@ class GatewayClientTest(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertEqual(json.loads(request.data), {"allow_on_fault": False})
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_direct_zero_requests_use_explicit_routes(
         self, urlopen: mock.Mock
     ) -> None:
@@ -262,7 +262,7 @@ class GatewayClientTest(unittest.TestCase):
         request = urlopen.call_args.args[0]
         self.assertTrue(request.full_url.endswith("/api/v1/zero/all"))
 
-    @mock.patch("factory_hmi.client.request.urlopen")
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_client_identity_token_and_binary_upload(
         self, urlopen: mock.Mock
     ) -> None:

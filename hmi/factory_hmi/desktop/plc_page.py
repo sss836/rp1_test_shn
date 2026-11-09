@@ -204,6 +204,7 @@ class PlcCabinetPage(QWidget):
         self.setObjectName("tabPage")
         self._pending = False
         self._pending_count = 0
+        self._closed = False
         self._retired_epochs: set[str] = set()
         self._request_error = ""
         self._submitted_request_id: str | None = None
@@ -217,10 +218,18 @@ class PlcCabinetPage(QWidget):
         self.timer.setInterval(250)
         self.timer.timeout.connect(self.refresh)
         self.timer.start()
-        QTimer.singleShot(0, self.refresh)
+        QTimer.singleShot(0, self, self.refresh)
 
     def stop(self) -> None:
         self.timer.stop()
+
+    def shutdown(self) -> None:
+        self._closed = True
+        self.stop()
+
+    def showEvent(self, event: Any) -> None:
+        super().showEvent(event)
+        self.refresh()
 
     def _build(self) -> None:
         layout = QVBoxLayout(self)
@@ -284,13 +293,9 @@ class PlcCabinetPage(QWidget):
         system_layout.addWidget(self.main_state, 1, 0, 1, 2)
         system_layout.addWidget(self.ps1_state, 2, 0, 1, 2)
 
-        self.connect_button = QPushButton("连接 PLC")
+        self.connect_button = QPushButton("启用 PLC 通信")
         self.connect_button.setObjectName("outlineButton")
-        self.connect_button.clicked.connect(
-            lambda: self._command(
-                "连接 PLC", lambda context: self.client.plc_connect(self._user(), context=context)
-            )
-        )
+        self.connect_button.clicked.connect(self._toggle_communication)
         self.start_button = QPushButton("系统总使能（顺序启动）")
         self.start_button.setObjectName("startButton")
         self.start_button.clicked.connect(self._start)
@@ -472,6 +477,12 @@ class PlcCabinetPage(QWidget):
         log_layout.addWidget(self.logs)
         layout.addWidget(log_group, 1)
 
+    def _toggle_communication(self) -> None:
+        if self._snapshot.get("communication_enabled", False):
+            self._command("停用 PLC 通信", lambda context: self.client.plc_disconnect(context=context))
+        else:
+            self._command("启用 PLC 通信", lambda context: self.client.plc_connect(self._user(), context=context))
+
     def _user(self) -> str:
         return self.operator_provider().strip() or "local-operator"
 
@@ -480,16 +491,20 @@ class PlcCabinetPage(QWidget):
         self._pending = self._pending_count > 0
 
     def refresh(self) -> None:
-        if self._pending:
+        if self._closed or self._pending:
             return
+        include_history = self.isVisible()
         self._pending_count += 1
         self._pending = True
         self.runner(
-            "刷新 PLC 状态", self.client.plc_snapshot, self._receive,
+            "刷新 PLC 状态",
+            lambda: self.client.plc_snapshot(include_history=include_history), self._receive,
             quiet=True, on_finished=self._finished,
         )
 
     def _failed(self, exc: Exception) -> None:
+        if self._closed:
+            return
         if isinstance(exc, GatewayError) and isinstance(exc.detail, Mapping):
             self._request_error = str(exc.detail.get("message") or exc)
             self._receive(exc.detail.get("snapshot"))
@@ -499,7 +514,7 @@ class PlcCabinetPage(QWidget):
 
     def _command(self, label: str, operation: Callable[[Mapping[str, Any]], Any],
                  *, priority: bool = False, request_id: str | None = None) -> None:
-        if self._pending and not priority:
+        if self._closed or (self._pending and not priority):
             return
         context = dict(self._snapshot.get("coordination", {}))
         context["request_id"] = request_id or str(uuid.uuid4())
@@ -550,6 +565,8 @@ class PlcCabinetPage(QWidget):
         self._start()
 
     def _receive(self, payload: Any) -> None:
+        if self._closed:
+            return
         value = payload
         if isinstance(value, Mapping) and isinstance(value.get("result"), Mapping):
             value = value["result"]
@@ -636,6 +653,13 @@ class PlcCabinetPage(QWidget):
         messages = cabinet_fault_messages(status)
         faulted = bool(messages)
         last_error = str(snapshot.get("last_error") or "")
+        log_status = snapshot.get("logging") or {}
+        if log_status.get("degraded"):
+            warning = "PLC操作日志保存异常，控制未被日志阻塞：" + str(log_status.get("last_error") or "记录不完整")
+            last_error = "；".join(filter(None, [last_error, warning]))
+        shutdown = snapshot.get("shutdown") or {}
+        if shutdown.get("state") == "unconfirmed":
+            last_error = "；".join(filter(None, [last_error, "退出停止未确认：" + str(shutdown.get("detail") or "请现场核对")]))
         self.fault.setText(
             ("故障：" + "；".join(messages) if messages else "故障：无")
             + (f"  |  {last_error}" if last_error and last_error != "；".join(messages) else "")
@@ -826,7 +850,13 @@ class PlcCabinetPage(QWidget):
         requests_off = not command.get("MainEnable") and not command.get("PS1OutputEnable") and not any(command.get("ChannelEnable") or [])
         self.reset_button.setEnabled(live and reset_supported and status.get('ProtocolVersion') == 0x0102 and requests_off and not any_pending)
         self.all_stop_button.setEnabled(live)
-        self.connect_button.setEnabled(communication != "LIVE")
+        enabled = bool(snapshot.get("communication_enabled", False))
+        self.connect_button.setText("停用 PLC 通信" if enabled else "启用 PLC 通信")
+        self.connect_button.setEnabled(not busy and (not enabled or bool(snapshot.get("communication_disable_allowed"))))
+        self.connect_button.setToolTip(str(snapshot.get("communication_disable_reason") or
+            "默认关闭，每次启动需手动启用；停用通信不代表已断电，所有窗口共享此开关"))
+        if not enabled:
+            self.communication.setText(self.communication.text() + "\n通信开关已关闭：不连接、不轮询、不重连；外部供电测试可继续")
 
         limits = snapshot.get("setpoint_limits")
         limits = limits if isinstance(limits, Mapping) else {}
@@ -933,15 +963,22 @@ class PlcCabinetPage(QWidget):
         self.setpoint_hint.setText(setpoint_reason)
         self.apply_setpoints_button.setToolTip(setpoint_reason)
 
+        # Still propagate live faults and command confirmations while hidden.
+        # A late summary must not erase displayed history after opening the page.
+        if not self.isVisible():
+            return
         trend = snapshot.get("trend")
         trend_items = (
             [item for item in trend if isinstance(item, Mapping)]
             if isinstance(trend, list)
             else []
         )
-        self.voltage_chart.set_samples(trend_items)
-        self.current_chart.set_samples(trend_items)
+        if "trend" in snapshot:
+            self.voltage_chart.set_samples(trend_items)
+            self.current_chart.set_samples(trend_items)
 
+        if "operation_log" not in snapshot:
+            return
         logs = snapshot.get("operation_log")
         log_items = (
             [item for item in logs if isinstance(item, Mapping)]

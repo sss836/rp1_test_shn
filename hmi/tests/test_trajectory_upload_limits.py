@@ -203,7 +203,7 @@ def test_client_streams_and_closes_file_on_http_failure(tmp_path):
         assert kwargs["timeout"] == 240
         raise HTTPError(req.full_url, 413, "too large", {}, io.BytesIO(b'{"detail":"limit"}'))
 
-    with mock.patch("factory_hmi.client.request.urlopen", side_effect=reject), mock.patch.object(
+    with mock.patch("factory_hmi.client.GatewayClient._open", side_effect=reject), mock.patch.object(
         Path, "read_bytes", side_effect=AssertionError("whole-file upload is forbidden"),
     ):
         with pytest.raises(GatewayHTTPError) as error:

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
+import re
+import runpy
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+from urllib.parse import urlsplit
 
 SOURCE = Path(__file__).resolve().parents[1]
 
@@ -34,6 +38,25 @@ def stage_installer_helper(package_root: Path) -> Path:
     return helper
 
 
+def configure_launcher_platform_url(source: str, override: str) -> tuple[str, str]:
+    matches = list(re.finditer(r"^DEFAULT_PLATFORM_URL = (.+)$", source, re.MULTILINE))
+    if len(matches) != 1:
+        raise RuntimeError("launcher must define one DEFAULT_PLATFORM_URL literal")
+    match = matches[0]
+    default = ast.literal_eval(match[1])
+    override = override.strip()
+    url = override or default
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or parsed.query or parsed.fragment
+            or any(character.isspace() for character in url)):
+        raise ValueError("platform URL must be an HTTPS address without credentials, query or fragment")
+    url = url.rstrip("/")
+    if override:
+        source = source[:match.start(1)] + repr(url) + source[match.end(1):]
+    return source, url
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-dir", type=Path, required=True, help="Verified offline Python 3.12 release runtime")
@@ -47,6 +70,8 @@ def main() -> None:
     parser.add_argument("--stage-only", action="store_true", help="Assemble and inspect the payload without compressing a deb")
     parser.add_argument("--compression-level", type=int, choices=range(1, 10), default=6)
     args = parser.parse_args()
+    validate_preview_assets = runpy.run_path(str(SOURCE / "factory_hmi/preview_assets.py"))["validate_preview_assets"]
+    preview_files = validate_preview_assets(SOURCE / "factory_hmi/resources/local-preview")
     runtime = args.runtime_dir.expanduser().resolve(strict=True)
     for module in ("PySide6", "pymodbus", "pyroute2", "yaml", "numpy"):
         if not (runtime / module).is_dir():
@@ -76,9 +101,8 @@ def main() -> None:
         raise RuntimeError("Native SDK verification failed:\n" + probe.stderr.strip())
     native_sdk = json.loads(probe.stdout)
     version = args.version.strip() or (SOURCE / "packaging/LOCAL_VERSION").read_text().strip()
-    platform_url = args.platform_url.strip()
-    if platform_url and not platform_url.startswith("https://"):
-        raise RuntimeError("platform URL must start with https://")
+    launcher = SOURCE / "launch.py"
+    launcher_source, platform_url = configure_launcher_platform_url(launcher.read_text(encoding="utf-8"), args.platform_url)
     out = args.output_dir.expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
     package = out / f"package-root-{version}"
@@ -89,6 +113,7 @@ def main() -> None:
     target_source = app / "hmi"
     for directory in ("factory_hmi", "scripts"):
         shutil.copytree(SOURCE / directory, target_source / directory, ignore=ignored)
+    validate_preview_assets(target_source / "factory_hmi/resources/local-preview")
     # Checked-in protocol primitives; the HMI adapter disables retries/reset.
     (target_source / "motors/scripts").mkdir(parents=True)
     shutil.copy2(SOURCE / "motors/scripts/motor_ota.py", target_source / "motors/scripts/motor_ota.py")
@@ -115,15 +140,10 @@ def main() -> None:
     (target_source / "packaging/LOCAL_VERSION").write_text(version + "\n")
     if args.native_provenance:
         shutil.copy2(args.native_provenance, target_source / "packaging/native-sdk-runtime.json")
-    shutil.copy2(SOURCE / "launch.py", app / "launch.py")
-    if platform_url:
-        launch_path = app / "launch.py"
-        launch_text = launch_path.read_text(encoding="utf-8")
-        old_url = '"RP1_FACTORY_PLATFORM_URL": "" if offline else "https://localhost:8443",'
-        new_url = f'"RP1_FACTORY_PLATFORM_URL": "" if offline else "{platform_url}",'
-        if old_url not in launch_text:
-            raise RuntimeError("launcher platform URL line was not found")
-        launch_path.write_text(launch_text.replace(old_url, new_url, 1), encoding="utf-8")
+    launch_path = app / "launch.py"
+    shutil.copy2(launcher, launch_path)
+    if args.platform_url.strip():
+        launch_path.write_text(launcher_source, encoding="utf-8")
     shutil.copy2(SOURCE / "packaging/user_launcher.py", app / "user_launcher.py")
     shutil.copytree(runtime, app / "runtime", symlinks=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     binary = package / "usr/bin/rp1-test-hmi"
@@ -234,8 +254,8 @@ Description: RP1 Modbus TCP PLC and physical SocketCAN HMI
               "source_date_epoch": epoch, "stage_only": args.stage_only, "hardware_actions": [],
               "depends_profile": args.depends_profile, "bundled_python": bool(args.python_binary),
               "bundled_stdlib": bool(args.python_stdlib), "runtime_file_count": len(runtime_manifest),
-              "compression_level": args.compression_level,
-              "native_sdk_load_check": native_sdk, "platform_url": platform_url or "https://localhost:8443"}
+              "compression_level": args.compression_level, "preview_assets": preview_files,
+              "native_sdk_load_check": native_sdk, "platform_url": platform_url}
     if not args.stage_only:
         output = out / f"rp1-test-hmi_{version}_amd64.deb"
         if output.exists():

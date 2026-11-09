@@ -9,25 +9,15 @@ import threading
 
 import pytest
 
-from factory_hmi.desktop.update_commands import gateway_download_command, package_install_command
+from factory_hmi.desktop.update_commands import gateway_download_command, package_install_command, validated_package_path
 
 
-def test_install_command_keeps_receipt_path_literal_without_running_apt(tmp_path):
-    # A stand-in sudo only prints argv; no real privilege or package operation.
-    binary = tmp_path / "bin"
-    binary.mkdir()
-    sudo = binary / "sudo"
-    sudo.write_text('#!/usr/bin/python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n')
-    sudo.chmod(0o755)
+def test_download_receipt_never_grants_direct_package_install(tmp_path):
     package = str(tmp_path / "下载包 ' $(touch MUST_NOT_RUN); `id`.deb")
-    command = package_install_command(package)
-    result = subprocess.run(["/bin/sh", "-c", command], cwd=tmp_path,
-                            env={**os.environ, "PATH": str(binary) + ":/usr/bin:/bin"},
-                            capture_output=True, text=True, timeout=5)
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == ["apt", "install", package]
+    assert validated_package_path(package) == package
+    with pytest.raises(ValueError, match="不能授权安装"):
+        package_install_command(package)
     assert not (tmp_path / "MUST_NOT_RUN").exists()
-    assert "python3 -c" not in command
 
 
 def test_install_command_rejects_missing_relative_or_multiline_paths():

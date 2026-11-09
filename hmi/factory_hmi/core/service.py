@@ -163,6 +163,9 @@ class FactoryService:
         with self._lifecycle_lock:
             if self._closed:
                 return {"closed": True, "report_errors": dict(self._report_errors)}
+            status = self.protective_damping_snapshot()
+            if status and status.get("active") is True:
+                raise RuntimeError("保护阻尼仍在运行；先可靠支撑机构并显式失能，再关闭服务")
             with self._lock:
                 self._closing.set()
                 controller = self._controller
@@ -171,7 +174,8 @@ class FactoryService:
             disconnect_error = None
             if controller is not None:
                 try:
-                    controller.disconnect()
+                    shutdown_disconnect = getattr(controller, "disconnect_for_shutdown", controller.disconnect)
+                    shutdown_disconnect()
                 except Exception as exc:
                     disconnect_error = exc
                     with self._lock:
@@ -614,7 +618,7 @@ class FactoryService:
 
     def protective_damping_snapshot(self):
         controller = self._controller
-        session = controller._protective_damping if controller is not None else None
+        session = getattr(controller, "_protective_damping", None) if controller is not None else None
         return session.snapshot() if session is not None else None
 
     def _require_protective_damping_released(self):

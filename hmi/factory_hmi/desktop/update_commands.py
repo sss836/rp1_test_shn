@@ -7,14 +7,20 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 
-def package_install_command(package_path: str) -> str:
-    """Copy an apt command for the staged receipt path; never execute it."""
+def validated_package_path(package_path: str) -> str:
+    """Validate a staged package location without granting installation."""
     if (not isinstance(package_path, str) or not package_path
             or any(ord(char) < 32 or ord(char) == 127 for char in package_path)
             or not Path(package_path).is_absolute()
             or Path(package_path).suffix.lower() != ".deb"):
         raise ValueError("下载回执缺少有效的 DEB 安装包绝对路径，请重新下载。")
-    return shlex.join(["sudo", "apt", "install", package_path])
+    return package_path
+
+
+def package_install_command(package_path: str) -> str:
+    """Fail closed for old callers: a download receipt is not safe-stop proof."""
+    validated_package_path(package_path)
+    raise ValueError("下载回执不能授权安装。请使用受保护安装流程；禁止绕过安全检查直接安装。")
 
 
 # Use the already authenticated gateway instead of putting a platform cookie or
@@ -41,7 +47,10 @@ def download(token):
     path = result.get("package_path")
     if not isinstance(path, str) or not os.path.isabs(path):
         raise ValueError("下载回执缺少安装包的绝对路径")
-    print("安装包已下载，签名和 SHA256 已校验。")
+    if result.get("release_authentication") == "authenticated_https_platform":
+        print("安装包已下载，平台已验证发布签名；本机已校验 SHA256 和 DEB 信息。")
+    else:
+        print("安装包已下载，请以下载回执中的校验信息为准。")
     print("保存位置（上位机网关所在电脑）：\\n" + path)
     print("仅下载，尚未安装。")
 

@@ -25,7 +25,7 @@ def test_plc_client_sends_the_captured_page_context_without_refresh_or_retry():
     client = GatewayClient('http://127.0.0.1:1', client_id='window-b')
     seen = snap()['coordination'] | {'request_id': 'click-1'}
     client._remember_plc_snapshot(snap(3, 2))
-    with patch('factory_hmi.client.request.urlopen', return_value=Reply({'ok': True, 'result': snap(4, 3)})) as send:
+    with patch('factory_hmi.client.GatewayClient._open', return_value=Reply({'ok': True, 'result': snap(4, 3)})) as send:
         client.plc_set_channel(1, False, 'b', context=seen)
     assert send.call_count == 1
     body = json.loads(send.call_args.args[0].data)
@@ -39,7 +39,7 @@ def test_conflict_caches_fresh_snapshot_and_does_not_retry():
     shared = snap(4, 3)
     detail = {'code': 'stale_revision', 'message': '其他窗口已改变状态', 'snapshot': shared}
     error = HTTPError('http://127.0.0.1:1', 409, '', {}, io.BytesIO(json.dumps({'detail': detail}).encode()))
-    with patch('factory_hmi.client.request.urlopen', side_effect=error) as send:
+    with patch('factory_hmi.client.GatewayClient._open', side_effect=error) as send:
         with pytest.raises(GatewayError) as rejected:
             client.plc_stop('b', context=snap()['coordination'])
     assert send.call_count == 1
@@ -60,7 +60,7 @@ def test_client_ignores_out_of_order_snapshots_and_retired_gateway_epochs():
 
 def test_all_stop_without_any_observed_snapshot_sends_once_without_a_get():
     client = GatewayClient('http://127.0.0.1:1')
-    with patch('factory_hmi.client.request.urlopen', return_value=Reply({'ok': True, 'result': snap()})) as send:
+    with patch('factory_hmi.client.GatewayClient._open', return_value=Reply({'ok': True, 'result': snap()})) as send:
         client.plc_all_stop('b')
     assert send.call_count == 1
     assert send.call_args.args[0].method == 'POST'

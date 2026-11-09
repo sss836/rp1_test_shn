@@ -344,6 +344,7 @@ class GatewayApiTests(unittest.TestCase):
             service.controller.record_output = service.record_root / "unaccepted-draft.csv"
             service._recording_session = mock.Mock(record_output=record)
             service._recording_session.snapshot.return_value = {"recording": {"finished": True}}
+            service._recording_session.recording_close_pending.return_value = False
             with TestClient(
                 create_app(service, data_root=Path(temp_dir))
             ) as client:

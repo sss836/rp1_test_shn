@@ -21,6 +21,14 @@ def gateway(tmp_path):
         yield client
 
 
+@pytest.fixture
+def powered_gateway(gateway):
+    # The production default is communication OFF. Only PLC-powered cases
+    # explicitly opt in; external-power tests retain the passive default.
+    gateway.app.state.runtime.plc.connect(user='explicit-offline-test')
+    return gateway
+
+
 @pytest.mark.parametrize('profile', [p['id'] for p in catalog()])
 def test_bundled_original_trajectories_load_with_matching_gateway_defaults(gateway, profile):
     item = preset(profile)
@@ -57,7 +65,8 @@ def status(client, owner='quick-a'):
     return client.get('/api/v1/quick/status', headers=headers(owner)).json()
 
 
-def test_offline_start_returns_default_preflights_loops_and_auto_disables(gateway):
+def test_offline_start_returns_default_preflights_loops_and_auto_disables(powered_gateway):
+    gateway = powered_gateway
     prepare(gateway)
     response = start(gateway)
     assert response.status_code == 200, response.text
@@ -84,7 +93,8 @@ def test_offline_start_returns_default_preflights_loops_and_auto_disables(gatewa
     assert gateway.app.state.runtime.plc.snapshot()['phase'] == 'RUNNING'
 
 
-def test_pause_then_end_only_releases_own_bus(gateway):
+def test_pause_then_end_only_releases_own_bus(powered_gateway):
+    gateway = powered_gateway
     prepare(gateway)
     prepare(gateway, profile='right_arm', owner='quick-b')
     response = start(gateway, hours=.01)
@@ -110,7 +120,8 @@ def test_busy_bus_and_invalid_mapping_cannot_enable_or_steal_other_session(gatew
     invalid = gateway.post('/api/v1/quick/prepare', headers=headers('quick-b'), json={
         'profile': 'waist_hip', 'interfaces': ['can0']*4, 'backend': 'fake'})
     assert invalid.status_code == 409
-    assert gateway.app.state.runtime.plc.snapshot()['phase'] == 'OFF'
+    assert gateway.app.state.runtime.plc.snapshot()['communication_enabled'] is False
+    assert gateway.app.state.runtime.plc.snapshot()['communication_state'] == 'DISABLED'
 
 
 def test_unconfirmed_safety_nonfinite_hours_and_plc_failure_do_not_enable(gateway):
@@ -126,7 +137,8 @@ def test_unconfirmed_safety_nonfinite_hours_and_plc_failure_do_not_enable(gatewa
     assert status(gateway)['phase'] == 'fault'
 
 
-def test_end_during_return_cancels_before_playback(gateway):
+def test_end_during_return_cancels_before_playback(powered_gateway):
+    gateway = powered_gateway
     import threading
     prepare(gateway)
     runtime = gateway.app.state.runtime.session('quick-a')
@@ -150,7 +162,8 @@ def test_end_during_return_cancels_before_playback(gateway):
     assert status(gateway)['phase'] == 'ended'
 
 
-def test_report_captures_own_playback_after_delayed_finalize_and_auto_disconnect(gateway):
+def test_report_captures_own_playback_after_delayed_finalize_and_auto_disconnect(powered_gateway):
+    gateway = powered_gateway
     import threading
     prepare(gateway)
     runtime = gateway.app.state.runtime.session('quick-a')
@@ -178,7 +191,8 @@ def test_report_captures_own_playback_after_delayed_finalize_and_auto_disconnect
     assert metadata['outcome'] == 'duration_complete'
 
 
-def test_two_windows_run_independent_buses_and_ending_one_keeps_other_running(gateway):
+def test_two_windows_run_independent_buses_and_ending_one_keeps_other_running(powered_gateway):
+    gateway = powered_gateway
     prepare(gateway)
     prepare(gateway, profile='right_arm', owner='quick-b')
     first=start(gateway,hours=.01)
@@ -195,7 +209,8 @@ def test_two_windows_run_independent_buses_and_ending_one_keeps_other_running(ga
     assert gateway.post('/api/v1/quick/end',headers=headers('quick-b')).status_code==200
 
 
-def test_window_heartbeat_expiry_cancels_long_default_return(gateway):
+def test_window_heartbeat_expiry_cancels_long_default_return(powered_gateway):
+    gateway = powered_gateway
     prepare(gateway)
     runtime=gateway.app.state.runtime.session('quick-a')
     original=runtime.controller.reset
@@ -233,7 +248,8 @@ def test_external_power_completes_without_any_plc_reads_or_commands(gateway):
     assert metadata['stage_code'] == 'QUICK_EXTERNAL'
     assert '外部供电' in metadata['test_name']
     assert metadata['recording_scope'] == 'local'
-    assert plc.snapshot()['phase'] == 'OFF'
+    assert plc.snapshot()['communication_enabled'] is False
+    assert plc.snapshot()['communication_state'] == 'DISABLED'
 
 
 def test_external_power_does_not_bypass_can_motor_feedback_failure(gateway):
@@ -270,4 +286,5 @@ def test_plc_rejection_retains_original_reason_even_after_end(gateway):
 def test_invalid_power_source_is_rejected_without_starting(gateway):
     prepare(gateway)
     assert start(gateway,power_source='unknown').status_code==422
-    assert gateway.app.state.runtime.plc.snapshot()['phase']=='OFF'
+    assert gateway.app.state.runtime.plc.snapshot()['communication_enabled'] is False
+    assert gateway.app.state.runtime.plc.snapshot()['communication_state']=='DISABLED'

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import fcntl
 import json
 import math
+import queue
+import threading
 import os
+import secrets
 from pathlib import Path
 import shutil
 import signal
@@ -14,18 +18,210 @@ import socket
 import subprocess
 import sys
 import time
-from urllib.request import urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 from urllib.parse import urlsplit
 
 PROGRAM_ROOT = Path(__file__).resolve().parent
 SOURCE_ROOT = PROGRAM_ROOT / "hmi" if (PROGRAM_ROOT / "hmi").is_dir() else PROGRAM_ROOT
+DEFAULT_PLATFORM_URL = "https://10.43.17.214:8443"
+# Only the local child gateway uses this opener. Never send readiness requests
+# or the private shutdown token to a workstation proxy.
+open_gateway = build_opener(ProxyHandler({})).open
 # The launcher itself needs YAML before gateway_environment() can set PYTHONPATH.
 # A clean 22.04 machine has no Python 3.12 site packages outside this bundle.
 if (PROGRAM_ROOT / "runtime").is_dir():
     sys.path.insert(0, str(PROGRAM_ROOT / "runtime"))
 
+class RotatingProcessFile:
+    """Writer-owned unbuffered FD: no logging atexit or Python buffer flush.
+
+    A disk syscall can still block the daemon writer. No other thread closes
+    or flushes this FD; process termination releases it at the OS boundary.
+    """
+    def __init__(self, path, *, max_bytes, backups):
+        self.path = Path(path)
+        self.max_bytes, self.backups = max_bytes, backups
+        self.fd = None
+        self._open()
+
+    def _open(self):
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            size = os.fstat(fd).st_size
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd, self.size = fd, size
+
+    def write(self, text):
+        data = text.encode("utf-8", errors="replace")
+        if self.size + len(data) > self.max_bytes:
+            self.rotate()
+        view = memoryview(data)
+        while view:
+            written = os.write(self.fd, view)
+            if written <= 0:
+                raise OSError("log write made no progress")
+            self.size += written
+            view = view[written:]
+
+    def rotate(self):
+        self.close()
+        for number in range(self.backups - 1, 0, -1):
+            source = self.path.with_name(self.path.name + f".{number}")
+            if source.exists():
+                source.replace(self.path.with_name(self.path.name + f".{number + 1}"))
+        if self.path.exists():
+            self.path.replace(self.path.with_name(self.path.name + ".1"))
+        self._open()
+
+    def close(self):
+        if self.fd is not None:
+            fd, self.fd = self.fd, None
+            os.close(fd)
+
+
+class BoundedProcessLog:
+    """Drain child output independently of disk; retain bounded recent diagnostics.
+
+    Existing legacy logs are preserved once before starting managed rotation.
+    Under a slow/full disk, diagnostic bytes may be dropped, never silently:
+    counters are persisted separately and a recovery marker enters the log.
+    """
+    def __init__(self, path, *, max_bytes=8 * 1024 * 1024, backups=4, capacity=256):
+        self.path = Path(path)
+        self.max_bytes = max_bytes
+        self.backups = backups
+        self.queue = queue.Queue(maxsize=capacity)
+        self.dropped_bytes = 0
+        self.failed_bytes = 0
+        self.last_error = ""
+        self.close_timed_out = False
+        self._done = threading.Event()
+        self._reader = None
+        self._writer = None
+        self._lock = threading.Lock()
+
+    def attach(self, stream):
+        self._writer = threading.Thread(target=self._write_loop, daemon=True, name="hmi-log-writer")
+        self._reader = threading.Thread(target=self._read_loop, args=(stream,), daemon=True, name="hmi-log-drain")
+        self._writer.start()
+        self._reader.start()
+
+    def _read_loop(self, stream):
+        try:
+            while True:
+                chunk = os.read(stream.fileno(), 4096)
+                if not chunk:
+                    break
+                try:
+                    self.queue.put_nowait(chunk)
+                except queue.Full:
+                    with self._lock:
+                        self.dropped_bytes += len(chunk)
+        except OSError as exc:
+            self.last_error = str(exc)
+        finally:
+            stream.close()
+            self._done.set()
+
+    def snapshot(self):
+        with self._lock:
+            return dict(dropped_bytes=self.dropped_bytes, failed_bytes=self.failed_bytes,
+                        last_error=self.last_error, pending_chunks=self.queue.unfinished_tasks,
+                        close_timed_out=self.close_timed_out)
+
+    def _save_status(self):
+        path = self.path.with_suffix(self.path.suffix + ".status.json")
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.snapshot()), encoding="utf-8")
+        tmp.replace(path)
+
+    def _write_loop(self):
+        handler = None
+        reported = (0, 0)
+        next_status = 0.0
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            while not self._done.is_set() or not self.queue.empty():
+                try:
+                    chunk = self.queue.get(timeout=.1)
+                except queue.Empty:
+                    chunk = None
+                try:
+                    if handler is None:
+                        # Preserve pre-existing evidence once. Retry sink setup
+                        # after disk recovery while the reader keeps draining.
+                        managed = self.path.with_suffix(self.path.suffix + ".managed")
+                        if not managed.exists():
+                            if self.path.exists():
+                                self.path.rename(self.path.with_name(self.path.name + ".legacy-" + str(time.time_ns())))
+                            managed.touch()
+                        handler = RotatingProcessFile(
+                            self.path, max_bytes=self.max_bytes, backups=self.backups)
+                    counters = (self.dropped_bytes, self.failed_bytes)
+                    text = "" if chunk is None else decoder.decode(chunk)
+                    if counters != reported:
+                        text = (f"\n[HMI LOG DEGRADED: dropped_bytes={counters[0]} failed_bytes={counters[1]}]\n" + text)
+                    if text:
+                        handler.write(text)
+                        reported = counters
+                    if time.monotonic() >= next_status:
+                        self._save_status()
+                        next_status = time.monotonic() + 1.0
+                except OSError as exc:
+                    with self._lock:
+                        self.failed_bytes += len(chunk or b"")
+                        self.last_error = str(exc)
+                    if handler is not None:
+                        try:
+                            handler.close()
+                        except OSError:
+                            pass
+                        handler = None
+                    # A partial write is uncertain: count it, never retry the
+                    # same chunk. Later chunks may resume after disk recovery.
+                    time.sleep(.05)
+                finally:
+                    if chunk is not None:
+                        self.queue.task_done()
+            # Preserve a truncated final UTF-8 code point as an explicit
+            # replacement instead of silently swallowing buffered bytes.
+            tail_bytes = len(decoder.getstate()[0])
+            tail = decoder.decode(b"", final=True)
+            if tail and handler is not None:
+                try:
+                    handler.write(tail)
+                except OSError as exc:
+                    self.failed_bytes += tail_bytes
+                    self.last_error = str(exc)
+        finally:
+            if handler is not None:
+                try:
+                    handler.close()
+                except OSError as exc:
+                    self.last_error = str(exc)
+            try:
+                self._save_status()
+            except OSError:
+                pass
+
+    def close(self, timeout=2.0):
+        # Called only after supervised shutdown. Never signal/kill a child here.
+        # Only the writer owns disk/status I/O; even a wedged disk must not
+        # extend this join deadline or race the writer's status replacement.
+        deadline = time.monotonic() + timeout
+        for thread in (self._reader, self._writer):
+            if thread is not None:
+                thread.join(max(0., deadline - time.monotonic()))
+        self.close_timed_out = any(t is not None and t.is_alive()
+                                   for t in (self._reader, self._writer))
+        return self.snapshot()
+
+
 stopping = False
 update_stopping = False
+stop_generation = 0
 
 
 def process_start(pid: int) -> str:
@@ -47,14 +243,15 @@ def running(state: Path) -> dict:
 
 
 def request_stop(_signum=None, _frame=None):
-    global stopping
+    global stopping, stop_generation
     stopping = True
+    stop_generation += 1
 
 
 def request_update_stop(_signum=None, _frame=None):
-    global stopping, update_stopping
+    global update_stopping
     update_stopping = True
-    stopping = True
+    request_stop()
 
 
 def raise_existing(root: Path, data: dict) -> bool:
@@ -117,7 +314,7 @@ def gateway_environment(root: Path, runtime: Path | None, *, offline: bool, driv
         "RP1_FACTORY_CAN_POLICY": "config/can-policy.yaml" if offline else "/etc/rp1-test-hmi/can-policy.yaml",
         "RP1_FACTORY_CAN_HELPER_PATH": str(root / "config/can-disabled") if offline else "/usr/lib/rp1-test-hmi/factory-hmi-can-helper",
         "RP1_FACTORY_CAN_DISABLED": "1" if offline else "0",
-        "RP1_FACTORY_PLATFORM_URL": "" if offline else "https://localhost:8443",
+        "RP1_FACTORY_PLATFORM_URL": "" if offline else DEFAULT_PLATFORM_URL,
         "RP1_FACTORY_PLATFORM_MODE": "reliability_v1",
         "RP1_FACTORY_STATION_ID": f"RP1-{socket.gethostname()}",
         "RP1_FACTORY_STATION_NAME": f"本机 · {'PLC 模拟' if driver == 'mock' else 'PLC 实机'} · {mode} · {socket.gethostname()}",
@@ -127,8 +324,8 @@ def gateway_environment(root: Path, runtime: Path | None, *, offline: bool, driv
         "RP1_HMI_STATE_ROOT": str(root),
     })
     # Keep the workstation's selected platform across software upgrades. The
-    # package default remains usable for a local platform; factory deployment
-    # can provision this non-secret URL once without rebuilding the package.
+    # The package default is the site platform. Other sites may set an
+    # explicit URL without rebuilding or replacing any saved user settings.
     if not offline:
         platform_file = root / "config/platform-url.txt"
         platform_url = os.environ.get("RP1_FACTORY_PLATFORM_URL", "").strip()
@@ -140,6 +337,8 @@ def gateway_environment(root: Path, runtime: Path | None, *, offline: bool, driv
                     or parsed.password is not None or parsed.query or parsed.fragment):
                 raise ValueError("平台地址须为不含凭据或查询参数的 HTTPS 地址。")
             env["RP1_FACTORY_PLATFORM_URL"] = platform_url.rstrip("/")
+        if env["RP1_FACTORY_PLATFORM_URL"] == DEFAULT_PLATFORM_URL:
+            env["RP1_FACTORY_PLATFORM_DIRECT"] = "1"
     ca = root / "config/platform-ca.crt"
     if ca.is_file():
         env["SSL_CERT_FILE"] = str(ca)
@@ -166,9 +365,9 @@ def wait_health(process: subprocess.Popen, url: str, driver: str, mode: str) -> 
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline and process.poll() is None and not stopping:
         try:
-            with urlopen(url + "/api/v1/health", timeout=1) as response:
+            with open_gateway(url + "/api/v1/health", timeout=1) as response:
                 health = json.load(response)
-            with urlopen(url + "/api/v1/plc/snapshot", timeout=1) as response:
+            with open_gateway(url + "/api/v1/plc/snapshot?include_history=false", timeout=1) as response:
                 plc = json.load(response)
             if health.get("ok") and plc.get("driver") == driver and plc.get("access_mode") == mode:
                 return
@@ -178,17 +377,76 @@ def wait_health(process: subprocess.Popen, url: str, driver: str, mode: str) -> 
     raise RuntimeError("网关启动失败，请检查用户状态目录 logs/gateway.log")
 
 
-def finish(process: subprocess.Popen | None, *, allow_kill: bool = True) -> bool:
+def write_state(state: Path, data: dict) -> None:
+    temporary = state.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False))
+    temporary.replace(state)
+
+
+def prepare_gateway(process: subprocess.Popen, url: str, token: str) -> dict:
+    """Do not send a process signal until the live gateway acknowledges close."""
+    method = "POST"
+    while process.poll() is None:
+        request = Request(url + "/api/v1/lifecycle/shutdown", method=method,
+                          headers={"X-RP1-Shutdown-Token": token})
+        try:
+            with open_gateway(request, timeout=2) as response:
+                result = json.load(response)
+        except (OSError, ValueError) as exc:
+            return {"state": "blocked", "ready": False,
+                    "detail": f"Shutdown handshake unavailable: {exc}"}
+        if not isinstance(result, dict):
+            return {"state": "blocked", "ready": False, "detail": "Invalid shutdown handshake response"}
+        if result.get("state") in {"ready", "blocked"}:
+            return result
+        method = "GET"
+        time.sleep(.2)
+    return {"state": "exited", "ready": False, "detail": "Gateway already exited"}
+
+
+def finish(process: subprocess.Popen | None, *, allow_kill: bool = False) -> bool:
+    # Kept as a compatible keyword for callers, but no shutdown path may
+    # escalate to SIGKILL. A deadline is not evidence of safe resource release.
     if process is not None and process.poll() is None:
         process.terminate()
         try:
             process.wait(timeout=8)
         except subprocess.TimeoutExpired:
-            if not allow_kill:
-                return False
-            process.kill()
-            process.wait(timeout=3)
+            return False
     return True
+
+
+def record_shutdown(state: Path, result: dict) -> None:
+    try:
+        data = json.loads(state.read_text())
+        data["shutdown"] = result
+        write_state(state, data)
+    except (OSError, ValueError) as exc:
+        print(f"Cannot persist shutdown status: {exc}", file=sys.stderr, flush=True)
+
+
+def supervised_shutdown(gateway, desktop, url: str, token: str, state: Path) -> None:
+    while gateway is not None and gateway.poll() is None:
+        generation = stop_generation
+        record_shutdown(state, {"state": "preparing", "ready": False})
+        result = prepare_gateway(gateway, url, token)
+        record_shutdown(state, result)
+        if result.get("ready") is True and result.get("state") == "ready":
+            break
+        if gateway.poll() is not None:
+            break
+        print("退出未完成，保留网关与单实例锁：" + str(result.get("detail", "unknown"))
+              + "。排除原因后再次执行 stop 重试；不会自动强杀。", file=sys.stderr, flush=True)
+        # Do not blindly repeat stop/close writes. A new user signal explicitly
+        # retries the same preparation, without bypassing its safety checks.
+        while gateway.poll() is None and stop_generation == generation:
+            time.sleep(.2)
+    finish(desktop)
+    finish(gateway)
+    # Keep the real launcher identity and inode lock until every owned child
+    # exits. Neither an updater timeout nor a second signal authorizes a kill.
+    while any(process is not None and process.poll() is None for process in (desktop, gateway)):
+        time.sleep(.2)
 
 
 def main() -> int:
@@ -242,7 +500,7 @@ def main() -> int:
                     print("HMI and its own gateway stopped.")
                     return 0
                 time.sleep(0.2)
-            raise RuntimeError("Stop still in progress; see logs.")
+            raise RuntimeError("Stop is incomplete; gateway and launcher remain alive. Check status/logs, resolve the blocker, then run stop again.")
         print("HMI is already stopped.")
         return 0
     runtime = args.runtime_dir
@@ -287,15 +545,21 @@ def main() -> int:
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGUSR1, request_update_stop)
         gateway = desktop = None
+        shutdown_token = secrets.token_urlsafe(32)
+        env["RP1_FACTORY_SHUTDOWN_TOKEN"] = shutdown_token
         url = f"http://127.0.0.1:{args.port}"
         activation_socket = str(root / f"run/desktop-{os.getpid()}.sock")
-        with (root / "logs/gateway.log").open("a") as glog, (root / "logs/desktop.log").open("a") as dlog:
+        glog = BoundedProcessLog(root / "logs/gateway.log")
+        dlog = BoundedProcessLog(root / "logs/desktop.log")
+        try:
             try:
-                gateway = subprocess.Popen([sys.executable, "-m", "factory_hmi.gateway", "--host", "127.0.0.1", "--port", str(args.port), "--data-root", "data", "--lease-timeout", str(args.lease_timeout)], cwd=root, env=env, stdout=glog, stderr=subprocess.STDOUT)
-                state.write_text(json.dumps({"pid": os.getpid(), "start": process_start(os.getpid()), "gateway_pid": gateway.pid, "gateway": url, "driver": driver, "access_mode": mode, "read_only": mode == "monitor", "activation_socket": activation_socket, "update_safe_exit": True}))
+                gateway = subprocess.Popen([sys.executable, "-m", "factory_hmi.gateway", "--host", "127.0.0.1", "--port", str(args.port), "--data-root", "data", "--lease-timeout", str(args.lease_timeout)], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                glog.attach(gateway.stdout)
+                write_state(state, {"pid": os.getpid(), "start": process_start(os.getpid()), "gateway_pid": gateway.pid, "gateway": url, "driver": driver, "access_mode": mode, "read_only": mode == "monitor", "activation_socket": activation_socket, "update_safe_exit": True, "shutdown_handshake": True})
                 wait_health(gateway, url, driver, mode)
                 if not args.gateway_only:
-                    desktop = subprocess.Popen([sys.executable, "-m", "factory_hmi.desktop", "--gateway-url", url], cwd=root, env=dict(env, RP1_HMI_ACTIVATION_SOCKET=activation_socket, RP1_HMI_STATION_CONFIG_DIR=str(root / "config/stations")), stdout=dlog, stderr=subprocess.STDOUT)
+                    desktop = subprocess.Popen([sys.executable, "-m", "factory_hmi.desktop", "--gateway-url", url], cwd=root, env=dict(env, RP1_HMI_ACTIVATION_SOCKET=activation_socket, RP1_HMI_STATION_CONFIG_DIR=str(root / "config/stations")), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    dlog.attach(desktop.stdout)
                 print(f"HMI ready: PLC {driver}, {mode}, {url}", flush=True)
                 deadline = time.monotonic() + args.duration if args.duration > 0 else None
                 while not stopping:
@@ -309,15 +573,11 @@ def main() -> int:
                         break
                     time.sleep(0.2)
             finally:
-                finish(desktop, allow_kill=not update_stopping)
-                finish(gateway, allow_kill=not update_stopping)
-                if update_stopping:
-                    # Keep the real launcher identity and the same inode lock
-                    # while a child has not exited. The installer times out;
-                    # it cannot turn this into permission to kill or install.
-                    while any(process is not None and process.poll() is None for process in (desktop, gateway)):
-                        time.sleep(.2)
+                supervised_shutdown(gateway, desktop, url, shutdown_token, state)
                 state.unlink(missing_ok=True)
+        finally:
+            glog.close()
+            dlog.close()
     return 0
 
 

@@ -56,6 +56,7 @@ class PlcCabinetController:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.client = client
+        self.connection_power_unverified = False
         self.timings = timings or PlcTimingConfig()
         self.setpoints = setpoints or PlcSetpointConfig()
         self.clock = clock
@@ -106,6 +107,10 @@ class PlcCabinetController:
     def connect(self, *, user: str = "system") -> None:
         try:
             self.client.connect()
+            # Persist uncertainty across the exception cleanup below. A live
+            # transport may reach a cabinet left ON by another host/session.
+            # Only service-level fresh actual OFF may clear this obligation.
+            self.connection_power_unverified = True
             self.status = self.client.read_status()
             if not self.status.control_protocol_supported:
                 raise PlcConfigurationError("控制需配套PLC V1.5 / Host Protocol V1.2（0x0102）；旧协议仅可监控，请升级配套源码")
@@ -1540,10 +1545,10 @@ class PlcCabinetController:
         self._ps1_feedback.reset()
         self._enter_fault("已知PLC CPU重启：本地反馈确认已撤销，需人工重新启动", "system")
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, *, include_history: bool = True) -> dict[str, Any]:
         stale = self.communication_state == "STALE" or self.stale
         status = self.status.to_dict(stale=stale, ps1_fresh=self._ps1_feedback.fresh(self.status, self.clock())) if self.status else None
-        return {
+        value = {
             "phase": self.phase.value,
             "communication_state": self.communication_state,
             "stale": stale,
@@ -1554,8 +1559,10 @@ class PlcCabinetController:
             "status": status,
             "command": self.command.to_dict(),
             "feedback": {key: value.to_dict() for key, value in self.feedback.items()},
-            "operation_log": [entry.to_dict() for entry in self.operation_log[-200:]],
         }
+        if include_history:
+            value["operation_log"] = [entry.to_dict() for entry in self.operation_log[-200:]]
+        return value
 
 
 __all__ = ["PlcCabinetController"]

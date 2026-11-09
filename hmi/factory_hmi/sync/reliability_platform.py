@@ -8,16 +8,20 @@ import http.cookiejar
 import json
 import os
 import re
+import socket
+import ssl
 import tarfile
 import threading
 import time
 from datetime import datetime, timezone
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Mapping
 from urllib import error, request, parse
 
 import yaml
 
+from factory_hmi.client import is_loopback_gateway
 from factory_hmi.core.identity import build_execution_code
 from .outbox import Outbox, OutboxItem
 from .uploader import PlatformError, read_secret
@@ -41,6 +45,63 @@ _ARCHIVE_UPLOAD_PATH = re.compile(
     r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/(?:content|segments/(?P<sequence>0|[1-9][0-9]{0,3}))"
     r"\?offset=(?:0|[1-9][0-9]*)"
 )
+_LOGIN_PATH = "/api/v1/auth/login"
+_STANDALONE_PLATFORM_URL = "http://127.0.0.1:8080"
+_CA_LABELS = {
+    "workstation_ca_file": "工位 config/platform-ca.crt",
+    "environment_ca": "进程证书环境配置",
+    "system_ca": "系统证书信任",
+    "not_applicable": "未使用 HTTPS",
+}
+_LOGIN_HTTP_FAILURES = {
+    401: ("platform_credentials_rejected", "平台拒绝登录，请核对账号、密码及账号状态。"),
+    403: ("platform_login_forbidden", "平台禁止此账号登录，请核对账号状态和权限。"),
+    404: ("platform_login_route_missing", "已连接该地址，但未找到平台登录接口。"),
+    407: ("platform_proxy_rejected", "代理拒绝转发平台登录请求，请核对工位代理配置。"),
+    429: ("platform_login_rate_limited", "平台限制登录频率，请稍后重试。"),
+}
+
+
+def _connection_diagnostics(url: str) -> dict[str, str]:
+    """Report the origin and trust source without URL credentials or local paths."""
+    try:
+        parsed = parse.urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return {"platform_origin": "", "ca_source": "not_applicable"}
+    if not host or parsed.scheme not in {"http", "https"}:
+        return {"platform_origin": "", "ca_source": "not_applicable"}
+    authority = f"[{host}]" if ":" in host else host
+    if port is not None:
+        authority += f":{port}"
+    ca_file = os.environ.get("SSL_CERT_FILE", "")
+    state_dir = os.environ.get("RP1_HMI_STATE_ROOT", "")
+    if parsed.scheme != "https":
+        source = "not_applicable"
+    elif ca_file and state_dir and Path(ca_file) == Path(state_dir) / "config/platform-ca.crt":
+        source = "workstation_ca_file"
+    elif ca_file or os.environ.get("SSL_CERT_DIR"):
+        source = "environment_ca"
+    else:
+        source = "system_ca"
+    return {"platform_origin": f"{parsed.scheme}://{authority}", "ca_source": source}
+
+
+def platform_connection_diagnostics() -> dict[str, str]:
+    return _connection_diagnostics(os.environ.get("RP1_FACTORY_PLATFORM_URL", _STANDALONE_PLATFORM_URL))
+
+
+class PlatformLoginError(PlatformError):
+    """Safe login error crossing the local gateway boundary."""
+
+    def __init__(self, code: str, message: str, connection: Mapping[str, str], *,
+                 gateway_status: int, upstream_status: int | None = None) -> None:
+        origin = connection["platform_origin"] or "未配置"
+        ca = _CA_LABELS[connection["ca_source"]]
+        super().__init__(f"{message} 平台地址 {origin}。证书来源 {ca}。", status=upstream_status)
+        self.gateway_status = gateway_status
+        self.detail = {"code": code, "message": str(self), **connection, "upstream_status": upstream_status}
 
 
 def load_test_profiles(path: Path | str | None = None) -> list[dict[str, Any]]:
@@ -194,8 +255,44 @@ class ReliabilityPlatformClient:
         self.api_key = api_key.strip()
         self.timeout = float(timeout)
         self.cookies = http.cookiejar.CookieJar()
-        self._operator_opener = request.build_opener(request.HTTPCookieProcessor(self.cookies))
+        handlers: list[request.BaseHandler] = [request.HTTPCookieProcessor(self.cookies)]
+        if is_loopback_gateway(self.base_url) or os.environ.get("RP1_FACTORY_PLATFORM_DIRECT") == "1":
+            handlers.append(request.ProxyHandler({}))
+        self._operator_opener = request.build_opener(*handlers)
         self._operator_lock = threading.RLock()
+
+    def connection_diagnostics(self) -> dict[str, str]:
+        return _connection_diagnostics(self.base_url)
+
+    def _login_failure(self, failure: Exception) -> PlatformLoginError:
+        connection = self.connection_diagnostics()
+        status = failure.status if isinstance(failure, PlatformError) else None
+        if status is not None:
+            code, message = _LOGIN_HTTP_FAILURES.get(
+                status, ("platform_login_http_error", f"平台登录接口返回 HTTP {status}。"),
+            )
+            return PlatformLoginError(code, message, connection,
+                                      gateway_status=status if 400 <= status < 500 else 502,
+                                      upstream_status=status)
+        # urllib usually wraps TLS, DNS and connection errors in URLError. A
+        # response-body timeout or TLS failure can also surface directly.
+        transport = failure.__cause__ if isinstance(failure, PlatformError) else failure
+        reason = transport.reason if isinstance(transport, error.URLError) else transport
+        gateway_status = 502
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            code, message = "platform_certificate_failed", "平台证书校验失败，请核对可信 CA 和地址是否与证书匹配。"
+        elif isinstance(reason, ssl.SSLError):
+            code, message = "platform_tls_failed", "平台 TLS 握手失败，请核对 HTTPS 端口和服务。"
+        elif isinstance(reason, socket.gaierror):
+            code, message = "platform_dns_failed", "无法解析平台地址，请核对工位 DNS 和配置。"
+        elif isinstance(reason, TimeoutError):
+            code, message = "platform_login_timeout", "等待平台登录响应超时，请核对网络和服务状态。"
+            gateway_status = 504
+        elif isinstance(reason, OSError) or isinstance(transport, error.URLError):
+            code, message = "platform_connection_failed", "无法连接平台，请核对工位网络路由、代理和平台监听。"
+        else:
+            code, message = "platform_login_response_invalid", "已联系平台地址，但登录响应格式无效。"
+        return PlatformLoginError(code, message, connection, gateway_status=gateway_status)
 
     def _call(
         self,
@@ -249,6 +346,11 @@ class ReliabilityPlatformClient:
                     with self._operator_opener.open(req, timeout=timeout or self.timeout) as response:
                         raw = response.read()
         except error.HTTPError as exc:
+            if path == _LOGIN_PATH:
+                # Login replies may originate at a proxy. Do not render or retain
+                # an arbitrary remote error body in the desktop or local logs.
+                exc.close()
+                raise PlatformError("平台拒绝登录请求。", status=exc.code) from None
             raw = exc.read()
             try:
                 decoded = json.loads(raw.decode("utf-8"))
@@ -274,12 +376,14 @@ class ReliabilityPlatformClient:
         return data
 
     def authenticate_operator(self, username: str, password: str) -> dict[str, Any]:
-        return self._call(
-            "POST",
-            "/api/v1/auth/login",
-            payload={"username": username, "password": password},
-            service_auth=False,
-        )
+        try:
+            grant = self._call("POST", _LOGIN_PATH, payload={"username": username, "password": password},
+                               service_auth=False)
+            if not isinstance(grant.get("user"), Mapping) or not grant["user"]:
+                raise ValueError("login response missing user")
+            return grant
+        except (PlatformError, OSError, HTTPException, ValueError) as exc:
+            raise self._login_failure(exc) from None
 
     def _software_opener(self) -> Any:
         """Snapshot this session; a package transfer must never lock heartbeats.
@@ -1071,15 +1175,17 @@ def _sha256(path: Path) -> str:
 
 
 def reliability_worker_from_environment(outbox: Outbox, *, snapshot_provider: Any = None, on_execution: Any = None) -> ReliabilityUploaderWorker:
+    platform_url = os.environ.get("RP1_FACTORY_PLATFORM_URL", _STANDALONE_PLATFORM_URL)
+    connection = _connection_diagnostics(platform_url)
+    if not connection["platform_origin"]:
+        raise PlatformLoginError("platform_not_configured", "工位未配置有效的平台地址。",
+                                 connection, gateway_status=503)
     key_file = os.environ.get("RP1_RELIABILITY_SERVICE_KEY_FILE", "").strip()
     try:
         api_key = read_secret(key_file) if key_file else os.environ.get("RP1_RELIABILITY_SERVICE_KEY", "").strip()
     except FileNotFoundError:
         api_key = ""
-    client = ReliabilityPlatformClient(
-        os.environ.get("RP1_FACTORY_PLATFORM_URL", "http://127.0.0.1:8080"),
-        api_key,
-    )
+    client = ReliabilityPlatformClient(platform_url, api_key)
     from .presence import HmiPresencePublisher
 
     presence = HmiPresencePublisher(
@@ -1092,9 +1198,11 @@ def reliability_worker_from_environment(outbox: Outbox, *, snapshot_provider: An
 
 __all__ = [
     "DEFAULT_PROFILE_PATH",
+    "PlatformLoginError",
     "ReliabilityPlatformClient",
     "ReliabilityUploaderWorker",
     "load_test_profiles",
+    "platform_connection_diagnostics",
     "profiles_from_setup",
     "reliability_worker_from_environment",
 ]

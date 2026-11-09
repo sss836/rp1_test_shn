@@ -6,13 +6,14 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import threading
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from fastapi import (
     FastAPI,
@@ -32,6 +33,7 @@ from factory_hmi.sync.outbox import Outbox
 from factory_hmi.version import process_identity
 from factory_hmi.execution_history import history_csv
 
+from .lifecycle import LIFECYCLE_PATH, SAFETY_PATHS, ShutdownCoordinator, ShutdownGate
 from .lease import ControlLease, LeaseConflict, DEFAULT_LEASE_TIMEOUT_S, validate_lease_timeout
 from .trajectory_upload import configured_trajectory_limit, receive_trajectory
 from .software_updates import SoftwareUpdates, installation_readiness
@@ -375,28 +377,47 @@ class GatewayRuntime:
         )
         self._lease_thread.start()
 
+    def _require_shutdown_support(self) -> None:
+        observe = getattr(self.controller, "protective_damping_snapshot", None)
+        protection = observe() if callable(observe) else None
+        if isinstance(protection, Mapping) and protection.get("active") is True:
+            raise RuntimeError("保护阻尼仍在运行；先可靠支撑机构并显式失能，再退出网关")
+
     def close(self) -> None:
+        # Process exit must not bypass the desktop's support-before-disable
+        # boundary or silently withdraw an active protective damping session.
+        self._require_shutdown_support()
         if self.quick is not None:
             self.quick.cancel()
         self._stop.set()
         if self._lease_thread is not None:
             self._lease_thread.join(timeout=2.0)
-        try:
+        # The same guard serializes admitted operator safety commands with
+        # resource close. Their authenticated cancellation signal is still
+        # sent before waiting on this guard, so an ongoing motion can yield.
+        with self._lease_guard:
+            self._require_shutdown_support()
+            # The facade owns the atomic controller shutdown guard as well as
+            # recording workers. Never bypass it with an earlier disconnect.
+            close_service = getattr(self.controller, "close", None)
+            if callable(close_service):
+                try:
+                    close_service()
+                except Exception as exc:
+                    self._cleanup_error = f"service shutdown failed: {exc}"
+                    raise RuntimeError(self._cleanup_error) from exc
+                return
+            # Compatibility for lightweight adapters without a service facade.
+            # Prefer their atomic shutdown entry point when available.
+            shutdown_disconnect = getattr(self.controller, "disconnect_for_shutdown", None)
+            if callable(shutdown_disconnect):
+                shutdown_disconnect()
+                return
             state = str(self.snapshot().get("state", ""))
             if state not in {"disconnected", "completed"}:
                 self._safe_stop("gateway shutdown")
+            self._require_shutdown_support()
             self._invoke(("disconnect",))
-        except Exception:
-            pass
-        # The facade owns recovery/finalization workers in addition to motor
-        # transport. Disconnect alone does not drain their filesystem writes.
-        close_service = getattr(self.controller, "close", None)
-        if callable(close_service):
-            try:
-                close_service()
-            except Exception as exc:
-                self._cleanup_error = f"service shutdown failed: {exc}"
-                raise RuntimeError(self._cleanup_error) from exc
 
     def lease_snapshot(self) -> dict[str, Any]:
         """Read liveness without polling hardware, reports, or the platform."""
@@ -820,6 +841,10 @@ class GatewayHub:
         self._last_owner: str | None = None
         self._lock = threading.RLock()
         self._started = False
+        self._closed_sessions: set[str] = set()
+        self._close_lock = threading.Lock()
+        self._closed = False
+        self.shutdown = ShutdownCoordinator(self.close)
 
     def apply_live_execution_code(self, session_key: str, execution_code: str) -> None:
         with self._lock:
@@ -891,30 +916,33 @@ class GatewayHub:
                     runtime.start()
 
     def close(self) -> None:
-        with self._lock:
-            runtimes = list(self._sessions.items())
-            owners = dict(self._interface_owners)
-            self._sessions.clear()
-            self._interface_owners.clear()
-            self._started = False
-        errors = []
-        for key, runtime in runtimes:
-            try:
-                runtime.close()
-            except Exception as exc:
-                errors.append(str(exc))
-                # Keep the failed owner reachable for a later close retry.
-                # A timeout is not permission to discard its worker/ownership.
-                with self._lock:
-                    self._sessions[key] = runtime
-                    self._interface_owners.update({bus: owner for bus, owner in owners.items() if owner == key})
-        for close in (self.plc.close, self._platform.close):
-            try:
-                close()
-            except Exception as exc:
-                errors.append(str(exc))
-        if errors:
-            raise RuntimeError("gateway shutdown incomplete: " + "; ".join(errors))
+        # Keep successful and failed sessions inspectable, but never close a
+        # successful one twice or release a failed owner's interfaces early.
+        with self._close_lock:
+            if self._closed:
+                return
+            with self._lock:
+                runtimes = list(self._sessions.items())
+            errors = []
+            for key, runtime in runtimes:
+                if key in self._closed_sessions:
+                    continue
+                try:
+                    runtime.close()
+                except Exception as exc:
+                    errors.append(str(exc))
+                else:
+                    self._closed_sessions.add(key)
+            if errors:
+                # A motor/record worker still needs recovery. Do not remove
+                # PLC polling or platform workers beneath that failed close.
+                raise RuntimeError("gateway shutdown incomplete: " + "; ".join(errors))
+            self.plc.close()
+            self._platform.close()
+            with self._lock:
+                self._interface_owners.clear()
+                self._started = False
+                self._closed = True
 
     def _key(self, owner: str) -> str:
         return "shared" if self.shared else owner
@@ -924,6 +952,8 @@ class GatewayHub:
         with self._lock:
             runtime = self._sessions.get(key)
             if runtime is None and create:
+                if self._closed or self.shutdown.snapshot()["state"] != "running":
+                    raise HTTPException(status_code=409, detail="Gateway shutdown requested; new sessions are disabled")
                 safe_name = _SAFE_SESSION_NAME.sub("_", key).strip("._") or "anonymous"
                 session_root = (
                     self.data_root
@@ -1060,6 +1090,8 @@ def create_app(
     data_root: Path | None = None,
     trajectory_max_bytes: int | None = None,
 ) -> FastAPI:
+    from factory_hmi.sync.reliability_platform import PlatformLoginError, platform_connection_diagnostics
+
     lease_timeout_s = validate_lease_timeout(lease_timeout_s)
     trajectory_limit = configured_trajectory_limit(trajectory_max_bytes)
     resolved_data_root = (
@@ -1088,15 +1120,17 @@ def create_app(
         try:
             yield
         finally:
-            hub.close()
+            await run_in_threadpool(hub.close)
 
     app = FastAPI(
         title="RP1 Factory Aging-Test Gateway",
         version="0.1.0",
         lifespan=lifespan,
     )
+    app.add_middleware(ShutdownGate, coordinator=hub.shutdown)
     app.state.runtime = hub
     app.state.software_identity = process_identity()
+    app.state.platform_connection = platform_connection_diagnostics()
     app.state.trajectory_max_bytes = trajectory_limit
     monitor_only = os.environ.get("RP1_HMI_UPDATE_MONITOR_ONLY") == "1"
 
@@ -1123,13 +1157,17 @@ def create_app(
         motion_command: bool = False,
     ) -> dict[str, Any]:
         require_token(token)
+        shutdown_safety = (request.url.path in SAFETY_PATHS
+                           and hub.shutdown.snapshot()["state"] in {"preparing", "blocked"})
+        preempt_motion = preempt_motion or shutdown_safety
+        motion_command = motion_command and not shutdown_safety
         if monitor_only and not preempt_motion:
             raise HTTPException(status_code=403, detail="更新后的监控实例禁止控制设备；请正常退出后启动常规实例。")
         owner = owner_id(request, client_id)
         runtime = hub.session(owner)
         interrupt_registered = False
         try:
-            if runtime._cleanup_error is not None:
+            if runtime._cleanup_error is not None and not shutdown_safety:
                 raise LeaseConflict("device cleanup quarantined; retry /api/v1/lease/recover before configuring")
             with runtime._motion_epoch_guard:
                 motion_epoch = runtime._motion_epoch
@@ -1185,11 +1223,37 @@ def create_app(
     async def unexpected_error(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=500, content={"detail": str(exc)})
 
+    def shutdown_status() -> dict[str, Any]:
+        # Do not acquire the PLC control lock while close is waiting for actual
+        # feedback. Status must remain available throughout preparation.
+        return {**hub.shutdown.snapshot(), "plc": dict(hub.plc.shutdown_status)}
+
+    def require_shutdown_access(request: Request, token: str | None) -> None:
+        expected = os.environ.get("RP1_FACTORY_SHUTDOWN_TOKEN", "")
+        if (request.client is None or request.client.host not in {"127.0.0.1", "::1"}
+                or not expected or not secrets.compare_digest(token or "", expected)):
+            raise HTTPException(status_code=403, detail="Private launcher shutdown authorization required")
+
+    @app.get(LIFECYCLE_PATH)
+    def get_shutdown(request: Request, x_rp1_shutdown_token: str | None = Header(default=None)):
+        require_shutdown_access(request, x_rp1_shutdown_token)
+        return shutdown_status()
+
+    @app.post(LIFECYCLE_PATH)
+    def prepare_shutdown(request: Request, x_rp1_shutdown_token: str | None = Header(default=None)):
+        require_shutdown_access(request, x_rp1_shutdown_token)
+        hub.shutdown.request()
+        return JSONResponse(status_code=200 if hub.shutdown.snapshot()["ready"] else 202,
+                            content=shutdown_status())
+
     @app.get("/api/v1/health")
     def health(
         request: Request,
         x_rp1_client_id: str | None = Header(default=None),
     ) -> dict[str, Any]:
+        if hub.shutdown.snapshot()["state"] != "running":
+            return {"ok": True, "service": "rp1-factory-gateway",
+                    "software": dict(app.state.software_identity), "shutdown": shutdown_status()}
         runtime = (
             hub.session(owner_id(request, x_rp1_client_id))
             if x_rp1_client_id
@@ -1199,6 +1263,7 @@ def create_app(
             "ok": True,
             "service": "rp1-factory-gateway",
             "software": dict(app.state.software_identity),
+            "platform_connection": dict(app.state.platform_connection),
             "snapshot": runtime.snapshot(),
             "sessions": len(hub._sessions),
             "outbox": {
@@ -1217,8 +1282,8 @@ def create_app(
         return hub.current().snapshot()
 
     @app.get("/api/v1/plc/snapshot")
-    def plc_snapshot() -> dict[str, Any]:
-        return hub.plc.snapshot()
+    def plc_snapshot(include_history: bool = True) -> dict[str, Any]:
+        return hub.plc.snapshot(include_history=include_history)
 
     @app.get("/api/v1/platform/options")
     def platform_options(
@@ -1512,13 +1577,22 @@ def create_app(
     def plc_mutate(operation: str, body: PlcOperatorRequest, client_id: str | None,
                    token: str | None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         require_token(token)
-        if monitor_only and operation not in {"stop", "all-stop", "disconnect"}:
+        readonly_enable = operation == "connect" and hub.plc.read_only is True
+        if monitor_only and operation not in {"stop", "all-stop", "disconnect"} and not readonly_enable:
             raise HTTPException(status_code=403, detail="更新后的监控实例禁止控制设备；请正常退出后启动常规实例。")
-        return hub.plc.coordination.execute(
-            operation, payload or {}, user=body.user, client_id=client_id,
-            request_id=body.request_id, expected_epoch=body.expected_epoch,
-            expected_revision=body.expected_revision,
-        )
+        # Register authenticated safety intent before entering the PLC lock.
+        # A close that has not started must yield too, not just an active one.
+        # Endpoint schema and coordinator identity/revision checks still apply
+        # before any device write; other operations cannot set this intent.
+        safety = (hub.plc.shutdown_safety_request()
+                  if operation in {"stop", "all-stop"} and client_id and body.request_id
+                  else nullcontext())
+        with safety:
+            return hub.plc.coordination.execute(
+                operation, payload or {}, user=body.user, client_id=client_id,
+                request_id=body.request_id, expected_epoch=body.expected_epoch,
+                expected_revision=body.expected_revision,
+            )
 
     @app.post("/api/v1/plc/connect")
     def plc_connect(
@@ -2034,7 +2108,10 @@ def create_app(
         with hub.diagnostics.login_lock:
             cancel_account_maintenance()
             hub.diagnostics.revoke()
-            result = runtime.platform_login(body)
+            try:
+                result = runtime.platform_login(body)
+            except PlatformLoginError as exc:
+                raise HTTPException(status_code=exc.gateway_status, detail=exc.detail) from None
             with hub._platform._lock:
                 uploader = hub._platform._uploader
                 if hub._platform._mode == "reliability_v1" and uploader is not None:

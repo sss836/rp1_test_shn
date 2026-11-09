@@ -18,6 +18,7 @@ def _post(client, path, payload):
 
 def test_ps1_setpoint_api_waits_for_mock_plc_confirmation(tmp_path: Path) -> None:
     with TestClient(create_app(data_root=tmp_path)) as client:
+        assert _post(client, "/api/v1/plc/connect", {"user": "tester"}).status_code == 200
         response = _post(client,
             "/api/v1/plc/setpoints",
             {"voltage": 24.0, "current": 8.0, "user": "tester"},
@@ -40,6 +41,7 @@ def test_ps1_setpoint_api_waits_for_mock_plc_confirmation(tmp_path: Path) -> Non
 
 def test_ps1_setpoint_api_rejects_configured_range_violation(tmp_path: Path) -> None:
     with TestClient(create_app(data_root=tmp_path)) as client:
+        assert _post(client, "/api/v1/plc/connect", {"user": "tester"}).status_code == 200
         response = _post(client,
             "/api/v1/plc/setpoints",
             {"voltage": 80.0, "current": 8.0, "user": "tester"},
@@ -54,6 +56,7 @@ def test_start_api_allows_power_sequence_without_selected_channels(
     tmp_path: Path,
 ) -> None:
     with TestClient(create_app(data_root=tmp_path)) as client:
+        assert _post(client, "/api/v1/plc/connect", {"user": "tester"}).status_code == 200
         response = _post(client,
             "/api/v1/plc/start",
             {

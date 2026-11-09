@@ -97,12 +97,16 @@ class GridTableModel(QAbstractTableModel):
         normalized = [tuple(row) for row in rows]
         if any(len(row) != len(self.headers) for row in normalized):
             raise ValueError("table row width does not match headers")
+        new_tones = dict(tones or {})
+        new_metadata = [dict(item) for item in (metadata or ())]
+        if normalized == self._rows and new_tones == self._tones and new_metadata == self._metadata:
+            return
         same_shape = len(normalized) == len(self._rows)
         if not same_shape:
             self.beginResetModel()
         self._rows = normalized
-        self._tones = dict(tones or {})
-        self._metadata = [dict(item) for item in (metadata or ())]
+        self._tones = new_tones
+        self._metadata = new_metadata
         if same_shape:
             if self._rows and self.headers:
                 self.dataChanged.emit(

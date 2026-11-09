@@ -6,6 +6,9 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
   echo 'Build on Ubuntu 24.04 x86_64.' >&2; exit 1;
 }
 unset PYTHONPATH LD_PRELOAD
+# The local preview is generated and deliberately absent from a clean checkout.
+# Build it with the frontend lockfile before the package and its smoke tests.
+(cd frontend && npm ci --no-audit --no-fund && npm run build:preview)
 runtime_dir="$PWD/hmi/build/release-runtime"
 [[ ! -e "$runtime_dir" ]] || { echo 'Use a fresh hmi/build/release-runtime directory.' >&2; exit 1; }
 python3 -m venv .venv-hmi

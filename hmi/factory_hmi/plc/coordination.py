@@ -48,14 +48,8 @@ class PlcCommandCoordinator:
 
     def _audit(self, record: dict[str, Any]) -> None:
         # Operational metadata stays on the workstation. No acquisition data.
-        path = self.service._log_path.with_name("requests.jsonl")
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(self._public(record), ensure_ascii=False) + "\n")
-        except OSError:
-            # A log failure must never block a stop request or repeat a write.
-            pass
+        self.service._log_writer.submit(
+            self.service._log_path.with_name("requests.jsonl"), self._public(record))
 
     @staticmethod
     def _public(record: dict[str, Any]) -> dict[str, Any]:

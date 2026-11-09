@@ -10,9 +10,9 @@ from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkProxy, QNetworkReply, QNetworkRequest
 
-from factory_hmi.client import GatewayClient, GatewayError, GatewayHTTPError
+from factory_hmi.client import GatewayClient, GatewayError, GatewayHTTPError, is_loopback_gateway
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,8 @@ class LeaseHeartbeat(QObject):
         self.client = client
         self.enabled = enabled
         self.manager = manager or QNetworkAccessManager(self)
+        if manager is None and is_loopback_gateway(client.base_url):
+            self.manager.setProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
         self.reply: Any = None
         self.closed = False
         self.deadline = QTimer(self)

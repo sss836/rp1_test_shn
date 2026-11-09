@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from ipaddress import ip_address
 import math
 import os
 import re
@@ -15,6 +16,18 @@ from typing import Any
 from urllib import error, parse, request
 
 JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
+
+
+def is_loopback_gateway(url: str) -> bool:
+    """Keep explicitly local HTTP and WebSocket connections off app proxies."""
+    try:
+        parsed = parse.urlsplit(url)
+        host = parsed.hostname
+        if parsed.scheme not in {"http", "https", "ws", "wss"} or not host:
+            return False
+        return host in {"localhost", "localhost."} or ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class GatewayError(RuntimeError):
@@ -75,6 +88,7 @@ class GatewayClient:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("gateway URL must be an absolute http(s) URL")
         self.base_url = base_url
+        self._direct_opener = request.build_opener(request.ProxyHandler({})) if is_loopback_gateway(base_url) else None
         self.timeout = timeout
         if not math.isfinite(lease_heartbeat_timeout) or not 0 < lease_heartbeat_timeout <= 2:
             raise ValueError("lease heartbeat timeout must be finite and in (0, 2] seconds")
@@ -120,6 +134,11 @@ class GatewayClient:
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}/{path.lstrip('/')}"
+
+    def _open(self, req: request.Request, *, timeout: float) -> Any:
+        if self._direct_opener is not None:
+            return self._direct_opener.open(req, timeout=timeout)
+        return request.urlopen(req, timeout=timeout)
 
     @staticmethod
     def _decode_response(raw: bytes, *, method: str, url: str) -> JsonValue:
@@ -174,7 +193,7 @@ class GatewayClient:
         if path == "/api/v1/lease/heartbeat" and self.lease_generation is not None:
             req.add_header("X-RP1-Lease-Generation", str(self.lease_generation))
         try:
-            with request.urlopen(req, timeout=self.timeout if timeout is None else timeout) as response:
+            with self._open(req, timeout=self.timeout if timeout is None else timeout) as response:
                 result = self._decode_response(
                     response.read(),
                     method=method,
@@ -219,7 +238,7 @@ class GatewayClient:
         req = request.Request(url, headers=headers, method="GET")
         target = Path(destination).expanduser()
         try:
-            with request.urlopen(req, timeout=self.timeout) as response:
+            with self._open(req, timeout=self.timeout) as response:
                 payload = response.read()
         except error.HTTPError as exc:
             detail = self._decode_error_detail(exc.read())
@@ -324,7 +343,7 @@ class GatewayClient:
             headers["X-RP1-Operator-Token"] = self.operator_token
         req = request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with request.urlopen(req, timeout=self.timeout) as response:
+            with self._open(req, timeout=self.timeout) as response:
                 return self._decode_response(response.read(), method="POST", url=url)
         except error.HTTPError as exc:
             raise GatewayHTTPError(
@@ -410,7 +429,7 @@ class GatewayClient:
             with source.open("rb") as stream:
                 headers["Content-Length"] = str(os.fstat(stream.fileno()).st_size)
                 req = request.Request(url, data=stream, headers=headers, method="POST")
-                with request.urlopen(req, timeout=self.trajectory_upload_timeout) as response:
+                with self._open(req, timeout=self.trajectory_upload_timeout) as response:
                     return self._decode_response(response.read(), method="POST", url=url)
         except error.HTTPError as exc:
             detail = self._decode_error_detail(exc.read())
@@ -669,7 +688,7 @@ class GatewayClient:
         req = request.Request(url, data=raw, headers=headers, method="POST")
         try:
             # Only attachment I/O gets this budget. Control/lease requests are unchanged.
-            with request.urlopen(req, timeout=120) as response:
+            with self._open(req, timeout=120) as response:
                 return self._decode_response(response.read(), method="POST", url=url)
         except error.HTTPError as exc:
             raise GatewayHTTPError("诊断附件上传被拒绝", status_code=exc.code, detail=self._decode_error_detail(exc.read())) from exc
@@ -840,8 +859,11 @@ class GatewayClient:
                 self._plc_retired_epochs.add(old["epoch"])
             self._plc_snapshot = deepcopy(dict(value))
 
-    def plc_snapshot(self) -> JsonValue:
-        result = self.get("/api/v1/plc/snapshot")
+    def plc_snapshot(self, *, include_history: bool = True) -> JsonValue:
+        path = "/api/v1/plc/snapshot"
+        if not include_history:
+            path += "?include_history=false"
+        result = self.get(path)
         self._remember_plc_snapshot(result)
         return result
 

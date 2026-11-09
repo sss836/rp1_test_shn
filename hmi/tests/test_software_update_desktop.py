@@ -8,7 +8,7 @@ from PySide6.QtCore import QCoreApplication, QEvent, QTimer
 from PySide6.QtWebSockets import QWebSocket
 from PySide6.QtWidgets import QApplication, QDialog, QLabel, QLineEdit, QMessageBox, QPushButton
 from factory_hmi.desktop.app import FactoryMainWindow
-from factory_hmi.desktop.update_commands import package_install_command
+from factory_hmi.desktop.update_commands import validated_package_path
 
 
 @pytest.fixture(scope="module")
@@ -91,8 +91,9 @@ def test_download_receipt_shows_path_and_copy_keeps_dialog_open(window, tmp_path
         dialog = window.findChild(QDialog, "softwareDownloadDialog")
         path = dialog.findChild(QLineEdit, "softwareDownloadPath")
         observed.append((path.text(), path.isReadOnly()))
-        button = dialog.findChild(QPushButton, "copySoftwareInstallCommand")
-        assert button.text() == "复制安装命令"
+        button = dialog.findChild(QPushButton, "copySoftwarePackagePath")
+        assert button.text() == "复制安装包路径"
+        assert dialog.findChild(QPushButton, "copySoftwareInstallCommand") is None
         assert dialog.findChild(QPushButton, "copySoftwareDownloadCommand") is None
         button.click()
         observed.append(dialog.isVisible())
@@ -105,7 +106,7 @@ def test_download_receipt_shows_path_and_copy_keeps_dialog_open(window, tmp_path
         window._show_software_download({"status": "staged", "package_path": str(package)}, release_id)
         assert opened.call_args.args[0].toLocalFile() == str(package.parent)
     assert observed == [(str(package), True), True]
-    assert QApplication.clipboard().text() == package_install_command(str(package))
+    assert QApplication.clipboard().text() == validated_package_path(str(package))
     # The normal queued PLC status refresh may run during the modal event loop;
     # copying/opening must not issue a software download or installation call.
     assert not any("下载" in call.args[0] or "安装" in call.args[0]

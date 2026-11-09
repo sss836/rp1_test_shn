@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from starlette.staticfiles import StaticFiles
+from ..preview_assets import validate_preview_assets
 
 class PreviewSessions:
  def __init__(self,hub):self.hub=hub;self.tickets={};self.sessions={};self.lock=threading.Lock();self.sockets=0
@@ -48,6 +49,10 @@ def local(request):
 
 def attach_preview(app,hub,require_token,owner_id):
  preview=PreviewSessions(hub);app.state.preview=preview
+ root=Path(__file__).resolve().parents[1]/"resources/local-preview"
+ def ensure_assets():
+  try:validate_preview_assets(root)
+  except RuntimeError as exc:raise HTTPException(503,str(exc)) from exc
  def runtime(request):
   local(request);return preview.runtime(request.cookies.get("rp1_preview"))
  def cache(rt):
@@ -60,6 +65,7 @@ def attach_preview(app,hub,require_token,owner_id):
   local(request);require_token(request.headers.get("x-rp1-operator-token"));owner=owner_id(request,request.headers.get("x-rp1-client-id"));key=hub._key(owner)
   with hub._lock:rt=hub._sessions.get(key)
   if rt is None:raise HTTPException(409,"尚无当前执行，不会为预览创建设备会话")
+  ensure_assets()
   c=cache(rt);ticket=preview.issue(key,c.run_id)
   return dict(url=str(request.base_url).rstrip("/")+"/preview/#ticket="+ticket,run_id=c.run_id)
  @app.post("/api/v1/preview/session")
@@ -136,8 +142,14 @@ def attach_preview(app,hub,require_token,owner_id):
   except (WebSocketDisconnect,asyncio.TimeoutError,RuntimeError,HTTPException):pass
   finally:
    with preview.lock:preview.sockets-=1
- root=Path(__file__).resolve().parents[1]/"resources/local-preview"
- if root.is_dir():
-  app.mount("/preview/assets",StaticFiles(directory=root/"assets"),name="preview-assets")
-  @app.get("/preview/")
-  def page(request:Request):local(request);return FileResponse(root/"index.html",headers={"Cache-Control":"no-store","Referrer-Policy":"no-referrer","Content-Security-Policy":"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self' data:"})
+ static=StaticFiles(directory=root/"assets",check_dir=False)
+ @app.api_route("/preview/assets/{asset_path:path}",methods=["GET","HEAD"],include_in_schema=False)
+ async def asset(request:Request,asset_path:str):
+  local(request)
+  # Look up files per request so a missing directory at startup cannot leave
+  # a working index and ticket endpoint pointing to permanently absent routes.
+  return await static.get_response(asset_path,request.scope)
+ @app.get("/preview/")
+ def page(request:Request):
+  local(request);ensure_assets()
+  return FileResponse(root/"index.html",headers={"Cache-Control":"no-store","Referrer-Policy":"no-referrer","Content-Security-Policy":"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self' data:"})

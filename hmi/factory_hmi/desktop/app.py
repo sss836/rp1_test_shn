@@ -27,6 +27,7 @@ try:
         Slot,
     )
     from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap
+    from PySide6.QtNetwork import QNetworkProxy
     from PySide6.QtWebSockets import QWebSocket
     from PySide6.QtWidgets import (
         QAbstractItemView,
@@ -76,7 +77,7 @@ except ModuleNotFoundError as exc:
         ) from exc
     raise
 
-from factory_hmi.client import GatewayClient, GatewayError, GatewayHTTPError
+from factory_hmi.client import GatewayClient, GatewayError, GatewayHTTPError, is_loopback_gateway
 from factory_hmi.desktop.lease_heartbeat import LeaseHeartbeat
 from factory_hmi.desktop.feedback_freshness import (
     DISPLAY_STALE_S, STATUS_SILENCE_S, feedback_age_s, finite_number, snapshot_key,
@@ -100,7 +101,7 @@ from factory_hmi.desktop.table_models import (
 from factory_hmi.desktop.quick_page import QuickVerificationPage
 from factory_hmi.desktop.plc_page import PlcCabinetPage
 from factory_hmi.desktop.theme import apply_theme, set_tone
-from factory_hmi.desktop.update_commands import package_install_command
+from factory_hmi.desktop.update_commands import validated_package_path
 from factory_hmi.plc.faults import cabinet_fault_messages
 from factory_hmi.execution_history import SYNC_LABELS, display_code, instant
 
@@ -202,6 +203,7 @@ class FactoryMainWindow(QMainWindow):
         )
         self.pool = QThreadPool.globalInstance()
         self._workers: set[RestWorker] = set()
+        self._closing = False
         self._configured = False
         self._motor_fault_reset_pending = False
         self._motor_discovery_pending = False
@@ -215,9 +217,11 @@ class FactoryMainWindow(QMainWindow):
         self._connected = False
         self._lease_enabled = False
         self._ws_connected = False
-        self._last_ws_snapshot_at: float | None = None
+        self._last_ws_status_at: float | None = None
+        self._ws_status_generation = 0
         self._telemetry_snapshot_key: tuple | None = None
         self._telemetry_received_at: float | None = None
+        self._feedback_expired_locally = False
         self._snapshot_pending = False
         self._heartbeat_pending = False
         self._lease_heartbeat = LeaseHeartbeat(self.client, lambda: self._lease_enabled, self)
@@ -2176,6 +2180,8 @@ class FactoryMainWindow(QMainWindow):
 
     def _setup_network(self) -> None:
         self.websocket = QWebSocket()
+        if is_loopback_gateway(self.client.base_url):
+            self.websocket.setProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
         self.websocket.connected.connect(self._ws_connected_slot)
         self.websocket.disconnected.connect(self._ws_disconnected_slot)
         self.websocket.textMessageReceived.connect(self._ws_message)
@@ -2206,13 +2212,15 @@ class FactoryMainWindow(QMainWindow):
         self._open_websocket()
 
     def _open_websocket(self) -> None:
-        if not self._ws_connected:
+        if not self._closing and not self._ws_connected:
             self.websocket.open(QUrl(self.client.status_ws_url))
 
     @Slot()
     def _ws_connected_slot(self) -> None:
+        if self._closing:
+            return
         self._ws_connected = True
-        self._last_ws_snapshot_at = time.monotonic()
+        self._last_ws_status_at = time.monotonic()
         self.connection_badge.setText("● 实时状态已连接")
         self.connection_badge.setObjectName("statusOk")
         self.connection_badge.style().unpolish(self.connection_badge)
@@ -2222,6 +2230,8 @@ class FactoryMainWindow(QMainWindow):
     @Slot()
     def _ws_disconnected_slot(self) -> None:
         self._ws_connected = False
+        if self._closing:
+            return
         self.connection_badge.setText("● 实时连接断开（轮询降级）")
         self.connection_badge.setObjectName("statusWarning")
         self.connection_badge.style().unpolish(self.connection_badge)
@@ -2233,6 +2243,8 @@ class FactoryMainWindow(QMainWindow):
     @Slot(object)
     def _ws_error(self, _error: Any) -> None:
         self._ws_connected = False
+        if self._closing:
+            return
         self._set_status_stream_badge("● 实时状态异常（轮询读取）", "statusWarning")
         if not self.reconnect_timer.isActive():
             self.reconnect_timer.start()
@@ -2240,6 +2252,8 @@ class FactoryMainWindow(QMainWindow):
 
     @Slot(str)
     def _ws_message(self, text: str) -> None:
+        if self._closing:
+            return
         try:
             message = json.loads(text)
         except json.JSONDecodeError:
@@ -2248,27 +2262,38 @@ class FactoryMainWindow(QMainWindow):
         if not isinstance(message, Mapping):
             return
 
-        previous_key = self._telemetry_snapshot_key
-
         kind = str(message.get("type", "")).lower()
         if kind == "snapshot":
             payload = message.get(
                 "snapshot",
                 message.get("data", message.get("payload", message)),
             )
-            if isinstance(payload, Mapping):
-                self._render_snapshot(dict(payload))
+            self._receive_ws_status(payload)
         elif kind == "event":
             payload = message.get("snapshot", message.get("payload"))
-            if isinstance(payload, Mapping):
-                self._render_snapshot(dict(payload))
+            self._receive_ws_status(payload)
             event_text = message.get("message") or message.get("event") or "状态事件"
             self.statusBar().showMessage(str(event_text), 5000)
         else:
-            self._render_snapshot(dict(message))
-        if self._telemetry_snapshot_key != previous_key:
-            self._last_ws_snapshot_at = time.monotonic()
-            self._set_status_stream_badge("● 实时状态已连接", "statusOk")
+            self._receive_ws_status(message)
+
+    def _receive_ws_status(self, payload: Any) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        status = payload.get("snapshot", payload)
+        if not isinstance(status, Mapping) or not (
+            isinstance(status.get("state"), str)
+            or isinstance(status.get("station"), Mapping)
+            or any(isinstance(status.get(key), (list, Mapping)) for key in ("motors", "motor_status"))
+            or isinstance(status.get("telemetry"), Mapping)
+        ):
+            return
+        # A valid status packet proves the link is live even for a disconnected
+        # station. Motor age is derived separately from the sample identity.
+        self._last_ws_status_at = time.monotonic()
+        self._ws_status_generation += 1
+        self._render_snapshot(dict(status))
+        self._set_status_stream_badge("● 实时状态已连接", "statusOk")
 
     def _set_status_stream_badge(self, message: str, tone: str) -> None:
         if self.connection_badge.text() == message and self.connection_badge.objectName() == tone:
@@ -2279,26 +2304,34 @@ class FactoryMainWindow(QMainWindow):
         self.connection_badge.style().polish(self.connection_badge)
 
     def _refresh_feedback_freshness(self) -> None:
-        if self._telemetry_received_at is None or not self._last_snapshot:
+        if (self._closing or self._telemetry_received_at is None or not self._last_snapshot
+                or self._feedback_expired_locally):
             return
         if time.monotonic() - self._telemetry_received_at >= DISPLAY_STALE_S:
             # Reuse the raw snapshot. snapshot_key prevents this render from
             # pretending a local UI refresh was a new device observation.
+            self._feedback_expired_locally = True
             self._render_snapshot(dict(self._last_snapshot), refresh_state=False)
 
     def _poll_snapshot(self) -> None:
-        if self._snapshot_pending:
+        if self._closing or self._snapshot_pending:
             return
-        if (self._ws_connected and self._last_ws_snapshot_at is not None
-                and time.monotonic() - self._last_ws_snapshot_at < STATUS_SILENCE_S):
+        if (self._ws_connected and self._last_ws_status_at is not None
+                and time.monotonic() - self._last_ws_status_at < STATUS_SILENCE_S):
             return
         if self._ws_connected:
             self._set_status_stream_badge("● 实时状态静默（轮询读取）", "statusWarning")
         self._snapshot_pending = True
+        generation = self._ws_status_generation
+
+        def accept_fallback(payload: Any) -> None:
+            if generation == self._ws_status_generation:
+                self._snapshot_received(payload)
+
         self._run_rest(
             "刷新状态",
             self.client.snapshot,
-            self._snapshot_received,
+            accept_fallback,
             quiet=True,
             on_finished=lambda: setattr(self, "_snapshot_pending", False),
         )
@@ -2353,6 +2386,8 @@ class FactoryMainWindow(QMainWindow):
         self.pool.start(worker)
 
     def _rest_failed(self, action: str, exc: Exception, quiet: bool) -> None:
+        if self._closing:
+            return
         detail = str(exc.detail or "") if isinstance(exc, GatewayError) else ""
         if action == "进入 Armed":
             self._preflight_pending = False
@@ -2377,7 +2412,12 @@ class FactoryMainWindow(QMainWindow):
                 quiet=True,
             )
             return
-        if isinstance(exc, GatewayError) and exc.status_code is None:
+        if (action == "登录测试平台" and isinstance(exc, GatewayHTTPError)
+                and isinstance(exc.detail, Mapping)
+                and str(exc.detail.get("code", "")).startswith("platform_")
+                and isinstance(exc.detail.get("message"), str)):
+            message = exc.detail["message"]
+        elif isinstance(exc, GatewayError) and exc.status_code is None:
             message = (
                 f"{action}失败：本机控制服务不可用。"
                 "请联系维护员检查 rp1-factory-gateway.service。"
@@ -2521,8 +2561,22 @@ class FactoryMainWindow(QMainWindow):
             self._start_default_return(recheck=True)
 
     def _health_received(self, payload: Any) -> None:
+        if self._closing:
+            return
         if isinstance(payload, Mapping):
             status = payload.get("status", payload.get("state", "ok"))
+            connection = payload.get("platform_connection")
+            if isinstance(connection, Mapping):
+                origin = str(connection.get("platform_origin") or "未配置")
+                trust = {
+                    "workstation_ca_file": "工位证书文件",
+                    "environment_ca": "进程证书配置",
+                    "system_ca": "系统证书信任",
+                    "not_applicable": "未使用 HTTPS",
+                }.get(connection.get("ca_source"), "未知")
+                tip = f"平台地址：{origin}\n证书来源：{trust}"
+                self.platform_login_button.setToolTip(tip)
+                self.platform_identity_label.setToolTip(tip)
             snapshot = payload.get("snapshot")
             if isinstance(snapshot, Mapping):
                 self._render_snapshot(dict(snapshot))
@@ -2531,7 +2585,7 @@ class FactoryMainWindow(QMainWindow):
         self.statusBar().showMessage(f"网关健康状态：{status}", 4000)
 
     def _snapshot_received(self, payload: Any) -> None:
-        if isinstance(payload, Mapping):
+        if not self._closing and isinstance(payload, Mapping):
             self._render_snapshot(dict(payload))
 
     @staticmethod
@@ -2654,6 +2708,7 @@ class FactoryMainWindow(QMainWindow):
         if key is not None and key != self._telemetry_snapshot_key:
             self._telemetry_snapshot_key = key
             self._telemetry_received_at = now
+            self._feedback_expired_locally = False
         local_gap = max(0., now - self._telemetry_received_at) if self._telemetry_received_at is not None else 0.
         read_error = str(snapshot.get("feedback_read_error") or "")
         if isinstance(motors, Mapping):
@@ -2724,7 +2779,10 @@ class FactoryMainWindow(QMainWindow):
                 "pos_rad",
             )
             measured_age = feedback_age_s(motor, snapshot.get("timestamp_s"), local_gap)
-            feedback_age = measured_age if math.isfinite(measured_age) else "—"
+            if not math.isfinite(measured_age):
+                feedback_age = "—"
+            else:
+                feedback_age = measured_age if refresh_state else f"≥{measured_age:.3f}"
             stale = bool(read_error) or measured_age > DISPLAY_STALE_S
             motor_id = self._pick(motor, "motor_id", "id")
             try:
@@ -3242,8 +3300,7 @@ class FactoryMainWindow(QMainWindow):
         self._last_motor_fault_snapshot = dict(snapshot)
         fault = snapshot.get("global_fault", snapshot.get("fault"))
         if not fault:
-            self.global_fault.setText("●  全局故障：无")
-            self.global_fault.setObjectName("faultBarOk")
+            text, style = "●  全局故障：无", "faultBarOk"
         else:
             if isinstance(fault, Mapping):
                 diagnoses = fault.get("diagnoses")
@@ -3271,19 +3328,19 @@ class FactoryMainWindow(QMainWindow):
                 text = "⚠  全局故障  |  " + "  |  ".join(parts or ["未提供故障描述"])
             else:
                 text = f"⚠  全局故障：{fault}"
-            self.global_fault.setText(text)
-            self.global_fault.setObjectName("faultBarError")
+            style = "faultBarError"
         status = self._last_plc_fault_snapshot.get("status")
         messages = cabinet_fault_messages(status) if isinstance(status, Mapping) else []
         if messages:
             cabinet_text = "；".join(messages)
-            self.global_fault.setText(
-                self.global_fault.text() + "\n配电柜：" + cabinet_text
-                if fault else "⚠  全局故障  |  " + cabinet_text
-            )
-            self.global_fault.setObjectName("faultBarError")
-        self.global_fault.style().unpolish(self.global_fault)
-        self.global_fault.style().polish(self.global_fault)
+            text = (text + "\n配电柜：" if fault else "⚠  全局故障  |  ") + cabinet_text
+            style = "faultBarError"
+        if self.global_fault.text() != text:
+            self.global_fault.setText(text)
+        if self.global_fault.objectName() != style:
+            self.global_fault.setObjectName(style)
+            self.global_fault.style().unpolish(self.global_fault)
+            self.global_fault.style().polish(self.global_fault)
 
     def _sync_state(self, snapshot: Mapping[str, Any]) -> None:
         configured_value = snapshot.get("configured")
@@ -4855,8 +4912,7 @@ class FactoryMainWindow(QMainWindow):
         try:
             if result.get("status") != "staged":
                 raise ValueError("尚未取得下载并校验完成的回执，请重新下载。")
-            package_path = str(result.get("package_path") or "")
-            command = package_install_command(package_path)
+            package_path = validated_package_path(result.get("package_path"))
         except ValueError as exc:
             QMessageBox.warning(self, "下载未完成", str(exc))
             return
@@ -4878,17 +4934,17 @@ class FactoryMainWindow(QMainWindow):
         location.setCursorPosition(0)
         location.setToolTip(package_path)
         layout.addWidget(location)
-        hint = QLabel("安装包已保存到上述位置。安装前请停止测试、核实设备安全并正常退出所有上位机窗口，再在网关所在电脑的终端执行安装命令。", dialog)
+        hint = QLabel("安装包已保存。当前尚未接通可信设备停机证明，自动安装不可用；请由维护人员按受保护更新流程处理。检查或下载失败不影响正常测试。", dialog)
         hint.setWordWrap(True)
         layout.addWidget(hint)
         actions = QHBoxLayout()
-        copy_command = QPushButton("复制安装命令", dialog)
-        copy_command.setObjectName("copySoftwareInstallCommand")
+        copy_command = QPushButton("复制安装包路径", dialog)
+        copy_command.setObjectName("copySoftwarePackagePath")
 
         def copied() -> None:
-            QApplication.clipboard().setText(command)
-            hint.setText("安装命令已复制。请先停止测试、核实设备安全并正常退出所有上位机窗口，再在网关所在电脑的终端执行；复制不会安装。")
-            self.statusBar().showMessage("安装命令已复制；设备安全停机并正常退出上位机后，可在终端粘贴执行。", 12000)
+            QApplication.clipboard().setText(package_path)
+            hint.setText("安装包路径已复制，仅用于定位文件，不是安装授权。维护人员需先核实安全停机及可恢复条件。")
+            self.statusBar().showMessage("安装包路径已复制；未安装、未停止测试。", 12000)
 
         copy_command.clicked.connect(copied)
         actions.addWidget(copy_command)
@@ -5981,10 +6037,11 @@ class FactoryMainWindow(QMainWindow):
             event.ignore()
             QMessageBox.warning(self,"保护阻尼仍在运行","请先可靠支撑机构并点击软件失能，再关闭窗口。关闭控制进程无法保证持续阻尼。")
             return
+        self._closing = True
         self.diagnostics_page.stop()
         self._lease_enabled = False
         self._lease_heartbeat.stop()
-        self.plc_page.stop()
+        self.plc_page.shutdown()
         self.quick_page.stop()
         previous_timeout = self.client.timeout
         self.client.timeout = min(previous_timeout, 2.0)

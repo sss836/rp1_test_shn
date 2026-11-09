@@ -42,6 +42,36 @@ class PlcClient(ABC):
     def write_command(self, command: PlcCommand) -> None: ...
 
 
+class DeferredPlcClient(PlcClient):
+    """Do not construct a real protocol client until explicit communication enable."""
+    def __init__(self, factory):
+        self._factory = factory
+        self._client = None
+
+    @property
+    def connected(self):
+        return self._client is not None and self._client.connected
+
+    def connect(self):
+        if self._client is None:
+            self._client = self._factory()
+        self._client.connect()
+
+    def disconnect(self):
+        if self._client is not None:
+            self._client.disconnect()
+
+    def read_status(self):
+        if self._client is None:
+            raise PlcCommunicationError("PLC通信未启用")
+        return self._client.read_status()
+
+    def write_command(self, command):
+        if self._client is None:
+            raise PlcCommunicationError("PLC通信未启用")
+        return self._client.write_command(command)
+
+
 class ReadOnlyPlcClient(PlcClient):
     """Enforce read-only access even if a controller accidentally attempts a write."""
 
@@ -394,6 +424,8 @@ class ModbusTcpPlcClient(PlcClient):
             raise PlcConfigurationError(
                 "pymodbus 3.8.6 is required for the modbus_tcp PLC driver"
             ) from exc
+        from .connection_logging import install_connection_log_filter
+        install_connection_log_filter()
         return ModbusTcpClient(host, **kwargs)
 
     @property
