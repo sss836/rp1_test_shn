@@ -559,8 +559,8 @@ class FactoryController:
         playback = self._require_playback()
         playback.resume()
 
-    def finish(self, reason: str | None = None) -> None:
-        self._require_playback().finish(reason=reason)
+    def finish(self, reason: str | None = None, *, complete_cycle: bool = False) -> None:
+        self._require_playback().finish(reason=reason, complete_cycle=complete_cycle)
 
     def stop(self, *, wait: bool = True, timeout: float = 2.0, reason: str | None = None) -> None:
         playback = self._require_playback()

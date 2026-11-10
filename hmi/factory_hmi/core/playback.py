@@ -250,7 +250,7 @@ class PlaybackController:
         self._mujoco_selected = False
         self._completion = dict(phase="running", active=False, safe_disabled=False,
             parameter_revision=None, return_seconds=0.0, settling_seconds=0.0, alarm=None,
-            evidence_path=str(self.completion_output))
+            evidence_path=str(self.completion_output), finish_cycle_requested=False)
         self._completion_evidence: dict[str, Any] = {}
         self._thread: threading.Thread | None = None
         self._progress = PlaybackProgress()
@@ -315,7 +315,7 @@ class PlaybackController:
                 approach=self._approach_plan.to_dict(),
                 parameter_revision=self._parameters.parameter_revision if self._parameters else None,
                 automatic_return_enabled=self._parameters is not None or self._mujoco_selected, alarm=None,
-                return_seconds=0.0, settling_seconds=0.0)
+                return_seconds=0.0, settling_seconds=0.0, finish_cycle_requested=False)
             self._finish_event.clear()
             self._test_finished.clear()
             self._test_started.clear()
@@ -370,10 +370,19 @@ class PlaybackController:
                 StationState.RUNNING, expected=StationState.PAUSED
             )
 
-    def finish(self, reason: str | None = None) -> None:
+    def finish(self, reason: str | None = None, *, complete_cycle: bool = False) -> None:
         """Request a normal decelerated finish; never block a gateway worker."""
         with self._lock:
+            if complete_cycle and self.state_machine.state is StationState.COMPLETED:
+                return
             self.state_machine.require({StationState.RUNNING, StationState.PAUSED})
+            if complete_cycle:
+                if self._finish_event.is_set() or self._completion["phase"] not in {"running", "approaching", "approach_settling"}:
+                    return
+                if self._test_started.is_set():
+                    self._stop_reason = reason or "operator normal finish"
+                    self._completion.update(phase="finishing_cycle", finish_cycle_requested=True)
+                    return
             if self.state_machine.state is StationState.PAUSED:
                 self.state_machine.transition(StationState.RUNNING, expected=StationState.PAUSED)
             self._stop_reason = reason or "operator normal finish"
@@ -540,14 +549,17 @@ class PlaybackController:
                 with self._lock:
                     self._recorder = recorder
 
-            if self._approach_first_frame():
-                self._test_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-                if recorder is not None:
-                    recorder.begin_sampling()
-                else:
-                    self._test_started.set()
-                with self._lock:
+            approached = self._approach_first_frame()
+            with self._lock:
+                start_test = approached and not (self._stop_event.is_set() or self._finish_event.is_set())
+                if start_test:
+                    self._test_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                    if recorder is not None:
+                        recorder.begin_sampling()
+                    else:
+                        self._test_started.set()
                     self._completion.update(phase="running", approach_completed=True)
+            if start_test:
                 terminal_outcome = self._control_loop(watchdog, recorder)
             else:
                 terminal_outcome = "stopped"
@@ -662,15 +674,27 @@ class PlaybackController:
                     velocity = (target - old_target) / delta
                 self._dispatch(target, active_time, watchdog, recorder)
                 self._sample_feedback(target, active_time, update_statistics=True)
-                if options.duration_s is not None and active_time >= options.duration_s:
-                    finish_cycle = True
-                    self._completion.update(phase="finishing_cycle")
-                if duration <= 0 or cycle_time >= duration:
-                    completed_cycles += 1
-                    if finish_cycle or not options.loop or (options.cycles > 0 and completed_cycles >= options.cycles):
-                        outcome = "duration_complete" if finish_cycle else ("cycles_complete" if options.loop else "completed")
-                        break
-                    cycle_time = 0.0
+                reached_time = not finish_cycle and options.duration_s is not None and active_time >= options.duration_s
+                at_cycle_end = cycle_time >= duration
+                if reached_time or at_cycle_end:
+                    # Serialize the boundary with pause and finish after
+                    # sending the last target and checking its feedback.
+                    with self._lock:
+                        if reached_time:
+                            finish_cycle = True
+                            self._completion.update(phase="finishing_cycle")
+                        if at_cycle_end and not self._pause_event.is_set():
+                            completed_cycles += 1
+                            operator_finish = self._completion["finish_cycle_requested"] or self._finish_event.is_set()
+                            reached_cycles = options.cycles > 0 and completed_cycles >= options.cycles
+                            if operator_finish or finish_cycle or not options.loop or reached_cycles:
+                                if operator_finish:
+                                    outcome = "stopped"
+                                else:
+                                    outcome = "duration_complete" if finish_cycle else ("cycles_complete" if options.loop else "completed")
+                                self._completion.update(phase="decelerating")
+                                break
+                            cycle_time = 0.0
             self._update_progress(cycle_time, active_time, completed_cycles, target)
             next_tick += period
             next_tick = self._tick(next_tick, period)

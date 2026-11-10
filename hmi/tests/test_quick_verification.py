@@ -1,13 +1,16 @@
 """Quick verification uses mock PLC and fake motors only."""
+import hashlib
 import json
+import threading
 import time
-from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from factory_hmi.gateway.app import create_app
+from factory_hmi.gateway import quick_run
 from factory_hmi.quick_profiles import catalog, preset
 
 
@@ -18,6 +21,7 @@ def headers(owner='quick-a'):
 @pytest.fixture
 def gateway(tmp_path):
     with TestClient(create_app(data_root=tmp_path, lease_timeout_s=30)) as client:
+        assert client.app.state.runtime.plc.config.driver == 'mock'
         yield client
 
 
@@ -27,6 +31,21 @@ def powered_gateway(gateway):
     # explicitly opt in; external-power tests retain the passive default.
     gateway.app.state.runtime.plc.connect(user='explicit-offline-test')
     return gateway
+
+
+@pytest.fixture
+def short_trajectory(monkeypatch, tmp_path):
+    def use_trajectory(initial_position=0.):
+        def simulated_preset(profile):
+            item = preset(profile)
+            path = tmp_path / f'{profile}-synthetic.npz'
+            positions = np.zeros((4, item['motor_count']))
+            positions[:, 0] = [initial_position, initial_position + .01, initial_position, initial_position]
+            np.savez(path, motor_pos=positions, time=[0., .12, .24, .4], fps=7.5, limb=profile)
+            return {**item, 'trajectory': path.name, 'trajectory_path': path,
+                    'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        monkeypatch.setattr(quick_run, 'preset', simulated_preset)
+    return use_trajectory
 
 
 @pytest.mark.parametrize('profile', [p['id'] for p in catalog()])
@@ -54,8 +73,9 @@ def prepare(client, profile='left_arm', owner='quick-a'):
     assert result.status_code == 200, result.text
 
 
-def start(client, hours=.0002, confirmed=True, owner='quick-a', power_source=None):
-    body = {'duration_hours': hours, 'physical_estop_confirmed': confirmed, 'sample_id': '离线任意样机'}
+def start(client, hours=.0002, confirmed=True, owner='quick-a', power_source=None, *, model=False):
+    body = {'duration_hours': hours, 'physical_estop_confirmed': confirmed, 'sample_id': '离线任意样机',
+            'completion_mode': 'mujoco_hanging' if model else 'configured', 'parking_pose_confirmed': model}
     if power_source is not None:
         body['power_source'] = power_source
     return client.post('/api/v1/quick/start', headers=headers(owner), json=body)
@@ -65,27 +85,55 @@ def status(client, owner='quick-a'):
     return client.get('/api/v1/quick/status', headers=headers(owner)).json()
 
 
-def test_offline_start_returns_default_preflights_loops_and_auto_disables(powered_gateway):
-    gateway = powered_gateway
+def wait_for_status(client, *phases, timeout=12.):
+    deadline = time.monotonic() + timeout
+    while True:
+        value = status(client)
+        if value['phase'] in phases:
+            return value
+        if time.monotonic() >= deadline:
+            pytest.fail(f'快速验证未进入 {phases}，实际状态 {value}')
+        time.sleep(.02)
+
+
+def test_arm_default_downward_finish_requires_confirmation_before_power(gateway):
     prepare(gateway)
-    response = start(gateway)
+    body = {'duration_hours': .01, 'physical_estop_confirmed': True,
+            'sample_id': '模拟左臂', 'power_source': 'external'}
+    rejected = gateway.post('/api/v1/quick/start', headers=headers(), json=body)
+    assert rejected.status_code == 409
+    assert 'MuJoCo' in rejected.json()['detail']
+    runtime = gateway.app.state.runtime.session('quick-a')
+    assert not runtime.snapshot()['can']['all_up']
+    assert not runtime.snapshot()['station']['motors_enabled']
+
+    accepted = gateway.post('/api/v1/quick/start', headers=headers(),
+                            json={**body, 'parking_pose_confirmed': True})
+    assert accepted.status_code == 200, accepted.text
+    assert runtime.controller.controller.playback._options.completion_mode == 'mujoco_hanging'
+    aborted = gateway.post('/api/v1/quick/abort', headers=headers())
+    assert aborted.status_code == 200, aborted.text
+
+
+def test_plc_powered_run_finishes_cycle_and_auto_disables(powered_gateway, short_trajectory):
+    gateway = powered_gateway
+    short_trajectory()
+    prepare(gateway)
+    response = start(gateway, model=True)
     assert response.status_code == 200, response.text
     runtime = gateway.app.state.runtime.session('quick-a')
-    deadline = time.monotonic()+5
-    while status(gateway)['phase'] not in {'completed', 'fault'} and time.monotonic()<deadline:
-        time.sleep(.05)
-    assert status(gateway)['phase'] == 'completed', status(gateway)
+    completed = wait_for_status(gateway, 'completed', 'fault')
+    assert completed['phase'] == 'completed', completed
     state = runtime.snapshot()
     assert not state['station']['motors_enabled']
     assert not state['can']['all_up']
     assert response.json()['snapshot']['playback']['options']['speed'] == 1.0
-    deadline = time.monotonic()+3
-    while not list(runtime.controller.report_manager.executions_root.glob('*/config/execution.json')) and time.monotonic()<deadline:
-        time.sleep(.05)
+    runtime.controller.wait_for_reports()
     context = list(runtime.controller.report_manager.executions_root.glob('*/config/execution.json'))
     assert len(context) == 1
     metadata = json.loads(context[0].read_text())
     assert metadata['active_seconds'] >= .7
+    assert metadata['completed_cycles'] == 2
     assert metadata['outcome'] == 'duration_complete'
     assert metadata['recording_scope'] == 'local'
     assert metadata['sample_id'] == '离线任意样机'
@@ -93,22 +141,30 @@ def test_offline_start_returns_default_preflights_loops_and_auto_disables(powere
     assert gateway.app.state.runtime.plc.snapshot()['phase'] == 'RUNNING'
 
 
-def test_pause_then_end_only_releases_own_bus(powered_gateway):
+def test_pause_then_end_only_releases_own_bus(powered_gateway, short_trajectory):
     gateway = powered_gateway
+    short_trajectory()
     prepare(gateway)
     prepare(gateway, profile='right_arm', owner='quick-b')
-    response = start(gateway, hours=.01)
+    response = start(gateway, hours=.01, model=True)
     assert response.status_code == 200, response.text
+    hub = gateway.app.state.runtime
+    playback = hub.session('quick-a').controller.controller.playback
+    assert playback._test_started.wait(2)
     paused = gateway.post('/api/v1/playback/pause', headers=headers())
     assert paused.status_code == 200, paused.text
-    deadline=time.monotonic()+2
-    while status(gateway)['phase'] != 'paused' and time.monotonic()<deadline:time.sleep(.05)
-    assert status(gateway)['phase'] == 'paused'
+    wait_for_status(gateway, 'paused', timeout=2)
     ended = gateway.post('/api/v1/quick/end', headers=headers())
     assert ended.status_code == 200, ended.text
-    owners = gateway.app.state.runtime.interface_owners()
-    assert 'can0' not in owners and owners['can1'] == 'quick-b'
-    assert gateway.app.state.runtime.plc.snapshot()['phase'] == 'RUNNING'
+    assert ended.json()['result']['phase'] == 'paused'
+    assert hub.interface_owners() == {'can0': 'quick-a', 'can1': 'quick-b'}
+    resumed = gateway.post('/api/v1/playback/resume', headers=headers())
+    assert resumed.status_code == 200, resumed.text
+    completed = wait_for_status(gateway, 'completed', 'fault')
+    assert completed['phase'] == 'completed', completed
+    assert playback.snapshot()['progress']['completed_cycles'] == 1
+    assert hub.interface_owners() == {'can1': 'quick-b'}
+    assert hub.plc.snapshot()['phase'] == 'RUNNING'
 
 
 def test_busy_bus_and_invalid_mapping_cannot_enable_or_steal_other_session(gateway):
@@ -137,57 +193,52 @@ def test_unconfirmed_safety_nonfinite_hours_and_plc_failure_do_not_enable(gatewa
     assert status(gateway)['phase'] == 'fault'
 
 
-def test_end_during_return_cancels_before_playback(powered_gateway):
+def test_end_during_first_frame_approach_cancels_before_test(powered_gateway, short_trajectory):
     gateway = powered_gateway
-    import threading
+    short_trajectory(initial_position=.05)
     prepare(gateway)
     runtime = gateway.app.state.runtime.session('quick-a')
-    reached = threading.Event()
-    original = runtime.controller.reset
-    def reset():
-        reached.set()
-        return original()
-    result = []
-    with mock.patch.object(runtime.controller, 'reset', side_effect=reset):
-        worker = threading.Thread(target=lambda: result.append(start(gateway, hours=.01)))
-        worker.start()
-        assert reached.wait(5)
-        ended = gateway.post('/api/v1/quick/end', headers=headers())
-        worker.join(5)
-    assert not worker.is_alive()
+    response = start(gateway, hours=.01)
+    assert response.status_code == 200, response.text
+    playback = runtime.controller.controller.playback
+    assert playback.snapshot()['completion']['phase'] in {'approaching', 'approach_settling'}
+    ended = gateway.post('/api/v1/quick/end', headers=headers())
     assert ended.status_code == 200, ended.text
-    assert result[0].status_code == 409
+    stopped = wait_for_status(gateway, 'ended', 'fault')
+    assert stopped['phase'] == 'ended', stopped
+    snapshot = playback.snapshot()
+    assert snapshot['test_started_at'] is None
+    assert snapshot['progress']['completed_cycles'] == 0
+    assert snapshot['recording']['row_count'] == 0
     assert not runtime.controller.controller.backend.motors_enabled
     assert runtime.snapshot()['playback'] is None
-    assert status(gateway)['phase'] == 'ended'
 
 
-def test_report_captures_own_playback_after_delayed_finalize_and_auto_disconnect(powered_gateway):
+def test_report_captures_own_playback_after_delayed_finalize_and_auto_disconnect(powered_gateway, short_trajectory):
     gateway = powered_gateway
-    import threading
+    short_trajectory()
     prepare(gateway)
     runtime = gateway.app.state.runtime.session('quick-a')
     gate = threading.Event()
     original = runtime.controller._finalize_after_run
     def delayed(*args):
-        assert gate.wait(10)
+        assert gate.wait(15)
         return original(*args)
     with mock.patch.object(runtime.controller, '_finalize_after_run', side_effect=delayed):
-        response = start(gateway)
-        assert response.status_code == 200, response.text
-        deadline = time.monotonic()+4
-        while status(gateway)['phase'] != 'completed' and time.monotonic()<deadline:
-            time.sleep(.05)
-        assert status(gateway)['phase'] == 'completed'
-        assert runtime.controller.controller.playback is None
-        gate.set()
-        deadline=time.monotonic()+4
-        while not list(runtime.controller.report_manager.executions_root.glob('*/config/execution.json')) and time.monotonic()<deadline:
-            time.sleep(.05)
+        try:
+            response = start(gateway, model=True)
+            assert response.status_code == 200, response.text
+            completed = wait_for_status(gateway, 'completed', 'fault')
+            assert completed['phase'] == 'completed', completed
+            assert runtime.controller.controller.playback is None
+        finally:
+            gate.set()
+        runtime.controller.wait_for_reports()
     paths=list(runtime.controller.report_manager.executions_root.glob('*/config/execution.json'))
     assert len(paths)==1
     metadata=json.loads(paths[0].read_text())
     assert metadata['active_seconds'] >= .7
+    assert metadata['completed_cycles'] == 2
     assert metadata['outcome'] == 'duration_complete'
 
 
@@ -199,54 +250,63 @@ def test_two_windows_run_independent_buses_and_ending_one_keeps_other_running(po
     assert first.status_code==200,first.text
     second=start(gateway,hours=.01,owner='quick-b')
     assert second.status_code==200,second.text
+    first_runtime = gateway.app.state.runtime.session('quick-a')
+    playback = first_runtime.controller.controller.playback
+    assert playback is not None, status(gateway)
+    assert playback._test_started.wait(2)
     ended=gateway.post('/api/v1/quick/end',headers=headers())
     assert ended.status_code==200,ended.text
     other=gateway.app.state.runtime.session('quick-b').snapshot()
     assert other['state']=='running'
     assert other['station']['motors_enabled'] is True
-    assert gateway.app.state.runtime.interface_owners()=={'can1':'quick-b'}
+    assert gateway.app.state.runtime.interface_owners()=={'can0':'quick-a', 'can1':'quick-b'}
     assert gateway.app.state.runtime.plc.snapshot()['status']['ChannelPermit'][1] is True
-    assert gateway.post('/api/v1/quick/end',headers=headers('quick-b')).status_code==200
+    assert gateway.post('/api/v1/quick/abort',headers=headers()).status_code==200
+    assert gateway.post('/api/v1/quick/abort',headers=headers('quick-b')).status_code==200
 
 
-def test_window_heartbeat_expiry_cancels_long_default_return(powered_gateway):
+def test_window_heartbeat_expiry_cancels_after_arm_before_playback(powered_gateway):
     gateway = powered_gateway
     prepare(gateway)
     runtime=gateway.app.state.runtime.session('quick-a')
-    original=runtime.controller.reset
-    def expire_before_return():
+    original = runtime.controller.arm
+    def arm_and_expire():
+        snapshot = original()
         runtime.lease.timeout_s=.01
-        return original()
-    with mock.patch.object(runtime.controller,'reset',side_effect=expire_before_return):
-        result=start(gateway,hours=.01)
+        time.sleep(.04)
+        return snapshot
+    try:
+        with mock.patch.object(runtime.controller, 'arm', side_effect=arm_and_expire):
+            result = start(gateway, hours=.01)
+    finally:
+        runtime.lease.timeout_s = 30
     assert result.status_code==409,result.text
+    assert '心跳已失效' in result.json()['detail']
     assert not runtime.controller.controller.backend.motors_enabled
     assert runtime.controller.controller.playback is None
     assert status(gateway)['phase']=='fault'
 
 
-def test_external_power_completes_without_any_plc_reads_or_commands(gateway):
+def test_external_power_completes_without_any_plc_reads_or_commands(gateway, short_trajectory):
+    short_trajectory()
     prepare(gateway)
     plc = gateway.app.state.runtime.plc
     with mock.patch.object(plc, 'snapshot', side_effect=AssertionError('External mode must not depend on PLC')) as plc_read, \
          mock.patch.object(plc.coordination, 'execute', side_effect=AssertionError('No PLC writes in external mode')) as plc_write:
-        response = start(gateway, power_source='external')
+        response = start(gateway, power_source='external', model=True)
         assert response.status_code == 200, response.text
         assert response.json()['result']['power_source'] == 'external'
-        deadline = time.monotonic()+5
-        while status(gateway)['phase'] not in {'completed','fault'} and time.monotonic()<deadline:
-            time.sleep(.05)
-        assert status(gateway)['phase'] == 'completed', status(gateway)
+        completed = wait_for_status(gateway, 'completed', 'fault')
+        assert completed['phase'] == 'completed', completed
         plc_read.assert_not_called()
         plc_write.assert_not_called()
     runtime = gateway.app.state.runtime.session('quick-a')
     assert not runtime.controller.controller.backend.motors_enabled
-    deadline=time.monotonic()+3
-    while not list(runtime.controller.report_manager.executions_root.glob('*/config/execution.json')) and time.monotonic()<deadline:
-        time.sleep(.05)
+    runtime.controller.wait_for_reports()
     metadata=json.loads(next(runtime.controller.report_manager.executions_root.glob('*/config/execution.json')).read_text())
     assert metadata['stage_code'] == 'QUICK_EXTERNAL'
-    assert '外部供电' in metadata['test_name']
+    assert '外部供电' in metadata['stage_name']
+    assert metadata['test_case_id'] == 'UNIT-AGING-006' and metadata['test_name'] == '左臂老化'
     assert metadata['recording_scope'] == 'local'
     assert plc.snapshot()['communication_enabled'] is False
     assert plc.snapshot()['communication_state'] == 'DISABLED'

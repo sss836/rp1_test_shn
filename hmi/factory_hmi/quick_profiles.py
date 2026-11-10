@@ -7,14 +7,14 @@ from pathlib import Path
 
 RESOURCE_ROOT = Path(__file__).resolve().parent / 'resources' / 'quick'
 PRESETS = {
-    'left_arm': ('左臂 · 7 自由度', 7, ['can0']),
-    'right_arm': ('右臂 · 7 自由度', 7, ['can1']),
-    'left_short_arm': ('左臂 · 5 自由度', 5, ['can0']),
-    'right_short_arm': ('右臂 · 5 自由度', 5, ['can1']),
-    'left_short_leg': ('左腿 · 5 自由度', 5, ['can0']),
-    'right_short_leg': ('右腿 · 5 自由度', 5, ['can1']),
+    'left_arm': ('左臂 · 7 自由度', 7, ['can0'], 'UNIT-AGING-006', '左臂老化'),
+    'right_arm': ('右臂 · 7 自由度', 7, ['can1'], 'UNIT-AGING-007', '右臂老化'),
+    'left_short_arm': ('左臂 · 5 自由度', 5, ['can0'], 'UNIT-AGING-004', '左短臂老化'),
+    'right_short_arm': ('右臂 · 5 自由度', 5, ['can1'], 'UNIT-AGING-005', '右短臂老化'),
+    'left_short_leg': ('左腿 · 5 自由度', 5, ['can0'], 'UNIT-AGING-001', '左腿老化'),
+    'right_short_leg': ('右腿 · 5 自由度', 5, ['can1'], 'UNIT-AGING-002', '右腿老化'),
     # NPZ motor order: right waist_roll, left waist_yaw, right hip_pitch, left hip_pitch.
-    'waist_hip': ('腰胯 · 4 自由度', 4, ['can1', 'can0', 'can1', 'can0']),
+    'waist_hip': ('腰胯 · 4 自由度', 4, ['can1', 'can0', 'can1', 'can0'], 'UNIT-AGING-003', '腰髋老化'),
 }
 
 
@@ -22,12 +22,13 @@ def catalog() -> list[dict]:
     manifest = json.loads((RESOURCE_ROOT / 'manifest.json').read_text())
     assets = {item['limb']: item for item in manifest['trajectories']}
     return [dict(id=key, label=label, motor_count=count, interfaces=list(interfaces),
+                 test_case_id=test_case_id, test_name=test_name,
                  config_path=key + '_motors.yaml', trajectory=assets[key]['file'],
                  sha256=assets[key]['sha256'], speed=1.0, bundle_version=manifest['version'],
                  resource_revision=assets[key].get('resource_revision', 1),
                  source_name=assets[key].get('source_name'),
                  source_sha256=assets[key].get('source_sha256', assets[key]['sha256']))
-            for key, (label, count, interfaces) in PRESETS.items()]
+            for key, (label, count, interfaces, test_case_id, test_name) in PRESETS.items()]
 
 
 def preset(key: str) -> dict:

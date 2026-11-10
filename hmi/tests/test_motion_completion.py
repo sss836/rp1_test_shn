@@ -163,6 +163,84 @@ def test_pause_holds_and_finish_from_pause_works(tmp_path):
         backend.disconnect()
 
 
+def test_cycle_finish_stays_paused_until_resume_and_keeps_first_request(tmp_path):
+    playback, backend = make_playback(tmp_path, duration=.8)
+    try:
+        playback.start(PlaybackOptions(loop=True))
+        assert playback._test_started.wait(1)
+        playback.pause()
+        playback.finish('first cycle finish', complete_cycle=True)
+        playback.finish('duplicate cycle finish', complete_cycle=True)
+        assert not playback.wait(.05)
+        pending = playback.snapshot()
+        assert playback.state_machine.state == StationState.PAUSED
+        assert pending['completion']['phase'] == 'finishing_cycle'
+        assert pending['progress']['completed_cycles'] == 0
+        assert backend.motors_enabled
+        playback.resume()
+        assert playback.wait(2)
+        finished = playback.snapshot()
+        assert finished['progress']['completed_cycles'] == 1
+        assert finished['progress']['frame'] == playback.trajectory.frame_count - 1
+        assert finished['progress']['outcome'] == 'stopped'
+        assert finished['stop_reason'] == 'first cycle finish'
+        assert finished['completion']['safe_disabled']
+    finally:
+        backend.disconnect()
+
+
+def test_cycle_finish_requested_after_timer_keeps_timed_outcome(tmp_path):
+    playback, backend = make_playback(tmp_path, duration=.8)
+    try:
+        playback.start(PlaybackOptions(loop=True, duration_s=.025))
+        await_phase(playback, 'finishing_cycle')
+        playback.finish('late cycle finish', complete_cycle=True)
+        assert playback.wait(2)
+        playback.finish('cycle finish received after completion', complete_cycle=True)
+        finished = playback.snapshot()
+        assert finished['progress']['completed_cycles'] == 1
+        assert finished['progress']['outcome'] == 'duration_complete'
+        assert finished['stop_reason'] is None
+        assert finished['completion']['safe_disabled']
+    finally:
+        backend.disconnect()
+
+
+def test_cycle_finish_while_waiting_for_first_frame_cancels_without_testing(tmp_path):
+    playback, backend = make_playback(tmp_path, duration=.8, recording=True)
+    backend.positions[:] = .01
+    try:
+        playback.start(PlaybackOptions(loop=True))
+        await_phase(playback, 'approach_settling')
+        playback.finish('cancel preparation', complete_cycle=True)
+        assert playback.wait(2)
+        assert playback.wait_recording(2)
+        interrupted = playback.snapshot()
+        assert interrupted['completion']['phase'] == 'interrupted'
+        assert interrupted['progress']['completed_cycles'] == 0
+        assert interrupted['recording']['row_count'] == 0
+        assert interrupted['test_started_at'] is None
+    finally:
+        backend.disconnect()
+
+
+def test_protective_stop_preempts_pending_cycle_finish(tmp_path):
+    playback, backend = make_playback(tmp_path, duration=.8)
+    try:
+        playback.start(PlaybackOptions(loop=True))
+        assert playback._test_started.wait(1)
+        playback.pause()
+        playback.finish('pending cycle finish', complete_cycle=True)
+        playback.stop(reason='synthetic protection')
+        interrupted = playback.snapshot()
+        assert interrupted['progress']['completed_cycles'] == 0
+        assert interrupted['completion']['phase'] == 'interrupted'
+        assert interrupted['stop_reason'] == 'synthetic protection'
+        assert not interrupted['completion']['safe_disabled']
+    finally:
+        backend.disconnect()
+
+
 def test_unreached_healthy_target_holds_alarm_until_protection_interrupt(tmp_path):
     playback, backend = make_playback(tmp_path, response=0.)
     try:
@@ -266,15 +344,18 @@ def test_quick_end_keeps_ownership_until_verified_safe_disable(tmp_path):
     quick._state('running', 'synthetic')
     watcher=threading.Thread(target=quick._watch,args=(quick._stop,),daemon=True); watcher.start()
     try:
-        time.sleep(.03)
+        assert session._test_started.wait(1)
         result=quick.end()
         assert result['active']
+        assert result['phase'] == 'finishing_cycle'
         assert not released and backend.motors_enabled
         watcher.join(2)
         assert not watcher.is_alive()
         assert quick.snapshot()['phase'] == 'completed'
         assert released == ['quick-a'] and owners == {'can1':'quick-b'}
-        assert session.snapshot()['completion']['safe_disabled']
+        finished = session.snapshot()
+        assert finished['progress']['completed_cycles'] == 1
+        assert finished['completion']['safe_disabled']
         assert not backend.connected
     finally:
         quick._stop.set()
@@ -336,13 +417,13 @@ def test_quick_paused_station_takes_priority_over_finishing_cycle_phase():
         while quick.snapshot()['phase']!='paused' and time.monotonic()<deadline:
             time.sleep(.005)
         assert quick.snapshot()['phase']=='paused'
-        assert '补尾已暂停' in quick.snapshot()['detail']
+        assert '按继续后补完当前周期' in quick.snapshot()['detail']
         station['state']='running'
         deadline=time.monotonic()+1
         while quick.snapshot()['phase']!='finishing_cycle' and time.monotonic()<deadline:
             time.sleep(.005)
         assert quick.snapshot()['phase']=='finishing_cycle'
-        assert '补完当前整个周期' in quick.snapshot()['detail']
+        assert '补完当前周期' in quick.snapshot()['detail']
     finally:
         quick._stop.set();watcher.join(1)
 

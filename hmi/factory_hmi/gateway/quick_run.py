@@ -18,11 +18,19 @@ from factory_hmi.quick_profiles import preset
 from .station_process import StationUnavailable
 
 logger = logging.getLogger(__name__)
+_NORMAL_FINISH = 'factory operator normal finish'
 
 
 def require_plc_power(value: dict, channels) -> None:
     status = value.get('status') or {}
-    if (value['communication_state'] != 'LIVE' or value['stale'] or value['phase'] != 'RUNNING'
+    phase = value['phase']
+    active = phase == 'RUNNING'
+    if phase in {'WAIT_CHANNEL_ACK', 'WAIT_CHANNEL_PERMIT'}:
+        # Another station may be changing its own channel. Require this
+        # station's channels to remain requested as well as actually permitted.
+        requested = (value.get('command') or {}).get('ChannelEnable') or []
+        active = all(0 < n <= len(requested) and requested[n-1] is True for n in channels)
+    if (value['communication_state'] != 'LIVE' or value['stale'] or not active
             or not status.get('PS1FeedbackValid') or status.get('PS1ActualOutput') is not True
             or not status.get('MainReady') or any(not status['ChannelPermit'][n-1] for n in channels)):
         raise RuntimeError('PLC 实际供电许可无效，已停止本窗口测试')
@@ -167,22 +175,8 @@ class QuickRun:
         require_plc_power(self.hub.plc.snapshot(include_history=False), self._channels)
 
     def start(self, hours: float, safety_confirmed: bool, sample: str, power_source: str = 'plc',
-              completion_mode: str = 'configured', parking_pose_confirmed: bool = False,
+              completion_mode: str | None = None, parking_pose_confirmed: bool = False,
               data_domain: str | None = None, bench_id: str | None = None, operator_id: str | None = None) -> dict:
-        from factory_hmi.models import PlaybackOptions
-        PlaybackOptions(completion_mode=completion_mode, parking_pose_confirmed=parking_pose_confirmed)
-        if completion_mode == 'mujoco_hanging':
-            validate = getattr(self.runtime.controller, 'validate_mujoco_return', None)
-            if callable(validate):
-                validate()
-            else:
-                from factory_hmi.core.mujoco_completion import plan_return
-                controller = self.runtime.controller.controller
-                trajectory = controller.trajectory
-                if trajectory is None:
-                    raise ValueError('尚未载入工厂轨迹')
-                velocity = (trajectory.motor_pos[-1]-trajectory.motor_pos[-2])/(trajectory.timestamps[-1]-trajectory.timestamps[-2])
-                plan_return(controller.config, trajectory.motor_pos[-1], velocity)
         if power_source not in {'external', 'plc'}:
             raise ValueError('供电方式必须为 external 或 plc')
         if not safety_confirmed:
@@ -203,6 +197,22 @@ class QuickRun:
         readiness = (current.get('station') or {}).get('motion_readiness') or {}
         if not readiness.get('test_allowed', readiness.get('ready')):
             raise RuntimeError(readiness.get('reason') or '运动参数尚未核实，禁止启动')
+        from factory_hmi.core.mujoco_completion import ARM_LIMBS, plan_return
+        from factory_hmi.models import PlaybackOptions
+        if completion_mode is None:
+            completion_mode = 'mujoco_hanging' if self._prepared['id'] in ARM_LIMBS else 'configured'
+        PlaybackOptions(completion_mode=completion_mode, parking_pose_confirmed=parking_pose_confirmed)
+        if completion_mode == 'mujoco_hanging':
+            validate = getattr(self.runtime.controller, 'validate_mujoco_return', None)
+            if callable(validate):
+                validate()
+            else:
+                controller = self.runtime.controller.controller
+                trajectory = controller.trajectory
+                if trajectory is None:
+                    raise ValueError('尚未载入工厂轨迹')
+                velocity = (trajectory.motor_pos[-1]-trajectory.motor_pos[-2])/(trajectory.timestamps[-1]-trajectory.timestamps[-2])
+                plan_return(controller.config, trajectory.motor_pos[-1], velocity)
         self._stop = threading.Event()
         self._power_source = power_source
         self._channels = []
@@ -231,8 +241,8 @@ class QuickRun:
                 completion_mode=completion_mode, parking_pose_confirmed=parking_pose_confirmed,
                 record=True, recording_scope='local', record_rate_hz=20.0,
                 data_domain=data_domain, bench_id=bench_id, operator_id=operator_id,
-                robot_id=sample.strip(), test_case_id='QUICK-'+self._prepared['id'].upper(),
-                test_name='工厂快速验证 · '+self._prepared['label'] + (' · 外部供电' if power_source == 'external' else ' · PLC 供电'),
+                robot_id=sample.strip(), test_case_id=self._prepared['test_case_id'],
+                test_name=self._prepared['test_name'],
                 stage_code='QUICK_EXTERNAL' if power_source == 'external' else 'QUICK_PLC',
                 stage_name='离线快速验证 · 外部供电' if power_source == 'external' else '离线快速验证 · PLC 供电')
             self._checkpoint()
@@ -253,9 +263,10 @@ class QuickRun:
                 self.runtime._invoke(('stop',), reason='factory quick verification ended')
         except Exception as exc:
             errors.append(str(exc))
-        for names in [('disable_motors', 'disable'), ('disconnect',), ('can_disconnect',)]:
+        for names, kwargs in [(('disable_motors', 'disable'), {}), (('disconnect',), {}),
+                              (('can_disconnect',), {'wait_for_recording': True})]:
             try:
-                self.runtime._invoke(names)
+                self.runtime._invoke(names, **kwargs)
             except Exception as exc:
                 errors.append(str(exc))
         # Keep ownership if any cleanup failed: never let another window take
@@ -286,8 +297,14 @@ class QuickRun:
         """Request normal finish; ownership stays held until safe completion."""
         state = self.runtime.controller.controller.state.value
         if state in {'running', 'paused'}:
-            self.runtime._invoke(('finish',), reason='factory operator normal finish')
-            self._state('decelerating', '正在结束当前测试；完成前保留 CAN 占用')
+            self.runtime._invoke(('finish',), reason=_NORMAL_FINISH, complete_cycle=True)
+            snapshot = self.runtime.controller.controller.snapshot()
+            completion = (snapshot.get('playback') or {}).get('completion') or {}
+            if completion.get('phase') == 'finishing_cycle':
+                if snapshot['station']['state'] == 'paused':
+                    self._state('paused', '已请求结束，按继续后补完当前周期')
+                else:
+                    self._state('finishing_cycle', '正在补完当前周期，随后收尾')
             return self.snapshot()
         if self.snapshot()['active'] and state not in {'completed', 'fault', 'disconnected'}:
             # No playback yet: an interrupted preparation has no NPZ tail.
@@ -316,7 +333,7 @@ class QuickRun:
                     expired = self.runtime.lease.snapshot().expired
                     if expired:
                         self.runtime.controller.request_motion_stop()
-                    if phase not in {'running', 'paused', 'finishing_cycle', 'decelerating', 'returning', 'settling', 'needs_attention', 'holding'}:
+                    if phase not in {'running', 'paused', 'finishing_cycle', 'decelerating', 'returning', 'settling', 'needs_attention', 'holding', 'sealing'}:
                         continue
                     snapshot = self.runtime.controller.controller.snapshot()
                 except StationUnavailable:
@@ -324,7 +341,8 @@ class QuickRun:
                     # Keep checking its UI state after a transient IPC timeout.
                     continue
                 state = snapshot['station']['state']
-                completion = (snapshot.get('playback') or {}).get('completion') or {}
+                playback = snapshot.get('playback') or {}
+                completion = playback.get('completion') or {}
                 failure = '窗口心跳已失效' if expired else ''
                 holding = state == 'completed' and completion.get('phase') == 'holding' and not completion.get('safe_disabled')
                 if not failure and (holding or state not in {'completed', 'fault', 'disconnected'}):
@@ -335,19 +353,33 @@ class QuickRun:
                 if holding and not failure:
                     self._state('holding', (completion.get('alarm') or '测试已结束并保持位置，未自动失能')+'；本窗口 CAN 继续占用')
                     continue
+                recording = playback.get('recording') or {}
+                record_error = recording.get('error')
+                if not failure and state == 'completed' and completion.get('safe_disabled') and (
+                        recording.get('closing') or recording.get('owner_alive')):
+                    detail = ('原始记录封存异常：'+str(record_error) if record_error else '正在封存原始记录')
+                    self._state('sealing', '电机已失能，'+detail+'；本窗口 CAN 继续占用')
+                    continue
                 if failure or state in {'completed', 'fault', 'disconnected'}:
                     with self.runtime._lease_guard:
                         if stop_event.is_set() or self._stop is not stop_event:
                             return
                         stop_event.set()
                         errors = self._cleanup()
-                        successful = state == 'completed' and completion.get('safe_disabled') and not failure and not errors
-                        self._state('completed' if successful else 'fault',
-                            '测试及受控收尾完成，电机已安全失能并断开本窗口 CAN；记录保存在本机' if successful else
-                            '；'.join([failure or '设备运行已中止，未确认安全收尾']+errors), active=False)
+                        if state == 'completed' and not failure and not errors:
+                            if completion.get('safe_disabled'):
+                                if record_error:
+                                    self._state('fault', '电机已失能并断开本窗口 CAN；原始记录封存异常：'+str(record_error), active=False)
+                                else:
+                                    self._state('completed', '测试及受控收尾完成，电机已失能并断开本窗口 CAN；记录保存在本机', active=False)
+                                return
+                            if not playback.get('test_started_at') and playback.get('stop_reason') == _NORMAL_FINISH:
+                                self._state('ended', '已取消首帧准备，电机已失能并断开本窗口 CAN', active=False)
+                                return
+                        self._state('fault', '；'.join([failure or '设备运行已中止，未确认安全收尾']+errors), active=False)
                     return
                 completion_phase = completion.get('phase')
-                details = {'finishing_cycle': '到时后正在补完当前整个周期',
+                details = {'finishing_cycle': '正在补完当前周期，随后收尾',
                     'decelerating': '正在按已核实加速度平滑减速',
                     'returning': '正在慢回已核实停放姿态',
                     'settling': '正在核对实际位置、速度和连续稳定窗口',
@@ -355,7 +387,7 @@ class QuickRun:
                 if completion.get('source') == 'mujoco_hanging':
                     details['returning'] = '正在执行本次确认选用的 MuJoCo 下垂轨迹'
                 if state == 'paused':
-                    self._state('paused', '补尾已暂停，可继续补完当前周期或结束'
+                    self._state('paused', '已请求结束，按继续后补完当前周期'
                         if completion_phase == 'finishing_cycle' else '已暂停，可继续或结束')
                 elif completion_phase in details:
                     self._state(completion_phase, details[completion_phase])

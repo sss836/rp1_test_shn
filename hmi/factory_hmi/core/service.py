@@ -580,11 +580,14 @@ class FactoryService:
                             "仅重新建立主机时序边界，不代表检测到电机重新上电。",
         )
 
-    def can_disconnect(self) -> dict[str, Any]:
+    def can_disconnect(self, *, wait_for_recording: bool = False) -> dict[str, Any]:
         # Use the same boundary as maintenance start/close, so a fresh task
         # cannot start between cancellation and the explicit interface down.
         with self._lifecycle_lock:
             self._require_open()
+            session = self._recording_session
+            if wait_for_recording and session is not None and session.recording_close_pending():
+                session.wait_recording(timeout=2.0)
             self._require_recording_closed()
             for task in self.maintenance_tasks():
                 task.cancel()
@@ -902,6 +905,16 @@ class FactoryService:
                 raise ValueError("记录编号已存在，不能覆盖之前的记录。")
             trajectory = controller.trajectory
             now = started_at.isoformat().replace("+00:00", "Z")
+            run_request = {
+                "duration_s": float(duration_hours) * 3600.0 if duration_hours is not None else None,
+                "loop": loop,
+                "cycles": cycles,
+                "speed": speed,
+                "completion_mode": completion_mode,
+                "parking_pose_confirmed": parking_pose_confirmed,
+            }
+            if stage_code in {"QUICK_EXTERNAL", "QUICK_PLC"}:
+                run_request["power_source"] = "external" if stage_code == "QUICK_EXTERNAL" else "plc"
             report_context = {
                 "capacity_admission": capacity, "recording_policy": recording_policy,
                 "execution_uuid": execution_id,
@@ -928,6 +941,7 @@ class FactoryService:
                 "operator_id": operator_id or "",
                 "stage_code": stage_code or "AGING",
                 "stage_name": stage_name or "老化运行",
+                "run_request": run_request,
                 "subject_map": dict(subject_map or {}),
                 "started_at": now,
                 "record_rate_hz": float(record_rate_hz),
@@ -1034,9 +1048,9 @@ class FactoryService:
         self.controller.resume()
         return self.snapshot()
 
-    def finish(self, reason: str | None = None) -> dict[str, Any]:
+    def finish(self, reason: str | None = None, *, complete_cycle: bool = False) -> dict[str, Any]:
         self._last_stop_reason = reason
-        self.controller.finish(reason=reason)
+        self.controller.finish(reason=reason, complete_cycle=complete_cycle)
         return self.snapshot()
 
     def stop(self, *, reason: str | None = None) -> dict[str, Any]:
@@ -1380,11 +1394,20 @@ class FactoryService:
                 if isinstance(playback, Mapping)
                 else {}
             )
+            completion = playback.get("completion") if isinstance(playback, Mapping) else None
             fault = playback.get("fault") if isinstance(playback, Mapping) else None
+            outcome = "fault" if fault else str(progress.get("outcome") or "interrupted")
+            if isinstance(completion, Mapping):
+                fields = ("phase", "safe_disabled", "automatic_return_enabled", "source",
+                          "parameter_revision", "preset_sha256", "return_seconds",
+                          "settling_seconds", "approach_completed", "finish_cycle_requested", "alarm")
+                context["motion_completion"] = {key: completion[key] for key in fields if key in completion}
+            if isinstance(fault, Mapping):
+                context["terminal_fault"] = dict(fault)
             if isinstance(playback, Mapping) and playback.get("test_started_at"):
                 context["preparation"] = {"requested_at": context.get("started_at"),
-                    "first_frame_approach": (playback.get("completion") or {}).get("approach"),
-                    "approach_elapsed_s": (playback.get("completion") or {}).get("approach_elapsed_s", 0.)}
+                    "first_frame_approach": (completion or {}).get("approach"),
+                    "approach_elapsed_s": (completion or {}).get("approach_elapsed_s", 0.)}
                 context["started_at"] = playback["test_started_at"]
             context.update(
                 {
@@ -1394,8 +1417,8 @@ class FactoryService:
                     "completed_cycles": int(
                         progress.get("completed_cycles") or 0
                     ),
-                    "outcome": str(progress.get("outcome") or "interrupted"),
-                    "manual_stop": progress.get("outcome") == "stopped",
+                    "outcome": outcome,
+                    "manual_stop": outcome == "stopped",
                     "safety_failure": bool(fault),
                     "stop_reason": (
                         str(fault.get("message") or "")

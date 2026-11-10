@@ -1,5 +1,6 @@
 """Recording runs using fake motors and a local data root, never real PLC/CAN."""
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from factory_hmi.core.identity import build_local_execution_code
 from factory_hmi.core.service import FactoryService
 from factory_hmi.gateway.schemas import PlaybackStartRequest
+from factory_hmi.models import FaultStatus
 
 HMI = Path(__file__).resolve().parents[1]
 
@@ -37,11 +39,7 @@ def service(tmp_path, monkeypatch):
 
 def finish_report(service):
     assert service.controller.wait(timeout=3)
-    with service._lock:
-        threads = list(service._report_threads)
-    for thread in threads:
-        thread.join(timeout=5)
-        assert not thread.is_alive()
+    service.wait_for_reports(timeout=5)
     assert service._report_errors == {}
     assert service.controller.snapshot()['playback']['progress']['outcome'] == 'completed'
     history = service.execution_history()
@@ -78,6 +76,60 @@ def test_recording_without_bench_or_platform_login_finishes_csv_and_local_report
     with pytest.raises(ValueError,match='必须核实'):
         service.submit_execution(manifest['test_id'])
     assert service.outbox.list()==[]
+
+
+@pytest.mark.parametrize(("outcome", "phase"), [
+    ("duration_complete", "holding"),
+    ("stopped", "interrupted"),
+    ("fault", "fault"),
+])
+def test_local_quick_evidence_keeps_raw_summary_and_actual_terminal_state(service, outcome, phase):
+    duration_s = .15 if outcome == "duration_complete" else 5
+    service.start(test_case_id="UNIT-AGING-006", robot_id="000023", loop=True,
+                  duration_hours=duration_s / 3600, recording_scope="local",
+                  data_domain="FACTORY", bench_id="MP-01", stage_code="QUICK_EXTERNAL")
+    playback = service.controller.playback
+    if outcome != "duration_complete":
+        deadline = time.monotonic() + 3
+        while playback.snapshot()["recording"]["row_count"] == 0 and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert playback.snapshot()["recording"]["row_count"] > 0
+        if outcome == "stopped":
+            service.stop(reason="synthetic operator stop")
+        else:
+            playback.signal_fault(FaultStatus(message="synthetic feedback fault"))
+
+    assert playback.wait(3)
+    service.wait_for_reports(timeout=10)
+    item, = service.execution_history_page(sn="000023", data_domain="FACTORY", bench="MP-01")["items"]
+    test_id = item["test_id"]
+    assert test_id.startswith("LOCAL_UNIT-AGING-006_")
+    assert item["test_case_id"] == "UNIT-AGING-006"
+    execution = service.report_manager.execution_dir(test_id)
+    context = json.loads((execution / "config/execution.json").read_text())
+    assert context["recording_policy"]["policy"] == "RDfull"
+    assert context["run_request"] == {
+        "duration_s": pytest.approx(duration_s), "loop": True, "cycles": 0, "speed": 1.0,
+        "completion_mode": "configured", "parking_pose_confirmed": False, "power_source": "external",
+    }
+    assert context["outcome"] == outcome
+    assert context["motion_completion"]["phase"] == phase
+    assert context["motion_completion"]["safe_disabled"] is False
+    assert "evidence_path" not in context["motion_completion"]
+    if outcome == "fault":
+        assert context["terminal_fault"]["message"] == "synthetic feedback fault"
+        assert context["safety_failure"] is True
+    else:
+        assert "terminal_fault" not in context
+    if outcome == "stopped":
+        assert context["manual_stop"] is True
+        assert context["stop_reason"] == "synthetic operator stop"
+    summary = service.report_manager.summary(test_id)
+    assert summary["quality"]["sample_count"] > 0
+    assert summary["timing"]["active_seconds"] > 0
+    assert len(summary["joint_metrics"]) == 7
+    assert (execution / "telemetry/raw.csv").read_bytes() == service.record_file().read_bytes()
+    assert service.outbox.list() == []
 
 
 def test_local_station_login_label_is_not_fabricated_as_a_bench_id(service):
@@ -168,10 +220,7 @@ def test_platform_runs_in_same_minute_keep_distinct_files(service):
             assert snapshot['playback']['execution_code'] == ''
             assert snapshot['playback']['test_id'].startswith('LOCAL_REL-SARM-001_')
             assert service.controller.wait(timeout=3)
-            with service._lock:
-                threads = list(service._report_threads)
-            for thread in threads:
-                thread.join(timeout=5)
+            service.wait_for_reports(timeout=5)
             assert service._report_errors == {}
             manifests.append(service.report_manager.manifest(snapshot['playback']['test_id']))
     first, second = manifests

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from factory_hmi.test_record_csv import FIELDS, catalog, chunks, criteria, row
 from factory_hmi.standard_record_export import standard_history_csv
+from factory_hmi.quick_profiles import catalog as quick_catalog
 
 
 def decode(content):
@@ -25,6 +26,31 @@ def test_contract_matches_both_apps_and_supplied_template():
     assert len(rows)==94
     assert sum(item['测试体系']=='MOD' for item in rows)==53
     assert all(item['是否通过']=='未测试' and not item['实际结果'] and not item['记录编号'] for item in rows)
+
+
+def test_quick_aging_projects_match_template_and_export():
+    root = Path(__file__).resolve().parents[2]
+    with (root/'docs/templates/RP1_测试记录标准模板_v3.csv').open(encoding='utf-8-sig', newline='') as handle:
+        projects = {item['测试项目编号']: item for item in csv.DictReader(handle)
+                    if item['测试体系'] == 'UNIT-AGING'}
+    expected_limbs = (
+        'left_short_leg', 'right_short_leg', 'waist_hip', 'left_short_arm',
+        'right_short_arm', 'left_arm', 'right_arm',
+    )
+    profiles = {item['id']: item for item in quick_catalog()}
+    assert set(profiles) == set(expected_limbs)
+    for number, limb in enumerate(expected_limbs, 1):
+        code = f'UNIT-AGING-{number:03d}'
+        expected = projects[code]
+        assert profiles[limb]['test_case_id'] == code
+        assert profiles[limb]['test_name'] == expected['测试内容']
+        result = decode(b''.join(standard_history_csv([{'test_case_id': code}])))[0]
+        for column in ('测试项目编号', '测试体系', '测试分类', '测试内容'):
+            assert result[column] == expected[column]
+        assert result['是否通过'] == '未测试'
+        assert '标准待补充' in result['通过标准']
+    legacy = decode(b''.join(standard_history_csv([{'test_case_id': 'QUICK-LEFT_ARM'}])))[0]
+    assert legacy['测试项目编号'] == 'QUICK-LEFT_ARM'
 
 
 def test_unicode_quotes_newlines_leading_zero_sn_and_formula_protection():

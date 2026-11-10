@@ -294,7 +294,7 @@ class QuickStartRequest(BaseModel):
     data_domain: Literal["RESEARCH", "FACTORY"] | None = None
     bench_id: str | None = Field(default=None, max_length=64)
     operator_id: str | None = Field(default=None, max_length=255)
-    completion_mode: Literal["configured", "mujoco_hanging"] = "configured"
+    completion_mode: Literal["configured", "mujoco_hanging"] | None = None
     parking_pose_confirmed: StrictBool = False
 
     @model_validator(mode="after")

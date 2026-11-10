@@ -1323,7 +1323,7 @@ class ReportManager:
             "calibration_version",
             "test_name", "actual_object", "origin", "machine_status", "timestamp_provenance",
             "acceptance", "history_declared_context", "history_context_sha256",
-            "preparation",
+            "preparation", "run_request", "motion_completion", "terminal_fault",
         }
         return {
             key: value

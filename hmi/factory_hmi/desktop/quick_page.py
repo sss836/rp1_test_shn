@@ -41,8 +41,8 @@ class QuickVerificationPage(QWidget):
         title = QLabel('工厂快速验证')
         title.setObjectName('pageHeading')
         layout.addWidget(title)
-        note = QLabel('选择部位与供电方式 → 运行并填写小时数 → 回默认位和循环验证\n'
-                      '全程使用本机配置与内置轨迹，速度固定 1 倍；记录保存在本机，无需登录云端。')
+        note = QLabel('选择部位与供电方式 → 填写运行小时数 → 确认首帧反馈并循环验证\n'
+                      '使用本机配置和内置轨迹，速度固定 1 倍。原始记录与摘要保存在本机。')
         note.setObjectName('pageDescription'); note.setWordWrap(True); layout.addWidget(note)
         self.selection_group = QButtonGroup(self)
         self.selection_group.setExclusive(True)
@@ -51,6 +51,8 @@ class QuickVerificationPage(QWidget):
         layout.addWidget(choices)
         settings = QGroupBox('本次验证'); settings.setObjectName('quickCard')
         form = QFormLayout(settings)
+        self.test_case = QLabel('等待选择部位')
+        form.addRow('测试项目', self.test_case)
         self.sample = QLineEdit()
         self.sample.setMaxLength(200)
         self.sample.setPlaceholderText('模块编号或 SN，可自由填写，保留前导零')
@@ -97,7 +99,7 @@ class QuickVerificationPage(QWidget):
         self.end_button.clicked.connect(self._end)
         self.abort_button.clicked.connect(self._abort)
         layout.addLayout(buttons)
-        self.supply_note = QLabel('收尾参数齐全时自动回位并确认后失能；否则结束测试后保持位置，不自动失能。外部电源由现场管理。')
+        self.supply_note = QLabel('正常结束先补完当前周期。收尾到位并确认稳定后失能；缺少已核实的收尾参数时保持位置。外部电源由现场管理。')
         self.supply_note.setWordWrap(True); layout.addWidget(self.supply_note); layout.addStretch(1)
         self.timer = QTimer(self); self.timer.setInterval(500); self.timer.timeout.connect(self.refresh)
         self.timer.start()
@@ -112,8 +114,8 @@ class QuickVerificationPage(QWidget):
             if external else
             '由网关按默认参数控制 PLC，实际供电许可确认后才扫描和使能。')
         if hasattr(self, 'supply_note'):
-            self.supply_note.setText('收尾参数齐全时自动回位并确认后失能；否则结束后保持位置，不自动失能。外部电源由现场管理。' if external else
-                                     '收尾参数齐全时自动回位并确认后失能；否则结束后保持位置。PLC 共用供电不自动停止。')
+            supply = '外部电源由现场管理。' if external else 'PLC 共用供电不自动停止。'
+            self.supply_note.setText('正常结束先补完当前周期。收尾到位并确认稳定后失能；缺少已核实的收尾参数时保持位置。' + supply)
 
     def _catalog(self, payload):
         for i, profile in enumerate(payload.get('items', [])):
@@ -139,6 +141,7 @@ class QuickVerificationPage(QWidget):
         if not self.sample.text().strip() or self.sample.text() == self._suggested_sample:
             self.sample.setText('本地验证-'+key)
         self._suggested_sample = '本地验证-'+key
+        self.test_case.setText(' · '.join(filter(None, (p.get('test_case_id'), p.get('test_name')))) or '—')
         self.asset.setText(p['trajectory'])
         self._loading = False
         self._mapping_text()
@@ -184,7 +187,7 @@ class QuickVerificationPage(QWidget):
         explanation = QLabel(
             ('使用已接通的外部电源，连接 CAN、扫描并使能电机，\n' if external else
              '按默认参数打开所需 PLC 通道，连接 CAN、扫描并使能电机，\n')
-            + '平滑回默认位，预检通过后以 1 倍速循环。')
+            + '预检通过并确认轨迹首帧反馈后，以 1 倍速循环。')
         explanation.setWordWrap(True)
         form.addRow(explanation)
         safety = QCheckBox(('已接通外部电源，并确认支撑、运动范围及物理急停安全' if external else
@@ -192,7 +195,7 @@ class QuickVerificationPage(QWidget):
         form.addRow(safety)
         from factory_hmi.core.mujoco_completion import ARM_LIMBS, pose_description
         model_supported = self.selected in ARM_LIMBS
-        use_model = QCheckBox('结束后按 MuJoCo 轨迹下垂，再软件失能')
+        use_model = QCheckBox('手臂默认收尾：按 MuJoCo 轨迹下垂，确认到位后失能')
         use_model.setChecked(model_supported)
         use_model.setVisible(model_supported)
         form.addRow(use_model)
@@ -233,9 +236,10 @@ class QuickVerificationPage(QWidget):
         power_source = self.power_source.currentData()
         self._pending = True; self._phase = 'starting'; self._sync_buttons()
         self.detail.setText('正在准备运行，需要取消时点击“软件失能”')
-        options = {'physical_estop_confirmed':confirmed, 'power_source':power_source, **run_context}
+        options = {'physical_estop_confirmed': confirmed, 'power_source': power_source,
+                   'completion_mode': 'mujoco_hanging' if use_model else 'configured', **run_context}
         if use_model:
-            options.update(completion_mode='mujoco_hanging', parking_pose_confirmed=parking_confirmed)
+            options['parking_pose_confirmed'] = parking_confirmed
         self.runner('快速验证运行', lambda: self.client.quick_start(hours, sample,
                     **options),
                     self._received, quiet=True, on_failure=self._start_failed, on_finished=self._finished)
@@ -268,7 +272,7 @@ class QuickVerificationPage(QWidget):
 
     def _end(self):
         self.end_button.setEnabled(False)
-        self.detail.setText('已请求正常结束；收尾行为取决于本次配置，请等待回执…')
+        self.detail.setText('已请求正常结束，请等待工位回执…')
         self.runner('结束快速验证', self.client.quick_end, self._received, quiet=True,
                     on_failure=self._failed, on_finished=self._finished)
 

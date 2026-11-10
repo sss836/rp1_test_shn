@@ -4,7 +4,7 @@ os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 import pytest
 from PySide6.QtCore import QTimer, QCoreApplication, QEvent
 from PySide6.QtWebSockets import QWebSocket
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox
 from factory_hmi.desktop.app import FactoryMainWindow, launcher_window_fd
 from factory_hmi.quick_profiles import catalog
 
@@ -50,6 +50,7 @@ def test_quick_page_selection_and_explicit_changed_mapping_prepare(window):
     page._catalog({'items':catalog()})
     with mock.patch.object(page.client,'quick_prepare',return_value={}) as prepare:
         page.select('waist_hip')
+        assert page.test_case.text() == 'UNIT-AGING-003 · 腰髋老化'
         operation=page.runner.call_args.args[1]
         operation()
         assert prepare.call_args.args==('waist_hip',['can1','can0','can1','can0'])
@@ -72,7 +73,8 @@ def test_quick_run_duration_local_sample_and_uncertain_response_cancellation(win
         page.runner.call_args.args[1]()
         assert start.call_args.args==(2.5,'任意离线标识')
         assert start.call_args.kwargs=={'physical_estop_confirmed':True,'power_source':'external',
-                                      'data_domain':'RESEARCH','bench_id':'','operator_id':''}
+                                      'data_domain':'RESEARCH','bench_id':'','operator_id':'',
+                                      'completion_mode':'configured'}
     page._start_failed(TimeoutError('simulated response loss'))
     assert page.runner.call_args.args[1]==page.client.quick_abort
 
@@ -113,3 +115,25 @@ def test_external_default_and_explicit_plc_mode_are_sent_by_the_ui(window):
         page.runner.call_args.args[1]()
         assert start.call_args.kwargs['power_source']=='plc'
     assert not page.power_source.isEnabled()
+
+
+def test_arm_dialog_defaults_to_downward_finish_and_requires_pose_confirmation(window):
+    page = window.quick_page
+    page.selected = 'left_arm'
+
+    def confirm_dialog(dialog):
+        checkboxes = dialog.findChildren(QCheckBox)
+        safety = next(box for box in checkboxes if '物理急停安全' in box.text())
+        use_model = next(box for box in checkboxes if 'MuJoCo' in box.text())
+        pose = dialog.findChild(QCheckBox, 'quickMujocoPoseConfirmed')
+        confirm = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok)
+        assert use_model.isChecked()
+        safety.setChecked(True)
+        assert not confirm.isEnabled()
+        pose.setChecked(True)
+        assert confirm.isEnabled()
+        return QDialog.DialogCode.Accepted
+
+    with mock.patch.object(QDialog, 'exec', confirm_dialog), mock.patch.object(page, 'start') as start:
+        page._ask_run()
+    start.assert_called_once_with(1.0, True, True, True)

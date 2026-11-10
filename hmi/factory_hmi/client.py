@@ -276,15 +276,17 @@ class GatewayClient:
         return self.post("/api/v1/quick/prepare", dict(profile=profile, interfaces=interfaces, backend=backend))
 
     def quick_start(self, hours: float, sample_id: str, *, physical_estop_confirmed: bool,
-                    power_source: str = "plc", completion_mode: str = "configured",
+                    power_source: str = "plc", completion_mode: str | None = None,
                     parking_pose_confirmed: bool = False, data_domain: str | None = None,
                     bench_id: str | None = None, operator_id: str | None = None) -> JsonValue:
         payload = dict(duration_hours=hours,
             sample_id=sample_id, physical_estop_confirmed=physical_estop_confirmed,
             power_source=power_source)
         payload.update({key: value for key, value in dict(data_domain=data_domain, bench_id=bench_id, operator_id=operator_id).items() if value is not None})
-        if completion_mode != "configured":
-            payload.update(completion_mode=completion_mode, parking_pose_confirmed=parking_pose_confirmed)
+        if completion_mode is not None:
+            payload["completion_mode"] = completion_mode
+        if parking_pose_confirmed:
+            payload["parking_pose_confirmed"] = parking_pose_confirmed
         return self._request("POST", "/api/v1/quick/start", payload, timeout=120.0)
 
     def quick_end(self) -> JsonValue:

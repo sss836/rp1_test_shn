@@ -1,5 +1,6 @@
 """Exercise the real gateway worker process boundary using only fake hardware."""
 
+import json
 import os
 from pathlib import Path
 import signal
@@ -33,6 +34,66 @@ def isolated_app(tmp_path, monkeypatch):
     monkeypatch.delenv("RP1_FACTORY_SHUTDOWN_TOKEN", raising=False)
     monkeypatch.delenv("RP1_HMI_UPDATE_MONITOR_ONLY", raising=False)
     return create_app(data_root=tmp_path / "state", isolate_stations=True)
+
+
+def test_quick_arm_finishes_one_cycle_then_disables_and_seals_its_record(isolated_app, tmp_path):
+    headers = {"X-RP1-Client-ID": "quick-arm-record"}
+
+    def wait_for(read, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = read()
+            if result:
+                return result
+            time.sleep(.05)
+        pytest.fail("mock station did not reach the expected phase")
+
+    with TestClient(isolated_app) as client:
+        prepared = client.post("/api/v1/quick/prepare", headers=headers,
+                               json={"profile": "left_arm", "backend": "fake"})
+        assert prepared.status_code == 200, prepared.text
+        assert prepared.json()["result"]["profile"]["test_case_id"] == "UNIT-AGING-006"
+        started = client.post("/api/v1/quick/start", headers=headers, json={
+            "duration_hours": 1, "sample_id": "fake-arm-001", "data_domain": "FACTORY",
+            "bench_id": "TEST-01", "physical_estop_confirmed": True,
+            "parking_pose_confirmed": True, "power_source": "external",
+        })
+        assert started.status_code == 200, started.text
+        test_id = started.json()["snapshot"]["playback"]["test_id"]
+        assert test_id.startswith("LOCAL_UNIT-AGING-006_")
+
+        def snapshot():
+            response = client.get("/api/v1/snapshot", headers=headers)
+            return response.json() if response.status_code == 200 else {}
+
+        wait_for(lambda: (snapshot().get("playback") or {}).get("test_started_at"), 3)
+        ended = client.post("/api/v1/quick/end", headers=headers)
+        assert ended.status_code == 200, ended.text
+        assert ended.json()["result"]["phase"] == "finishing_cycle"
+        assert ended.json()["snapshot"]["station"]["motors_enabled"]
+
+        def terminal_quick_status():
+            status = client.get("/api/v1/quick/status", headers=headers).json()
+            return status if not status["active"] else None
+
+        finished = wait_for(terminal_quick_status, 24)
+        assert finished["phase"] == "completed", finished
+
+        def released_snapshot():
+            current = snapshot()
+            return (current.get("station", {}).get("motors_enabled") is False
+                    and current.get("can", {}).get("all_up") is False)
+
+        wait_for(released_snapshot, 2)
+        report = tmp_path / "state" / "executions" / test_id
+        wait_for(lambda: (report / "manifest.json").is_file(), 5)
+        context = json.loads((report / "config/execution.json").read_text())
+        assert context["test_case_id"] == "UNIT-AGING-006"
+        assert context["completed_cycles"] == 1 and context["outcome"] == "stopped"
+        assert context["run_request"]["completion_mode"] == "mujoco_hanging"
+        assert context["motion_completion"]["safe_disabled"] is True
+        assert context["motion_completion"]["finish_cycle_requested"] is True
+        assert (report / "telemetry/raw.csv").stat().st_size > 0
 
 
 def test_stopped_fake_station_does_not_block_other_station_or_mock_cabinet(isolated_app):
