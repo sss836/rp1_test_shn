@@ -93,6 +93,15 @@ class ControlLease:
             return LeaseSnapshot(self._owner, timestamp - self._last_refresh,
                                  self.timeout_s, True, self._generation, True)
 
+    def revoke(self, *, generation: int) -> bool:
+        """Revoke an active lease when an independent safety permit is lost."""
+        with self._lock:
+            if self._owner is None or self._revoked or self._generation != generation:
+                return False
+            self._revoked = True
+            self._requires_claim = True
+            return True
+
     def release(self, owner: str | None = None) -> None:
         with self._lock:
             if owner is not None and self._owner not in {None, owner}:

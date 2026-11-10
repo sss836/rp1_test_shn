@@ -24,7 +24,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from factory_hmi.plc.service import PlcCabinetService, PlcControlDisabledError
@@ -35,6 +35,8 @@ from factory_hmi.execution_history import history_csv
 
 from .lifecycle import LIFECYCLE_PATH, SAFETY_PATHS, ShutdownCoordinator, ShutdownGate
 from .lease import ControlLease, LeaseConflict, DEFAULT_LEASE_TIMEOUT_S, validate_lease_timeout
+from .display import DisplayPublisher
+from .station_process import StationProcess, StationUnavailable
 from .trajectory_upload import configured_trajectory_limit, receive_trajectory
 from .software_updates import SoftwareUpdates, installation_readiness
 from .motor_firmware import MotorFirmwareDownloads
@@ -362,14 +364,23 @@ class GatewayRuntime:
         self._cleanup_error: str | None = None
         self._cleanup_job: dict[str, Any] | None = None
         self._cleanup_timeout_s = 2.0
+        self._close_generation: int | None = None
         self.quick = None
         self.outbox = outbox
         self._platform = platform
+        self._process = controller if isinstance(controller, StationProcess) else None
+        if self._process is not None:
+            self.lease = self._process.lease
+        self.display = (DisplayPublisher(lambda: self.snapshot(display=True), rate_hz=status_rate_hz)
+                        if self._process is not None else None)
 
     def start(self) -> None:
         self.trajectory_root.mkdir(parents=True, exist_ok=True)
         self.config_root.mkdir(parents=True, exist_ok=True)
         self._stop.clear()
+        if self.display is not None:
+            self.display.start()
+            return
         self._lease_thread = threading.Thread(
             target=self._monitor_lease,
             name="factory-hmi-lease",
@@ -383,9 +394,24 @@ class GatewayRuntime:
         if isinstance(protection, Mapping) and protection.get("active") is True:
             raise RuntimeError("保护阻尼仍在运行；先可靠支撑机构并显式失能，再退出网关")
 
-    def close(self) -> None:
+    def close(self, *, disconnect_can: bool = False) -> None:
         # Process exit must not bypass the desktop's support-before-disable
         # boundary or silently withdraw an active protective damping session.
+        if self._process is not None:
+            if self.display is not None and not self.display.stop(timeout=2):
+                raise RuntimeError("工位状态采集仍未退出")
+            try:
+                if self.quick is not None and self.quick.snapshot()["active"] and not self._process.close_pending:
+                    self.quick.cancel()
+                with self._lease_guard:
+                    self._process.close()
+            except Exception:
+                if self.display is not None:
+                    self.display.start()
+                raise
+            from factory_hmi.core.report_jobs import resume_report_jobs
+            resume_report_jobs(self._process.report_root)
+            return
         self._require_shutdown_support()
         if self.quick is not None:
             self.quick.cancel()
@@ -402,7 +428,10 @@ class GatewayRuntime:
             close_service = getattr(self.controller, "close", None)
             if callable(close_service):
                 try:
-                    close_service()
+                    if disconnect_can:
+                        close_service(disconnect_can=True)
+                    else:
+                        close_service()
                 except Exception as exc:
                     self._cleanup_error = f"service shutdown failed: {exc}"
                     raise RuntimeError(self._cleanup_error) from exc
@@ -421,6 +450,17 @@ class GatewayRuntime:
 
     def lease_snapshot(self) -> dict[str, Any]:
         """Read liveness without polling hardware, reports, or the platform."""
+        if self._process is not None:
+            value, released = self._process.lease_status()
+            if released and self._expiry_callback is not None and self._lease_guard.acquire(blocking=False):
+                try:
+                    value, released = self._process.lease_status()
+                    if released and value["owner"] is None:
+                        self._process.clear_release_notice()
+                        self._expiry_callback()
+                finally:
+                    self._lease_guard.release()
+            return value
         lease = self.lease.snapshot()
         observe = getattr(self.controller,"protective_damping_snapshot",None)
         protection = observe() if callable(observe) else None
@@ -436,8 +476,11 @@ class GatewayRuntime:
             "protective_damping": protection if isinstance(protection,dict) else None,
         }
 
-    def snapshot(self) -> dict[str, Any]:
-        result = self._invoke(("snapshot", "get_snapshot"))
+    def snapshot(self, *, display: bool = False) -> dict[str, Any]:
+        if self._process is not None:
+            result = (self._process.collect_display_snapshot() if display else self._process.display_snapshot())
+        else:
+            result = self._invoke(("snapshot", "get_snapshot"))
         if hasattr(result, "to_dict"):
             result = result.to_dict()
         if not isinstance(result, dict):
@@ -734,8 +777,17 @@ class GatewayRuntime:
                 )
                 self._safe_release()
 
-    def _safe_release(self) -> bool:
+    def _safe_release(self, *, reason: str = "operator lease expired", disconnect_can: bool = True) -> bool:
         """Keep ownership quarantined unless every cleanup step succeeds."""
+        if self._process is not None:
+            try:
+                self._process.recover()
+            except (LeaseConflict, RuntimeError) as exc:
+                self._cleanup_error = str(exc)
+                return False
+            self._cleanup_error = None
+            self.lease_snapshot()
+            return True
         job = getattr(self, "_cleanup_job", None)
         if job is not None and job.get("protection") is not None:
             observe = getattr(self.controller, "protective_damping_snapshot", None)
@@ -753,7 +805,7 @@ class GatewayRuntime:
                     protective = getattr(self.controller, "enter_protective_damping", None)
                     if callable(protective):
                         stage = "protective_damping"
-                        status = protective("operator lease expired")
+                        status = protective(reason)
                         if isinstance(status, dict) and status.get("active") is True:
                             job["protection"] = status
                             logger.warning("operator loss: protective damping requested Kp=0 Kd=1 owner=%s safe_confirmed=false",self.lease.snapshot().owner)
@@ -761,9 +813,11 @@ class GatewayRuntime:
                     control = getattr(self.controller, "_controller", self.controller)
                     state = getattr(control, "state", "")
                     if str(getattr(state, "value", state)) in {"armed", "running", "paused", "stopping"}:
-                        self._safe_stop("operator lease expired")
-                    for names in (("disable_motors", "disable", "emergency_disable"),
-                                  ("disconnect",), ("can_disconnect",)):
+                        self._safe_stop(reason)
+                    cleanup_steps = [("disable_motors", "disable", "emergency_disable"), ("disconnect",)]
+                    if disconnect_can:
+                        cleanup_steps.append(("can_disconnect",))
+                    for names in cleanup_steps:
                         stage = "/".join(names)
                         self._invoke(names)
                 except Exception as exc:
@@ -801,11 +855,13 @@ class GatewayHub:
         lease_timeout_s: float,
         status_rate_hz: float,
         data_root: Path,
+        isolate_stations: bool = False,
     ) -> None:
         self.data_root = data_root
         self.lease_timeout_s = lease_timeout_s
         self.status_rate_hz = status_rate_hz
         self._shared_controller = controller
+        self.isolate_stations = isolate_stations and controller is None
         controller_outbox = (
             getattr(controller, "outbox", None) if controller is not None else None
         )
@@ -832,7 +888,11 @@ class GatewayHub:
         self.motor_firmware_resources = MotorFirmwareResourceDownloads(self.software_updates, self.data_root)
         self.diagnostics = DiagnosticBridge(self.data_root)
         plc_config = os.environ.get("RP1_FACTORY_PLC_CONFIG", "").strip() or None
-        self.plc = PlcCabinetService(
+        plc_factory = PlcCabinetService
+        if self.isolate_stations:
+            from factory_hmi.plc.process import PlcCabinetProcess
+            plc_factory = PlcCabinetProcess
+        self.plc = plc_factory(
             config_path=plc_config,
             data_root=self.data_root,
         )
@@ -842,6 +902,7 @@ class GatewayHub:
         self._lock = threading.RLock()
         self._started = False
         self._closed_sessions: set[str] = set()
+        self._retired_sessions: dict[str, None] = {}
         self._close_lock = threading.Lock()
         self._closed = False
         self.shutdown = ShutdownCoordinator(self.close)
@@ -860,7 +921,10 @@ class GatewayHub:
             runtimes = list(self._sessions.items())
         snapshots = {}
         for key, runtime in runtimes:
-            snapshot = runtime._invoke(("snapshot", "get_snapshot"))
+            try:
+                snapshot = runtime._invoke(("display_snapshot",)) if self.isolate_stations else runtime._invoke(("snapshot", "get_snapshot"))
+            except StationUnavailable:
+                continue
             if hasattr(snapshot, "to_dict"):
                 snapshot = snapshot.to_dict()
             if not isinstance(snapshot, dict):
@@ -907,6 +971,9 @@ class GatewayHub:
         with self._lock:
             self._started = True
             self.plc.start()
+            if self.isolate_stations:
+                from factory_hmi.core.report_jobs import resume_report_jobs
+                resume_report_jobs(self.data_root)
             if self.shared:
                 self.session("shared")
             # A paired session may have been prepared before lifespan starts.
@@ -952,9 +1019,16 @@ class GatewayHub:
         with self._lock:
             runtime = self._sessions.get(key)
             if runtime is None and create:
+                if key in self._retired_sessions:
+                    raise HTTPException(410, "工位窗口已关闭")
                 if self._closed or self.shutdown.snapshot()["state"] != "running":
                     raise HTTPException(status_code=409, detail="Gateway shutdown requested; new sessions are disabled")
+                if self.isolate_stations and len(self._sessions) >= 4:
+                    raise HTTPException(429, "工位会话已满，请先正常关闭闲置窗口")
                 safe_name = _SAFE_SESSION_NAME.sub("_", key).strip("._") or "anonymous"
+                if self.isolate_stations and (safe_name != key or len(key) > 80):
+                    import hashlib
+                    safe_name = hashlib.sha256(key.encode()).hexdigest()
                 session_root = (
                     self.data_root
                     if self.shared
@@ -963,7 +1037,8 @@ class GatewayHub:
                 controller = (
                     self._shared_controller
                     if self.shared
-                    else _default_controller(
+                    else StationProcess(session_root, self.data_root, self.outbox, self.lease_timeout_s)
+                    if self.isolate_stations else _default_controller(
                         session_root,
                         self.outbox,
                         self.data_root,
@@ -982,6 +1057,8 @@ class GatewayHub:
                 if self._started:
                     runtime.start()
             if runtime is None:
+                if self.isolate_stations:
+                    raise HTTPException(409, "工位会话不存在，请重新配置")
                 raise RuntimeError("station session does not exist")
             self._last_owner = key
             return runtime
@@ -1020,9 +1097,17 @@ class GatewayHub:
                 self._reserve_interfaces(key, requested)
             self._set_interfaces(key, requested)
             return result
+        except StationUnavailable:
+            # A transport timeout is not proof that device work stopped.
+            raise
         except Exception:
             self._set_interfaces(key, previous)
             raise
+
+    def connect_can(self, owner, runtime, bindings):
+        if self.isolate_stations and bindings:
+            self._reserve_interfaces(self._key(owner), [binding["interface"] for binding in bindings])
+        return runtime._invoke(("can_connect",), bus_bindings=bindings)
 
     def _reserve_interfaces(self, owner: str, interfaces: list[str]) -> None:
         with self._lock:
@@ -1075,7 +1160,38 @@ class GatewayHub:
         runtime = self.session(owner, create=False)
         with runtime._lease_guard:
             runtime.lease.release(owner)
-            self.release_interfaces(self._key(owner))
+            if not self.isolate_stations:
+                self.release_interfaces(self._key(owner))
+
+    def close_station(self, owner: str, generation: int | None) -> None:
+        key = self._key(owner)
+        with self._lock:
+            runtime = self._sessions.get(key)
+        if runtime is None:
+            return
+        if self.shared:
+            raise LeaseConflict("共享测试适配器不支持单独关闭工位")
+        with runtime._lease_guard:
+            with self._lock:
+                if self._sessions.get(key) is not runtime:
+                    return
+            if runtime._process is not None and runtime._process.close_pending:
+                if runtime._close_generation != generation:
+                    raise LeaseConflict("工位关闭身份或控制代次不匹配")
+            else:
+                lease = runtime.lease.snapshot()
+                if lease.owner is not None and (lease.owner != owner or lease.generation != generation):
+                    raise LeaseConflict("工位关闭身份或控制代次不匹配")
+                runtime._close_generation = generation
+            runtime.close()
+            self.release_interfaces(key)
+            with self._lock:
+                self._sessions.pop(key)
+                self._retired_sessions[key] = None
+                if len(self._retired_sessions) > 256:
+                    del self._retired_sessions[next(iter(self._retired_sessions))]
+                if self._last_owner == key:
+                    self._last_owner = next(reversed(self._sessions), None)
 
     def interface_owners(self) -> dict[str, str]:
         with self._lock:
@@ -1089,6 +1205,7 @@ def create_app(
     status_rate_hz: float = 10.0,
     data_root: Path | None = None,
     trajectory_max_bytes: int | None = None,
+    isolate_stations: bool = False,
 ) -> FastAPI:
     from factory_hmi.sync.reliability_platform import PlatformLoginError, platform_connection_diagnostics
 
@@ -1112,6 +1229,7 @@ def create_app(
         lease_timeout_s=lease_timeout_s,
         status_rate_hz=status_rate_hz,
         data_root=resolved_data_root,
+        isolate_stations=isolate_stations,
     )
 
     @asynccontextmanager
@@ -1155,6 +1273,7 @@ def create_app(
         claim: bool = False,
         preempt_motion: bool = False,
         motion_command: bool = False,
+        after_command: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         require_token(token)
         shutdown_safety = (request.url.path in SAFETY_PATHS
@@ -1167,7 +1286,8 @@ def create_app(
         runtime = hub.session(owner)
         interrupt_registered = False
         try:
-            if runtime._cleanup_error is not None and not shutdown_safety:
+            cleanup = runtime.lease_snapshot().get("cleanup_error") if runtime._process else runtime._cleanup_error
+            if cleanup is not None and not shutdown_safety:
                 raise LeaseConflict("device cleanup quarantined; retry /api/v1/lease/recover before configuring")
             with runtime._motion_epoch_guard:
                 motion_epoch = runtime._motion_epoch
@@ -1201,11 +1321,15 @@ def create_app(
                 result = operation(runtime)
                 # The guard excludes expiry cleanup for this accepted command.
                 runtime.lease.refresh(owner, command_completed=True)
+                if after_command is not None:
+                    after_command()
             return {
                 "ok": True,
                 "result": _json_result(result),
                 "snapshot": runtime.snapshot(),
             }
+        except StationUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except LeaseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ValueError, RuntimeError) as exc:
@@ -1218,6 +1342,10 @@ def create_app(
     @app.exception_handler(PlcControlDisabledError)
     async def plc_control_disabled(_request: Request, exc: PlcControlDisabledError) -> JSONResponse:
         return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+    @app.exception_handler(StationUnavailable)
+    async def station_unavailable(_request: Request, exc: StationUnavailable) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
 
     @app.exception_handler(Exception)
     async def unexpected_error(_request: Request, exc: Exception) -> JSONResponse:
@@ -1254,7 +1382,7 @@ def create_app(
         if hub.shutdown.snapshot()["state"] != "running":
             return {"ok": True, "service": "rp1-factory-gateway",
                     "software": dict(app.state.software_identity), "shutdown": shutdown_status()}
-        runtime = (
+        runtime = None if hub.isolate_stations and not x_rp1_client_id else (
             hub.session(owner_id(request, x_rp1_client_id))
             if x_rp1_client_id
             else hub.current()
@@ -1264,8 +1392,9 @@ def create_app(
             "service": "rp1-factory-gateway",
             "software": dict(app.state.software_identity),
             "platform_connection": dict(app.state.platform_connection),
-            "snapshot": runtime.snapshot(),
+            "snapshot": (runtime.snapshot() if runtime is not None else {"state": "disconnected", "connected": False}),
             "sessions": len(hub._sessions),
+            "station_processes": [r._process.pid for r in tuple(hub._sessions.values()) if r._process and r._process.pid],
             "outbox": {
                 "path": str(hub.outbox.path),
                 "migration_errors": list(hub.outbox_migration_errors),
@@ -1276,10 +1405,29 @@ def create_app(
     def snapshot(
         request: Request,
         x_rp1_client_id: str | None = Header(default=None),
-    ) -> dict[str, Any]:
-        if x_rp1_client_id:
-            return hub.session(owner_id(request, x_rp1_client_id)).snapshot()
-        return hub.current().snapshot()
+    ) -> Any:
+        runtime = hub.session(owner_id(request, x_rp1_client_id)) if x_rp1_client_id else hub.current()
+        if runtime.display is None:
+            return runtime.snapshot()
+        frame = runtime.display.latest(max_age_s=1.0)
+        if frame is None:
+            raise HTTPException(503, "尚无新鲜工位快照")
+        return Response(frame.text, media_type="application/json", headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/v1/station/close")
+    def close_station(request: Request, x_rp1_client_id: str | None = Header(default=None),
+                      x_rp1_operator_token: str | None = Header(default=None),
+                      x_rp1_lease_generation: int | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        if not x_rp1_client_id:
+            raise HTTPException(422, "缺少工位窗口身份")
+        try:
+            hub.close_station(owner_id(request, x_rp1_client_id), x_rp1_lease_generation)
+        except StationUnavailable as exc:
+            raise HTTPException(503, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+        return {"ok": True, "result": {"released": True}}
 
     @app.get("/api/v1/plc/snapshot")
     def plc_snapshot(include_history: bool = True) -> dict[str, Any]:
@@ -1846,22 +1994,21 @@ def create_app(
             x_rp1_operator_token: str | None = Header(default=None),
         ) -> dict[str, Any]:
             owner = owner_id(request, x_rp1_client_id)
-            response = mutate(
+            def release_after_command():
+                if release:
+                    hub.release_session(owner)
+                if "can_disconnect" in method_names or "clear_configuration" in method_names:
+                    hub.release_interfaces(hub._key(owner))
+
+            return mutate(
                 request,
                 x_rp1_client_id,
                 x_rp1_operator_token,
                 lambda runtime: runtime._invoke(method_names),
                 preempt_motion=preempt_motion,
                 motion_command=not preempt_motion,
+                after_command=release_after_command,
             )
-            if release:
-                hub.release_session(owner)
-            elif (
-                "can_disconnect" in method_names
-                or "clear_configuration" in method_names
-            ):
-                hub.release_interfaces(hub._key(owner))
-            return response
 
         app.post(path, name=path.rsplit("/", 1)[-1])(endpoint)
 
@@ -1906,10 +2053,7 @@ def create_app(
             request,
             x_rp1_client_id,
             x_rp1_operator_token,
-            lambda runtime: runtime._invoke(
-                ("can_connect",),
-                bus_bindings=bindings,
-            ),
+            lambda runtime: hub.connect_can(owner_id(request, x_rp1_client_id), runtime, bindings),
         )
 
     @app.post("/api/v1/motors/enable")
@@ -2420,7 +2564,7 @@ def create_app(
     ) -> dict[str, Any]:
         require_token(x_rp1_operator_token)
         owner = owner_id(request, x_rp1_client_id)
-        runtime = hub.session(owner)
+        runtime = hub.session(owner, create=not hub.isolate_stations)
         try:
             if x_rp1_lease_generation is None:
                 raise LeaseConflict("lease heartbeat requires generation; update the desktop client")
@@ -2449,9 +2593,12 @@ def create_app(
             status = observe() if callable(observe) else None
             if not isinstance(status,dict) or status.get("active") is not True:
                 raise HTTPException(409, "当前没有活动的保护阻尼")
-            runtime._invoke(("disable_motors",))
-            runtime._cleanup_job = None
-            if not runtime._safe_release():raise HTTPException(409, runtime._cleanup_error)
+            if runtime._process is not None:
+                runtime._process.disable_protection()
+            else:
+                runtime._invoke(("disable_motors",))
+                runtime._cleanup_job = None
+                if not runtime._safe_release():raise HTTPException(409, runtime._cleanup_error)
         return {"ok":True,"lease":runtime.lease_snapshot()}
 
     @app.post("/api/v1/lease/recover")
@@ -2461,7 +2608,8 @@ def create_app(
         require_token(x_rp1_operator_token)
         runtime = hub.session(owner_id(request, x_rp1_client_id), create=False)
         with runtime._lease_guard:
-            if runtime._cleanup_error is None:
+            cleanup = runtime.lease_snapshot().get("cleanup_error") if runtime._process else runtime._cleanup_error
+            if cleanup is None:
                 raise HTTPException(status_code=409, detail="no quarantined cleanup to retry")
             if not runtime._safe_release():
                 raise HTTPException(status_code=409, detail=runtime._cleanup_error)
@@ -2523,15 +2671,39 @@ def create_app(
             await websocket.close(code=1008, reason="invalid operator token")
             return
         client_id = websocket.query_params.get("client_id", "").strip()
-        runtime = hub.session(client_id) if client_id else hub.current()
+        try:
+            runtime = hub.session(client_id) if client_id else hub.current()
+        except HTTPException as exc:
+            await websocket.close(code=1008, reason=str(exc.detail))
+            return
         await websocket.accept()
         period = 1.0 / max(1.0, runtime.status_rate_hz)
         try:
+            sequence = 0
+            empty_slots = 0
             while True:
-                snapshot = await asyncio.to_thread(runtime.snapshot)
-                await websocket.send_json(snapshot)
-                await asyncio.sleep(period)
-        except WebSocketDisconnect:
+                if runtime.display is None:
+                    snapshot = await asyncio.to_thread(runtime.snapshot)
+                    await websocket.send_json(snapshot)
+                    await asyncio.sleep(period)
+                    continue
+                frame = runtime.display.latest(max_age_s=1.0)
+                if frame is not None:
+                    empty_slots = 0
+                    if frame.sequence != sequence:
+                        await asyncio.wait_for(websocket.send_text(frame.text), timeout=1)
+                        sequence = frame.sequence
+                else:
+                    empty_slots += 1
+                    if empty_slots * period > 4:
+                        await websocket.close(code=1013)
+                        return
+                try:
+                    if (await asyncio.wait_for(websocket.receive(), timeout=period))["type"] == "websocket.disconnect":
+                        return
+                except TimeoutError:
+                    pass
+        except (WebSocketDisconnect, TimeoutError):
             return
 
     @app.post("/api/v1/report-jobs/{job_id}/cancel")

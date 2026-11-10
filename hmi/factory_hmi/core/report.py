@@ -17,7 +17,7 @@ import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -833,6 +833,7 @@ class ReportManager:
         context: Mapping[str, Any],
         *,
         native_log: Path | str | None = None,
+        publication=None,
     ) -> ReportResult:
         source = Path(csv_path).expanduser()
         if source.is_symlink():
@@ -952,10 +953,11 @@ class ReportManager:
             # Build before publication; an existing execution is never replaced.
             temporary_bundle = temporary.with_suffix(".tar.gz")
             _deterministic_tar_gz(temporary, temporary_bundle)
-            os.rename(temporary, destination)
-            os.rename(temporary_bundle, bundle_path)
-            _fsync_directory(self.executions_root)
-            _fsync_directory(self.exports_root)
+            with publication() if publication is not None else nullcontext():
+                os.rename(temporary, destination)
+                os.rename(temporary_bundle, bundle_path)
+                _fsync_directory(self.executions_root)
+                _fsync_directory(self.exports_root)
             self.refresh_history_index(test_id)
             self.write_ledger(self.iter_history())
             return ReportResult(

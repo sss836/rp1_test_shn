@@ -1094,14 +1094,47 @@ class FactoryController:
         remaining = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
         return playback.wait_recording(remaining)
 
-    def snapshot(self) -> dict[str, Any]:
+    def _refresh_snapshot_feedback_locked(self) -> None:
+        read_error = None
+        read_attempted = False
+        if self.backend.connected and self.state_machine.state not in {
+            StationState.RUNNING,
+            StationState.PAUSED,
+            StationState.STOPPING,
+        }:
+            read_attempted = True
+            try:
+                if not self.backend.motors_enabled:
+                    self.backend.refresh_feedback()
+                self._last_samples = self.backend.read_samples()
+            except Exception as exc:
+                read_error = f"{type(exc).__name__}: {exc}"
+        if read_error != self._snapshot_read_error:
+            if read_error and not self._snapshot_read_error:
+                logger.warning("Motor snapshot read failed; cached measurements are not current: %s", read_error)
+            elif not read_error and self._snapshot_read_error and read_attempted:
+                logger.info("Motor snapshot reading recovered")
+            self._snapshot_read_error = read_error
+
+    def sample_display_feedback(self) -> None:
+        """Try one owned display observation without queuing behind a command."""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            self._refresh_snapshot_feedback_locked()
+        finally:
+            self._lock.release()
+
+    def snapshot(self, *, refresh_feedback: bool = True) -> dict[str, Any]:
         with self._lock:
-            read_error = None
-            read_attempted = False
             playback = self._playback
             if playback is not None:
                 playback_samples = playback.last_samples()
-                if playback_samples:
+                if playback_samples and (
+                    refresh_feedback or not self._last_samples or self.state_machine.state in {
+                        StationState.RUNNING, StationState.PAUSED, StationState.STOPPING,
+                    }
+                ):
                     self._last_samples = playback_samples
                 playback_snapshot = playback.snapshot()
                 progress = playback_snapshot["progress"]
@@ -1109,24 +1142,9 @@ class FactoryController:
                 playback_snapshot = None
                 progress = None
             manual_snapshot = self._manual.snapshot() if self._manual else None
-            if self.backend.connected and self.state_machine.state not in {
-                StationState.RUNNING,
-                StationState.PAUSED,
-                StationState.STOPPING,
-            }:
-                read_attempted = True
-                try:
-                    if not self.backend.motors_enabled:
-                        self.backend.refresh_feedback()
-                    self._last_samples = self.backend.read_samples()
-                except Exception as exc:
-                    read_error = f"{type(exc).__name__}: {exc}"
-            if read_error != self._snapshot_read_error:
-                if read_error and not self._snapshot_read_error:
-                    logger.warning("Motor snapshot read failed; cached measurements are not current: %s", read_error)
-                elif not read_error and self._snapshot_read_error and read_attempted:
-                    logger.info("Motor snapshot reading recovered")
-                self._snapshot_read_error = read_error
+            if refresh_feedback:
+                self._refresh_snapshot_feedback_locked()
+            read_error = self._snapshot_read_error
             now = time.monotonic()
             view_samples = [sample.with_feedback_age(now) for sample in self._last_samples]
             joint_positions: list[float | None] = []

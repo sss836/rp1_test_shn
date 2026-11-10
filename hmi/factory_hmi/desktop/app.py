@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import time
 from datetime import datetime, time as day_time
@@ -27,7 +28,7 @@ try:
         Slot,
     )
     from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap
-    from PySide6.QtNetwork import QNetworkProxy
+    from PySide6.QtNetwork import QNetworkProxy, QNetworkReply, QNetworkRequest
     from PySide6.QtWebSockets import QWebSocket
     from PySide6.QtWidgets import (
         QAbstractItemView,
@@ -195,7 +196,8 @@ class FactoryMainWindow(QMainWindow):
         "当前状态",
     )
 
-    def __init__(self, gateway_url: str, *, operator_token: str | None = None) -> None:
+    def __init__(self, gateway_url: str, *, operator_token: str | None = None,
+                 new_window_fd: int | None = None) -> None:
         super().__init__()
         self.client = GatewayClient(
             gateway_url,
@@ -204,6 +206,14 @@ class FactoryMainWindow(QMainWindow):
         self.pool = QThreadPool.globalInstance()
         self._workers: set[RestWorker] = set()
         self._closing = False
+        self._new_window_fd = new_window_fd
+        self._close_reply: QNetworkReply | None = None
+        self._close_verified = False
+        self._close_timer = QTimer(self)
+        self._close_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._close_timer.setSingleShot(True)
+        self._close_timer.setInterval(10_000)
+        self._close_timer.timeout.connect(self._station_close_timed_out)
         self._configured = False
         self._motor_fault_reset_pending = False
         self._motor_discovery_pending = False
@@ -235,7 +245,6 @@ class FactoryMainWindow(QMainWindow):
         self._last_trajectory: dict[str, Any] = {}
         self._config_preview: dict[str, Any] = {}
         self._available_can: list[dict[str, Any]] = []
-        self._child_windows: list[FactoryMainWindow] = []
         self._compact_layout: bool | None = None
         self._manual_mode_active = False
         self._manual_starting = False
@@ -421,6 +430,9 @@ class FactoryMainWindow(QMainWindow):
         status = QStatusBar()
         status.setObjectName("appStatusBar")
         status.setFixedHeight(24)
+        self._close_status = QLabel(status)
+        self._close_status.hide()
+        status.addPermanentWidget(self._close_status)
         self.setStatusBar(status)
         self.statusBar().showMessage("正在连接网关…")
 
@@ -3352,6 +3364,7 @@ class FactoryMainWindow(QMainWindow):
             owns_lease = (
                 lease.get("owner") == self.client.client_id
                 and lease.get("expired") is not True
+                and lease.get("revoked") is not True
             )
         station = snapshot.get("station")
         if isinstance(station, Mapping):
@@ -3850,20 +3863,15 @@ class FactoryMainWindow(QMainWindow):
         self.module_config_dialog.activateWindow()
 
     def _new_module_window(self) -> None:
-        window = FactoryMainWindow(
-            self.client.base_url,
-            operator_token=self.client.operator_token or None,
-        )
-        window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self._child_windows.append(window)
-        window.destroyed.connect(
-            lambda _object=None, current=window: (
-                self._child_windows.remove(current)
-                if current in self._child_windows
-                else None
-            )
-        )
-        window.show()
+        if self._new_window_fd is None:
+            self.statusBar().showMessage("请从 RP1 上位机启动器启动后再打开独立窗口。", 6000)
+            return
+        try:
+            os.write(self._new_window_fd, b"+")
+        except OSError:
+            self.statusBar().showMessage("未能通知启动器打开独立窗口，请检查上位机运行状态。", 6000)
+            return
+        self.statusBar().showMessage("已请求打开独立窗口。", 3000)
 
     def _selected_limb(self) -> str:
         if not hasattr(self, "limb"):
@@ -6032,32 +6040,94 @@ class FactoryMainWindow(QMainWindow):
             self.zero_dialog.reject()
 
     def closeEvent(self, event: Any) -> None:
+        if self._close_verified:
+            self._finish_window_close(event)
+            return
+        event.ignore()
+        if self._close_reply is not None:
+            return
         protection = ((self._last_snapshot or {}).get("station") or {}).get("protective_damping") or {}
         if protection.get("active") is True:
-            event.ignore()
             QMessageBox.warning(self,"保护阻尼仍在运行","请先可靠支撑机构并点击软件失能，再关闭窗口。关闭控制进程无法保证持续阻尼。")
             return
+        if self._new_window_fd is None and not (
+                self._lease_enabled or self._motors_enabled or self._motors_discovered or self._can_connected):
+            event.accept()
+            self._finish_window_close(event)
+            return
+
+        self._request_station_close()
+
+    def _request_station_close(self) -> None:
+        self._show_station_close_status("正在核实本窗口工位已停止并释放…")
+        request = QNetworkRequest(QUrl(self.client.base_url + "/api/v1/station/close"))
+        request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                             QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
+        request.setRawHeader(b"Content-Type", b"application/json")
+        request.setRawHeader(b"X-RP1-Client-ID", self.client.client_id.encode())
+        generation = self.client.lease_generation
+        if generation is not None:
+            request.setRawHeader(b"X-RP1-Lease-Generation", str(generation).encode())
+        if self.client.operator_token:
+            request.setRawHeader(b"X-RP1-Operator-Token", self.client.operator_token.encode())
+        try:
+            # This manager already uses loopback direct connections and keeps
+            # asynchronous network events on the owning Qt event loop.
+            reply = self._lease_heartbeat.manager.post(request, b"{}")
+        except RuntimeError:
+            self._show_station_close_status("无法发送工位释放请求，窗口保持打开。")
+            return
+        self._close_reply = reply
+        reply.finished.connect(lambda: self._station_close_finished(reply))
+        self._close_timer.start()
+
+    def _show_station_close_status(self, message: str) -> None:
+        self._close_status.setText(message)
+        self._close_status.show()
+
+    @Slot()
+    def _station_close_timed_out(self) -> None:
+        reply, self._close_reply = self._close_reply, None
+        if reply is not None:
+            self._show_station_close_status("关窗确认超时，窗口保持打开。再次关闭可核对释放结果。")
+            reply.abort()
+            reply.deleteLater()
+
+    def _station_close_finished(self, reply: QNetworkReply) -> None:
+        if self._close_reply is not reply:
+            return
+        self._close_reply = None
+        self._close_timer.stop()
+        try:
+            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            try:
+                payload = json.loads(bytes(reply.readAll()))
+            except (UnicodeDecodeError, ValueError):
+                payload = None
+            result = payload.get("result") if isinstance(payload, Mapping) else None
+            if (reply.error() == QNetworkReply.NetworkError.NoError and status == 200
+                    and isinstance(result, Mapping) and payload.get("ok") is True
+                    and result.get("released") is True):
+                self._close_verified = True
+                self._lease_enabled = False
+            else:
+                detail = payload.get("detail") if isinstance(payload, Mapping) else None
+                if isinstance(detail, Mapping):
+                    detail = detail.get("message") or detail.get("detail")
+                reason = detail[:120] if isinstance(detail, str) and status in {409, 503} else ""
+                self._show_station_close_status("工位释放未确认，窗口保持打开。" + (" " + reason if reason else ""))
+        finally:
+            reply.deleteLater()
+        if self._close_verified:
+            QTimer.singleShot(0, self, self.close)
+
+    def _finish_window_close(self, event: Any) -> None:
         self._closing = True
         self.diagnostics_page.stop()
         self._lease_enabled = False
         self._lease_heartbeat.stop()
         self.plc_page.shutdown()
         self.quick_page.stop()
-        previous_timeout = self.client.timeout
-        self.client.timeout = min(previous_timeout, 2.0)
-        try:
-            if self._motors_enabled:
-                self.client.playback_disable()
-            if self._motors_discovered:
-                self.client.disconnect()
-            if self._can_connected:
-                self.client.can_disconnect()
-        except Exception:
-            # The gateway lease monitor performs the same fail-safe cleanup
-            # when the desktop disappears unexpectedly.
-            pass
-        finally:
-            self.client.timeout = previous_timeout
         self.sample_timer.stop()
         self.reconnect_timer.stop()
         self.snapshot_timer.stop()
@@ -6066,6 +6136,18 @@ class FactoryMainWindow(QMainWindow):
         self.lease_timer.stop()
         self.websocket.close()
         super().closeEvent(event)
+
+
+def launcher_window_fd() -> int | None:
+    try:
+        fd = int(os.environ.get("RP1_HMI_NEW_WINDOW_FD", ""))
+        if fd >= 3 and stat.S_ISFIFO(os.fstat(fd).st_mode) and not os.get_blocking(fd):
+            # Keep the private control channel in this desktop process only.
+            os.set_inheritable(fd, False)
+            return fd
+    except (OSError, ValueError, OverflowError):
+        pass
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -6097,6 +6179,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     window = FactoryMainWindow(
         args.gateway_url,
         operator_token=args.operator_token,
+        new_window_fd=launcher_window_fd(),
     )
     from .activation import install_activation, restore_window
     activation_address = os.environ.get("RP1_HMI_ACTIVATION_SOCKET", "")

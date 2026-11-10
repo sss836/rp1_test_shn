@@ -69,11 +69,19 @@ def _source(service,run_id):
    try:duration=float(line.split(b',',1)[0]);break
    except ValueError:continue
   return dict(windows=root/'telemetry/segments/windows.jsonl',duration=duration,sealed=True)
- identity=dict(getattr(service,'_record_identity',{}) or {})
+ read_identity=getattr(service,'preview_record_identity',None)
+ if callable(read_identity):
+  identity=read_identity(run_id) or {}
+ else:
+  identity=dict(getattr(service,'_record_identity',{}) or {})
  if identity.get('execution_uuid')!=run_id:raise HTTPException(409,'本次没有可读取的测量记录；只能查看已有实时缓存')
+ record_root=getattr(service,'record_root',None)
+ if record_root is None and callable(read_identity):
+  record_root=Path(service.data_root)/'records'
+ if record_root is None:raise HTTPException(409,'本次记录缺少可用的工位目录')
  test_id=str(identity.get('test_id') or '')
- if not test_id or Path(test_id).name!=test_id:raise HTTPException(422,'无效记录身份')
- output=Path(service.record_root)/(test_id+'.csv');checkpoint=output.with_suffix('.checkpoint.json')
+ if not test_id or test_id in {'.','..'} or Path(test_id).name!=test_id:raise HTTPException(422,'无效记录身份')
+ output=Path(record_root)/(test_id+'.csv');checkpoint=output.with_suffix('.checkpoint.json')
  if not checkpoint.is_file():raise HTTPException(409,'记录正在准备，尚无已持久化时段')
  if checkpoint.stat().st_size>8192:raise HTTPException(422,'记录检查点超出预算')
  value=json.loads(checkpoint.read_text());duration=float(value.get('last_time_s') or 0.)

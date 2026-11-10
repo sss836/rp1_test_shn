@@ -18,7 +18,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from factory_hmi.models import StationState
+from factory_hmi.models import StationConfig, StationState
 
 from ._legacy import motor_default_positions
 from .backend import FakeMotorBackend, MotorsPyBackend
@@ -30,7 +30,7 @@ from .can_manager import (
     CanInterfaceStatus,
     CanManager,
 )
-from .config import load_station_config
+from .config import load_station_config, require_supported_limb
 from .controller import FactoryController
 from .command_receipts import StartReceipts
 from .motion_completion import automatic_completion_parameters
@@ -92,9 +92,12 @@ class FactoryService:
         self._last_stop_reason: str | None = None
         self._can_manager = can_manager or CanManager()
         self._can_interfaces: tuple[str, ...] = ()
+        self._display_can: tuple[str, float, dict[str, Any]] | None = None
+        self._display_can_probe: tuple[str, float] | None = None
         self._can_bindings: tuple[dict[str, Any], ...] = ()
         self._fake_can_connected = False
         self._report_threads: set[threading.Thread] = set()
+        self._queued_report_ids: set[str] = set()
         self._report_errors: dict[str, str] = {}
         self._recording_session: Any = None
         self._record_identity: dict[str, str] = {}
@@ -102,6 +105,8 @@ class FactoryService:
         self._start_receipts = StartReceipts(self.data_root / "start-receipts.sqlite3")
         self._record_sidecar: Path | None = None
         self._live_report_context: dict[str, Any] | None = None
+        from .report_jobs import resume_report_jobs
+        resume_report_jobs(self.report_manager.data_root)
         # Empty stations have nothing to recover. In particular, do not create
         # an evidence lock/SQLite connection/empty ledger after __init__ returns.
         # The first explicit history query still creates the empty ledger.
@@ -128,8 +133,8 @@ class FactoryService:
             # thread. Keep finished handles until a join/reap confirms exit.
             worker.start()
 
-    def wait_for_reports(self, timeout: float = 5.0) -> None:
-        """Drain owned file writers without holding the service/report locks."""
+    def _wait_for_report_staging(self, timeout: float) -> None:
+        """Wait for CSV sealing and handoff, including startup recovery."""
         if not np.isfinite(timeout) or timeout < 0:
             raise ValueError("report timeout must be finite and non-negative")
         deadline = time.monotonic() + timeout
@@ -153,8 +158,38 @@ class FactoryService:
                     self._report_errors["shutdown"] = message
                 raise TimeoutError(message)
 
-    def close(self, timeout: float = 5.0) -> dict[str, Any]:
-        """Normally disconnect, then drain recovery/finalization before return.
+    def _reap_report_receipts(self) -> None:
+        from .report_jobs import report_job_status
+
+        with self._lock:
+            pending = tuple(self._queued_report_ids)
+        for key in pending:
+            receipt = report_job_status(self.report_manager.data_root, key)
+            if receipt["state"] not in {"completed", "failed", "cancelled"}:
+                continue
+            with self._lock:
+                self._queued_report_ids.discard(key)
+                if receipt["state"] == "completed":
+                    self._report_errors.pop(key, None)
+                else:
+                    self._report_errors[key] = receipt["error"] or f"report job {receipt['state']}"
+
+    def wait_for_reports(self, timeout: float = 5.0) -> None:
+        """Explicitly wait for detached reports as well as local staging."""
+        deadline = time.monotonic() + timeout
+        self._wait_for_report_staging(timeout)
+        while True:
+            self._reap_report_receipts()
+            with self._lock:
+                if not self._queued_report_ids:
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("detached reports still running; source evidence retained")
+            time.sleep(min(.05, remaining))
+
+    def close(self, timeout: float = 5.0, *, disconnect_can: bool = False) -> dict[str, Any]:
+        """Normally disconnect, then finish local CSV handoff before return.
 
         Timeout bounds the report drain, not an unresponsive native disconnect.
         A failed close remains closing and can be retried; it never authorizes
@@ -180,10 +215,14 @@ class FactoryService:
                     disconnect_error = exc
                     with self._lock:
                         self._report_errors["shutdown-disconnect"] = str(exc)
-            self.wait_for_reports(timeout)
+            self._wait_for_report_staging(timeout)
             self._require_recording_closed()
             if disconnect_error is not None:
                 raise RuntimeError("station disconnect failed during close") from disconnect_error
+            if disconnect_can:
+                with self._lock:
+                    if self._can_interfaces:
+                        self._disconnect_can_locked("工位安全退出")
             self._zeroing = None
             self._closed = True
             return {"closed": True, "report_errors": dict(self._report_errors)}
@@ -211,6 +250,7 @@ class FactoryService:
         backend: str,
         bus_bindings: Sequence[Mapping[str, Any]] | None = None,
         motor_overrides: Sequence[Mapping[str, Any]] | None = None,
+        station_config: StationConfig | None = None,
     ) -> dict[str, Any]:
         self._require_recording_closed()
         self._require_protective_damping_released()
@@ -229,12 +269,15 @@ class FactoryService:
                     raise RuntimeError(
                         "disconnect CAN interfaces before configuring another station"
                     )
-            station_config = load_station_config(
-                limb,
-                path,
-                bus_bindings=bus_bindings,
-                motor_overrides=motor_overrides,
-            )
+            if station_config is None:
+                station_config = load_station_config(
+                    limb,
+                    path,
+                    bus_bindings=bus_bindings,
+                    motor_overrides=motor_overrides,
+                )
+            elif not isinstance(station_config, StationConfig) or station_config.limb != require_supported_limb(limb):
+                raise ValueError("station configuration does not match the requested module")
             can_interfaces = tuple(
                 sorted(
                     {
@@ -306,10 +349,8 @@ class FactoryService:
         with self._lock:
             if self._controller is not None:
                 self._controller.disconnect()
-            if self._backend_name == "fake":
-                self._fake_can_connected = False
-            elif self._can_interfaces:
-                self._can_manager.disconnect(self._can_interfaces)
+            if self._can_interfaces:
+                self._disconnect_can_locked("清除工位配置")
             self._controller = None
             self._zeroing = None
             self._backend_name = None
@@ -411,9 +452,9 @@ class FactoryService:
                 return self._can_payload([])
             if self._backend_name == "fake":
                 return self._can_payload(self._fake_can_statuses())
-            return self._can_payload(
-                self._can_manager.status(self._can_interfaces)
-            )
+            payload = self._can_payload(self._can_manager.status(self._can_interfaces))
+            self._display_can = self._config_revision, time.monotonic(), payload
+            return payload
 
     def can_interfaces(self) -> dict[str, Any]:
         """Discover policy-approved CAN links independently of station YAML."""
@@ -521,6 +562,24 @@ class FactoryService:
                         )
             return self.snapshot()
 
+    def _disconnect_can_locked(self, reason: str) -> None:
+        if self._controller is not None and self._controller.backend.connected:
+            raise RuntimeError("disconnect motors before disconnecting CAN")
+        if self._backend_name == "fake":
+            self._fake_can_connected = False
+        elif self._can_interfaces:
+            self._can_manager.disconnect(self._can_interfaces)
+            statuses = self._can_manager.status(self._can_interfaces)
+            if ({row.interface for row in statuses} != set(self._can_interfaces)
+                    or any(row.up for row in statuses)):
+                raise RuntimeError("CAN关闭状态未确认；保留Pn通道隔离")
+        from .motor_parameter_transport import archive_pn_quarantine
+        archive_pn_quarantine(
+            self.report_manager.data_root / "pn-quarantine", self._can_interfaces,
+            reason=reason + "，接口关闭已确认；重新接入仍需Pn静默窗口。"
+                            "仅重新建立主机时序边界，不代表检测到电机重新上电。",
+        )
+
     def can_disconnect(self) -> dict[str, Any]:
         # Use the same boundary as maintenance start/close, so a fresh task
         # cannot start between cancellation and the explicit interface down.
@@ -530,21 +589,7 @@ class FactoryService:
             for task in self.maintenance_tasks():
                 task.cancel()
             with self._lock:
-                if self._controller is not None and self._controller.backend.connected:
-                    raise RuntimeError("disconnect motors before disconnecting CAN")
-                if self._backend_name == "fake":
-                    self._fake_can_connected = False
-                elif self._can_interfaces:
-                    self._can_manager.disconnect(self._can_interfaces)
-                    statuses = self._can_manager.status(self._can_interfaces)
-                    if ({row.interface for row in statuses} != set(self._can_interfaces)
-                            or any(row.up for row in statuses)):
-                        raise RuntimeError("CAN关闭状态未确认；保留Pn通道隔离")
-                from .motor_parameter_transport import archive_pn_quarantine
-                archive_pn_quarantine(
-                    self.report_manager.data_root / 'pn-quarantine', self._can_interfaces,
-                    reason='用户显式断开CAN，接口关闭已确认；重新接入仍需Pn静默窗口。'
-                           '仅重新建立主机时序边界，不代表检测到电机重新上电。')
+                self._disconnect_can_locked("用户显式断开CAN")
                 return self.snapshot()
 
     @_open_service_operation
@@ -1027,6 +1072,14 @@ class FactoryService:
         self.controller.manual_stop()
         return self.snapshot()
 
+    def preview_record_identity(self, run_id: str) -> dict[str, str] | None:
+        """Only the exact current execution can expose a durable-window identity."""
+        with self._lock:
+            identity = self._record_identity
+            if identity.get("execution_uuid") != run_id or not identity.get("test_id"):
+                return None
+            return {"execution_uuid": run_id, "test_id": identity["test_id"]}
+
     def record_file(self) -> Path:
         # Download only from the committed recording session, never a start draft.
         output = self._recording_session.record_output if self._recording_session is not None else None
@@ -1288,7 +1341,8 @@ class FactoryService:
                 self._report_errors[source.stem]="记录存在未封段尾部；已保留原件和确认持久前缀，需核实，未自动续测"
             from .report_jobs import recover_report_jobs
             for result in recover_report_jobs(self.report_manager.data_root):
-                if result["state"] == "failed":self._report_errors[result["id"]] = result["reason"]
+                if result["state"] == "failed":
+                    self._report_errors[result["id"]] = result["error"]
             self.recover_reports()
         except Exception as exc:
             with self._lock:
@@ -1350,13 +1404,12 @@ class FactoryService:
                     ),
                 }
             )
-            from .report_jobs import run_report_job
-            run_report_job(self.report_manager.data_root, record_path, context)
-            self.capacity_reservations.complete(context.get("execution_uuid", ""))
-            self.execution_history_page(limit=1)
-            record_path.with_suffix(".context.json").unlink(missing_ok=True)
+            from .report_jobs import enqueue_report_job
+            job = enqueue_report_job(self.report_manager.data_root, record_path, context)
             with self._lock:
+                self._queued_report_ids.add(job)
                 self._report_errors.pop(test_id, None)
+            self._reap_report_receipts()
         except Exception as exc:
             with self._lock:
                 self._report_errors[test_id] = str(exc)
@@ -1499,7 +1552,43 @@ class FactoryService:
         if not self.can_status()["all_up"]:
             raise RuntimeError("CAN接口未就绪；维护不会自动配置或启动接口")
 
+    def collect_display_snapshot(self) -> dict[str, Any]:
+        """Called only by this runtime's periodic display producer."""
+        with self._lock:
+            self._require_open()
+            controller = self._controller
+            revision = self._config_revision
+            interfaces = self._can_interfaces if self._backend_name != "fake" else ()
+            started = time.monotonic()
+            probe = self._display_can_probe
+            query_can = bool(interfaces) and (
+                probe is None or probe[0] != revision or started - probe[1] >= 1.0
+            )
+            if query_can:
+                self._display_can_probe = revision, started
+
+        if controller is not None:
+            controller.sample_display_feedback()
+        if query_can:
+            try:
+                statuses = self._can_manager.status(interfaces)
+            except (RuntimeError, OSError):
+                # Keep the last verified result only within its display TTL.
+                pass
+            else:
+                with self._lock:
+                    cached = self._display_can
+                    if revision == self._config_revision and (cached is None or cached[1] <= started):
+                        self._display_can = revision, started, self._can_payload(statuses)
+        return self.display_snapshot()
+
+    def display_snapshot(self) -> dict[str, Any]:
+        return self._snapshot(for_display=True)
+
     def snapshot(self) -> dict[str, Any]:
+        return self._snapshot(for_display=False)
+
+    def _snapshot(self, *, for_display: bool) -> dict[str, Any]:
         # Never take the task lock while holding the service lock: preview
         # reads final targets in the opposite direction.
         maintenance_snapshot = self._maintenance.snapshot() if self._maintenance else {"active": False, "status": "idle"}
@@ -1524,7 +1613,8 @@ class FactoryService:
                     "fault": None,
                     "diagnostics": [],
                 }
-            snapshot = self._controller.snapshot()
+            snapshot = (self._controller.snapshot(refresh_feedback=False)
+                        if for_display else self._controller.snapshot())
             snapshot["motor_maintenance"] = maintenance_snapshot
             snapshot["motor_parameters"] = parameters_snapshot
             snapshot["motor_versions"] = self._controller.backend.motor_versions()
@@ -1562,7 +1652,15 @@ class FactoryService:
             state = str(station.get("state", self._controller.state.value))
             fault = snapshot.get("fault")
             diagnoses = fault.get("diagnoses", []) if isinstance(fault, dict) else []
-            can_snapshot = self.can_status()
+            if for_display and self._backend_name != "fake":
+                cached = self._display_can
+                if (cached is not None and cached[0] == self._config_revision
+                        and time.monotonic() - cached[1] <= 2.5):
+                    can_snapshot = {**cached[2], "sampled_monotonic_s": cached[1], "stale": False}
+                else:
+                    can_snapshot = {**self._can_payload([]), "stale": True}
+            else:
+                can_snapshot = self.can_status()
             motors_discovered = bool(station.get("motors_discovered", station.get("backend_connected", False)))
             motors_enabled = bool(station.get("motors_enabled", False))
             if motors_enabled:

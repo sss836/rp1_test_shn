@@ -83,6 +83,10 @@ class PlcCabinetService:
             self.controller.feedback = previous
             raise PlcRequestConflict("rejected", detail)
 
+    def _tick(self, now: float | None = None) -> None:
+        self.controller.tick(now)
+        self.coordination.advance()
+
     def start(self) -> None:
         # Gateway startup is passive. Only explicit connect() opens a client
         # or creates the polling worker; configuration never auto-enables it.
@@ -166,7 +170,7 @@ class PlcCabinetService:
                 else:
                     self.shutdown_status = {"state": "stopping", "detail": "Waiting for fresh PLC shutdown feedback"}
                     self._shutdown_error_kind = "electrical"
-                    self.controller.tick()
+                    self._tick()
                     self._check_shutdown_interrupt()
                     if not self._shutdown_feedback_confirmed() and not self.controller.request_stop(user="system-shutdown"):
                         raise RuntimeError(self.controller.feedback["Stop"].detail)
@@ -174,7 +178,7 @@ class PlcCabinetService:
                     deadline = time.monotonic() + (6*t.command_timeout_ms + t.km0_timeout_ms + 4*t.ps1_timeout_ms)/1000
                     while True:
                         self._check_shutdown_interrupt()
-                        self.controller.tick()
+                        self._tick()
                         self._check_shutdown_interrupt()
                         if self._shutdown_feedback_confirmed():
                             self.controller.connection_power_unverified = False
@@ -187,6 +191,7 @@ class PlcCabinetService:
                         self.controller.heartbeat()
                         self._shutdown_interrupt.wait(t.poll_ms / 1000)
                 self.controller.disconnect()
+                self.coordination.advance()
                 self._shutdown_error_kind = None
             except Exception as exc:
                 self.shutdown_status = {"state": "unconfirmed", "detail": str(exc)}
@@ -229,6 +234,7 @@ class PlcCabinetService:
                     self._power_off_unverified = False
                 else:
                     self._power_off_unverified = True
+            self.coordination.advance()
 
     def connect(self, *, user: str) -> dict[str, Any]:
         with self._lock:
@@ -268,6 +274,7 @@ class PlcCabinetService:
             self._communication_gate.clear()
             self._power_off_unverified = False
             self.shutdown_status = {"state": "unverified", "detail": "PLC通信已停用；不代表外部供电或机械安全已确认"}
+            self.coordination.advance()
             return self.snapshot()
 
     def _require_control(self) -> None:
@@ -401,7 +408,7 @@ class PlcCabinetService:
                         command = self.controller.command
                         if command.main_enable or command.ps1_output_enable or any(command.channel_enable):
                             self._power_off_unverified = True
-                        self.controller.tick(now)
+                        self._tick(now)
                         if self._shutdown_feedback_confirmed():
                             self.controller.connection_power_unverified = False
                             self._power_off_unverified = False
@@ -416,6 +423,7 @@ class PlcCabinetService:
                 except PlcCommunicationError as exc:
                     self.controller._communication_lost(str(exc))
                     self.client.disconnect()
+                    self.coordination.advance()
                 except Exception as exc:
                     self.controller.last_error = str(exc)
 
@@ -426,7 +434,7 @@ class PlcCabinetService:
         if status.status_counter == self._last_status_counter:
             return
         self._last_status_counter = status.status_counter
-        values = self.controller.snapshot()["status"]
+        values = self.controller.snapshot(include_history=False)["status"]
         self._trend.append(
             {
                 "timestamp": time.time(),

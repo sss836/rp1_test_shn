@@ -23,6 +23,7 @@ def service(tmp_path, monkeypatch):
     monkeypatch.setattr('factory_hmi.plc.service.build_plc_client', lambda *a: client)
     service = PlcCabinetService(load_plc_config(), data_root=tmp_path)
     service.controller.connect(user='offline')
+    service.coordination.advance()
     yield service
     # These arbitration tests deliberately leave fake feedback stuck/faulted.
     # Tear down only the mock transport; shutdown verification has dedicated
@@ -46,7 +47,7 @@ def execute(service, operation, payload=None, *, source='window-a', request_id=N
 
 def advance(service, phase=None):
     for _ in range(30):
-        service.controller.tick()
+        service._tick()
         snap = service.snapshot()
         if not snap['coordination']['busy'] and (phase is None or snap['phase'] == phase):
             return snap
@@ -149,7 +150,7 @@ def test_channel_receipt_waits_for_actual_output_not_just_sequence_ack(service):
     execute(service, 'channel', {'channel': 1, 'enabled': False})
     service.client.set_status(channel_permit=(True, True, False, False))
     for _ in range(3):
-        service.controller.tick()
+        service._tick()
     snap = service.snapshot()
     assert snap['coordination']['busy']
     assert snap['coordination']['active_command']['state'] == 'pending'
@@ -172,7 +173,7 @@ def test_other_window_all_stop_supersedes_start_even_from_old_revision(service):
     assert snap['command']['PS1OutputEnable'] is False
     # No queued startup or later delayed write can revive the cabinet.
     for _ in range(5):
-        service.controller.tick()
+        service._tick()
     assert service.controller.phase == CabinetPhase.FAULT
     assert service.controller.command.main_enable is False
 
@@ -181,7 +182,7 @@ def test_all_stop_waits_for_actual_power_off(service):
     start(service)
     execute(service, 'all-stop', source='window-b')
     service.client.set_status(ps1_actual_output=True, main_ready=True)
-    service.controller.tick()
+    service._tick()
     assert service.snapshot()['coordination']['busy']
     service.client.set_status(ps1_actual_output=False, main_ready=False)
     assert advance(service)['coordination']['last_command']['state'] == 'confirmed'
@@ -268,17 +269,24 @@ def test_uncertain_write_is_cached_and_never_repeated(service, monkeypatch):
 def test_lost_communication_settles_start_feedback_and_receipt(service):
     execute(service, 'start', {'channels': [1], 'voltage': 3., 'current': .5})
     service.controller._communication_lost('offline test disconnect')
+    service.coordination.advance()
     snap = service.snapshot()
     assert snap['feedback']['Start']['state'] != 'pending'
     assert snap['coordination']['last_command']['state'] in {'rejected', 'failed'}
 
 
-def test_channel_actual_confirmation_timeout_enters_safe_fault(service):
+def test_channel_timeout_advances_from_tick_without_snapshot_writing_to_plc(service):
     start(service)
     execute(service, 'channel', {'channel': 1, 'enabled': False})
     service.client.set_status(channel_permit=(True, True, False, False))
-    for _ in range(3): service.controller.tick()
+    for _ in range(3): service._tick()
     service.coordination._active['_deadline'] = 0
+    before = len(service.client.command_history)
+    observed = service.snapshot()['coordination']
+    assert observed['active_command']['state'] == 'pending'
+    assert service.snapshot()['coordination']['revision'] == observed['revision']
+    assert len(service.client.command_history) == before
+    service._tick()
     snap = service.snapshot()
     assert snap['coordination']['last_command']['state'] == 'timeout'
     assert snap['phase'] == 'FAULT'

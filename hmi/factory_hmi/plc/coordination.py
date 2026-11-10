@@ -61,11 +61,15 @@ class PlcCommandCoordinator:
         if record is self._active:
             self._active = None
 
-    def _resolve(self) -> None:
+    def _track_command_sequence(self) -> None:
         sequence = self.service.controller.command.command_sequence
         if sequence != self._last_sequence:
             self._last_sequence = sequence
             self.revision += 1
+
+    def advance(self) -> None:
+        """Resolve hardware receipts from a cabinet tick or command, under its lock."""
+        self._track_command_sequence()
         record = self._active
         if record is None:
             return
@@ -111,10 +115,11 @@ class PlcCommandCoordinator:
             self._finish(record, "timeout", "PLC 实际状态未在规定时间内确认")
             if operation == "channel":
                 controller._enter_fault("channel output confirmation timeout", "system")
+                self._track_command_sequence()
 
     def snapshot(self) -> dict[str, Any]:
-        # The caller holds the service lock, including while serializing a GET.
-        self._resolve()
+        # Observations remain ordered for clients without advancing a receipt
+        # or the cabinet control revision on the read path.
         self._snapshot_sequence += 1
         return {
             "epoch": self.epoch,
@@ -135,7 +140,7 @@ class PlcCommandCoordinator:
         with service._lock:
             if operation not in {"connect", "disconnect"}:
                 service._require_control()
-            self._resolve()
+            self.advance()
             if not client_id or not request_id:
                 raise PlcRequestConflict("missing_context", "缺少窗口或请求标识，请更新上位机并刷新 PLC 页面")
             key = (client_id, request_id)
@@ -231,5 +236,6 @@ class PlcCommandCoordinator:
             self._audit(record)
             if operation in {"connect", "disconnect"}:
                 self._finish(record, "confirmed", "连接状态已更新")
+            self.advance()
             result = service.snapshot()
             return {"ok": True, "result": result, "request": self._public(record), "replayed": False}

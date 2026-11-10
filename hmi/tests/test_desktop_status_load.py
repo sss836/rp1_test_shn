@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from fastapi.testclient import TestClient
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QObject, QThreadPool, QTimer, Signal
+from PySide6.QtNetwork import QNetworkReply
 from PySide6.QtWidgets import QApplication
 from shiboken6 import isValid
 
@@ -97,6 +98,7 @@ setpoints:
     cabinet.controller.clock = lambda: 500.0
     cabinet.controller.connect(user="fixture")
     cabinet.communication_enabled = True
+    cabinet.coordination.advance()
     cabinet._trend = deque(({
         "timestamp": index / 10, "Voltage": [24.0] * 4,
         "Current": [1.0] * 4, "Power": [24.0] * 4, "AnalogValidMask": 15,
@@ -148,7 +150,7 @@ def test_hidden_plc_page_keeps_shared_faults_and_confirmations_in_two_windows(de
         left.plc_page.current_setpoint.setValue(1.0)
         left.plc_page._start()
         for _ in range(30):
-            cabinet.controller.tick()
+            cabinet._tick()
             if not cabinet.snapshot()["coordination"]["busy"]:
                 break
         left.plc_page.refresh()
@@ -160,7 +162,7 @@ def test_hidden_plc_page_keeps_shared_faults_and_confirmations_in_two_windows(de
         assert "其他窗口" in right.plc_page.coordination_state.text()
 
         cabinet.client._status = replace(cabinet.client._status, fault_latched=True, fault_code=17)
-        cabinet.controller.tick()
+        cabinet._tick()
         left.plc_page.refresh()
         right.plc_page.refresh()
         assert all("FaultCode=17" in window.global_fault.text() for window in (left, right))
@@ -285,3 +287,71 @@ def test_close_discards_late_status_and_plc_replies_without_restarting_timers(de
         release.set()
         closing.pool.waitForDone(2000)
         qapp.processEvents()
+
+
+class StationCloseReply(QObject):
+    finished = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.status = 200
+        self.body = b'{"ok":true,"result":{"released":true}}'
+        self.aborted = False
+
+    def attribute(self, _attribute):
+        return self.status
+
+    def readAll(self):
+        return self.body
+
+    def error(self):
+        return QNetworkReply.NetworkError.NoError
+
+    def abort(self):
+        self.aborted = True
+        self.finished.emit()
+
+
+def test_managed_close_waits_for_verified_station_release_and_preserves_other_window(desktop_pair, monkeypatch):
+    qapp, (window, other) = desktop_pair
+    window._new_window_fd = 42
+    window.client.observe_lease({"lease": {"generation": 9}})
+    response = StationCloseReply()
+    posted = []
+    monkeypatch.setattr(window._lease_heartbeat.manager, "post",
+                        lambda request, body: posted.append((request, body)) or response)
+    assert not window.close()
+    assert window.isVisible() and other.isVisible()
+    assert window._close_timer.isActive()
+    assert not window.close() and len(posted) == 1
+    request, body = posted[0]
+    assert request.url().path() == "/api/v1/station/close"
+    assert bytes(request.rawHeader("X-RP1-Client-ID")) == window.client.client_id.encode()
+    assert bytes(request.rawHeader("X-RP1-Lease-Generation")) == b"9"
+    assert body == b"{}"
+    response.finished.emit()
+    qapp.processEvents()
+    assert not window.isVisible() and other.isVisible()
+    assert window._closing and not other._closing
+    assert not window._close_timer.isActive()
+
+
+def test_managed_close_timeout_and_rejection_keep_the_window_open(desktop_pair, monkeypatch):
+    qapp, (window, _other) = desktop_pair
+    window._new_window_fd = 42
+    first, second = StationCloseReply(), StationCloseReply()
+    second.status = 409
+    second.body = b'{"detail":{"message":"station still quarantined"}}'
+    replies = iter((first, second))
+    monkeypatch.setattr(window._lease_heartbeat.manager, "post", lambda *_: next(replies))
+    assert not window.close()
+    window._station_close_timed_out()
+    assert first.aborted and window.isVisible() and not window._close_verified
+    assert "超时" in window._close_status.text()
+    assert not window.close()
+    first.finished.emit()
+    assert window._close_reply is second and not window._close_verified
+    second.finished.emit()
+    qapp.processEvents()
+    assert window.isVisible() and not window._close_verified
+    assert "station still quarantined" in window._close_status.text()

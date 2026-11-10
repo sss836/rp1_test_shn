@@ -8,6 +8,9 @@ from fastapi.responses import FileResponse
 from starlette.staticfiles import StaticFiles
 from ..preview_assets import validate_preview_assets
 
+PREVIEW_BATCH_FRAMES = 64
+PREVIEW_BATCH_FRAME_BYTES = 256 * 1024
+
 class PreviewSessions:
  def __init__(self,hub):self.hub=hub;self.tickets={};self.sessions={};self.lock=threading.Lock();self.sockets=0
  def cleanup(self):
@@ -23,7 +26,7 @@ class PreviewSessions:
    self.cleanup();value=self.tickets.pop(ticket,None)
    if value is None:raise HTTPException(401,"预览票据已过期，请从上位机重新打开")
    token=secrets.token_urlsafe(32);self.sessions[token]=(value[0],time.monotonic()+3600,value[2]);return token
- def runtime(self,token):
+ def runtime(self,token,*,include_run=False):
   with self.lock:
    self.cleanup();value=self.sessions.get(token or "")
   if value is None:raise HTTPException(401,"预览会话过期")
@@ -34,7 +37,7 @@ class PreviewSessions:
   if controller is None or controller.telemetry_hub.run_id!=value[2]:raise HTTPException(410,"执行已切换，请从上位机重新打开曲线")
   with self.lock:
    if token in self.sessions:self.sessions[token]=(value[0],time.monotonic()+3600,value[2])
-  return runtime
+  return (runtime,value[2]) if include_run else runtime
  def allowed_run(self,token):
   self.runtime(token)
   with self.lock:return self.sessions[token][2]
@@ -53,8 +56,8 @@ def attach_preview(app,hub,require_token,owner_id):
  def ensure_assets():
   try:validate_preview_assets(root)
   except RuntimeError as exc:raise HTTPException(503,str(exc)) from exc
- def runtime(request):
-  local(request);return preview.runtime(request.cookies.get("rp1_preview"))
+ def runtime(request,*,include_run=False):
+  local(request);return preview.runtime(request.cookies.get("rp1_preview"),include_run=include_run)
  def cache(rt):
   service=rt.controller;controller=getattr(service,"_controller",None)
   if controller is None and hasattr(service,"telemetry_hub"):controller=service
@@ -84,10 +87,12 @@ def attach_preview(app,hub,require_token,owner_id):
  @app.get("/api/v1/preview/capabilities")
  def capabilities(request:Request):return cache(runtime(request)).capabilities()
  @app.get("/api/v1/preview/state")
- def state(request:Request,response:Response,after:int=0,limit:int=600):
+ def state(request:Request,response:Response,after:int=0,limit:int=PREVIEW_BATCH_FRAMES):
   if after<0:raise HTTPException(422,"无效序号")
   try:
-   data=cache(runtime(request)).read(after=after,limit=limit)
+   rt,run_id=runtime(request,include_run=True)
+   data=cache(rt).read(after=after,limit=limit,max_response_bytes=PREVIEW_BATCH_FRAME_BYTES)
+   if data["run_id"]!=run_id:raise HTTPException(410,"执行已切换，请从上位机重新打开曲线")
    response.set_cookie('rp1_preview',request.cookies.get('rp1_preview'),httponly=True,samesite='strict',max_age=3600,path='/')
    response.headers['Cache-Control']='no-store';return data
   except ValueError as exc:raise HTTPException(422,str(exc))
@@ -126,19 +131,35 @@ def attach_preview(app,hub,require_token,owner_id):
    # WebSocket exposes URL instead of base_url; same-origin validation is explicit.
    host=ws.headers.get("host","");origin=ws.headers.get("origin","")
    if ws.client is None or ws.client.host not in {"127.0.0.1","::1","testclient"} or urlsplit("http://"+host).hostname not in {"localhost","127.0.0.1","::1"} or origin not in {"http://"+host,"https://"+host}:raise HTTPException(403,"仅允许同源本机预览")
-   rt=preview.runtime(ws.cookies.get("rp1_preview"));hubcache=cache(rt)
+   token=ws.cookies.get("rp1_preview")
+   await asyncio.to_thread(preview.runtime,token)
    with preview.lock:
     if preview.sockets>=8:raise HTTPException(429,"预览连接已满")
     preview.sockets+=1
-  except HTTPException:await ws.close(code=1008);return
+  except (HTTPException,RuntimeError):await ws.close(code=1008);return
   try:
-   await ws.accept();after=0;stream=None
+   await ws.accept()
+   after=0
+   last_sent=None
+   last_sent_at=0.
+   def next_payload():
+    rt,run_id=preview.runtime(token,include_run=True)
+    hubcache=cache(rt)
+    payload=hubcache.read(after=after,limit=PREVIEW_BATCH_FRAMES,max_response_bytes=PREVIEW_BATCH_FRAME_BYTES)
+    if last_sent is not None and payload["stream_id"]!=last_sent[0]:
+     payload=hubcache.read(limit=PREVIEW_BATCH_FRAMES,max_response_bytes=PREVIEW_BATCH_FRAME_BYTES)
+    if payload["run_id"]!=run_id:raise HTTPException(410,"执行已切换，请从上位机重新打开曲线")
+    return payload
    while True:
-    preview.runtime(ws.cookies.get("rp1_preview"))
-    payload=hubcache.read(after=after,limit=600)
-    if payload["stream_id"]!=stream:stream=payload["stream_id"];payload=hubcache.read();after=0
-    await asyncio.wait_for(ws.send_json(payload),timeout=1.)
-    after=payload["last_sequence"];await asyncio.sleep(.1)
+    payload=await asyncio.to_thread(next_payload)
+    marker=(payload["stream_id"],payload["last_sequence"],payload["stale"])
+    if marker!=last_sent or time.monotonic()-last_sent_at>=1.:
+     # Retain no per-viewer queue. A slow viewer skips obsolete frames.
+     await asyncio.wait_for(ws.send_json(payload),timeout=1.)
+     last_sent=marker
+     last_sent_at=time.monotonic()
+    after=payload["last_sequence"]
+    await asyncio.sleep(.1)
   except (WebSocketDisconnect,asyncio.TimeoutError,RuntimeError,HTTPException):pass
   finally:
    with preview.lock:preview.sockets-=1

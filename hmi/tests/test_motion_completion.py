@@ -359,13 +359,13 @@ def test_report_wall_and_paused_seconds_use_frozen_test_boundary(tmp_path):
         'entries':[{'motor_id':e.motor_id,'joint_name':e.joint_name} for e in playback.config.entries]}
     result={}
     service=FactoryService.__new__(FactoryService)
-    service._lock=threading.RLock();service._report_errors={};service._report_threads=set()
+    service._lock=threading.RLock();service._report_errors={};service._report_threads=set();service._queued_report_ids=set()
     def finalize(path,context):
         result['context']=dict(context)
         result['summary']=_build_summary(path,context)
     service.report_manager=SimpleNamespace(data_root=tmp_path/"report-spool")
     service.capacity_reservations=SimpleNamespace(complete=lambda execution_uuid:None)
-    service.execution_history_page=lambda **kwargs: {'items': []}
+    service._reap_report_receipts=lambda: None
     try:
         playback.start(PlaybackOptions(loop=True,duration_s=.02))
         time.sleep(.035);playback.pause();time.sleep(.04);playback.resume()
@@ -374,7 +374,7 @@ def test_report_wall_and_paused_seconds_use_frozen_test_boundary(tmp_path):
         return_complete=datetime.now(timezone.utc)
         assert (return_complete-boundary).total_seconds()>.15
         from unittest.mock import patch
-        with patch('factory_hmi.core.report_jobs.run_report_job',side_effect=lambda root,path,ctx:finalize(path,ctx)):
+        with patch('factory_hmi.core.report_jobs.enqueue_report_job',side_effect=lambda root,path,ctx:finalize(path,ctx)):
             service._finalize_after_run(SimpleNamespace(),tmp_path/'test.csv',context,playback)
         assert not service._report_errors
         timing=result['summary']['timing']

@@ -49,8 +49,8 @@ def service(tmp_path, monkeypatch):
 
 def fault(service, **extra):
     service.client.set_status(fault_latched=True, fault_code=7, **extra)
-    service.controller.tick()
-    service.controller.tick()
+    service._tick()
+    service._tick()
     assert service.controller.phase == CabinetPhase.FAULT
 
 
@@ -68,13 +68,13 @@ def test_old_fault_first_frame_remains_pending_then_reset_success(service):
     receipt = submit(service)
     assert receipt["request"]["state"] == "pending"
     for _ in range(3):
-        service.controller.tick()
+        service._tick()
         snapshot = service.snapshot()
         assert snapshot["status"]["FaultLatched"] is True
         assert snapshot["coordination"]["active_command"]["state"] == "pending"
         assert snapshot["phase"] == "WAIT_RESET_RESULT"
     service.client.complete(ResetResult.SUCCEEDED)
-    service.controller.tick()
+    service._tick()
     snapshot = service.snapshot()
     assert snapshot["coordination"]["last_command"]["state"] == "confirmed"
     assert snapshot["phase"] == "OFF"
@@ -89,7 +89,7 @@ def test_final_negative_results_are_reported_in_chinese(service, result, state, 
     fault(service)
     submit(service)
     service.client.complete(result)
-    service.controller.tick()
+    service._tick()
     snapshot = service.snapshot()
     receipt = snapshot["coordination"]["last_command"]
     assert receipt["state"] == state
@@ -104,7 +104,7 @@ def test_success_resets_plc_only_and_keeps_ps1_faults_and_start_blocked(service)
           ps1_mb_status=0xF001, ps1_device_status=0x12, fault_source_flags=7)
     submit(service)
     service.client.complete(ResetResult.SUCCEEDED)
-    service.controller.tick()
+    service._tick()
     snapshot = service.snapshot()
     assert snapshot["coordination"]["last_command"]["state"] == "confirmed"
     assert snapshot["status"]["FaultLatched"] is False
@@ -123,14 +123,14 @@ def test_final_result_requires_receipt_acceptance_and_matching_reset_sequence(se
     submit(service)
     sequence = service.controller.command.command_sequence
     service.client.complete(ResetResult.SUCCEEDED, ack=(sequence - 1) & 0xFFFF)
-    service.controller.tick()
+    service._tick()
     assert service.snapshot()["coordination"]["busy"]
     service.client.complete(ResetResult.SUCCEEDED)
     service.client.set_status(acknowledged_sequence=sequence - 1)
-    service.controller.tick()
+    service._tick()
     assert service.snapshot()["coordination"]["busy"]
     service.client.set_status(acknowledged_sequence=sequence + 1)
-    service.controller.tick()
+    service._tick()
     assert service.snapshot()["coordination"]["last_command"]["state"] == "confirmed"
 
 
@@ -143,10 +143,10 @@ def test_pending_result_times_out_only_at_configured_deadline(service, monkeypat
     submit(service)
     deadline = service.controller._pending.deadline
     now[0] = deadline - 0.001
-    service.controller.tick()
+    service._tick()
     assert service.snapshot()["coordination"]["active_command"]["state"] == "pending"
     now[0] = deadline + 0.001
-    service.controller.tick()
+    service._tick()
     assert service.snapshot()["coordination"]["last_command"]["state"] == "timeout"
     assert "复位结果超时" in service.controller.feedback["ResetFaultPulse"].detail
 
@@ -154,9 +154,10 @@ def test_pending_result_times_out_only_at_configured_deadline(service, monkeypat
 def test_sequence_wrap_and_final_ack_raw_word(service):
     service.controller.command = replace(service.controller.command, command_sequence=0xFFFF)
     service.client.set_status(acknowledged_sequence=0xFFFF)
+    service.coordination.advance()
     submit(service)
     service.client.complete(ResetResult.SUCCEEDED)
-    service.controller.tick()
+    service._tick()
     snapshot = service.snapshot()
     assert service.client.reset_sequence == 0
     assert snapshot["coordination"]["last_command"]["state"] == "confirmed"
@@ -167,7 +168,7 @@ def test_sequence_wrap_and_final_ack_raw_word(service):
 
 def test_legacy_protocol_rejects_reset_without_any_write(service):
     service.client.set_status(protocol_version=PROTOCOL_V10)
-    service.controller.tick()
+    service._tick()
     before = len(service.client.command_history)
     assert not service.controller.request_reset_fault(user="offline")
     assert len(service.client.command_history) == before
@@ -183,7 +184,7 @@ def test_all_stop_can_supersede_reset_without_replaying_pulse(service):
     submit(service)
     pulses = sum(command.reset_fault_pulse for command in service.client.command_history)
     submit(service, "all-stop")
-    service.controller.tick()
+    service._tick()
     assert service.snapshot()["coordination"]["commands"][-2]["state"] == "superseded"
     service.controller.heartbeat()
     assert sum(command.reset_fault_pulse for command in service.client.command_history) == pulses == 1
@@ -192,7 +193,7 @@ def test_all_stop_can_supersede_reset_without_replaying_pulse(service):
 def test_three_fault_sources_with_zero_fault_code_are_separate(service):
     fault(service, ps1_comm_fault=True, ps1_device_fault=True, fault_source_flags=7)
     service.client.set_status(fault_code=0)
-    service.controller.tick()
+    service._tick()
     messages = cabinet_fault_messages(service.snapshot()["status"])
     assert len(messages) == 3
     assert "PLC控制故障已锁存（FaultCode=0）" == messages[0]
@@ -243,7 +244,7 @@ def timed_reset(service, monkeypatch, result, delay):
 
     def poll_after(seconds):
         now[0] = submitted_at[0] + seconds
-        service.controller.tick()
+        service._tick()
         return service.snapshot()
 
     return poll_after

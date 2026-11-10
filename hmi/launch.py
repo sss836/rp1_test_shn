@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 PROGRAM_ROOT = Path(__file__).resolve().parent
 SOURCE_ROOT = PROGRAM_ROOT / "hmi" if (PROGRAM_ROOT / "hmi").is_dir() else PROGRAM_ROOT
 DEFAULT_PLATFORM_URL = "https://10.43.17.214:8443"
+MAX_DESKTOP_WINDOWS = 2
 # Only the local child gateway uses this opener. Never send readiness requests
 # or the private shutdown token to a workstation proxy.
 open_gateway = build_opener(ProxyHandler({})).open
@@ -255,18 +256,113 @@ def request_update_stop(_signum=None, _frame=None):
 
 
 def raise_existing(root: Path, data: dict) -> bool:
-    """Only send a window request to this verified launcher's private socket."""
-    address = data.get("activation_socket")
-    if not address or address != str(root / f"run/desktop-{data['pid']}.sock"):
+    """Only send a window request to this verified launcher's private sockets."""
+    pid = data.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
         return False
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(1.0)
-            client.connect(address)
-            client.sendall(b"raise\n")
-        return True
-    except OSError:
+    expected = {str(desktop_address(root, pid, slot))
+                for slot in range(1, MAX_DESKTOP_WINDOWS + 1)}
+    addresses = data.get("activation_sockets")
+    if not isinstance(addresses, list):
+        addresses = [data.get("activation_socket")]
+    for address in addresses:
+        if not isinstance(address, str) or address not in expected:
+            continue
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(1.0)
+                client.connect(address)
+                client.sendall(b"raise\n")
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def desktop_address(root: Path, pid: int, slot: int) -> Path:
+    suffix = "" if slot == 1 else f"-{slot}"
+    return root / f"run/desktop-{pid}{suffix}.sock"
+
+
+class DesktopChildren:
+    """Launch and reap isolated Qt processes under the existing gateway owner."""
+
+    def __init__(self, root: Path, url: str, env: dict[str, str]) -> None:
+        self.root = root
+        self.url = url
+        self.env = env
+        self.processes: dict[int, subprocess.Popen] = {}
+        self.logs: dict[int, BoundedProcessLog] = {}
+        self.read_fd, self.write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+
+    def spawn(self) -> bool:
+        for slot in range(1, MAX_DESKTOP_WINDOWS + 1):
+            if slot in self.processes:
+                continue
+            previous_log = self.logs.get(slot)
+            if previous_log and previous_log.close(timeout=0)["close_timed_out"]:
+                continue
+            path = self.root / "logs" / ("desktop.log" if slot == 1 else f"desktop-{slot}.log")
+            sink = BoundedProcessLog(path)
+            address = desktop_address(self.root, os.getpid(), slot)
+            process = subprocess.Popen(
+                [sys.executable, "-m", "factory_hmi.desktop", "--gateway-url", self.url],
+                cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=dict(self.env, RP1_HMI_ACTIVATION_SOCKET=str(address),
+                         RP1_HMI_STATION_CONFIG_DIR=str(self.root / "config/stations"),
+                         RP1_HMI_NEW_WINDOW_FD=str(self.write_fd)),
+                pass_fds=(self.write_fd,),
+            )
+            self.processes[slot] = process
+            self.logs[slot] = sink
+            sink.attach(process.stdout)
+            return True
         return False
+
+    def reap(self) -> tuple[bool, bool]:
+        exited = failed = False
+        for slot, process in list(self.processes.items()):
+            if (code := process.poll()) is not None:
+                exited = True
+                if code:
+                    failed = True
+                    print(f"Desktop {slot} exited with status {code}; see desktop logs.",
+                          file=sys.stderr, flush=True)
+                del self.processes[slot]
+                try:
+                    desktop_address(self.root, os.getpid(), slot).unlink(missing_ok=True)
+                except OSError as exc:
+                    print(f"Could not remove desktop {slot} activation socket: {exc}", file=sys.stderr, flush=True)
+        return exited, failed
+
+    def spawn_requested(self) -> bool:
+        try:
+            requested = b"+" in os.read(self.read_fd, 64)
+        except BlockingIOError:
+            return False
+        if not requested:
+            return False
+        try:
+            return self.spawn()
+        except (OSError, RuntimeError) as exc:
+            print(f"Could not open another desktop: {exc}", file=sys.stderr, flush=True)
+            return False
+
+    def snapshot(self) -> dict:
+        slots = sorted(self.processes)
+        addresses = [str(desktop_address(self.root, os.getpid(), slot))
+                     for slot in slots]
+        return {"activation_socket": addresses[0] if addresses else None,
+                "activation_sockets": addresses,
+                "desktop_pids": [self.processes[slot].pid for slot in slots]}
+
+    def stop_requests(self) -> None:
+        os.close(self.read_fd)
+        os.close(self.write_fd)
+
+    def close_logs(self) -> None:
+        for sink in self.logs.values():
+            sink.close()
 
 
 def seed_configs(root: Path, *, offline: bool, offline_access: str) -> None:
@@ -425,7 +521,7 @@ def record_shutdown(state: Path, result: dict) -> None:
         print(f"Cannot persist shutdown status: {exc}", file=sys.stderr, flush=True)
 
 
-def supervised_shutdown(gateway, desktop, url: str, token: str, state: Path) -> None:
+def supervised_shutdown(gateway, desktop, url: str, token: str, state: Path, *, extra_desktops=()) -> None:
     while gateway is not None and gateway.poll() is None:
         generation = stop_generation
         record_shutdown(state, {"state": "preparing", "ready": False})
@@ -441,11 +537,13 @@ def supervised_shutdown(gateway, desktop, url: str, token: str, state: Path) -> 
         # retries the same preparation, without bypassing its safety checks.
         while gateway.poll() is None and stop_generation == generation:
             time.sleep(.2)
-    finish(desktop)
+    desktops = (desktop, *extra_desktops) if desktop is not None else extra_desktops
+    for process in desktops:
+        finish(process)
     finish(gateway)
     # Keep the real launcher identity and inode lock until every owned child
     # exits. Neither an updater timeout nor a second signal authorizes a kill.
-    while any(process is not None and process.poll() is None for process in (desktop, gateway)):
+    while any(process is not None and process.poll() is None for process in (*desktops, gateway)):
         time.sleep(.2)
 
 
@@ -544,40 +642,57 @@ def main() -> int:
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGUSR1, request_update_stop)
-        gateway = desktop = None
+        gateway = None
         shutdown_token = secrets.token_urlsafe(32)
         env["RP1_FACTORY_SHUTDOWN_TOKEN"] = shutdown_token
         url = f"http://127.0.0.1:{args.port}"
-        activation_socket = str(root / f"run/desktop-{os.getpid()}.sock")
         glog = BoundedProcessLog(root / "logs/gateway.log")
-        dlog = BoundedProcessLog(root / "logs/desktop.log")
+        desktops = None if args.gateway_only else DesktopChildren(root, url, env)
         try:
             try:
                 gateway = subprocess.Popen([sys.executable, "-m", "factory_hmi.gateway", "--host", "127.0.0.1", "--port", str(args.port), "--data-root", "data", "--lease-timeout", str(args.lease_timeout)], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                 glog.attach(gateway.stdout)
-                write_state(state, {"pid": os.getpid(), "start": process_start(os.getpid()), "gateway_pid": gateway.pid, "gateway": url, "driver": driver, "access_mode": mode, "read_only": mode == "monitor", "activation_socket": activation_socket, "update_safe_exit": True, "shutdown_handshake": True})
+                launch_state = {"pid": os.getpid(), "start": process_start(os.getpid()),
+                                "gateway_pid": gateway.pid, "gateway": url, "driver": driver,
+                                "access_mode": mode, "read_only": mode == "monitor",
+                                "update_safe_exit": True, "shutdown_handshake": True}
+                write_state(state, launch_state)
                 wait_health(gateway, url, driver, mode)
-                if not args.gateway_only:
-                    desktop = subprocess.Popen([sys.executable, "-m", "factory_hmi.desktop", "--gateway-url", url], cwd=root, env=dict(env, RP1_HMI_ACTIVATION_SOCKET=activation_socket, RP1_HMI_STATION_CONFIG_DIR=str(root / "config/stations")), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                    dlog.attach(desktop.stdout)
+                if desktops is not None:
+                    desktops.spawn()
+                    write_state(state, {**launch_state, **desktops.snapshot()})
                 print(f"HMI ready: PLC {driver}, {mode}, {url}", flush=True)
                 deadline = time.monotonic() + args.duration if args.duration > 0 else None
                 while not stopping:
                     if gateway.poll() is not None:
                         raise RuntimeError("Gateway exited unexpectedly; see logs.")
-                    if desktop is not None and desktop.poll() is not None:
-                        if desktop.returncode:
-                            raise RuntimeError("Desktop exited unexpectedly; see logs.")
-                        break
+                    if desktops is not None:
+                        exited, failed = desktops.reap()
+                        spawned = not stopping and desktops.spawn_requested()
+                        if exited or spawned:
+                            try:
+                                write_state(state, {**launch_state, **desktops.snapshot()})
+                            except OSError as exc:
+                                print(f"Could not update desktop process status: {exc}", file=sys.stderr, flush=True)
+                        if not desktops.processes:
+                            if failed:
+                                raise RuntimeError("Last desktop exited unexpectedly; see logs.")
+                            break
                     if deadline is not None and time.monotonic() >= deadline:
                         break
                     time.sleep(0.2)
             finally:
-                supervised_shutdown(gateway, desktop, url, shutdown_token, state)
+                if desktops is not None:
+                    desktops.stop_requests()
+                supervised_shutdown(gateway, None, url, shutdown_token, state,
+                                    extra_desktops=tuple(desktops.processes.values()) if desktops else ())
+                if desktops is not None:
+                    desktops.reap()
                 state.unlink(missing_ok=True)
         finally:
             glog.close()
-            dlog.close()
+            if desktops is not None:
+                desktops.close_logs()
     return 0
 
 

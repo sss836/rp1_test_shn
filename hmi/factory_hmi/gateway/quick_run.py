@@ -15,8 +15,17 @@ import uuid
 
 from factory_hmi.core.config import preview_station_config, load_station_config
 from factory_hmi.quick_profiles import preset
+from .station_process import StationUnavailable
 
 logger = logging.getLogger(__name__)
+
+
+def require_plc_power(value: dict, channels) -> None:
+    status = value.get('status') or {}
+    if (value['communication_state'] != 'LIVE' or value['stale'] or value['phase'] != 'RUNNING'
+            or not status.get('PS1FeedbackValid') or status.get('PS1ActualOutput') is not True
+            or not status.get('MainReady') or any(not status['ChannelPermit'][n-1] for n in channels)):
+        raise RuntimeError('PLC 实际供电许可无效，已停止本窗口测试')
 
 
 class QuickRun:
@@ -148,16 +157,14 @@ class QuickRun:
         else:
             raise RuntimeError('PLC 当前处于故障或其他操作中，请先在配电柜页处理')
         self._check_power()
+        watch_plc = getattr(self.runtime.controller, 'watch_plc', None)
+        if callable(watch_plc):
+            watch_plc(plc.connection_info(), self._channels)
 
     def _check_power(self):
         if self._power_source == 'external':
             return
-        value = self.hub.plc.snapshot()
-        status = value['status']
-        if (value['communication_state'] != 'LIVE' or value['stale'] or value['phase'] != 'RUNNING'
-                or not status['PS1FeedbackValid'] or status['PS1ActualOutput'] is not True
-                or not status['MainReady'] or any(not status['ChannelPermit'][n-1] for n in self._channels)):
-            raise RuntimeError('PLC 实际供电许可无效，已停止本窗口测试')
+        require_plc_power(self.hub.plc.snapshot(include_history=False), self._channels)
 
     def start(self, hours: float, safety_confirmed: bool, sample: str, power_source: str = 'plc',
               completion_mode: str = 'configured', parking_pose_confirmed: bool = False,
@@ -165,13 +172,17 @@ class QuickRun:
         from factory_hmi.models import PlaybackOptions
         PlaybackOptions(completion_mode=completion_mode, parking_pose_confirmed=parking_pose_confirmed)
         if completion_mode == 'mujoco_hanging':
-            from factory_hmi.core.mujoco_completion import plan_return
-            controller = self.runtime.controller.controller
-            trajectory = controller.trajectory
-            if trajectory is None:
-                raise ValueError('尚未载入工厂轨迹')
-            velocity = (trajectory.motor_pos[-1]-trajectory.motor_pos[-2])/(trajectory.timestamps[-1]-trajectory.timestamps[-2])
-            plan_return(controller.config, trajectory.motor_pos[-1], velocity)
+            validate = getattr(self.runtime.controller, 'validate_mujoco_return', None)
+            if callable(validate):
+                validate()
+            else:
+                from factory_hmi.core.mujoco_completion import plan_return
+                controller = self.runtime.controller.controller
+                trajectory = controller.trajectory
+                if trajectory is None:
+                    raise ValueError('尚未载入工厂轨迹')
+                velocity = (trajectory.motor_pos[-1]-trajectory.motor_pos[-2])/(trajectory.timestamps[-1]-trajectory.timestamps[-2])
+                plan_return(controller.config, trajectory.motor_pos[-1], velocity)
         if power_source not in {'external', 'plc'}:
             raise ValueError('供电方式必须为 external 或 plc')
         if not safety_confirmed:
@@ -301,13 +312,17 @@ class QuickRun:
                 if self._stop is not stop_event:
                     return
                 phase = self.snapshot()['phase']
-                expired = self.runtime.lease.snapshot().expired
-                if expired:
-                    self.runtime.controller.request_motion_stop()
-                if phase not in {'running', 'paused', 'finishing_cycle', 'decelerating', 'returning', 'settling', 'needs_attention', 'holding'}:
+                try:
+                    expired = self.runtime.lease.snapshot().expired
+                    if expired:
+                        self.runtime.controller.request_motion_stop()
+                    if phase not in {'running', 'paused', 'finishing_cycle', 'decelerating', 'returning', 'settling', 'needs_attention', 'holding'}:
+                        continue
+                    snapshot = self.runtime.controller.controller.snapshot()
+                except StationUnavailable:
+                    # The station enforces the actual lease and PLC permit.
+                    # Keep checking its UI state after a transient IPC timeout.
                     continue
-                controller = self.runtime.controller.controller
-                snapshot = controller.snapshot()
                 state = snapshot['station']['state']
                 completion = (snapshot.get('playback') or {}).get('completion') or {}
                 failure = '窗口心跳已失效' if expired else ''

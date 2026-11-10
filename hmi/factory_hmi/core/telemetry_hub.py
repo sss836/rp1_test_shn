@@ -44,16 +44,29 @@ class TelemetryHub:
    self._frames.append((frame,size)); self._bytes+=size
    while self._frames and (self._bytes>self.max_bytes or len(self._frames)>self.max_frames or now-self._frames[0][0]["received_monotonic_s"]>self.window_s):
     self._bytes-=self._frames.popleft()[1]
- def read(self, *, after=0, limit=600, now=None):
+ def read(self, *, after=0, limit=600, max_response_bytes=None, now=None):
   if not 1<=limit<=600: raise ValueError("limit must be 1..600")
+  if max_response_bytes is not None and max_response_bytes < 1: raise ValueError("invalid display byte budget")
   now=time.monotonic() if now is None else now
   with self._lock:
-   frames=[f for f,_ in self._frames if f["sequence"]>after][-limit:]
-   age=max(0.,now-self._last_publish) if self._frames else None
+   frames=[]
+   used=0
+   for frame,size in reversed(self._frames):
+    if frame["sequence"]<=after or len(frames)>=limit:
+     break
+    if max_response_bytes is not None and used+size+1>max_response_bytes:
+     break
+    frames.append(frame)
+    used+=size+1
+   frames.reverse()
+   age=max(0.,now-self._frames[-1][0]["received_monotonic_s"]) if self._frames else None
    return dict(schema_version="telemetry-v1",run_id=self.run_id,stream_id=self.stream_id,
     boot_id=self.boot_id,frames=frames,age_s=age,stale=age is None or age>.5,
     cache_bytes=self._bytes,window_s=self.window_s,first_sequence=self._frames[0][0]["sequence"] if self._frames else None,
-    last_sequence=self._sequence,display_rate_limit_hz=20,source_rate_hz=None,
+    last_sequence=self._sequence,sequence_gap=(self._sequence>after and (
+      not frames or frames[0]["sequence"]>after+1 or frames[-1]["sequence"]<self._sequence
+      or frames[-1]["sequence"]-frames[0]["sequence"]+1!=len(frames))),
+    display_rate_limit_hz=20,source_rate_hz=None,
     observed_rate_hz=(len(self._frames)-1)/(self._frames[-1][0]["received_monotonic_s"]-self._frames[0][0]["received_monotonic_s"]) if len(self._frames)>1 else None)
  def capabilities(self):
   data=self.read(); keys=data["frames"][-1]["values"] if data["frames"] else {}

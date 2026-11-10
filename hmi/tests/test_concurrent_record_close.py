@@ -232,7 +232,7 @@ def test_report_waiter_records_close_failure_without_archiving_or_releasing_capa
     source = tmp_path / "retained.csv"
     source.write_bytes(b"original evidence")
     try:
-        with patch("factory_hmi.core.report_jobs.run_report_job") as report:
+        with patch("factory_hmi.core.report_jobs.enqueue_report_job") as report:
             service._finalize_after_run(SimpleNamespace(), source, {"test_id": "synthetic-timeout"}, playback)
             report.assert_not_called()
         assert "收尾超时" in service._report_errors["synthetic-timeout"]

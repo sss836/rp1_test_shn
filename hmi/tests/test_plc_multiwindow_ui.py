@@ -60,6 +60,7 @@ def pages(tmp_path, monkeypatch, qapp):
     monkeypatch.setattr('factory_hmi.plc.service.build_plc_client', lambda *a: MockPlcClient())
     service = PlcCabinetService(load_plc_config(), data_root=tmp_path)
     service.controller.connect(user='offline')
+    service.coordination.advance()
     runners = [Runner(), Runner()]
     pages = [PlcCabinetPage(OfflineClient(service, f'window-{i}'), runners[i], lambda: 'offline') for i in range(2)]
     for page in pages:
@@ -73,7 +74,7 @@ def pages(tmp_path, monkeypatch, qapp):
 
 def complete(service):
     for _ in range(30):
-        service.controller.tick()
+        service._tick()
         snap = service.snapshot()
         if not snap['coordination']['busy']: return snap
     raise AssertionError(snap)

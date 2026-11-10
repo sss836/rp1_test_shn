@@ -67,6 +67,7 @@ def main() -> int:
         lease_timeout_s=float(args.lease_timeout),
         status_rate_hz=float(args.status_rate),
         data_root=args.data_root,
+        isolate_stations=True,
     )
     server = PreparedShutdownServer(uvicorn.Config(
         app, host=args.host, port=args.port, log_level=args.log_level,

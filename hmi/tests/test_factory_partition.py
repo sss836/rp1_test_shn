@@ -358,12 +358,8 @@ async def with_isolated_gateway(app, operation):
 
 
 async def wait_for_reports(service, seconds=5):
-    for _ in range(int(seconds / .005)):
-        if not any(thread.is_alive() for thread in list(service._report_threads)):
-            assert not service._report_errors
-            return
-        await asyncio.sleep(.005)
-    raise AssertionError(f"isolated report did not finish within {seconds} seconds")
+    await asyncio.to_thread(service.wait_for_reports, seconds)
+    assert not service._report_errors
 
 
 def test_asgi_factory_start_and_filtered_list_export_use_real_payload_with_fake_motors(service, tmp_path):

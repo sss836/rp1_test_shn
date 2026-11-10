@@ -1,5 +1,6 @@
 """Window activation is local IPC only; these tests never create device services."""
 import importlib.util
+import os
 import socket
 import tempfile
 import time
@@ -44,11 +45,72 @@ def test_restore_moves_offscreen_window_into_available_screen():
     window.close()
 
 
-def test_launcher_only_targets_socket_of_verified_instance(tmp_path):
+def load_launcher():
     spec = importlib.util.spec_from_file_location("activation_launcher", Path(__file__).parents[1] / "launch.py")
     launcher = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(launcher)
+    return launcher
+
+
+def test_launcher_only_targets_socket_of_verified_instance(tmp_path):
+    launcher = load_launcher()
     with mock.patch.object(launcher.socket, "socket") as connect:
         assert not launcher.raise_existing(tmp_path, {})
         assert not launcher.raise_existing(tmp_path, {"pid": 123, "activation_socket": "/tmp/other.sock"})
         connect.assert_not_called()
+
+
+def test_supervisor_starts_and_tracks_independent_desktops_on_the_same_gateway(tmp_path, monkeypatch):
+    launcher = load_launcher()
+    children = []
+
+    class DesktopProcess:
+        def __init__(self):
+            self.pid = 20_000 + len(children)
+            self.stdout = object()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    def start(argv, **options):
+        child = DesktopProcess()
+        children.append((child, argv, options))
+        return child
+
+    def log(_path):
+        return mock.Mock(**{"close.return_value": {"close_timed_out": False}})
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", start)
+    monkeypatch.setattr(launcher, "BoundedProcessLog", log)
+    gateway = "http://127.0.0.1:19200"
+    group = launcher.DesktopChildren(tmp_path, gateway, {})
+    try:
+        assert group.spawn()
+        os.write(group.write_fd, b"+")
+        assert group.spawn_requested()
+        assert group.snapshot()["desktop_pids"] == [20_000, 20_001]
+        first, second = children
+        for _, argv, options in children:
+            assert argv[1:] == ["-m", "factory_hmi.desktop", "--gateway-url", gateway]
+            assert options["pass_fds"] == (group.write_fd,)
+            assert options["env"]["RP1_HMI_NEW_WINDOW_FD"] == str(group.write_fd)
+        assert first[2]["env"]["RP1_HMI_ACTIVATION_SOCKET"] != second[2]["env"]["RP1_HMI_ACTIVATION_SOCKET"]
+        os.write(group.write_fd, b"+")
+        assert not group.spawn_requested()
+
+        first[0].returncode = 0
+        assert group.reap() == (True, False)
+        state = {"pid": os.getpid(), **group.snapshot()}
+        assert state["desktop_pids"] == [20_001]
+        assert second[0].poll() is None
+        with mock.patch.object(launcher.socket, "socket") as socket_factory:
+            assert launcher.raise_existing(tmp_path, state)
+            socket_factory.return_value.__enter__.return_value.connect.assert_called_once_with(
+                second[2]["env"]["RP1_HMI_ACTIVATION_SOCKET"])
+        os.write(group.write_fd, b"+")
+        assert group.spawn_requested()
+        assert sorted(group.snapshot()["desktop_pids"]) == [20_001, 20_002]
+    finally:
+        group.stop_requests()
+        group.close_logs()

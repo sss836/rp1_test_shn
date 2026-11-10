@@ -5,7 +5,7 @@ import pytest
 from PySide6.QtCore import QTimer, QCoreApplication, QEvent
 from PySide6.QtWebSockets import QWebSocket
 from PySide6.QtWidgets import QApplication
-from factory_hmi.desktop.app import FactoryMainWindow
+from factory_hmi.desktop.app import FactoryMainWindow, launcher_window_fd
 from factory_hmi.quick_profiles import catalog
 
 @pytest.fixture(scope='module')
@@ -30,18 +30,19 @@ def window(app):
     QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
 
 
-def test_new_window_button_uses_same_gateway_and_independent_client_session(window,app):
-    with mock.patch.object(FactoryMainWindow,'_setup_network',no_network), mock.patch.object(FactoryMainWindow,'_run_rest'):
+def test_new_window_button_requests_independent_launcher_child(window, monkeypatch):
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        monkeypatch.setenv("RP1_HMI_NEW_WINDOW_FD", str(write_fd))
+        window._new_window_fd = launcher_window_fd()
+        assert window._new_window_fd == write_fd
+        client = window.client
         window.new_window_button.click()
-    assert len(window._child_windows)==1
-    child=window._child_windows[0]
-    assert child.isVisible()
-    assert child.client.base_url==window.client.base_url
-    assert child.client.client_id!=window.client.client_id
-    child.quick_page.timer.stop();child.sample_timer.stop()
-    child.close()
-    QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
-    assert len(window._child_windows)==0
+        assert os.read(read_fd, 1) == b"+"
+        assert window.client is client
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
 
 
 def test_quick_page_selection_and_explicit_changed_mapping_prepare(window):

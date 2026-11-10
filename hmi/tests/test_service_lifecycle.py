@@ -110,15 +110,16 @@ def test_gateway_drains_facades_even_when_one_close_fails(tmp_path):
             assert not hub._sessions and not hub._interface_owners
 
 
-def test_close_waits_for_finalizer_record_boundary_and_preserves_partial_report(tmp_path):
+def test_close_waits_for_finalizer_record_boundary_and_preserves_partial_report(tmp_path, monkeypatch):
     """A finalizer holds its captured playback; close must wait for CSV finish."""
     from types import SimpleNamespace
     service = FactoryService(data_root=tmp_path)
     boundary, csv_closed = threading.Event(), threading.Event()
-    report = Mock()
-    service.report_manager.finalize = report
+    report = Mock(return_value="synthetic-stop")
+    monkeypatch.setattr("factory_hmi.core.report_jobs.enqueue_report_job", report)
+    monkeypatch.setattr(service, "_reap_report_receipts", lambda: None)
     playback = SimpleNamespace(wait=lambda: boundary.wait(2),
-        wait_recording=lambda: csv_closed.wait(2), snapshot=lambda: {"progress": {"outcome": "stopped"}})
+        wait_recording=lambda **_: csv_closed.wait(2), snapshot=lambda: {"progress": {"outcome": "stopped"}})
     def disconnect():
         boundary.set()
     service._controller = SimpleNamespace(disconnect=disconnect)
@@ -135,7 +136,7 @@ def test_close_waits_for_finalizer_record_boundary_and_preserves_partial_report(
             csv_closed.set()
         assert future.result(timeout=2)["closed"]
     report.assert_called_once()
-    assert report.call_args.args[1]["outcome"] == "stopped"
+    assert report.call_args.args[2]["outcome"] == "stopped"
     assert not service._report_threads
 
 
