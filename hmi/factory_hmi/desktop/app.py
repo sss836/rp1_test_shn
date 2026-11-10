@@ -4140,7 +4140,7 @@ class FactoryMainWindow(QMainWindow):
         )
         self.trajectory_info.setText(
             f"SHA-256：{sha}\n帧数：{frames}\n时长：{duration} s\n"
-            f"最大速度：{max_speed}\n轨迹文件检查违规：{violation_text}\n"
+            f"轨迹峰值速度（文件参考）：{max_speed}\n轨迹文件检查违规：{violation_text}\n"
             f"文件检查提示（启动仍需实时预检）：{warning_text}"
         )
         self.preflight_result.setText("轨迹已解析，请执行预检确认。")

@@ -1,4 +1,5 @@
 """Quick verification uses mock PLC and fake motors only."""
+from dataclasses import replace
 import hashlib
 import json
 import threading
@@ -35,13 +36,14 @@ def powered_gateway(gateway):
 
 @pytest.fixture
 def short_trajectory(monkeypatch, tmp_path):
-    def use_trajectory(initial_position=0.):
+    def use_trajectory(initial_position=0., *, offsets=(0., .01, 0., 0.), timestamps=(0., .12, .24, .4)):
         def simulated_preset(profile):
             item = preset(profile)
             path = tmp_path / f'{profile}-synthetic.npz'
-            positions = np.zeros((4, item['motor_count']))
-            positions[:, 0] = [initial_position, initial_position + .01, initial_position, initial_position]
-            np.savez(path, motor_pos=positions, time=[0., .12, .24, .4], fps=7.5, limb=profile)
+            positions = np.zeros((len(timestamps), item['motor_count']))
+            positions[:, 0] = initial_position + np.asarray(offsets)
+            fps = (len(timestamps) - 1) / (timestamps[-1] - timestamps[0])
+            np.savez(path, motor_pos=positions, time=timestamps, fps=fps, limb=profile)
             return {**item, 'trajectory': path.name, 'trajectory_path': path,
                     'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
         monkeypatch.setattr(quick_run, 'preset', simulated_preset)
@@ -113,6 +115,43 @@ def test_arm_default_downward_finish_requires_confirmation_before_power(gateway)
     assert runtime.controller.controller.playback._options.completion_mode == 'mujoco_hanging'
     aborted = gateway.post('/api/v1/quick/abort', headers=headers())
     assert aborted.status_code == 200, aborted.text
+
+
+def test_quick_playback_accepts_peak_speed_and_completes_normal_return(gateway, short_trajectory):
+    short_trajectory(offsets=(0., .1, 0., 0.), timestamps=(0., .1, .103, .4))
+    prepare(gateway)
+    runtime = gateway.app.state.runtime.session('quick-a')
+    limits = runtime.controller.controller.config.safety_limits
+    preflight = runtime.snapshot()['trajectory']['preflight']
+    assert preflight['max_velocity_rad_s'] > limits.max_velocity_rad_s
+    assert preflight['max_frame_delta_rad'] < limits.max_frame_delta_rad
+
+    response = start(gateway, hours=.0001, power_source='external', model=True)
+    assert response.status_code == 200, response.text
+    assert response.json()['snapshot']['playback']['options']['speed'] == 1.0
+    playback = runtime.controller.controller.playback
+    completed = wait_for_status(gateway, 'completed', 'fault')
+    assert completed['phase'] == 'completed', completed
+    result = playback.snapshot()
+    assert result['progress']['completed_cycles'] == 1
+    assert result['completion']['source'] == 'mujoco_hanging'
+    assert result['completion']['safe_disabled']
+
+
+def test_quick_playback_rejects_overspeed_return_connection_before_enabling(gateway, short_trajectory):
+    short_trajectory(offsets=(0., .1, .1, 0.), timestamps=(0., .1, .36, .4))
+    prepare(gateway)
+    runtime = gateway.app.state.runtime.session('quick-a')
+    controller = runtime.controller.controller
+    # A low test limit isolates the return speed error from the model's position limits.
+    controller.config = replace(controller.config, safety_limits=replace(
+        controller.config.safety_limits, max_velocity_rad_s=2.0))
+
+    response = start(gateway, hours=.0001, power_source='external', model=True)
+    assert response.status_code == 409, response.text
+    assert 'MuJoCo 收尾接续速度超出本机配置上限' in response.json()['detail']
+    assert not runtime.snapshot()['station']['motors_enabled']
+    assert not runtime.snapshot()['can']['all_up']
 
 
 def test_plc_powered_run_finishes_cycle_and_auto_disables(powered_gateway, short_trajectory):

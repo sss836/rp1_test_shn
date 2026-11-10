@@ -80,8 +80,8 @@ def test_missing_completion_preserves_legacy_arm_but_stale_verified_parameters_b
     assert not motion_readiness(configured)['test_allowed']
 
 
-def test_verified_limits_first_frame_and_speed_are_enforced(tmp_path):
-    config = synthetic_config(max_velocity_rad_s=[.1]*5, return_velocity_rad_s=[.1]*5)
+def test_verified_file_speed_is_strict_for_validation_but_not_playback(tmp_path):
+    config = synthetic_config(max_velocity_rad_s=[.25]*5, return_velocity_rad_s=[.25]*5)
     params = MotionParameters.load(config)
     with pytest.raises(MotionParameterError, match='限位'):
         params.check_target(config, np.array([5.,0,0,0,0]))
@@ -89,9 +89,27 @@ def test_verified_limits_first_frame_and_speed_are_enforced(tmp_path):
     try:
         with pytest.raises(MotionParameterError, match='首帧'):
             params.check_trajectory(config, playback.trajectory, current=np.ones(5))
-        with pytest.raises(MotionParameterError, match='速度'):
-            playback.start(PlaybackOptions(speed=5))
+        with pytest.raises(MotionParameterError, match='轨迹速度'):
+            params.check_trajectory(config, playback.trajectory)
+        playback.start()
+        assert playback.wait(2)
+        assert playback.snapshot()['completion']['safe_disabled']
+    finally:
+        backend.disconnect()
+
+
+@pytest.mark.parametrize(('speed', 'bounds', 'message'), [
+    (5., {}, '轨迹加速度'),
+    (1., {'motor_max_rad': [.021]*5, 'parking_joint_rad': [0.]*5}, 'motor 限位'),
+])
+def test_verified_acceleration_and_braking_limits_still_block_start(tmp_path, speed, bounds, message):
+    config = synthetic_config(max_velocity_rad_s=[.25]*5, return_velocity_rad_s=[.25]*5, **bounds)
+    playback, backend = make_playback(tmp_path, config=config)
+    try:
+        with pytest.raises(MotionParameterError, match=message):
+            playback.start(PlaybackOptions(speed=speed))
         assert not playback.running
+        assert not backend.command_history
     finally:
         backend.disconnect()
 

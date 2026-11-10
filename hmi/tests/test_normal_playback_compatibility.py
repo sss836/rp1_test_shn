@@ -1,4 +1,5 @@
 """Production station compatibility using fake motors only; no real CAN/PLC."""
+from dataclasses import replace
 from types import SimpleNamespace
 import threading
 import time
@@ -10,7 +11,6 @@ from factory_hmi.core.backend import FakeMotorBackend
 from factory_hmi.core.config import load_station_config
 from factory_hmi.core.controller import FactoryController
 from factory_hmi.core.motion_completion import automatic_completion_parameters, MotionParameterError
-from factory_hmi.core.trajectory import TrajectoryValidationError
 from factory_hmi.models import PlaybackOptions, StationState
 
 
@@ -45,8 +45,7 @@ def test_existing_arm_configs_can_preflight_start_and_complete_without_auto_disa
         controller.disconnect()
 
 
-def test_large_initial_gap_is_prepared_without_motion_and_speed_still_rejected(tmp_path):
-    from dataclasses import replace
+def test_large_initial_gap_is_prepared_without_motion(tmp_path):
     controller, backend = controller_for(tmp_path)
     try:
         controller._trajectory.motor_pos += 2.
@@ -55,12 +54,33 @@ def test_large_initial_gap_is_prepared_without_motion_and_speed_still_rejected(t
         assert controller._trajectory.preflight.approach['max_distance_rad'] == 2.
         assert controller.position_hold_active and backend.motors_enabled
         assert np.allclose(backend.positions, 0)
-        controller._trajectory.motor_pos -= 2.
+    finally:
+        controller.disconnect()
+
+
+def test_file_peak_does_not_block_normal_start_but_live_overspeed_stops_playback(tmp_path, monkeypatch):
+    controller, backend = controller_for(tmp_path)
+    try:
         controller.config = replace(controller.config, safety_limits=replace(
             controller.config.safety_limits, max_velocity_rad_s=.5))
-        with pytest.raises(TrajectoryValidationError, match='velocity'):
-            controller.start(PlaybackOptions(speed=5.))
-        assert controller.position_hold_active and backend.motors_enabled
+        controller.arm()
+        assert controller.trajectory.preflight.max_velocity_rad_s * 5 > .5
+        controller.start(PlaybackOptions(speed=5., loop=True))
+        playback = controller.playback
+        assert playback._test_started.wait(1)
+        assert controller.state is StationState.RUNNING
+
+        read_samples = backend.read_samples
+
+        def overspeed_feedback():
+            samples = read_samples()
+            samples[0] = replace(samples[0], spd_rad_s=.6)
+            return samples
+
+        monkeypatch.setattr(backend, 'read_samples', overspeed_feedback)
+        assert controller.wait(2)
+        assert controller.state is StationState.FAULT
+        assert '实际电机速度超过当前配置上限' in playback.fault.message
     finally:
         controller.disconnect()
 

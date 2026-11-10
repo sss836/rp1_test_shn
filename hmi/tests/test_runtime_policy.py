@@ -195,8 +195,8 @@ def test_csv_open_failure_also_interrupts_initial_approach(tmp_path):
         controller.disconnect()
 
 
-@pytest.mark.parametrize('raw_speed, multiplier, accepted', [(30.,.1,True),(3.,5.,True),(5.,5.,False)])
-def test_selected_multiplier_is_applied_before_velocity_gate(tmp_path, raw_speed, multiplier, accepted):
+@pytest.mark.parametrize('raw_speed, multiplier', [(30., .1), (3., 5.), (5., 5.)])
+def test_selected_multiplier_is_applied_without_file_velocity_gate(tmp_path, raw_speed, multiplier):
     controller, backend = make_controller(tmp_path, gap=0.)
     try:
         values=np.zeros((3,len(controller.config.entries))); values[1]=.15
@@ -204,13 +204,11 @@ def test_selected_multiplier_is_applied_before_velocity_gate(tmp_path, raw_speed
         path=tmp_path/'scaled.npz'
         np.savez(path,motor_pos=values,time=[0.,dt,2*dt],fps=[1/dt],limb=[controller.config.limb])
         controller.load_trajectory(path); controller.arm()
-        if accepted:
-            controller.start(speed=multiplier)
-            assert controller.wait(2) and controller.state == StationState.COMPLETED
-        else:
-            with pytest.raises(ValueError,match='velocity'):
-                controller.start(speed=multiplier)
-            assert controller.position_hold_active and backend.motors_enabled
+        controller.start(speed=multiplier)
+        assert controller.wait(2) and controller.state == StationState.COMPLETED
+        playback = controller.snapshot()['playback']
+        assert playback['options']['speed'] == multiplier
+        assert playback['progress']['completed_cycles'] == 1
     finally:
         controller.disconnect()
 

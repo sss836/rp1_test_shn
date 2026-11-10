@@ -229,7 +229,7 @@ class QuickRun:
                 ('connecting', '连接 CAN', ('can_connect',), {}),
                 ('discovering', '扫描电机并核对反馈', ('discover_motors',), {}),
                 ('enabling', '确认使能电机', ('enable_motors',), {'physical_estop_confirmed': True}),
-                ('preflight', '核对首帧、限位和轨迹速度', ('arm',), {}),
+                ('preflight', '核对首帧和限位', ('arm',), {}),
             ]:
                 self._checkpoint()
                 self._check_power()

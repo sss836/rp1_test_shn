@@ -294,14 +294,16 @@ class PlaybackController:
             if len(samples) != len(self.config.entries) or any(sample.error_id for sample in samples):
                 raise PlaybackError('电机反馈不完整或存在故障，禁止启动')
             current = np.asarray([sample.pos_rad for sample in samples], dtype=float)
+            # The file's peak speed is informational for playback. Live speed
+            # feedback and the approach/braking/return constraints still apply.
             if self._parameters is not None:
                 self._parameters.check_trajectory(self.config, self.trajectory,
-                    speed=self._options.speed, loop=self._options.loop)
+                    speed=self._options.speed, loop=self._options.loop, check_velocity=False)
             scaled = replace(self.trajectory, timestamps=self.trajectory.timestamps / self._options.speed,
                              fps=self.trajectory.fps * self._options.speed)
             preflight_trajectory(scaled, entries=self.config.entries, config=self.config.raw,
                                  limits=self.config.safety_limits, current_motor_pos=current,
-                                 check_initial_gap=False)
+                                 check_velocity=False, check_initial_gap=False)
             self._approach_plan = plan_first_frame_approach(self.config, current,
                 self.trajectory.motor_pos[0], parameters=self._parameters)
             if self._mujoco_selected:

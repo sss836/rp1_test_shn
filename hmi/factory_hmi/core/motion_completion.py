@@ -116,7 +116,8 @@ class MotionParameters:
 
     def check_trajectory(self, config: StationConfig, trajectory: TrajectoryData,
                          current: np.ndarray | None = None, speed: float = 1.0,
-                         loop: bool = False, check_dynamics: bool = True) -> None:
+                         loop: bool = False, check_dynamics: bool = True, *,
+                         check_velocity: bool = True) -> None:
         for row in trajectory.motor_pos:
             self.check_target(config, row)
         if current is not None:
@@ -125,7 +126,7 @@ class MotionParameters:
         dt = np.diff(trajectory.timestamps)
         if dt.size and check_dynamics:
             velocity = np.diff(trajectory.motor_pos, axis=0) / dt[:, None] * speed
-            if np.any(np.abs(velocity) > self.values['max_velocity_rad_s'] + 1e-9):
+            if check_velocity and np.any(np.abs(velocity) > self.values['max_velocity_rad_s'] + 1e-9):
                 raise MotionParameterError('轨迹速度超过已核实上限')
             # Reserve a verified braking distance for operator finish at any
             # point of every piecewise-linear segment. Never discover an

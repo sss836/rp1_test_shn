@@ -249,7 +249,7 @@ def preflight_trajectory(
             "first-frame delta check is deferred until live motor feedback is available"
         )
     if not check_velocity:
-        warnings.append("启动时按所选倍率核验实际轨迹速度；当前仅检查文件结构、位置与相邻帧变化")
+        warnings.append("轨迹峰值速度仅供参考；运行中监测实际电机速度")
 
     report = PreflightReport(
         safe=not violations,
