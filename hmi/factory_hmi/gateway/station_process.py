@@ -21,6 +21,7 @@ import threading
 import time
 
 from .lease import LeaseConflict
+from factory_hmi.core.can_manager import CanConnectOutcomeUnknown
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ class StationOutcomeUnknown(StationUnavailable):
 
 
 _ERROR_TYPES = {error.__name__: error for error in
-                (LeaseConflict, ValueError, KeyError, TypeError, FileNotFoundError, PermissionError,
+                (CanConnectOutcomeUnknown, LeaseConflict, ValueError, KeyError, TypeError, FileNotFoundError, PermissionError,
                  TimeoutError, OSError, RuntimeError)}
 
 
@@ -382,7 +383,7 @@ class _Channel:
     pending: str | None = None
     buffer: bytearray = field(default_factory=bytearray)
 
-    def call(self, name, args, kwargs, *, timeout):
+    def call(self, name, args, kwargs, *, timeout, late_reply_timeout=0.0):
         deadline = time.monotonic() + timeout
         if not self.lock.acquire(timeout=min(timeout, 0.5)):
             raise StationUnavailable("工位通道繁忙，请核对当前状态")
@@ -404,7 +405,17 @@ class _Channel:
                 # A partial request can never be followed by another frame.
                 self.connection.close()
                 raise
-            status, result = _receive(self.connection, self.buffer, deadline)
+            try:
+                status, result = _receive(self.connection, self.buffer, deadline)
+            except (TimeoutError, BlockingIOError):
+                if not late_reply_timeout:
+                    raise
+                # The connect job still owns this single in-flight request.
+                # Continue receiving its reply without issuing another write.
+                logger.warning("Waiting for late CAN receipt: command_id=%s", kwargs.get("command_id"))
+                status, result = _receive(
+                    self.connection, self.buffer, time.monotonic() + late_reply_timeout
+                )
             self.pending = None
         except TimeoutError as exc:
             raise StationOutcomeUnknown("工位进程请求超时，结果未确认") from exc
@@ -528,10 +539,14 @@ class StationProcess:
         self._start()
         timeout = {"read": 1.0, "lease": 0.3, "safety": 8.0, "control": 120.0, "records": 120.0}[channel]
         try:
-            return self._channels[channel].call(name, args, kwargs, timeout=timeout)
-        except StationOutcomeUnknown:
+            grace = 5.0 if channel == "control" and name == "can_connect" and kwargs.get("command_id") else 0.0
+            return self._channels[channel].call(name, args, kwargs, timeout=timeout, late_reply_timeout=grace)
+        except (StationOutcomeUnknown, CanConnectOutcomeUnknown):
             if channel == "control":
                 self._control_unknown = True
+            if name == "can_connect":
+                logger.warning("CAN operation outcome unknown: channel=%s operation=%s command_id=%s budget_s=%s",
+                               channel, name, kwargs.get("command_id"), timeout)
             raise
 
     def __getattr__(self, name):
@@ -543,7 +558,10 @@ class StationProcess:
                     raise StationUnavailable("上一条工位指令结果未确认，请先执行安全恢复")
                 if any(task.active for task in self.maintenance_tasks()):
                     raise RuntimeError("模块固件或参数维护占用当前实例")
-                return self._call("control", name, self.lease.snapshot().generation, *args, **kwargs)
+                generation = kwargs.pop("lease_generation", None) if name == "can_connect" else None
+                if generation is None:
+                    generation = self.lease.snapshot().generation
+                return self._call("control", name, generation, *args, **kwargs)
             return control
         for names, channel in ((_READS, "read"), (_RECORDS, "records"), (_SAFETY, "safety")):
             if name in names:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import threading
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import pytest
@@ -21,6 +23,7 @@ from factory_hmi.core.can_manager import (
     ARBITRATION_BITRATE,
     DATA_BITRATE,
     CanInterfaceStatus,
+    CanConnectOutcomeUnknown,
     CanManager,
     CanOperationError,
     CanValidationError,
@@ -29,6 +32,7 @@ from factory_hmi.core.can_manager import (
     Pyroute2NetlinkAdapter,
     validate_timing,
 )
+from factory_hmi.core.service import FactoryService
 
 
 class FakeAdapter(NetlinkAdapter):
@@ -419,6 +423,80 @@ def test_manager_rolls_back_completed_interfaces_on_partial_connect_failure() ->
         ("disconnect", ("can0",)),
     ]
     assert adapter.states["can0"]["up"] is False
+
+
+def test_service_can_connect_keeps_display_readable_and_reuses_matching_link(tmp_path, monkeypatch):
+    monkeypatch.setenv("RP1_FACTORY_CAN_DISABLED", "0")
+    entered, resume, display_ready = threading.Event(), threading.Event(), threading.Event()
+    adapter = FakeAdapter()
+
+    class SlowHelper(FakeHelperClient):
+        def execute(self, action, interfaces, **kwargs):
+            if action == "connect":
+                entered.set()
+                assert resume.wait(5)
+            return super().execute(action, interfaces, **kwargs)
+
+    helper = SlowHelper(adapter)
+    manager = CanManager(adapter=adapter, helper_client=helper)
+    monkeypatch.setattr(manager, "authorize_reuse", lambda _interface, **timing: True)
+    service = FactoryService(data_root=tmp_path, can_manager=manager)
+    service.configure(limb="left_arm", backend="fake",
+                      config_path=Path(__file__).resolve().parents[1] / "scripts/config/left_arm_motors.yaml")
+    # Use the real CAN path with a fake motor backend, helper and netlink adapter.
+    service._backend_name = "motors_py"
+    result, display = [], []
+    connecting = threading.Thread(target=lambda: result.append(service.can_connect()))
+
+    def collect():
+        display.append(service.collect_display_snapshot())
+        display_ready.set()
+
+    reader = threading.Thread(target=collect)
+    connecting.start()
+    try:
+        assert entered.wait(2)
+        reader.start()
+        assert display_ready.wait(.75), "display must not wait for the in-flight helper"
+        assert display[0]["can"]["stale"]
+        assert manager.try_status(("can0",)) is None
+    finally:
+        resume.set()
+        connecting.join(timeout=4)
+        if reader.ident is not None:
+            reader.join(timeout=4)
+    assert result[0]["can"]["all_up"] is True
+    assert result[0]["reused_interfaces"] == []
+    assert service.can_connect()["reused_interfaces"] == ["can0"]
+    assert [call[0] for call in helper.calls] == ["connect"]
+
+    # Same bitrate, wrong mode: must reconfigure instead of reusing.
+    adapter.states["can0"]["fd"] = False
+    assert service.can_connect()["reused_interfaces"] == []
+    assert [call[0] for call in helper.calls] == ["connect", "connect"]
+
+
+def test_healthy_link_reuse_obeys_the_installed_can_policy(monkeypatch):
+    monkeypatch.setattr("factory_hmi.can_helper.load_policy", lambda _path: approved_policy("can0"))
+    manager = CanManager(helper_client=PkexecHelperClient(
+        helper_path="/usr/lib/rp1-test-hmi/factory-hmi-can-helper"))
+    timing = {"bitrate": ARBITRATION_BITRATE, "dbitrate": DATA_BITRATE, "fd": True}
+    assert manager.authorize_reuse("can0", **timing) is True
+    with pytest.raises(CanPermissionError):
+        manager.authorize_reuse("can1", **timing)
+    with pytest.raises(CanPermissionError):
+        manager.authorize_reuse("can0", bitrate=ARBITRATION_BITRATE, dbitrate=None, fd=False)
+
+
+def test_can_helper_timeout_is_not_reported_as_a_confirmed_failure(monkeypatch):
+    def expire(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setenv("RP1_FACTORY_CAN_DISABLED", "0")
+    monkeypatch.setattr(subprocess, "run", expire)
+    manager = CanManager(adapter=FakeAdapter(), helper_client=PkexecHelperClient())
+    with pytest.raises(CanConnectOutcomeUnknown, match="helper timed out"):
+        manager.connect(["can0"])
 
 
 def test_helper_rolls_back_partial_connect_failure() -> None:

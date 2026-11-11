@@ -32,10 +32,12 @@ from factory_hmi.plc.coordination import PlcRequestConflict
 from factory_hmi.sync.outbox import Outbox
 from factory_hmi.version import process_identity
 from factory_hmi.execution_history import history_csv
+from factory_hmi.core.can_manager import CanConnectOutcomeUnknown
 
 from .lifecycle import LIFECYCLE_PATH, SAFETY_PATHS, ShutdownCoordinator, ShutdownGate
 from .lease import ControlLease, LeaseConflict, DEFAULT_LEASE_TIMEOUT_S, validate_lease_timeout
 from .display import DisplayPublisher
+from .can_connect import CanConnectCommands
 from .station_process import StationProcess, StationUnavailable
 from .trajectory_upload import configured_trajectory_limit, receive_trajectory
 from .software_updates import SoftwareUpdates, installation_readiness
@@ -354,6 +356,7 @@ class GatewayRuntime:
         )
         self.trajectory_root = self.data_root / "trajectories"
         self.config_root = self.data_root / "configs"
+        self.can_connect_commands = CanConnectCommands(self.data_root)
         self._stop = threading.Event()
         self._lease_thread: threading.Thread | None = None
         self._expiry_callback = expiry_callback
@@ -1104,10 +1107,19 @@ class GatewayHub:
             self._set_interfaces(key, previous)
             raise
 
-    def connect_can(self, owner, runtime, bindings):
+    def connect_can(self, owner, runtime, bindings, **identity):
+        key = self._key(owner)
+        previous = self._owned_interfaces(key)
         if self.isolate_stations and bindings:
-            self._reserve_interfaces(self._key(owner), [binding["interface"] for binding in bindings])
-        return runtime._invoke(("can_connect",), bus_bindings=bindings)
+            self._reserve_interfaces(key, [binding["interface"] for binding in bindings])
+        if runtime._process is None:
+            identity.pop("lease_generation", None)
+        try:
+            return runtime._invoke(("can_connect",), bus_bindings=bindings, **identity)
+        except ValueError:
+            if self.isolate_stations and bindings:
+                self._set_interfaces(key, previous)
+            raise
 
     def _reserve_interfaces(self, owner: str, interfaces: list[str]) -> None:
         with self._lock:
@@ -1274,6 +1286,8 @@ def create_app(
         preempt_motion: bool = False,
         motion_command: bool = False,
         after_command: Callable[[], None] | None = None,
+        action_receipt_only: bool = False,
+        expected_lease_generation: int | None = None,
     ) -> dict[str, Any]:
         require_token(token)
         shutdown_safety = (request.url.path in SAFETY_PATHS
@@ -1286,7 +1300,8 @@ def create_app(
         runtime = hub.session(owner)
         interrupt_registered = False
         try:
-            cleanup = runtime.lease_snapshot().get("cleanup_error") if runtime._process else runtime._cleanup_error
+            cleanup = (runtime.lease_snapshot().get("cleanup_error")
+                       if runtime._process and not action_receipt_only else runtime._cleanup_error)
             if cleanup is not None and not shutdown_safety:
                 raise LeaseConflict("device cleanup quarantined; retry /api/v1/lease/recover before configuring")
             with runtime._motion_epoch_guard:
@@ -1316,19 +1331,24 @@ def create_app(
                         )
                 if claim:
                     runtime.lease.claim(owner)
+                elif expected_lease_generation is not None:
+                    runtime.lease.refresh(owner, generation=expected_lease_generation, require_active=True)
                 else:
                     runtime.lease.refresh(owner)
                 result = operation(runtime)
                 # The guard excludes expiry cleanup for this accepted command.
-                runtime.lease.refresh(owner, command_completed=True)
+                if not action_receipt_only:
+                    runtime.lease.refresh(owner, command_completed=True)
                 if after_command is not None:
                     after_command()
+            if action_receipt_only:
+                return {"ok": True, "result": _json_result(result)}
             return {
                 "ok": True,
                 "result": _json_result(result),
                 "snapshot": runtime.snapshot(),
             }
-        except StationUnavailable as exc:
+        except (StationUnavailable, CanConnectOutcomeUnknown) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except LeaseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -2043,18 +2063,64 @@ def create_app(
         body: CanConnectRequest | None = None,
         x_rp1_client_id: str | None = Header(default=None),
         x_rp1_operator_token: str | None = Header(default=None),
-    ) -> dict[str, Any]:
+    ):
         bindings = (
             None
             if body is None or body.bus_bindings is None
             else [item.model_dump() for item in body.bus_bindings]
         )
-        return mutate(
-            request,
-            x_rp1_client_id,
-            x_rp1_operator_token,
-            lambda runtime: hub.connect_can(owner_id(request, x_rp1_client_id), runtime, bindings),
-        )
+        owner = owner_id(request, x_rp1_client_id)
+        if body is None or body.command_id is None:
+            response = mutate(
+                request, x_rp1_client_id, x_rp1_operator_token,
+                lambda runtime: hub.connect_can(owner, runtime, bindings),
+                action_receipt_only=True,
+            )
+            # Legacy clients can render the verified CAN evidence as a partial snapshot.
+            return {**response, "snapshot": response["result"]}
+
+        require_token(x_rp1_operator_token)
+        if monitor_only or hub.shutdown.snapshot()["state"] != "running":
+            raise HTTPException(409, "当前网关不接受新的 CAN 连接")
+        if body.expected_config_revision is None or body.expected_lease_generation is None:
+            raise HTTPException(422, "请先刷新工位配置版本和控制代次")
+        runtime = hub.session(owner, create=False)
+        command_id = body.command_id
+        generation = body.expected_lease_generation
+        payload = {"expected_config_revision": body.expected_config_revision,
+                   "expected_lease_generation": generation, "bus_bindings": bindings}
+        with runtime._motion_epoch_guard:
+            epoch = runtime._motion_epoch
+        def operation(current: GatewayRuntime):
+            if current is not runtime or hub.shutdown.snapshot()["state"] != "running":
+                raise LeaseConflict("工位已关闭或正在退出，连接命令已取消")
+            with current._motion_epoch_guard:
+                if current._motion_epoch != epoch or current._motion_interrupts_pending:
+                    raise LeaseConflict("已有新的安全操作，原连接命令已取消")
+            return hub.connect_can(owner, current, bindings,
+                                   expected_config_revision=body.expected_config_revision,
+                                   command_id=command_id, lease_generation=generation)
+
+        def execute():
+            return mutate(request, x_rp1_client_id, x_rp1_operator_token, operation,
+                          action_receipt_only=True, expected_lease_generation=generation)["result"]
+
+        receipt = runtime.can_connect_commands.submit(owner, command_id, payload, execute)
+        return JSONResponse({"ok": True, "result": receipt},
+                            status_code=202 if receipt["status"] == "pending" else 200,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/can/connect/receipts/{command_id}")
+    def can_connect_receipt(command_id: str, request: Request,
+                            x_rp1_client_id: str | None = Header(default=None),
+                            x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        if re.fullmatch(r"[A-Za-z0-9._-]{8,128}", command_id) is None:
+            raise HTTPException(422, "连接请求编号无效")
+        owner = owner_id(request, x_rp1_client_id)
+        runtime = hub.session(owner, create=False)
+        return JSONResponse({"ok": True, "result": runtime.can_connect_commands.get(owner, command_id)},
+                            headers={"Cache-Control": "no-store"})
 
     @app.post("/api/v1/motors/enable")
     def enable_motors(

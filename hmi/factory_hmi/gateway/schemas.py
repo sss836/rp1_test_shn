@@ -63,6 +63,9 @@ class ConfigPreviewRequest(BaseModel):
 
 class CanConnectRequest(BaseModel):
     bus_bindings: list[CanBusBinding] | None = None
+    command_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._-]{8,128}$")
+    expected_config_revision: str | None = Field(default=None, min_length=1, max_length=128)
+    expected_lease_generation: int | None = Field(default=None, ge=1)
 
 
 class TrajectoryImportRequest(BaseModel):

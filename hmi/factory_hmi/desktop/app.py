@@ -10,6 +10,7 @@ import re
 import stat
 import sys
 import time
+import uuid
 from datetime import datetime, time as day_time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -108,6 +109,9 @@ from factory_hmi.execution_history import SYNC_LABELS, display_code, instant
 
 
 FACTORY_QUALITY_LABELS = {"passed": "通过", "failed": "不通过", "not_evaluated": "未判定"}
+CAN_RECEIPT_TIMEOUT_S = 135
+CAN_RECEIPT_APPEARANCE_S = 5
+CAN_EVIDENCE_TTL_S = 2.5
 
 
 class WorkerSignals(QObject):
@@ -225,6 +229,18 @@ class FactoryMainWindow(QMainWindow):
         self._preflight_pending = False
         self._default_return_pending = False
         self._can_connected = False
+        self._can_command_id: str | None = None
+        self._can_command_generation: int | None = None
+        self._can_command_checking = False
+        self._can_command_status = ""
+        self._can_command_detail = ""
+        self._can_command_started = 0.0
+        self._can_evidence: Mapping[str, Any] | None = None
+        self._can_evidence_revision: str | None = None
+        self._can_status_expires_at: float | None = None
+        self._can_command_timer = QTimer(self)
+        self._can_command_timer.setInterval(700)
+        self._can_command_timer.timeout.connect(self._poll_can_command)
         self._motors_discovered = False
         self._motors_enabled = False
         self._connected = False
@@ -2325,6 +2341,9 @@ class FactoryMainWindow(QMainWindow):
         self.connection_badge.style().polish(self.connection_badge)
 
     def _refresh_feedback_freshness(self) -> None:
+        if (not self._closing and self._can_status_expires_at is not None
+                and time.monotonic() >= self._can_status_expires_at):
+            self._render_can_controls(self._last_snapshot)
         if (self._closing or self._telemetry_received_at is None or not self._last_snapshot
                 or self._feedback_expired_locally):
             return
@@ -3439,29 +3458,7 @@ class FactoryMainWindow(QMainWindow):
             and not self._preflight_pending and not self._default_return_pending
         )
 
-        can = snapshot.get("can")
-        if isinstance(can, Mapping):
-            all_up = can.get("all_up", can.get("connected"))
-            if isinstance(all_up, bool):
-                self._can_connected = all_up
-            interfaces = can.get("interfaces", [])
-            details = []
-            if isinstance(interfaces, list):
-                for item in interfaces:
-                    if isinstance(item, Mapping):
-                        name = item.get("interface", item.get("name", "can?"))
-                        bus_state = item.get(
-                            "bus_state",
-                            "up" if item.get("up") else "down",
-                        )
-                        details.append(f"{name}:{bus_state}")
-            detail_text = "，".join(details) if details else "无接口证据"
-        else:
-            detail_text = "等待服务状态"
-
-        self.can_status_label.setText(
-            f"CAN\n{'已连接' if self._can_connected else '未连接'} · {detail_text}"
-        )
+        self._render_can_controls(snapshot)
         self.motor_discovery_label.setText(
             "电机\n"
             + (
@@ -3489,10 +3486,6 @@ class FactoryMainWindow(QMainWindow):
             )
         )
         set_tone(
-            self.can_status_label,
-            "success" if self._can_connected else "warning",
-        )
-        set_tone(
             self.motor_discovery_label,
             "success" if self._motors_discovered else "warning",
         )
@@ -3508,27 +3501,7 @@ class FactoryMainWindow(QMainWindow):
             self.feedback_read_label,
             "success" if self._motors_discovered else "warning",
         )
-        self.can_connect_button.setEnabled(self._configured and not self._can_connected)
-        self.discover_button.setEnabled(
-            self._configured and self._can_connected and not self._motors_discovered
-            and not self._motor_discovery_pending
-        )
-        self.enable_motors_button.setEnabled(
-            self._motors_discovered and not self._motors_enabled
-            and not self._motor_fault_reset_pending
-            and not self._motor_discovery_pending
-        )
-        self.disconnect_button.setEnabled(
-            self._can_connected or self._motors_discovered
-        )
-        can_apply_configuration = (
-            bool(self._config_preview) and not self._configuration_pending
-        )
-        self.configure_button.setEnabled(can_apply_configuration)
-        self.apply_editor_button.setEnabled(can_apply_configuration)
-        self.clear_config_button.setEnabled(
-            self._configured and not self._configuration_pending
-        )
+        self._refresh_configuration_buttons()
         self._sync_preflight_controls(state)
         self.pause_button.setEnabled(state == "running")
         self.resume_button.setEnabled(state == "paused")
@@ -3547,10 +3520,77 @@ class FactoryMainWindow(QMainWindow):
         )
         self.motor_fault_reset_button.setEnabled(
             self._configured and self._can_connected and not self._motors_enabled
+            and self._can_command_id is None
             and not self._motor_fault_reset_pending
             and state in {"disconnected", "connected", "fault", "armed", "completed"}
         )
         self.disable_button.setEnabled(self._motors_enabled)
+
+    def _render_can_controls(self, snapshot: Mapping[str, Any]) -> None:
+        can = snapshot.get("can")
+        evidence = self._can_evidence
+        now = time.monotonic()
+        if evidence is not None and self._can_evidence_revision != snapshot.get("config_revision"):
+            self._can_evidence = evidence = None
+        if evidence is not None:
+            sampled = can.get("sampled_monotonic_s") if isinstance(can, Mapping) else None
+            confirmed = evidence.get("sampled_monotonic_s")
+            if isinstance(sampled, (int, float)) and isinstance(confirmed, (int, float)) and sampled >= confirmed:
+                self._can_evidence = None
+            elif isinstance(confirmed, (int, float)) and 0 <= now - confirmed < CAN_EVIDENCE_TTL_S:
+                can = evidence
+        fresh = isinstance(can, Mapping) and can.get("stale") is not True
+        sampled = can.get("sampled_monotonic_s") if fresh else None
+        self._can_status_expires_at = None
+        if isinstance(sampled, (int, float)):
+            fresh = 0 <= now - sampled < CAN_EVIDENCE_TTL_S
+            if fresh:
+                self._can_status_expires_at = sampled + CAN_EVIDENCE_TTL_S
+        details = []
+        if fresh:
+            all_up = can.get("all_up", can.get("connected"))
+            if isinstance(all_up, bool):
+                self._can_connected = all_up
+            interfaces = can.get("interfaces")
+            for item in interfaces if isinstance(interfaces, list) else ():
+                if isinstance(item, Mapping):
+                    name = item.get("interface", item.get("name", "can?"))
+                    state = item.get("bus_state") or ("up" if item.get("up") else "down")
+                    details.append(f"{name}:{state}")
+        command = self._can_command_status
+        pending = self._can_command_id is not None
+        if command == "pending":
+            label = "正在连接，等待工位确认"
+        elif command == "unknown":
+            label = "结果未确认 · 请核对原请求"
+        elif command == "failed":
+            label = "连接未完成 · 查看原因"
+        elif not fresh:
+            label = "等待刷新接口状态" if not self._can_connected else "此前已连接 · 等待刷新状态"
+        else:
+            label = ("已连接" if self._can_connected else "未连接") + " · " + ("，".join(details) or "无接口证据")
+        self.can_status_label.setText("CAN\n" + label)
+        self.can_status_label.setToolTip(self._can_command_detail + (
+            "。如仍未确认，请正常关闭工位后重开。" if command == "unknown" else ""))
+        set_tone(self.can_status_label, "success" if fresh and self._can_connected and not command else "warning")
+        self.can_connect_button.setText(
+            "核对连接结果" if command == "unknown" else "连接中…" if pending else "1. 连接 CAN"
+        )
+        self.can_connect_button.setEnabled(
+            not self._can_command_checking and (command == "unknown" or (
+                not pending and self._configured and (not self._can_connected or command == "failed")))
+        )
+        self.discover_button.setEnabled(
+            not pending and command != "failed" and fresh and self._configured and self._can_connected
+            and not self._motors_discovered and not self._motor_discovery_pending
+        )
+        self.enable_motors_button.setEnabled(
+            not pending and self._motors_discovered and not self._motors_enabled
+            and not self._motor_fault_reset_pending and not self._motor_discovery_pending
+        )
+        self.disconnect_button.setEnabled(
+            not pending and (self._can_connected or self._motors_discovered)
+        )
 
     @staticmethod
     def _current_station_state(snapshot: Mapping[str, Any]) -> str:
@@ -3663,9 +3703,7 @@ class FactoryMainWindow(QMainWindow):
             f"待应用：{limb_label(preview_limb or self._selected_limb())} · "
             f"{len(motors)} 个电机 · {len(groups)} 个 CAN 总线组"
         )
-        can_apply = not self._configuration_pending
-        self.configure_button.setEnabled(can_apply)
-        self.apply_editor_button.setEnabled(can_apply)
+        self._refresh_configuration_buttons()
         self._show_module_config_dialog()
         self._refresh_can_interfaces()
 
@@ -3925,13 +3963,13 @@ class FactoryMainWindow(QMainWindow):
             if self._active_limb and limb == self._active_limb
             else "切换并应用模块"
         )
-        can_apply = bool(self._config_preview) and not self._configuration_pending
+        can_apply = bool(self._config_preview) and not self._configuration_pending and self._can_command_id is None
         self.configure_button.setEnabled(can_apply)
         if hasattr(self, "apply_editor_button"):
             self.apply_editor_button.setEnabled(can_apply)
 
     def _configure(self) -> None:
-        if not self._sample_selection_allowed():
+        if self._can_command_id is not None or not self._sample_selection_allowed():
             return
         config_path = self.config_path.text().strip()
         robot_id = self.robot_id.text().strip()
@@ -4002,6 +4040,7 @@ class FactoryMainWindow(QMainWindow):
         self._trajectory_imported = False
         self._preflight_ok = False
         self._can_connected = False
+        self._reset_can_command()
         self._motors_discovered = False
         self._motors_enabled = False
         self.configure_button.setEnabled(True)
@@ -4023,18 +4062,22 @@ class FactoryMainWindow(QMainWindow):
             f"可靠性测试上位机 - {limb_label(self._selected_limb())} - {interfaces}"
         )
         data = dict(payload) if isinstance(payload, Mapping) else {}
-        result = data.get("result")
-        if isinstance(result, Mapping):
-            data = dict(result)
+        snapshot = data.get("snapshot", data.get("result"))
+        if isinstance(snapshot, Mapping):
+            data = dict(snapshot)
         if data:
             self._render_snapshot(data)
 
     def _configuration_operation_finished(self) -> None:
         self._configuration_pending = False
-        can_apply = bool(self._config_preview)
+        self._refresh_configuration_buttons()
+
+    def _refresh_configuration_buttons(self) -> None:
+        available = not self._configuration_pending and self._can_command_id is None
+        can_apply = bool(self._config_preview) and available
         self.configure_button.setEnabled(can_apply)
         self.apply_editor_button.setEnabled(can_apply)
-        self.clear_config_button.setEnabled(self._configured)
+        self.clear_config_button.setEnabled(self._configured and available)
 
     def _clear_trajectory_selection(self) -> None:
         self._trajectory_imported = False
@@ -4047,7 +4090,7 @@ class FactoryMainWindow(QMainWindow):
         self.start_button.setEnabled(False)
 
     def _clear_configuration(self) -> None:
-        if not self._configured:
+        if not self._configured or self._can_command_id is not None:
             return
         answer = QMessageBox.question(
             self,
@@ -4070,6 +4113,7 @@ class FactoryMainWindow(QMainWindow):
         )
 
     def _configuration_cleared_ok(self, payload: Any) -> None:
+        self._reset_can_command()
         self._configured = False
         self._lease_enabled = False
         self._can_connected = False
@@ -4238,31 +4282,131 @@ class FactoryMainWindow(QMainWindow):
             self._poll_snapshot()
 
     def _connect_can(self) -> None:
+        if self._can_command_checking:
+            return
+        if self._can_command_id is not None:
+            if self._can_command_status == "unknown":
+                self._poll_can_command()
+            return
+        if self._configuration_pending or self._motor_discovery_pending:
+            return
+        revision = self._last_snapshot.get("config_revision")
+        generation = self.client.lease_generation
+        if not revision or not generation or not self._lease_enabled:
+            self.statusBar().showMessage("请刷新工位配置和控制状态后再连接 CAN。", 5000)
+            self._poll_snapshot()
+            return
         try:
             bindings = self._bus_bindings_from_table()
         except (TypeError, ValueError) as exc:
             QMessageBox.warning(self, "CAN 配置无效", str(exc))
             return
-        self.can_connect_button.setEnabled(False)
-        self._run_rest(
-            "连接 CAN",
-            lambda: self.client.can_connect(bindings),
-            self._can_connected_ok,
-            on_finished=lambda: self.can_connect_button.setEnabled(
-                self._configured and not self._can_connected
-            ),
-        )
+        command_id = uuid.uuid4().hex
+        self._can_command_id = command_id
+        self._can_command_generation = generation
+        self._can_command_started = time.monotonic()
+        self._can_evidence = None
+        self._show_can_command("pending", "正在配置并核对 CAN 接口")
+        self._can_command_timer.start()
+        self._check_can_command(command_id, lambda: self.client.can_connect(
+            bindings, command_id=command_id, expected_config_revision=revision,
+            expected_lease_generation=generation,
+        ), submitting=True)
 
-    def _can_connected_ok(self, payload: Any) -> None:
-        self._can_connected = True
-        self._lease_enabled = True
-        if isinstance(payload, Mapping):
-            self._render_snapshot(dict(payload))
-        self.discover_button.setEnabled(True)
-        self.disconnect_button.setEnabled(True)
+    def _poll_can_command(self) -> None:
+        command_id = self._can_command_id
+        if command_id is not None:
+            self._check_can_command(command_id, lambda: self.client.can_connect_receipt(command_id))
+
+    def _check_can_command(self, command_id: str, operation: Callable[[], Any], *, submitting=False) -> None:
+        if self._closing or self._can_command_checking:
+            return
+        self._can_command_checking = True
+        self._render_can_controls(self._last_snapshot)
+
+        def accept(payload: Any) -> None:
+            if self._closing or command_id != self._can_command_id:
+                return
+            receipt = payload.get("result") if isinstance(payload, Mapping) else None
+            if not isinstance(receipt, Mapping) or receipt.get("command_id") != command_id:
+                self._show_can_command("unknown", "未收到匹配的工位回执；只查询原编号")
+                return
+            status = receipt.get("status")
+            detail = str(receipt.get("error") or "")
+            if status == "connected":
+                result = receipt.get("result")
+                evidence = result.get("can") if isinstance(result, Mapping) else None
+                if not isinstance(evidence, Mapping) or evidence.get("all_up") is not True:
+                    self._show_can_command("unknown", "回执缺少接口核验信息")
+                    return
+                generation = self._can_command_generation
+                self._reset_can_command()
+                if (self._lease_enabled and self.client.lease_generation == generation
+                        and result.get("config_revision") == self._last_snapshot.get("config_revision")):
+                    self._can_evidence = evidence
+                    self._can_evidence_revision = result.get("config_revision")
+                self._show_can_command("", "")
+                self.statusBar().showMessage("CAN 连接已确认。", 5000)
+                self._poll_snapshot()
+            elif status == "failed":
+                self._reset_can_command()
+                self._show_can_command("failed", detail or "请检查接口和工位配置")
+            elif status == "pending" and time.monotonic() - self._can_command_started < CAN_RECEIPT_TIMEOUT_S:
+                self._show_can_command("pending", "工位仍在处理此连接请求")
+                if not self._can_command_timer.isActive():
+                    self._can_command_timer.start()
+            elif status == "not_found" and time.monotonic() - self._can_command_started < CAN_RECEIPT_APPEARANCE_S:
+                # The POST response may have been lost before the receipt appeared.
+                return
+            else:
+                self._show_can_command("unknown", detail or "工位没有返回最终结果；未重发连接")
+
+        def failed(exc: Exception) -> None:
+            if self._closing or command_id != self._can_command_id:
+                return
+            if (submitting and isinstance(exc, GatewayHTTPError)
+                    and exc.status_code in {400, 401, 403, 409, 410, 422, 429}):
+                self._reset_can_command()
+                self._show_can_command("failed", str(exc.detail or exc))
+            elif not submitting and isinstance(exc, GatewayHTTPError) and exc.status_code == 404:
+                self._show_can_command("unknown", "网关不支持查询连接回执，请核对运行版本；未重发连接")
+            elif time.monotonic() - self._can_command_started >= CAN_RECEIPT_TIMEOUT_S:
+                self._show_can_command("unknown", "暂时无法读取工位回执；未重发连接")
+            elif self._can_command_status == "pending":
+                self._show_can_command("pending", "暂未读到回执，继续核对原请求")
+
+        def finished() -> None:
+            self._can_command_checking = False
+            if not self._closing:
+                self._render_can_controls(self._last_snapshot)
+
+        self._run_rest("核对 CAN 连接", operation, accept, quiet=True, on_failure=failed, on_finished=finished)
+
+    def _reset_can_command(self) -> None:
+        self._can_command_timer.stop()
+        self._can_command_id = None
+        self._can_command_generation = None
+        self._can_command_status = ""
+        self._can_command_detail = ""
+        self._can_evidence = None
+
+    def _show_can_command(self, status: str, detail: str) -> None:
+        self._can_command_status = status
+        self._can_command_detail = detail
+        if status != "pending":
+            self._can_command_timer.stop()
+        self._render_can_controls(self._last_snapshot)
+        self._refresh_configuration_buttons()
+        if status == "failed":
+            self.statusBar().showMessage("CAN 连接未完成：" + detail, 8000)
+        if self._can_command_id is not None:
+            self.motor_fault_reset_button.setEnabled(False)
 
     def _discover_motors(self) -> None:
-        if self._motor_discovery_pending:
+        if self._motor_discovery_pending or self._can_command_id is not None:
+            return
+        if self._can_status_expires_at is not None and time.monotonic() >= self._can_status_expires_at:
+            self._render_can_controls(self._last_snapshot)
             return
         if self._motors_discovered:
             QMessageBox.information(
@@ -4305,6 +4449,8 @@ class FactoryMainWindow(QMainWindow):
         self.disconnect_button.setEnabled(True)
 
     def _enable_motors(self) -> None:
+        if self._can_command_id is not None:
+            return
         answer = QMessageBox.question(
             self,
             "电机使能安全确认",
@@ -4362,12 +4508,15 @@ class FactoryMainWindow(QMainWindow):
         self._run_rest("断开连接", disconnect_all, self._disconnected_ok)
 
     def _disconnected_ok(self, _payload: Any) -> None:
+        self._reset_can_command()
+        self._can_status_expires_at = None
         self._can_connected = False
         self._motors_discovered = False
         self._motors_enabled = False
         self._connected = False
         self._lease_enabled = False
         self.can_connect_button.setEnabled(self._configured)
+        self.can_connect_button.setText("1. 连接 CAN")
         self.discover_button.setEnabled(False)
         self.enable_motors_button.setEnabled(False)
         self.disconnect_button.setEnabled(False)
@@ -4381,6 +4530,8 @@ class FactoryMainWindow(QMainWindow):
             self.disable_button,
         ):
             button.setEnabled(False)
+        self._refresh_configuration_buttons()
+        self._poll_snapshot()
 
     def _manual_speed_from_slider(self, value: int) -> None:
         speed = float(value) / 10.0
@@ -6123,7 +6274,8 @@ class FactoryMainWindow(QMainWindow):
             QMessageBox.warning(self,"保护阻尼仍在运行","请先可靠支撑机构并点击软件失能，再关闭窗口。关闭控制进程无法保证持续阻尼。")
             return
         if self._new_window_fd is None and not (
-                self._lease_enabled or self._motors_enabled or self._motors_discovered or self._can_connected):
+                self._lease_enabled or self._motors_enabled or self._motors_discovered
+                or self._can_connected or self._can_command_id is not None):
             event.accept()
             self._finish_window_close(event)
             return
@@ -6195,6 +6347,7 @@ class FactoryMainWindow(QMainWindow):
 
     def _finish_window_close(self, event: Any) -> None:
         self._closing = True
+        self._can_command_timer.stop()
         self.diagnostics_page.stop()
         self._lease_enabled = False
         self._lease_heartbeat.stop()

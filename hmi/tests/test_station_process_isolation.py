@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import threading
 import time
 from uuid import uuid4
 
@@ -244,6 +245,121 @@ def test_partial_response_resumes_and_close_is_not_replayed():
         worker.setblocking(False)
         with pytest.raises(BlockingIOError):
             worker.recv(1)
+
+
+def test_can_connect_waits_for_the_same_late_partial_reply():
+    client, worker = socket.socketpair()
+    with client, worker:
+        channel = _Channel(client)
+        received = []
+        reply = _encode(("ok", {"can": {"all_up": True}}))
+
+        def send_reply():
+            received.append(_receive(worker, bytearray(), time.monotonic() + 1))
+            worker.sendall(reply[:7])
+            time.sleep(.12)
+            worker.sendall(reply[7:])
+
+        thread = threading.Thread(target=send_reply)
+        thread.start()
+        args = {"command_id": "can-late-001"}
+        assert channel.call("can_connect", (1,), args, timeout=.05, late_reply_timeout=.5) == {
+            "can": {"all_up": True}
+        }
+        thread.join()
+        assert received == [("can_connect", (1,), args)]
+        assert channel.pending is None
+        worker.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            worker.recv(1)
+
+
+def test_can_receipt_survives_delayed_connect_and_failed_snapshot(isolated_app, monkeypatch):
+    arm, leg = ({"X-RP1-Client-ID": owner} for owner in ("receipt-arm", "receipt-leg"))
+    hub = isolated_app.state.runtime
+    original = hub.connect_can
+    entered, release = threading.Event(), threading.Event()
+    attempts = []
+
+    def connect(owner, runtime, bindings, **identity):
+        attempts.append((owner, identity["command_id"]))
+        if identity["command_id"] == "arm-can-004":
+            raise StationOutcomeUnknown("injected missing control reply")
+        if identity["command_id"] == "arm-can-001":
+            entered.set()
+            assert release.wait(8)
+        return original(owner, runtime, bindings, **identity)
+
+    def unavailable_snapshot(**_kwargs):
+        raise StationOutcomeUnknown("injected read channel failure")
+
+    def configure(client, headers, limb, interface, command_id):
+        configured = client.post("/api/v1/configure", headers=headers, json={
+            "config_path": f"{limb}_motors.yaml", "limb": limb, "backend": "fake",
+            "bus_bindings": [{"index": 0, "interface": interface, "mode": "canfd",
+                              "bitrate": 1_000_000, "dbitrate": 5_000_000}],
+        })
+        assert configured.status_code == 200, configured.text
+        snapshot = configured.json()["snapshot"]
+        return {"command_id": command_id, "expected_config_revision": snapshot["config_revision"],
+                "expected_lease_generation": snapshot["lease"]["generation"]}
+
+    def receipt(client, headers, cmd):
+        response = client.get(f"/api/v1/can/connect/receipts/{cmd}", headers=headers)
+        assert response.status_code == 200, response.text
+        return response.json()["result"]
+
+    def terminal(client, headers, cmd):
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            value = receipt(client, headers, cmd)
+            if value["status"] != "pending":
+                return value
+            time.sleep(.02)
+        pytest.fail(f"missing CAN connection receipt for {cmd}")
+
+    path = "/api/v1/can/connect"
+    with TestClient(isolated_app) as client:
+        arm_body = configure(client, arm, "left_arm", "can0", "arm-can-001")
+        leg_body = configure(client, leg, "left_short_leg", "can1", "leg-can-001")
+        monkeypatch.setattr(hub, "connect_can", connect)
+        monkeypatch.setattr(hub.session(arm["X-RP1-Client-ID"]), "snapshot", unavailable_snapshot)
+        try:
+            first = client.post(path, headers=arm, json=arm_body)
+            assert first.status_code == 202, first.text
+            assert entered.wait(2)
+            assert receipt(client, arm, "arm-can-001")["status"] == "pending"
+            assert client.post(path, headers=arm, json=arm_body).status_code == 202
+            assert client.post(path, headers=arm, json={**arm_body, "command_id": "arm-can-002"}).status_code == 409
+            assert client.post(path, headers=arm, json={**arm_body, "expected_config_revision": "old"}).status_code == 409
+            assert receipt(client, leg, "arm-can-001")["status"] == "not_found"
+            heartbeat = client.post("/api/v1/lease/heartbeat", headers={
+                **arm, "X-RP1-Lease-Generation": str(arm_body["expected_lease_generation"]),
+            })
+            assert heartbeat.status_code == 200, heartbeat.text
+            assert client.post(path, headers=leg, json=leg_body).status_code == 202
+            assert terminal(client, leg, "leg-can-001")["status"] == "connected"
+            assert receipt(client, arm, "arm-can-001")["status"] == "pending"
+        finally:
+            release.set()
+        result = terminal(client, arm, "arm-can-001")
+        assert result["status"] == "connected", result
+        assert result["result"]["can"]["all_up"] is True
+        assert result["result"]["station"]["motors_enabled"] is False
+        assert client.post(path, headers=arm, json=arm_body).json()["result"] == result
+        assert attempts == [("receipt-arm", "arm-can-001"), ("receipt-leg", "leg-can-001")]
+
+        stale = {**arm_body, "command_id": "arm-can-003", "expected_config_revision": "old"}
+        assert client.post(path, headers=arm, json=stale).status_code == 202
+        failure = terminal(client, arm, "arm-can-003")
+        assert failure["status"] == "failed" and "配置已变化" in failure["error"]
+
+        unknown = {**arm_body, "command_id": "arm-can-004"}
+        assert client.post(path, headers=arm, json=unknown).status_code == 202
+        result = terminal(client, arm, "arm-can-004")
+        assert result["status"] == "unknown" and result["result"] is None
+        assert client.post(path, headers=arm, json=unknown).json()["result"] == result
+        assert attempts.count(("receipt-arm", "arm-can-004")) == 1
 
 
 def test_two_fake_stations_play_and_record_concurrently(tmp_path, isolated_app):

@@ -375,9 +375,20 @@ class GatewayClient:
     def can_connect(
         self,
         bus_bindings: list[Mapping[str, Any]] | None = None,
+        *, command_id: str | None = None, expected_config_revision: str | None = None,
+        expected_lease_generation: int | None = None,
     ) -> JsonValue:
         payload = None if bus_bindings is None else {"bus_bindings": bus_bindings}
+        if command_id is not None:
+            payload = dict(payload or {}, command_id=command_id,
+                           expected_config_revision=expected_config_revision,
+                           expected_lease_generation=expected_lease_generation)
+            return self._request("POST", "/api/v1/can/connect", payload, timeout=min(self.timeout, 3.0))
         return self.post("/api/v1/can/connect", payload)
+
+    def can_connect_receipt(self, command_id: str) -> JsonValue:
+        return self._request("GET", f"/api/v1/can/connect/receipts/{parse.quote(command_id, safe='')}",
+                             timeout=min(self.timeout, 2.0))
 
     def can_disconnect(self) -> JsonValue:
         return self.post("/api/v1/can/disconnect")

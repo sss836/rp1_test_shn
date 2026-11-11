@@ -176,6 +176,52 @@ class FactoryHmiResponsiveTests(unittest.TestCase):
         self.assertFalse(self.window.motor_fault_reset_button.isEnabled())
         self.assertTrue(self.window.reset_button.isEnabled())
 
+    def test_can_connect_polls_original_receipt_when_post_response_is_lost(self) -> None:
+        window = self.window
+        snapshot = {"configured": True, "config_revision": "revision-01",
+                    "can": {"all_up": False, "stale": True},
+                    "lease": {"generation": 1, "owner": window.client.client_id}}
+        window._last_snapshot = snapshot
+        window._sync_state(snapshot)
+        with mock.patch.object(window, "_run_rest") as run, \
+                mock.patch.object(window, "_bus_bindings_from_table", return_value=[]), \
+                mock.patch.object(window, "_poll_snapshot"), \
+                mock.patch.object(window.client, "can_connect") as submit, \
+                mock.patch.object(window.client, "can_connect_receipt") as query:
+            window._connect_can()
+            post = run.call_args
+            post.args[1]()
+            command_id = submit.call_args.kwargs["command_id"]
+            post.kwargs["on_failure"](TimeoutError("injected lost response"))
+            post.kwargs["on_finished"]()
+            self.assertIn("等待工位确认", window.can_status_label.text())
+            self.assertFalse(window.discover_button.isEnabled())
+            window._connect_can()
+            self.assertEqual(run.call_count, 1)
+            window._poll_can_command()
+            get = run.call_args
+            get.args[1]()
+            query.assert_called_once_with(command_id)
+            sampled = time.monotonic()
+            get.args[2]({"result": {"command_id": command_id, "status": "connected",
+                                    "result": {"config_revision": "revision-01", "can": {
+                                        "all_up": True, "sampled_monotonic_s": sampled,
+                                        "interfaces": [{"interface": "can0", "bus_state": "error-active"}],
+                                    }}}})
+            get.kwargs["on_finished"]()
+            submit.assert_called_once()
+            self.assertIsNone(window._can_command_id)
+            self.assertFalse(window._can_command_timer.isActive())
+            self.assertIn("已连接", window.can_status_label.text())
+            self.assertTrue(window.discover_button.isEnabled())
+            with mock.patch("factory_hmi.desktop.app.time.monotonic", return_value=sampled + 3):
+                window._refresh_feedback_freshness()
+            self.assertIn("等待刷新", window.can_status_label.text())
+            self.assertFalse(window.discover_button.isEnabled())
+            window._sync_state({**snapshot, "can": {"all_up": False, "sampled_monotonic_s": time.monotonic()}})
+            self.assertIn("未连接", window.can_status_label.text())
+            self.assertFalse(window.discover_button.isEnabled())
+
     def test_selected_platform_profile_passes_its_bench_code_to_start(self) -> None:
         self._online_upper_sample()
         self.window.robot_id.setText("RP1.3-UPPER-01")

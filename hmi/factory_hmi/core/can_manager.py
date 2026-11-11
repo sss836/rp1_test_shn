@@ -60,6 +60,10 @@ class CanOperationError(CanManagerError):
     """One or more requested interface operations failed."""
 
 
+class CanConnectOutcomeUnknown(CanOperationError):
+    """The helper action or its rollback could not be confirmed."""
+
+
 @dataclass(frozen=True)
 class CanInterfaceStatus:
     """Normalized status for one SocketCAN interface."""
@@ -522,7 +526,8 @@ class PkexecHelperClient:
                 f"CAN helper launcher not found: {exc.filename}"
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise HelperExecutionError(
+            error = CanConnectOutcomeUnknown if action == "connect" else HelperExecutionError
+            raise error(
                 f"CAN helper timed out after {self.timeout_s:g} seconds"
             ) from exc
         if completed.returncode != 0:
@@ -534,7 +539,8 @@ class PkexecHelperClient:
         try:
             response = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
-            raise HelperExecutionError("CAN helper returned invalid JSON") from exc
+            error = CanConnectOutcomeUnknown if action == "connect" else HelperExecutionError
+            raise error("CAN helper returned invalid JSON") from exc
         if not isinstance(response, Mapping) or response.get("ok") is not True:
             raise HelperExecutionError("CAN helper returned an unsuccessful response")
         return response
@@ -565,6 +571,32 @@ class CanManager:
         with self._lock:
             return [self.adapter.get_status(name) for name in names]
 
+    def try_status(self, interfaces: Sequence[str]) -> list[CanInterfaceStatus] | None:
+        """Display polling must not queue behind a privileged link operation."""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return self.status(interfaces)
+        finally:
+            self._lock.release()
+
+    def authorize_reuse(self, interface: str, *, bitrate: int, dbitrate: int | None, fd: bool) -> bool:
+        """A read-only reuse must meet the installed helper's policy too."""
+        if not isinstance(self._helper, PkexecHelperClient):
+            return False
+        if self._helper.helper_path != "/usr/lib/rp1-test-hmi/factory-hmi-can-helper":
+            return False
+        from factory_hmi.can_helper import CanPolicyError, authorize_request, load_policy
+
+        try:
+            policy = load_policy("/etc/rp1-test-hmi/can-policy.yaml")
+        except CanPolicyError:
+            # The helper may be able to read a policy unavailable to the HMI.
+            return False
+        authorize_request(policy, {"action": "connect", "interfaces": [interface],
+                                   "bitrate": bitrate, "dbitrate": dbitrate, "fd": fd})
+        return True
+
     def list_interfaces(self) -> tuple[str, ...]:
         """List existing ``canN`` interfaces through the netlink adapter."""
 
@@ -593,6 +625,7 @@ class CanManager:
                         fd=fd,
                     )
                     connected.append(name)
+                return [self.adapter.get_status(name) for name in names]
             except Exception as exc:
                 rollback_errors: list[str] = []
                 for name in reversed(connected):
@@ -605,10 +638,11 @@ class CanManager:
                     if rollback_errors
                     else "; completed interfaces were rolled back"
                 )
-                raise CanOperationError(
+                error = (CanConnectOutcomeUnknown if rollback_errors or isinstance(exc, CanConnectOutcomeUnknown)
+                         else CanOperationError)
+                raise error(
                     f"failed to connect CAN interface set at {name}: {exc}{detail}"
                 ) from exc
-            return [self.adapter.get_status(name) for name in names]
 
     def disconnect(self, interfaces: Sequence[str]) -> list[CanInterfaceStatus]:
         names = validate_interfaces(interfaces)

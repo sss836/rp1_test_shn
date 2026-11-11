@@ -27,8 +27,10 @@ from .can_manager import (
     ALLOWED_DATA_BITRATES,
     ARBITRATION_BITRATE,
     DATA_BITRATE,
+    CanConnectOutcomeUnknown,
     CanInterfaceStatus,
     CanManager,
+    HelperExecutionError,
 )
 from .config import load_station_config, require_supported_limb
 from .controller import FactoryController
@@ -94,6 +96,7 @@ class FactoryService:
         self._can_interfaces: tuple[str, ...] = ()
         self._display_can: tuple[str, float, dict[str, Any]] | None = None
         self._display_can_probe: tuple[str, float] | None = None
+        self._can_connecting = False
         self._can_bindings: tuple[dict[str, Any], ...] = ()
         self._fake_can_connected = False
         self._report_threads: set[threading.Thread] = set()
@@ -372,28 +375,8 @@ class FactoryService:
             if item.get("interface")
         }
 
-        def healthy(status: CanInterfaceStatus) -> bool:
-            binding = expected.get(status.interface)
-            if binding is None:
-                return False
-            fd = str(binding.get("mode", "canfd")).lower() == "canfd"
-            timing_matches = (
-                status.bitrate == int(binding.get("bitrate", ARBITRATION_BITRATE))
-                and status.fd is fd
-            )
-            if fd:
-                timing_matches = timing_matches and status.dbitrate == int(
-                    binding.get("dbitrate", DATA_BITRATE)
-                )
-            return (
-                status.exists
-                and status.up
-                and timing_matches
-                and status.bus_state not in {"bus-off", "stopped"}
-            )
-
-        all_up = bool(statuses) and all(
-            healthy(status) for status in statuses
+        all_up = bool(expected) and set(expected) == {status.interface for status in statuses} and all(
+            self._can_link_matches(status, expected[status.interface]) for status in statuses
         )
         return {
             "connected": all_up,
@@ -416,6 +399,16 @@ class FactoryService:
             "bindings": [dict(item) for item in self._can_bindings],
             "interfaces": interfaces,
         }
+
+    @staticmethod
+    def _can_link_matches(status: CanInterfaceStatus, binding: Mapping[str, Any]) -> bool:
+        fd = str(binding.get("mode", "canfd")).lower() == "canfd"
+        return (
+            status.exists and status.up and status.fd is fd
+            and status.bitrate == int(binding.get("bitrate", ARBITRATION_BITRATE))
+            and (not fd or status.dbitrate == int(binding.get("dbitrate", DATA_BITRATE)))
+            and status.bus_state not in {"bus-off", "stopped"}
+        )
 
     def _fake_can_statuses(self) -> list[CanInterfaceStatus]:
         connected = self._fake_can_connected
@@ -452,8 +445,17 @@ class FactoryService:
                 return self._can_payload([])
             if self._backend_name == "fake":
                 return self._can_payload(self._fake_can_statuses())
-            payload = self._can_payload(self._can_manager.status(self._can_interfaces))
-            self._display_can = self._config_revision, time.monotonic(), payload
+            if self._can_connecting:
+                return {**self._can_payload([]), "stale": True, "connecting": True}
+            revision, interfaces = self._config_revision, self._can_interfaces
+            started = time.monotonic()
+        statuses = self._can_manager.status(interfaces)
+        with self._lock:
+            if revision != self._config_revision or self._can_connecting:
+                return {**self._can_payload([]), "stale": True, "connecting": self._can_connecting}
+            payload = self._can_payload(statuses)
+            if self._display_can is None or self._display_can[1] <= started:
+                self._display_can = revision, started, payload
             return payload
 
     def can_interfaces(self) -> dict[str, Any]:
@@ -517,50 +519,92 @@ class FactoryService:
         self,
         *,
         bus_bindings: Sequence[Mapping[str, Any]] | None = None,
+        expected_config_revision: str | None = None,
+        command_id: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             if not self._can_interfaces:
                 raise RuntimeError("configure a station before connecting CAN")
+            revision = self._config_revision
+            if expected_config_revision is not None and revision != expected_config_revision:
+                raise ValueError("配置已变化，请刷新后重新连接 CAN")
             if bus_bindings is not None:
                 requested = tuple(dict(item) for item in bus_bindings)
                 if requested != self._can_bindings:
                     raise ValueError(
                         "CAN bindings changed after configuration; apply configuration again"
                     )
-            if self._backend_name == "fake":
-                self._fake_can_connected = True
-            else:
-                connected: list[str] = []
-                try:
-                    for binding in self._can_bindings:
-                        interface = str(binding["interface"])
-                        if interface in connected:
+            interfaces = self._can_interfaces
+            bindings = {str(item["interface"]): dict(item) for item in self._can_bindings}
+            controller = self._controller
+            fake = self._backend_name == "fake"
+            self._can_connecting = True
+            self._display_can = None
+        changed: list[str] = []
+        reused: list[str] = []
+        try:
+            # The lifecycle lock still excludes configuration, other device
+            # commands and close. No display lock is held through device I/O.
+            statuses = []
+            if not fake:
+                if os.environ.get("RP1_FACTORY_CAN_DISABLED") == "1":
+                    raise HelperExecutionError("CAN 配置未启用：当前包不配置物理 CAN")
+                before = {item.interface: item for item in self._can_manager.status(interfaces)}
+                for interface in interfaces:
+                    binding = bindings[interface]
+                    timing = {"bitrate": int(binding["bitrate"]), "dbitrate": binding.get("dbitrate"),
+                              "fd": binding.get("mode", "canfd") == "canfd"}
+                    previous = before.get(interface)
+                    if (previous is not None and previous.bus_state == "error-active"
+                            and self._can_link_matches(previous, binding)):
+                        try:
+                            can_reuse = self._can_manager.authorize_reuse(interface, **timing)
+                        except PermissionError as exc:
+                            raise ValueError(str(exc)) from exc
+                        if can_reuse:
+                            reused.append(interface)
+                            statuses.append(previous)
                             continue
-                        self._can_manager.connect(
-                            [interface],
-                            bitrate=int(binding["bitrate"]),
-                            dbitrate=(
-                                int(binding["dbitrate"])
-                                if binding.get("dbitrate") is not None
-                                else None
-                            ),
-                            fd=binding.get("mode", "canfd") == "canfd",
-                        )
-                        connected.append(interface)
-                except Exception:
-                    if connected:
-                        self._can_manager.disconnect(connected)
-                    raise
-                statuses = self._can_manager.status(self._can_interfaces)
-                payload = self._can_payload(statuses)
-                if not payload["all_up"]:
-                    try:
-                        self._can_manager.disconnect(self._can_interfaces)
-                    finally:
-                        raise RuntimeError(
-                            "CAN helper completed but interfaces are not healthy"
-                        )
-            return self.snapshot()
+                    if controller is not None and controller.backend.connected:
+                        raise RuntimeError("请先断开电机，再重新配置 CAN 接口")
+                    verified = self._can_manager.connect([interface], **timing)
+                    changed.append(interface)
+                    if (len(verified) != 1 or verified[0].interface != interface
+                            or not self._can_link_matches(verified[0], binding)):
+                        raise RuntimeError(f"{interface} 启用后未确认接口健康或配置时序不匹配")
+                    statuses.extend(verified)
+            with self._lock:
+                if self._config_revision != revision:
+                    raise RuntimeError("连接期间配置已变化，不能确认旧配置的连接")
+                if fake:
+                    self._fake_can_connected = True
+                    statuses = self._fake_can_statuses()
+                can = self._can_payload(statuses)
+                if not can["all_up"]:
+                    raise RuntimeError("未确认所有配置的 CAN 接口均已就绪")
+                sampled_at = time.monotonic()
+                self._display_can = revision, sampled_at, can
+                self._display_can_probe = revision, sampled_at
+                discovered = bool(controller and controller.backend.connected)
+                enabled = bool(controller and controller.backend.motors_enabled)
+                state = controller.state.value if controller is not None else "disconnected"
+                return {"can": {**can, "sampled_monotonic_s": sampled_at, "stale": False},
+                        "configured": True, "connected": discovered, "state": state,
+                        "config_revision": revision, "reused_interfaces": reused,
+                        "station": {"limb": controller.config.limb if controller is not None else "",
+                                    "state": state, "can_connected": True, "motors_discovered": discovered,
+                                    "motors_enabled": enabled, "connection_phase": (
+                            "motors_enabled" if enabled else "motors_discovered" if discovered else "can_connected")}}
+        except Exception as exc:
+            if changed:
+                try:
+                    self._can_manager.disconnect(changed)
+                except Exception as rollback:
+                    raise CanConnectOutcomeUnknown(f"{exc}；CAN 回退未确认：{rollback}") from exc
+            raise
+        finally:
+            with self._lock:
+                self._can_connecting = False
 
     def _disconnect_can_locked(self, reason: str) -> None:
         if self._controller is not None and self._controller.backend.connected:
@@ -1587,27 +1631,30 @@ class FactoryService:
             self._require_open()
             controller = self._controller
             revision = self._config_revision
+            connecting = self._can_connecting
             interfaces = self._can_interfaces if self._backend_name != "fake" else ()
             started = time.monotonic()
             probe = self._display_can_probe
-            query_can = bool(interfaces) and (
+            query_can = bool(interfaces) and not connecting and (
                 probe is None or probe[0] != revision or started - probe[1] >= 1.0
             )
             if query_can:
                 self._display_can_probe = revision, started
 
-        if controller is not None:
+        if controller is not None and not connecting:
             controller.sample_display_feedback()
         if query_can:
             try:
-                statuses = self._can_manager.status(interfaces)
+                manager = self._can_manager
+                statuses = manager.try_status(interfaces) if isinstance(manager, CanManager) else manager.status(interfaces)
             except (RuntimeError, OSError):
                 # Keep the last verified result only within its display TTL.
                 pass
             else:
                 with self._lock:
                     cached = self._display_can
-                    if revision == self._config_revision and (cached is None or cached[1] <= started):
+                    if (statuses is not None and not self._can_connecting and revision == self._config_revision
+                            and (cached is None or cached[1] <= started)):
                         self._display_can = revision, started, self._can_payload(statuses)
         return self.display_snapshot()
 
@@ -1688,6 +1735,8 @@ class FactoryService:
                     can_snapshot = {**cached[2], "sampled_monotonic_s": cached[1], "stale": False}
                 else:
                     can_snapshot = {**self._can_payload([]), "stale": True}
+            elif self._backend_name == "fake":
+                can_snapshot = {**self.can_status(), "sampled_monotonic_s": time.monotonic(), "stale": False}
             else:
                 can_snapshot = self.can_status()
             motors_discovered = bool(station.get("motors_discovered", station.get("backend_connected", False)))
