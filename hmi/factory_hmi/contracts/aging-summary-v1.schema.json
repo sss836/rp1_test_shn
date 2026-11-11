@@ -86,7 +86,7 @@
       "additionalProperties": false,
       "required": ["schema_version", "status", "reason", "profile", "metrics", "execution_checks"],
       "properties": {
-        "schema_version": {"enum": ["factory-quality-v1", "factory-quality-v2"]},
+        "schema_version": {"enum": ["factory-quality-v1", "factory-quality-v2", "factory-quality-v3"]},
         "status": {"enum": ["passed", "failed", "not_evaluated"]},
         "reason": {"type": "string"},
         "profile": {"type": ["object", "null"]},

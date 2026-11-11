@@ -10,7 +10,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from factory_hmi.core.config import load_station_config
-from factory_hmi.core.factory_quality import CRITERIA_VERSION, freeze_factory_quality
+from factory_hmi.core.factory_quality import CRITERIA_VERSION, evaluate_factory_quality, freeze_factory_quality
 from factory_hmi.core.report import ReportManager
 from factory_hmi.core.trajectory import import_trajectory
 from factory_hmi.quick_profiles import catalog, preset
@@ -116,7 +116,8 @@ def test_matching_factory_run_seals_passed_quality_separately_from_legacy_verdic
 def test_each_builtin_factory_profile_seals_an_explicit_result(tmp_path, limb):
     manager, context, summary = finalize_synthetic(tmp_path, limb=limb)
     result = summary["factory_quality"]
-    assert result["schema_version"] == CRITERIA_VERSION
+    expected_version = CRITERIA_VERSION if limb.endswith("_arm") else "factory-quality-v2"
+    assert result["schema_version"] == expected_version
     assert result["status"] == "passed", result["reason"]
     assert result["profile"]["test_case_id"] == context["test_case_id"]
     assert result["profile"]["basis_kind"] == ("reference" if limb == "waist_hip" else "trial")
@@ -140,18 +141,41 @@ def test_old_right_short_arm_trajectory_does_not_inherit_the_current_profile():
     assert "轨迹哈希" in policy["reason"]
 
 
-def test_long_arm_report_identifies_the_failed_new_wrist_axis(tmp_path):
+@pytest.mark.parametrize(("limb", "joint", "measured", "old_limit", "new_limit"), [
+    ("left_short_arm", "left_shoulder_pitch_joint", 13.0, 11.0, 14.0),
+    ("right_short_arm", "right_shoulder_pitch_joint", 13.0, 11.0, 14.0),
+    ("left_arm", "left_wrist_yaw_joint", 8.25, 7.0, 9.0),
+    ("right_arm", "right_wrist_yaw_joint", 8.25, 7.0, 9.0),
+])
+def test_new_arm_limits_pass_without_reinterpreting_frozen_v2(tmp_path, limb, joint, measured, old_limit, new_limit):
+    _, context, summary = finalize_synthetic(tmp_path, limb=limb, overrides={f"{joint}_torque_nm": measured})
+    current = summary["factory_quality"]
+    assert current["status"] == "passed"
+    assert current["profile"]["joint_limits"][joint]["torque_p999_abs_nm"] == new_limit
+
+    frozen = copy.deepcopy(context["factory_quality_policy"])
+    frozen["criteria_version"] = "factory-quality-v2"
+    frozen["profile"]["id"] = frozen["profile"]["id"].replace("-v3", "-v2")
+    frozen["profile"]["joint_limits"][joint]["torque_p999_abs_nm"] = old_limit
+    old = evaluate_factory_quality({**context, "factory_quality_policy": frozen}, summary["quality"],
+                                   summary["joint_metrics"])
+    assert old["schema_version"] == "factory-quality-v2"
+    assert old["status"] == "failed"
+    assert old["profile"]["joint_limits"][joint]["torque_p999_abs_nm"] == old_limit
+
+
+def test_long_arm_report_identifies_the_failed_wrist_axis(tmp_path):
     manager, context, summary = finalize_synthetic(
-        tmp_path, limb="left_arm", overrides={"left_wrist_yaw_joint_torque_nm": 8.25},
+        tmp_path, limb="left_arm", overrides={"left_wrist_yaw_joint_torque_nm": 10.25},
     )
     result = summary["factory_quality"]
     assert result["status"] == "failed"
-    assert "腕偏航（ID 6）绝对力矩 P99.9 8.25 N·m > 7 N·m" in result["reason"]
+    assert "腕偏航（ID 6）绝对力矩 P99.9 10.25 N·m > 9 N·m" in result["reason"]
     wrist = next(row for row in result["metrics"] if row["motor_id"] == 6)
     torque = next(check for check in wrist["checks"] if check["key"] == "torque_p999_abs_nm")
-    assert torque["value"] == 8.25 and torque["limit"] == 7 and torque["exceedance"] == 1.25
+    assert torque["value"] == 10.25 and torque["limit"] == 9 and torque["exceedance"] == 1.25
     text = (manager.execution_dir(context["test_id"]) / "analysis/report.md").read_text()
-    assert "腕偏航（ID 6） | 绝对力矩 P99.9 | 8.25 N·m | 7 N·m | 超限 | 1.25 N·m" in text
+    assert "腕偏航（ID 6） | 绝对力矩 P99.9 | 10.25 N·m | 9 N·m | 超限 | 1.25 N·m" in text
 
 
 @pytest.mark.parametrize(("column", "value", "failed_key"), [
