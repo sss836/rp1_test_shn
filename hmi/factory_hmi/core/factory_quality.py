@@ -25,9 +25,10 @@ _METRICS = (
 _PROFILES = {
     "right_short_arm": {
         "id": "right-short-arm-reference-v1",
-        "label": "右短臂参考轨迹 0.6 倍",
+        "label": "右短臂参考轨迹（用户确认1倍，执行节拍待核对）",
         "trajectory_sha256": "6b5b447399d48233c5c27571c67cbc7c0ef6a984a954f34e27b1cd1434945a84",
-        "speed": 0.6,
+        "speed": 1.0,
+        "timing_verified": False,
         "reference_run_count": 1,
         "limits": {
             "right_shoulder_pitch_joint": (0.10, 0.30, 11.0),
@@ -39,9 +40,10 @@ _PROFILES = {
     },
     "right_short_leg": {
         "id": "right-short-leg-reference-v1",
-        "label": "右短腿参考轨迹 0.8 倍",
+        "label": "右短腿参考轨迹（用户确认1倍，执行节拍待核对）",
         "trajectory_sha256": "8a45ed836d1557fd149cf15b65b812d8d1cbd935189a5e1c88ef01a405d70d3b",
-        "speed": 0.8,
+        "speed": 1.0,
+        "timing_verified": False,
         "reference_run_count": 1,
         "limits": {
             "right_hip_roll_joint": (0.22, 0.35, 32.0),
@@ -111,6 +113,8 @@ def freeze_factory_quality(context: Mapping[str, Any]) -> dict[str, Any]:
     if reference is None:
         reasons.append("当前部位尚无工厂参考判据")
     else:
+        if reference.get("timing_verified") is False:
+            reasons.append("参考记录按用户确认的1倍设定，但实际指令周期与文件周期不一致，执行节拍待核对")
         if identity["trajectory_sha256"] != reference["trajectory_sha256"]:
             reasons.append("轨迹哈希与参考记录不一致")
         if identity["speed"] is None or not math.isclose(identity["speed"], reference["speed"], rel_tol=0, abs_tol=1e-9):

@@ -101,6 +101,22 @@ def test_matching_factory_run_seals_passed_quality_separately_from_legacy_verdic
     assert frozen["factory_quality_policy"] == context["factory_quality_policy"]
 
 
+@pytest.mark.parametrize(("limb", "trajectory_sha"), [
+    ("right_short_arm", "6b5b447399d48233c5c27571c67cbc7c0ef6a984a954f34e27b1cd1434945a84"),
+    ("right_short_leg", "8a45ed836d1557fd149cf15b65b812d8d1cbd935189a5e1c88ef01a405d70d3b"),
+])
+def test_nominal_one_times_reference_does_not_treat_inferred_pace_as_selected_speed(limb, trajectory_sha):
+    context = context_for_factory()
+    config = load_station_config(limb)
+    context.update(limb=limb, trajectory={"sha256": trajectory_sha},
+                   entries=[{"joint_name": entry.joint_name} for entry in config.entries])
+    policy = freeze_factory_quality(context)
+    assert policy["identity"]["speed"] == 1.0
+    assert policy["matched"] is False
+    assert "执行节拍待核对" in policy["reason"]
+    assert "运行倍率与参考记录不一致" not in policy["reason"]
+
+
 @pytest.mark.parametrize(("column", "value", "failed_key"), [
     ("waist_roll_joint_temp_c", 80.0, "temperature_peak_c"),
     ("waist_roll_joint_pos_rad", 1.0, "tracking_rms_rad"),
