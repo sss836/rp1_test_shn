@@ -202,6 +202,7 @@ def test_cycle_finish_stays_paused_until_resume_and_keeps_first_request(tmp_path
         assert finished['progress']['frame'] == playback.trajectory.frame_count - 1
         assert finished['progress']['outcome'] == 'stopped'
         assert finished['stop_reason'] == 'first cycle finish'
+        assert finished['completion']['finish_cycle_completed']
         assert finished['completion']['safe_disabled']
     finally:
         backend.disconnect()

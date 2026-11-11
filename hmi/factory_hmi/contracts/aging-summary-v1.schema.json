@@ -80,10 +80,54 @@
       "type": "array",
       "minItems": 1,
       "items": {"$ref": "#/$defs/jointMetric"}
+    },
+    "factory_quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "status", "reason", "profile", "metrics", "execution_checks"],
+      "properties": {
+        "schema_version": {"const": "factory-quality-v1"},
+        "status": {"enum": ["passed", "failed", "not_evaluated"]},
+        "reason": {"type": "string"},
+        "profile": {"type": ["object", "null"]},
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["joint_name", "motor_id", "checks"],
+            "properties": {
+              "joint_name": {"type": "string"},
+              "motor_id": {"type": "integer", "minimum": 0},
+              "checks": {
+                "type": "array",
+                "minItems": 5,
+                "maxItems": 5,
+                "items": {"$ref": "#/$defs/factoryMotorCheck"}
+              }
+            }
+          }
+        },
+        "execution_checks": {"type": "array", "items": {"type": "object"}}
+      }
     }
   },
   "$defs": {
     "nullableMetric": {"type": ["number", "null"]},
+    "factoryMotorCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "value", "limit", "unit", "passed"],
+      "properties": {
+        "key": {"enum": ["tracking_rms_rad", "tracking_p99_abs_rad", "temperature_peak_c",
+          "temperature_peak_rise_c", "torque_p999_abs_nm"]},
+        "label": {"type": "string"},
+        "value": {"$ref": "#/$defs/nullableMetric"},
+        "limit": {"$ref": "#/$defs/nullableMetric"},
+        "unit": {"enum": ["rad", "°C", "N·m"]},
+        "passed": {"type": ["boolean", "null"]}
+      }
+    },
     "moduleMetric": {
       "type": "object",
       "additionalProperties": false,
@@ -134,6 +178,8 @@
         "torque_utilization": {"$ref": "#/$defs/nullableMetric"},
         "tracking_rms_rad": {"$ref": "#/$defs/nullableMetric"},
         "tracking_max_rad": {"$ref": "#/$defs/nullableMetric"},
+        "tracking_p99_abs_rad": {"$ref": "#/$defs/nullableMetric"},
+        "factory_metric_sample_count": {"type": "integer", "minimum": 0},
         "fault_count": {"type": "integer", "minimum": 0}
       }
     }

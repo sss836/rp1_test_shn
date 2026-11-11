@@ -250,7 +250,7 @@ class PlaybackController:
         self._mujoco_selected = False
         self._completion = dict(phase="running", active=False, safe_disabled=False,
             parameter_revision=None, return_seconds=0.0, settling_seconds=0.0, alarm=None,
-            evidence_path=str(self.completion_output), finish_cycle_requested=False)
+            evidence_path=str(self.completion_output), finish_cycle_requested=False, finish_cycle_completed=False)
         self._completion_evidence: dict[str, Any] = {}
         self._thread: threading.Thread | None = None
         self._progress = PlaybackProgress()
@@ -317,7 +317,7 @@ class PlaybackController:
                 approach=self._approach_plan.to_dict(),
                 parameter_revision=self._parameters.parameter_revision if self._parameters else None,
                 automatic_return_enabled=self._parameters is not None or self._mujoco_selected, alarm=None,
-                return_seconds=0.0, settling_seconds=0.0, finish_cycle_requested=False)
+                return_seconds=0.0, settling_seconds=0.0, finish_cycle_requested=False, finish_cycle_completed=False)
             self._finish_event.clear()
             self._test_finished.clear()
             self._test_started.clear()
@@ -578,6 +578,8 @@ class PlaybackController:
                 self._ended_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             if self._stop_event.is_set() and self._completion["phase"] != "fault":
                 self._completion.update(phase="interrupted", active=False)
+            if self._stop_event.is_set() or self._fault:
+                self._completion["finish_cycle_completed"] = False
             self._completion["evidence_path"] = str(self.completion_output)
             self._write_completion_evidence()
         current = self.state_machine.state
@@ -675,7 +677,7 @@ class PlaybackController:
                 if delta > 0:
                     velocity = (target - old_target) / delta
                 self._dispatch(target, active_time, watchdog, recorder)
-                self._sample_feedback(target, active_time, update_statistics=True)
+                self._sample_feedback(target, active_time, update_statistics=True, check_speed_limit=False)
                 reached_time = not finish_cycle and options.duration_s is not None and active_time >= options.duration_s
                 at_cycle_end = cycle_time >= duration
                 if reached_time or at_cycle_end:
@@ -692,6 +694,9 @@ class PlaybackController:
                             if operator_finish or finish_cycle or not options.loop or reached_cycles:
                                 if operator_finish:
                                     outcome = "stopped"
+                                    self._completion["finish_cycle_completed"] = (
+                                        self._completion["finish_cycle_requested"] and not self._finish_event.is_set()
+                                    )
                                 else:
                                     outcome = "duration_complete" if finish_cycle else ("cycles_complete" if options.loop else "completed")
                                 self._completion.update(phase="decelerating")
@@ -910,7 +915,7 @@ class PlaybackController:
         return next_tick
 
     def _sample_feedback(self, target: np.ndarray, active_time: float,
-                         *, update_statistics: bool) -> list[MotorSample]:
+                         *, update_statistics: bool, check_speed_limit: bool = True) -> list[MotorSample]:
         samples = self.backend.read_samples()
         stale_seconds = (self._parameters.feedback_stale_seconds if self._parameters is not None
                          else self._diagnosis.thresholds.stale_seconds)
@@ -937,7 +942,8 @@ class PlaybackController:
                         or (upper is not None and np.any(values > np.asarray(upper)))):
                     raise PlaybackError('实际位置超过当前配置限位')
             speed_limit = limits.max_velocity_rad_s
-        if speed_limit is not None and np.any(np.abs([s.spd_rad_s for s in samples]) > speed_limit):
+        if check_speed_limit and speed_limit is not None and np.any(
+                np.abs([s.spd_rad_s for s in samples]) > speed_limit):
             raise PlaybackError("实际电机速度超过当前配置上限")
         with self._lock:
             self._last_samples = samples

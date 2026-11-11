@@ -700,6 +700,13 @@ def _build_summary(
         result["quality"]["sample_completeness"] = None
         for joint in result["joint_metrics"]:
             joint["sample_completeness"] = None
+    if context.get("factory_quality_policy") is not None:
+        from .factory_quality import evaluate_factory_quality
+        factory_quality = evaluate_factory_quality(
+            context, result["quality"], joints, non_monotonic=non_monotonic or not valid_time_rows
+        )
+        if factory_quality is not None:
+            result["factory_quality"] = factory_quality
     return result
 
 
@@ -738,6 +745,18 @@ def _render_report(summary: Mapping[str, Any], manifest_identity: Mapping[str, A
         lines.append("- Acceptance criteria not configured / 未配置正式合格判据。")
     else:
         lines.append("- All configured acceptance rules passed.")
+    if factory_quality := summary.get("factory_quality"):
+        status = {"passed": "通过", "failed": "不通过", "not_evaluated": "未判定"}[factory_quality["status"]]
+        profile = factory_quality.get("profile") or {}
+        lines.extend(["", f"## 工厂质量：{status}", "", factory_quality["reason"],
+                      f"规程：`{factory_quality['schema_version']}`；参考工况：{profile.get('label', '未匹配')}",
+                      profile.get("scope_note", ""), "",
+                      "| 电机通道 | 指标 | 实测 | 上限 |",
+                      "| --- | --- | ---: | ---: |"])
+        for motor in factory_quality["metrics"]:
+            for check in motor["checks"]:
+                lines.append(f"| {motor['joint_name']} | {check['label']} ({check['unit']}) | "
+                             f"{number(check['value'])} | {number(check['limit'])} |")
     lines.extend(
         [
             "",
@@ -1222,6 +1241,9 @@ class ReportManager:
                 "verdict": "未配置判据" if summary["verdict"].get("criteria_version") == "UNCONFIGURED" or summary["verdict"]["status"] == "unconfigured" else summary["verdict"]["status"],
                 "bundle_path": str(self.exports_root / f"{manifest['test_id']}.tar.gz"),
             }
+            if factory_quality := summary.get("factory_quality"):
+                item["factory_quality_status"] = factory_quality["status"]
+                item["factory_quality_reason"] = factory_quality["reason"]
             try:
                 store = self.local_correction_store(item['test_id'])
                 item.update(view_values(store.original))
@@ -1323,7 +1345,7 @@ class ReportManager:
             "calibration_version",
             "test_name", "actual_object", "origin", "machine_status", "timestamp_provenance",
             "acceptance", "history_declared_context", "history_context_sha256",
-            "preparation", "run_request", "motion_completion", "terminal_fault",
+            "preparation", "run_request", "motion_completion", "terminal_fault", "factory_quality_policy",
         }
         return {
             key: value

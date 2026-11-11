@@ -107,6 +107,9 @@ from factory_hmi.plc.faults import cabinet_fault_messages
 from factory_hmi.execution_history import SYNC_LABELS, display_code, instant
 
 
+FACTORY_QUALITY_LABELS = {"passed": "通过", "failed": "不通过", "not_evaluated": "未判定"}
+
+
 class WorkerSignals(QObject):
     succeeded = Signal(object)
     failed = Signal(object)
@@ -260,6 +263,7 @@ class FactoryMainWindow(QMainWindow):
         self._history_total = 0
         self._history_filters: dict[str, str] = {}
         self._history_export_pending = False
+        self._execution_summary_loading = False
         self._submission_review_loading = False
         self._local_correction_pending = False
         self._local_correction_generation = 0
@@ -1465,9 +1469,9 @@ class FactoryMainWindow(QMainWindow):
         history_filters.addWidget(self.export_history_csv_button)
         result_layout.addLayout(history_filters)
 
-        self.execution_history_table = QTableWidget(0, 8)
+        self.execution_history_table = QTableWidget(0, 9)
         self.execution_history_table.setHorizontalHeaderLabels(
-            ("测试单号", "模块编号 / SN", "判定", "同步状态", "审批意见", "开始时间（本机）", "数据分区", "本地更正")
+            ("测试单号", "模块编号 / SN", "判定", "同步状态", "审批意见", "开始时间（本机）", "数据分区", "本地更正", "工厂质量")
         )
         self.execution_history_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -1562,6 +1566,11 @@ class FactoryMainWindow(QMainWindow):
             action_row.addWidget(button)
         result_layout.addLayout(action_row)
         local_actions = QHBoxLayout()
+        self.view_summary_button = QPushButton("查看摘要")
+        self.view_summary_button.setObjectName("outlineButton")
+        self.view_summary_button.setEnabled(False)
+        self.view_summary_button.clicked.connect(self._view_execution_summary)
+        local_actions.addWidget(self.view_summary_button)
         self.local_correction_button = QPushButton('本地更正…')
         self.local_correction_button.setObjectName('outlineButton')
         self.local_correction_button.setEnabled(False)
@@ -3129,6 +3138,7 @@ class FactoryMainWindow(QMainWindow):
         submitted = sync_state in {"pending_review", "approved", "uploaded", "archived", "awaiting_classification"}
         in_progress = sync_state in {"uploading", "validating", "processing_failed"}
         self.export_bundle_button.setEnabled(report_ready)
+        self.view_summary_button.setEnabled(report_ready and not self._execution_summary_loading)
         self.local_correction_button.setEnabled(report_ready and not self._local_correction_pending)
         self.submit_review_button.setEnabled(
             report_ready and not submitted and not in_progress and not self._submission_review_loading
@@ -5073,6 +5083,7 @@ class FactoryMainWindow(QMainWindow):
             sync_label = SYNC_LABELS.get(sync_state, sync_state)
             started = instant(item.get("started_at"))
             correction = item.get('local_correction') or {}
+            factory_record = item.get("data_domain") == "FACTORY"
             values = (
                 display_code(item),
                 item.get("sample_id", ""),
@@ -5082,11 +5093,14 @@ class FactoryMainWindow(QMainWindow):
                 started.astimezone().strftime("%Y-%m-%d %H:%M:%S") if started else "时间未知",
                 {"RESEARCH": "研发", "FACTORY": "工厂", "UNCLASSIFIED": "分区待归类"}.get(str(item.get("data_domain")), "分区待归类"),
                 f"本地已更正 · v{correction['revision']}" if correction else ('更正记录异常' if item.get('local_correction_error') else ''),
+                FACTORY_QUALITY_LABELS.get(str(item.get("factory_quality_status")), "未判定" if factory_record else "—"),
             )
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
                 cell.setToolTip(str(value))
                 table.setItem(row, column, cell)
+            table.item(row, 8).setToolTip(str(item.get("factory_quality_reason") or (
+                "暂无工厂质量判定" if factory_record else "")))
             if correction:
                 audit = (f"本地更正v{correction['revision']}；原始SN：{correction['original'].get('sample_id', '')}\n"
                          f"操作人：{correction['actor']}；时间：{correction['recorded_at']}\n原因：{correction['reason']}\n仅本机生效，平台关联和审批状态未改变。")
@@ -5281,6 +5295,64 @@ class FactoryMainWindow(QMainWindow):
                 lambda: self.client.save_local_correction(test_id, payload), saved)
         self._run_local_correction('读取本地更正与原值',
             lambda: self.client.execution_local_corrections(test_id), received)
+
+    def _view_execution_summary(self) -> None:
+        test_id = self._selected_test_id()
+        if not test_id or self._execution_summary_loading:
+            return
+        self._execution_summary_loading = True
+        self._update_execution_actions()
+
+        def finished() -> None:
+            self._execution_summary_loading = False
+            self._update_execution_actions()
+
+        self._run_rest("读取本机摘要", lambda: self.client.execution_summary(test_id),
+            lambda payload: self._show_execution_summary(test_id, payload), on_finished=finished)
+
+    def _show_execution_summary(self, test_id: str, payload: Any) -> None:
+        summary = payload.get("result", payload) if isinstance(payload, Mapping) else {}
+        if not isinstance(summary, Mapping) or "timing" not in summary:
+            QMessageBox.information(self, "摘要暂不可用", "请刷新执行记录后重试。")
+            return
+        quality = summary.get("factory_quality")
+        quality = quality if isinstance(quality, Mapping) else {}
+        label = FACTORY_QUALITY_LABELS.get(str(quality.get("status")), "未判定")
+        lines = [f"本地记录 {test_id}", analysis_text(summary)]
+        if quality:
+            lines.extend(["", f"工厂质量 {label}", str(quality.get("reason") or "暂无工厂质量判定")])
+        profile = quality.get("profile")
+        if isinstance(profile, Mapping):
+            scope_note = profile.get("scope_note")
+            profile = profile.get("label") or profile.get("name") or profile.get("id") or profile.get("version")
+            if profile:
+                lines.append(f"判据 {profile}")
+            if scope_note:
+                lines.append(str(scope_note))
+        for metric in quality.get("metrics") or []:
+            if not isinstance(metric, Mapping):
+                continue
+            lines.append(str(metric.get("joint_name") or metric.get("label") or metric.get("motor_id") or "电机"))
+            for check in metric.get("checks") or []:
+                if not isinstance(check, Mapping):
+                    continue
+                result = {True: "通过", False: "不通过"}.get(check.get("passed"), "未判定")
+                name = check.get("label") or check.get("key") or "指标"
+                value, limit = self._format_value(check.get("value")), self._format_value(check.get("limit"))
+                unit = str(check.get("unit") or "")
+                lines.append(f"  {name} {value} {unit}，阈值 {limit} {unit}，{result}")
+        dialog = QDialog(self)
+        dialog.setWindowTitle("本地执行摘要")
+        dialog.resize(760, 600)
+        layout = QVBoxLayout(dialog)
+        text = QTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setPlainText("\n".join(lines))
+        layout.addWidget(text)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _submit_execution(self) -> None:
         test_id = self._selected_test_id()

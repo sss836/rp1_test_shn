@@ -125,6 +125,11 @@ def test_local_quick_evidence_keeps_raw_summary_and_actual_terminal_state(servic
         assert context["manual_stop"] is True
         assert context["stop_reason"] == "synthetic operator stop"
     summary = service.report_manager.summary(test_id)
+    assert context["factory_quality_policy"]["identity"]["trajectory_sha256"]
+    assert summary["factory_quality"]["status"] == "not_evaluated"  # no left-arm reference
+    assert item["factory_quality_status"] == "not_evaluated"
+    summary_schema = json.loads((HMI / "factory_hmi/contracts/aging-summary-v1.schema.json").read_text())
+    Draft202012Validator(summary_schema, format_checker=FormatChecker()).validate(summary)
     assert summary["quality"]["sample_count"] > 0
     assert summary["timing"]["active_seconds"] > 0
     assert len(summary["joint_metrics"]) == 7
@@ -138,6 +143,13 @@ def test_local_station_login_label_is_not_fabricated_as_a_bench_id(service):
     assert manifest['bench_id']=='unknown'
     assert manifest['station_id']=='Fab_01'
     assert manifest['recording_scope']=='local'
+
+
+def test_factory_other_cannot_start_without_recording(service):
+    with pytest.raises(ValueError, match="工厂模式须启用记录"):
+        service.start(test_case_id="OTHER", test_name="synthetic", robot_id="000024",
+                      bench_id="MP-01", data_domain="FACTORY", record=False)
+    assert service.controller.playback is None
 
 
 @pytest.mark.parametrize('changes,reason',[

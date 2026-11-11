@@ -814,6 +814,8 @@ class FactoryService:
             raise ValueError("工厂测试必须填写 SN 和实际台架")
         if data_domain == "FACTORY" and (len(resolved_sample) > 200 or not bench_evidence(resolved_bench)):
             raise ValueError("工厂 SN 最多200字，实际台架须为有效编号")
+        if data_domain == "FACTORY" and not record:
+            raise ValueError("工厂模式须启用记录，才能保存原始采样与质量摘要")
         if not selected_case:
             raise ValueError("测试用例编号必填，没有对应用例请选择 OTHER 并填写测试名称")
         if selected_case == "OTHER":
@@ -968,6 +970,9 @@ class FactoryService:
                 ),
                 "trajectory": trajectory.to_dict() if trajectory else {},
             }
+            if data_domain == "FACTORY":
+                from .factory_quality import freeze_factory_quality
+                report_context["factory_quality_policy"] = freeze_factory_quality(report_context)
             sidecar = record_path.with_suffix(".context.json")
             sidecar.write_text(
                 json.dumps(
@@ -1400,7 +1405,8 @@ class FactoryService:
             if isinstance(completion, Mapping):
                 fields = ("phase", "safe_disabled", "automatic_return_enabled", "source",
                           "parameter_revision", "preset_sha256", "return_seconds",
-                          "settling_seconds", "approach_completed", "finish_cycle_requested", "alarm")
+                          "settling_seconds", "approach_completed", "finish_cycle_requested",
+                          "finish_cycle_completed", "alarm")
                 context["motion_completion"] = {key: completion[key] for key in fields if key in completion}
             if isinstance(fault, Mapping):
                 context["terminal_fault"] = dict(fault)

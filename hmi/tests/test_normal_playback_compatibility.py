@@ -58,18 +58,47 @@ def test_large_initial_gap_is_prepared_without_motion(tmp_path):
         controller.disconnect()
 
 
-def test_file_peak_does_not_block_normal_start_but_live_overspeed_stops_playback(tmp_path, monkeypatch):
+def test_speed_threshold_does_not_block_start_or_stop_trajectory_loop(tmp_path, monkeypatch):
     controller, backend = controller_for(tmp_path)
     try:
         controller.config = replace(controller.config, safety_limits=replace(
             controller.config.safety_limits, max_velocity_rad_s=.5))
         controller.arm()
         assert controller.trajectory.preflight.max_velocity_rad_s * 5 > .5
-        controller.start(PlaybackOptions(speed=5., loop=True))
+        controller.start(PlaybackOptions(speed=5., loop=True, cycles=20))
         playback = controller.playback
         assert playback._test_started.wait(1)
         assert controller.state is StationState.RUNNING
 
+        read_samples = backend.read_samples
+
+        injected = 0
+
+        def overspeed_feedback():
+            nonlocal injected
+            injected += 1
+            samples = read_samples()
+            samples[0] = replace(samples[0], spd_rad_s=.6)
+            return samples
+
+        monkeypatch.setattr(backend, 'read_samples', overspeed_feedback)
+        assert controller.wait(2)
+        assert injected > 0
+        assert controller.state is StationState.COMPLETED
+        assert playback.fault is None
+        assert playback.snapshot()['progress']['completed_cycles'] == 20
+    finally:
+        controller.disconnect()
+
+
+def test_live_speed_limit_still_applies_during_first_frame_approach(tmp_path, monkeypatch):
+    controller, backend = controller_for(tmp_path)
+    try:
+        controller.config = replace(controller.config, safety_limits=replace(
+            controller.config.safety_limits, max_velocity_rad_s=.5))
+        controller.trajectory.motor_pos += .1
+        controller.arm()
+        assert controller.trajectory.preflight.approach['required']
         read_samples = backend.read_samples
 
         def overspeed_feedback():
@@ -78,8 +107,11 @@ def test_file_peak_does_not_block_normal_start_but_live_overspeed_stops_playback
             return samples
 
         monkeypatch.setattr(backend, 'read_samples', overspeed_feedback)
+        controller.start()
         assert controller.wait(2)
+        playback = controller.playback
         assert controller.state is StationState.FAULT
+        assert not playback._test_started.is_set()
         assert '实际电机速度超过当前配置上限' in playback.fault.message
     finally:
         controller.disconnect()

@@ -117,7 +117,7 @@ def test_arm_default_downward_finish_requires_confirmation_before_power(gateway)
     assert aborted.status_code == 200, aborted.text
 
 
-def test_quick_playback_accepts_peak_speed_and_completes_normal_return(gateway, short_trajectory):
+def test_quick_playback_ignores_peak_speed_in_cycle_and_completes_normal_return(gateway, short_trajectory):
     short_trajectory(offsets=(0., .1, 0., 0.), timestamps=(0., .1, .103, .4))
     prepare(gateway)
     runtime = gateway.app.state.runtime.session('quick-a')
@@ -126,11 +126,26 @@ def test_quick_playback_accepts_peak_speed_and_completes_normal_return(gateway, 
     assert preflight['max_velocity_rad_s'] > limits.max_velocity_rad_s
     assert preflight['max_frame_delta_rad'] < limits.max_frame_delta_rad
 
-    response = start(gateway, hours=.0001, power_source='external', model=True)
-    assert response.status_code == 200, response.text
-    assert response.json()['snapshot']['playback']['options']['speed'] == 1.0
-    playback = runtime.controller.controller.playback
-    completed = wait_for_status(gateway, 'completed', 'fault')
+    controller = runtime.controller.controller
+    read_samples = controller.backend.read_samples
+    injected = False
+
+    def feedback():
+        nonlocal injected
+        samples = read_samples()
+        playback = controller.playback
+        if playback and playback.snapshot()['completion']['phase'] in {'running', 'finishing_cycle'}:
+            samples[0] = replace(samples[0], spd_rad_s=limits.max_velocity_rad_s + 1.)
+            injected = True
+        return samples
+
+    with mock.patch.object(controller.backend, 'read_samples', side_effect=feedback):
+        response = start(gateway, hours=.0001, power_source='external', model=True)
+        assert response.status_code == 200, response.text
+        assert response.json()['snapshot']['playback']['options']['speed'] == 1.0
+        playback = controller.playback
+        completed = wait_for_status(gateway, 'completed', 'fault')
+    assert injected
     assert completed['phase'] == 'completed', completed
     result = playback.snapshot()
     assert result['progress']['completed_cycles'] == 1
@@ -152,6 +167,29 @@ def test_quick_playback_rejects_overspeed_return_connection_before_enabling(gate
     assert 'MuJoCo 收尾接续速度超出本机配置上限' in response.json()['detail']
     assert not runtime.snapshot()['station']['motors_enabled']
     assert not runtime.snapshot()['can']['all_up']
+
+
+def test_factory_waist_quick_run_seals_quality_from_builtin_trajectory(gateway):
+    prepare(gateway, profile='waist_hip')
+    response = gateway.post('/api/v1/quick/start', headers=headers(), json={
+        'duration_hours': .0002, 'physical_estop_confirmed': True,
+        'sample_id': '000024', 'bench_id': 'MP-01', 'data_domain': 'FACTORY',
+        'power_source': 'external',
+    })
+    assert response.status_code == 200, response.text
+    runtime = gateway.app.state.runtime.session('quick-a')
+    completed = wait_for_status(gateway, 'holding', 'completed', 'fault')
+    assert completed['phase'] in {'holding', 'completed'}, completed
+    service = runtime.controller
+    service.wait_for_reports(timeout=10)
+    item, = service.execution_history_page(sn='000024', data_domain='FACTORY')['items']
+    summary = service.report_manager.summary(item['test_id'])
+    quality = summary['factory_quality']
+    assert item['factory_quality_status'] == quality['status'] == 'passed', quality
+    assert quality['profile']['id'] == 'waist-hip-reference-v1'
+    assert len(quality['metrics']) == 4
+    assert summary['timing']['completed_cycles'] == 1
+    assert not service.outbox.list()
 
 
 def test_plc_powered_run_finishes_cycle_and_auto_disables(powered_gateway, short_trajectory):
