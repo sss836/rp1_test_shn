@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 from PySide6.QtCore import QCoreApplication, QDate, QEvent, QTimer
 from PySide6.QtWebSockets import QWebSocket
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QTextEdit
 from factory_hmi.desktop.app import FactoryMainWindow
 
 
@@ -109,3 +109,35 @@ def test_filtered_empty_list_never_targets_hidden_current_execution(window):
     assert window._selected_test_id() == ""
     assert not window.export_bundle_button.isEnabled()
     assert not window.submit_review_button.isEnabled()
+
+
+def test_factory_history_and_summary_show_trial_result_and_measured_excess(window):
+    test_id = "LOCAL_UNIT-AGING-006_synthetic"
+    window._execution_history_received({"items": [{
+        "test_id": test_id, "data_domain": "FACTORY", "factory_quality_status": "failed",
+        "factory_quality_basis": "trial",
+    }]})
+    assert window.execution_history_table.item(0, 8).text() == "试行不通过"
+    summary = {"timing": {}, "factory_quality": {
+        "status": "failed", "schema_version": "factory-quality-v2",
+        "profile": {"basis_kind": "trial", "label": "UNIT-AGING-006 左臂（7轴）"},
+        "execution_checks": [{"key": "sample_completeness", "label": "采样完整率",
+                              "value": .99, "limit": .95, "unit": "ratio", "passed": True}],
+        "metrics": [{"motor_label": "腕偏航", "motor_id": 6, "sample_count": 250,
+                     "valid_metric_sample_count": 250, "checks": [{
+                         "label": "绝对力矩 P99.9", "value": 8.25, "limit": 7.0,
+                         "unit": "N·m", "passed": False, "exceedance": 1.25,
+                     }]}],
+    }}
+    rendered = []
+
+    def capture(dialog):
+        rendered.append(dialog.findChild(QTextEdit).toPlainText())
+
+    with patch("factory_hmi.desktop.app.QDialog.exec", new=capture):
+        window._show_execution_summary(test_id, {"result": summary})
+    text, = rendered
+    assert "工厂质量筛查：试行不通过" in text
+    assert "采样完整率：99.00%；要求 ≥ 95.00%；满足" in text
+    assert "腕偏航（ID 6） · 有效测量 250/250" in text
+    assert "实测 8.25 N·m；上限 7 N·m；超限（超出 1.25 N·m）" in text

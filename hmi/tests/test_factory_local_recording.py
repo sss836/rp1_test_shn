@@ -126,7 +126,7 @@ def test_local_quick_evidence_keeps_raw_summary_and_actual_terminal_state(servic
         assert context["stop_reason"] == "synthetic operator stop"
     summary = service.report_manager.summary(test_id)
     assert context["factory_quality_policy"]["identity"]["trajectory_sha256"]
-    assert summary["factory_quality"]["status"] == "not_evaluated"  # no left-arm reference
+    assert summary["factory_quality"]["status"] == "not_evaluated"  # fixture uses a different trajectory
     assert item["factory_quality_status"] == "not_evaluated"
     summary_schema = json.loads((HMI / "factory_hmi/contracts/aging-summary-v1.schema.json").read_text())
     Draft202012Validator(summary_schema, format_checker=FormatChecker()).validate(summary)

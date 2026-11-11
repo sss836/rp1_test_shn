@@ -80,6 +80,7 @@ except ModuleNotFoundError as exc:
     raise
 
 from factory_hmi.client import GatewayClient, GatewayError, GatewayHTTPError, is_loopback_gateway
+from factory_hmi.core.factory_quality import execution_check_values, format_quality_value, quality_status_label
 from factory_hmi.desktop.lease_heartbeat import LeaseHeartbeat
 from factory_hmi.desktop.feedback_freshness import (
     DISPLAY_STALE_S, STATUS_SILENCE_S, feedback_age_s, finite_number, snapshot_key,
@@ -108,7 +109,6 @@ from factory_hmi.plc.faults import cabinet_fault_messages
 from factory_hmi.execution_history import SYNC_LABELS, display_code, instant
 
 
-FACTORY_QUALITY_LABELS = {"passed": "通过", "failed": "不通过", "not_evaluated": "未判定"}
 CAN_RECEIPT_TIMEOUT_S = 135
 CAN_RECEIPT_APPEARANCE_S = 5
 CAN_EVIDENCE_TTL_S = 2.5
@@ -5244,7 +5244,8 @@ class FactoryMainWindow(QMainWindow):
                 started.astimezone().strftime("%Y-%m-%d %H:%M:%S") if started else "时间未知",
                 {"RESEARCH": "研发", "FACTORY": "工厂", "UNCLASSIFIED": "分区待归类"}.get(str(item.get("data_domain")), "分区待归类"),
                 f"本地已更正 · v{correction['revision']}" if correction else ('更正记录异常' if item.get('local_correction_error') else ''),
-                FACTORY_QUALITY_LABELS.get(str(item.get("factory_quality_status")), "未判定" if factory_record else "—"),
+                quality_status_label(str(item.get("factory_quality_status")), item.get("factory_quality_basis"))
+                if factory_record or item.get("factory_quality_status") else "—",
             )
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
@@ -5468,30 +5469,45 @@ class FactoryMainWindow(QMainWindow):
             return
         quality = summary.get("factory_quality")
         quality = quality if isinstance(quality, Mapping) else {}
-        label = FACTORY_QUALITY_LABELS.get(str(quality.get("status")), "未判定")
-        lines = [f"本地记录 {test_id}", analysis_text(summary)]
-        if quality:
-            lines.extend(["", f"工厂质量 {label}", str(quality.get("reason") or "暂无工厂质量判定")])
         profile = quality.get("profile")
-        if isinstance(profile, Mapping):
-            scope_note = profile.get("scope_note")
-            profile = profile.get("label") or profile.get("name") or profile.get("id") or profile.get("version")
-            if profile:
-                lines.append(f"判据 {profile}")
-            if scope_note:
-                lines.append(str(scope_note))
+        profile = profile if isinstance(profile, Mapping) else {}
+        label = quality_status_label(str(quality.get("status")), profile.get("basis_kind"))
+        lines = [f"本地记录 {test_id}"]
+        if quality:
+            lines.extend(["", f"工厂质量筛查：{label}", str(quality.get("reason") or "暂无工厂质量判定")])
+        if profile:
+            lines.append(f"判据：{profile.get('label') or profile.get('id') or '未记录'}（{quality.get('schema_version', '')}）")
+            lines.extend(str(profile[key]) for key in ("basis", "scope_note") if profile.get(key))
+        if quality.get("execution_checks"):
+            lines.extend(["", "判定前提"])
+            for check in quality["execution_checks"]:
+                actual, target = execution_check_values(check)
+                lines.append(f"  {check['label']}：{actual}；要求 {target}；{'满足' if check['passed'] else '未满足'}")
+        if quality.get("metrics"):
+            lines.extend(["", "逐电机实测与上限"])
         for metric in quality.get("metrics") or []:
             if not isinstance(metric, Mapping):
                 continue
-            lines.append(str(metric.get("joint_name") or metric.get("label") or metric.get("motor_id") or "电机"))
+            motor_label = metric.get("motor_label") or metric.get("joint_name") or "电机"
+            motor_id = format_quality_value(metric.get("motor_id"))
+            count = metric.get("sample_count")
+            coverage = (f" · 有效测量 {format_quality_value(metric.get('valid_metric_sample_count'))}"
+                        f"/{format_quality_value(count)}" if count is not None else "")
+            lines.append(f"{motor_label}（ID {motor_id}）{coverage}")
             for check in metric.get("checks") or []:
                 if not isinstance(check, Mapping):
                     continue
-                result = {True: "通过", False: "不通过"}.get(check.get("passed"), "未判定")
+                result = {True: "满足", False: "超限"}.get(check.get("passed"), "未比较")
                 name = check.get("label") or check.get("key") or "指标"
-                value, limit = self._format_value(check.get("value")), self._format_value(check.get("limit"))
                 unit = str(check.get("unit") or "")
-                lines.append(f"  {name} {value} {unit}，阈值 {limit} {unit}，{result}")
+                value = format_quality_value(check.get("value"), unit)
+                limit = format_quality_value(check.get("limit"), unit)
+                excess = check.get("exceedance")
+                detail = f"（超出 {format_quality_value(excess, unit)}）" if excess is not None else ""
+                lines.append(f"  {name}：实测 {value}；上限 {limit}；{result}{detail}")
+        if quality:
+            lines.extend(["", "通用记录分析（独立于工厂质量筛查）"])
+        lines.append(analysis_text(summary))
         dialog = QDialog(self)
         dialog.setWindowTitle("本地执行摘要")
         dialog.resize(760, 600)

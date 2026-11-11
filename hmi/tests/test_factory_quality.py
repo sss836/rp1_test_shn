@@ -3,37 +3,46 @@ import copy
 import csv
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from factory_hmi.core.config import load_station_config
-from factory_hmi.core.factory_quality import freeze_factory_quality
+from factory_hmi.core.factory_quality import CRITERIA_VERSION, freeze_factory_quality
 from factory_hmi.core.report import ReportManager
-from factory_hmi.quick_profiles import preset
+from factory_hmi.core.trajectory import import_trajectory
+from factory_hmi.quick_profiles import catalog, preset
 
 
 JOINTS = (
     "waist_roll_joint", "waist_yaw_joint", "right_hip_pitch_joint", "left_hip_pitch_joint",
 )
 SUFFIXES = ("cmd_pos_rad", "pos_rad", "spd_rad_s", "torque_nm", "temp_c", "error_id")
+SUMMARY_SCHEMA = Path(__file__).resolve().parents[1] / "factory_hmi/contracts/aging-summary-v1.schema.json"
 
 
-def context_for_factory():
-    config = load_station_config("waist_hip")
+def context_for_factory(limb="waist_hip"):
+    profile = preset(limb)
+    path = Path(__file__).resolve().parents[1] / "scripts/config" / profile["config_path"]
+    config = load_station_config(limb, path)
+    trajectory = import_trajectory(profile["trajectory_path"], limb=limb, motor_count=len(config.entries))
+    start = datetime(2026, 11, 11, tzinfo=timezone.utc)
     return {
-        "test_id": "LOCAL_UNIT-AGING-003_factory_quality",
+        "test_id": f"LOCAL_{profile['test_case_id']}_factory_quality",
         "execution_uuid": "11111111-1111-4111-8111-111111111111",
-        "test_case_id": "UNIT-AGING-003",
-        "sample_id": "SYNTHETIC-WAIST-001",
+        "test_case_id": profile["test_case_id"],
+        "sample_id": "SYNTHETIC-001",
         "bench_id": "MOCK-BENCH",
         "recording_scope": "local",
         "data_domain": "FACTORY",
         "data_domain_source": "EXPLICIT",
-        "limb": "waist_hip",
-        "module_name": "waist_hip",
-        "started_at": "2026-11-11T00:00:00Z",
-        "ended_at": "2026-11-11T00:00:06.580000Z",
-        "active_seconds": 6.58,
+        "limb": limb,
+        "module_name": limb,
+        "started_at": start.isoformat(),
+        "ended_at": (start + timedelta(seconds=trajectory.duration_s)).isoformat(),
+        "active_seconds": trajectory.duration_s,
         "completed_cycles": 1,
         "record_rate_hz": 20.0,
         "outcome": "duration_complete",
@@ -43,25 +52,25 @@ def context_for_factory():
         },
         "motion_completion": {"phase": "holding", "safe_disabled": False},
         "entries": [{"joint_name": entry.joint_name, "motor_id": entry.motor_id,
+                     "motor_type": entry.motor_type, "motor_model": entry.motor_model,
                      "module_name": config.limb} for entry in config.entries],
-        "trajectory": {"sha256": preset("waist_hip")["sha256"],
-                       "filename": "waist_hip_joint_inspect.npz", "duration_s": 6.58},
+        "trajectory": trajectory.to_dict(),
         "config": config.raw,
         "acceptance": config.raw["factory_hmi_acceptance"],
     }
 
 
-def write_measurements(path, *, overrides=None, missing=None):
+def write_measurements(path, *, joints=JOINTS, active_seconds=6.58, overrides=None, missing=None):
     overrides = overrides or {}
-    fieldnames = ["time_s", "sample"] + [f"{name}_{suffix}" for name in JOINTS for suffix in SUFFIXES]
+    fieldnames = ["time_s", "sample"] + [f"{name}_{suffix}" for name in joints for suffix in SUFFIXES]
     if missing:
         fieldnames.remove(missing)
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
-        for index in range(132):
+        for index in range(int(active_seconds * 20) + 1):
             row = {"time_s": index / 20.0, "sample": index}
-            for name in JOINTS:
+            for name in joints:
                 for suffix, value in zip(SUFFIXES, (.1, .08, .0, 1.0, 30.0, 0)):
                     row[f"{name}_{suffix}"] = value
             row.update(overrides)
@@ -70,13 +79,15 @@ def write_measurements(path, *, overrides=None, missing=None):
             writer.writerow(row)
 
 
-def finalize_synthetic(tmp_path, *, changes=None, overrides=None, missing=None):
-    context = context_for_factory()
+def finalize_synthetic(tmp_path, *, limb="waist_hip", changes=None, overrides=None, missing=None):
+    context = context_for_factory(limb)
+    active_seconds = context["active_seconds"]
     if changes:
         changes(context)
     context["factory_quality_policy"] = freeze_factory_quality(context)
     source = tmp_path / "acquired.csv"
-    write_measurements(source, overrides=overrides, missing=missing)
+    write_measurements(source, joints=tuple(entry["joint_name"] for entry in context["entries"]),
+                       active_seconds=active_seconds, overrides=overrides, missing=missing)
     before = source.read_bytes()
     manager = ReportManager(tmp_path / "reports")
     manager.finalize(source, context)
@@ -101,20 +112,46 @@ def test_matching_factory_run_seals_passed_quality_separately_from_legacy_verdic
     assert frozen["factory_quality_policy"] == context["factory_quality_policy"]
 
 
-@pytest.mark.parametrize(("limb", "trajectory_sha"), [
-    ("right_short_arm", "6b5b447399d48233c5c27571c67cbc7c0ef6a984a954f34e27b1cd1434945a84"),
-    ("right_short_leg", "8a45ed836d1557fd149cf15b65b812d8d1cbd935189a5e1c88ef01a405d70d3b"),
-])
-def test_nominal_one_times_reference_does_not_treat_inferred_pace_as_selected_speed(limb, trajectory_sha):
-    context = context_for_factory()
-    config = load_station_config(limb)
-    context.update(limb=limb, trajectory={"sha256": trajectory_sha},
-                   entries=[{"joint_name": entry.joint_name} for entry in config.entries])
+@pytest.mark.parametrize("limb", [item["id"] for item in catalog()])
+def test_each_builtin_factory_profile_seals_an_explicit_result(tmp_path, limb):
+    manager, context, summary = finalize_synthetic(tmp_path, limb=limb)
+    result = summary["factory_quality"]
+    assert result["schema_version"] == CRITERIA_VERSION
+    assert result["status"] == "passed", result["reason"]
+    assert result["profile"]["test_case_id"] == context["test_case_id"]
+    assert result["profile"]["basis_kind"] == ("reference" if limb == "waist_hip" else "trial")
+    assert len(result["metrics"]) == preset(limb)["motor_count"]
+    assert all(len(motor["checks"]) == 5 and motor["valid_metric_sample_count"] == summary["quality"]["sample_count"]
+               for motor in result["metrics"])
+    text = (manager.execution_dir(context["test_id"]) / "analysis/report.md").read_text()
+    assert ("工厂质量筛查：通过" if limb == "waist_hip" else "工厂质量筛查：试行通过") in text
+    assert result["profile"]["basis"]
+    assert "| 判定前提 | 实测或状态 | 要求 | 结果 |" in text
+    assert "| 电机通道 | 指标 | 实测 | 上限 | 对照结果 | 超出量 |" in text
+    assert "99.9" in text and "20 °C" in text
+    Draft202012Validator(json.loads(SUMMARY_SCHEMA.read_text())).validate(summary)
+
+
+def test_old_right_short_arm_trajectory_does_not_inherit_the_current_profile():
+    context = context_for_factory("right_short_arm")
+    context["trajectory"]["sha256"] = "6b5b447399d48233c5c27571c67cbc7c0ef6a984a954f34e27b1cd1434945a84"
     policy = freeze_factory_quality(context)
-    assert policy["identity"]["speed"] == 1.0
     assert policy["matched"] is False
-    assert "执行节拍待核对" in policy["reason"]
-    assert "运行倍率与参考记录不一致" not in policy["reason"]
+    assert "轨迹哈希" in policy["reason"]
+
+
+def test_long_arm_report_identifies_the_failed_new_wrist_axis(tmp_path):
+    manager, context, summary = finalize_synthetic(
+        tmp_path, limb="left_arm", overrides={"left_wrist_yaw_joint_torque_nm": 8.25},
+    )
+    result = summary["factory_quality"]
+    assert result["status"] == "failed"
+    assert "腕偏航（ID 6）绝对力矩 P99.9 8.25 N·m > 7 N·m" in result["reason"]
+    wrist = next(row for row in result["metrics"] if row["motor_id"] == 6)
+    torque = next(check for check in wrist["checks"] if check["key"] == "torque_p999_abs_nm")
+    assert torque["value"] == 8.25 and torque["limit"] == 7 and torque["exceedance"] == 1.25
+    text = (manager.execution_dir(context["test_id"]) / "analysis/report.md").read_text()
+    assert "腕偏航（ID 6） | 绝对力矩 P99.9 | 8.25 N·m | 7 N·m | 超限 | 1.25 N·m" in text
 
 
 @pytest.mark.parametrize(("column", "value", "failed_key"), [
@@ -137,8 +174,11 @@ def test_measurement_exceedance_fails_factory_quality_without_rewriting_legacy_v
     lambda c: c["run_request"].update(speed=.8),
     lambda c: c["trajectory"].update(sha256="0" * 64),
     lambda c: c.update(record_rate_hz=10.0),
+    lambda c: c["entries"][0].update(motor_id=9),
+    lambda c: c["entries"][0].update(motor_model=1),
     lambda c: c.update(outcome="stopped", manual_stop=True, completed_cycles=0, active_seconds=2.0),
-], ids=("missing-speed", "different-speed", "different-trajectory", "different-sample-rate", "interrupted"))
+], ids=("missing-speed", "different-speed", "different-trajectory", "different-sample-rate",
+        "different-motor-id", "different-motor-model", "interrupted"))
 def test_unmatched_or_incomplete_factory_execution_remains_not_evaluated(tmp_path, change):
     _, _, summary = finalize_synthetic(tmp_path, changes=change)
     assert summary["factory_quality"]["status"] == "not_evaluated"
@@ -179,3 +219,24 @@ def test_quality_policy_and_original_evidence_stay_frozen_on_reanalysis(tmp_path
     assert rebuilt.summary["factory_quality"] == summary["factory_quality"]
     assert {path: hashlib.sha256((execution / path).read_bytes()).hexdigest() for path in original} == original
     assert json.loads((execution / "config/execution.json").read_text())["factory_quality_policy"] == policy
+
+
+def test_frozen_v1_policy_can_still_be_reanalyzed(tmp_path):
+    context = context_for_factory()
+    policy = freeze_factory_quality(context)
+    policy["criteria_version"] = "factory-quality-v1"
+    del policy["identity"]["motors"]
+    policy["profile"] = {"id": "waist-hip-reference-v1", "label": "腰胯参考轨迹 1 倍",
+                         "joint_limits": policy["profile"]["joint_limits"]}
+    context["factory_quality_policy"] = policy
+    for entry in context["entries"]:
+        del entry["motor_type"], entry["motor_model"]
+    source = tmp_path / "v1.csv"
+    write_measurements(source)
+    manager = ReportManager(tmp_path / "reports")
+    manager.finalize(source, context)
+    result = manager.rebuild(context["test_id"], actor="synthetic-reviewer", reason="核对历史判据")
+    quality = result.summary["factory_quality"]
+    assert quality["schema_version"] == "factory-quality-v1"
+    assert quality["profile"]["id"] == "waist-hip-reference-v1"
+    assert quality["status"] == "passed"

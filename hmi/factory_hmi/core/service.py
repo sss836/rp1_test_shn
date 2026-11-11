@@ -1000,6 +1000,8 @@ class FactoryService:
                             getattr(entry, "joint_name", f"joint_{index}")
                         ),
                         "module_name": controller.config.limb,
+                        "motor_type": str(entry.motor_type),
+                        "motor_model": int(entry.motor_model),
                     }
                     for index, entry in enumerate(controller.config.entries)
                 ],

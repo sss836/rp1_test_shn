@@ -24,6 +24,7 @@ from typing import Any, Iterable, Mapping
 
 from factory_hmi.execution_history import select_history, history_csv
 from factory_hmi.data_domain import domain_metadata
+from .factory_quality import execution_check_values, format_quality_value, quality_status_label
 
 import yaml
 
@@ -746,17 +747,31 @@ def _render_report(summary: Mapping[str, Any], manifest_identity: Mapping[str, A
     else:
         lines.append("- All configured acceptance rules passed.")
     if factory_quality := summary.get("factory_quality"):
-        status = {"passed": "通过", "failed": "不通过", "not_evaluated": "未判定"}[factory_quality["status"]]
         profile = factory_quality.get("profile") or {}
-        lines.extend(["", f"## 工厂质量：{status}", "", factory_quality["reason"],
-                      f"规程：`{factory_quality['schema_version']}`；参考工况：{profile.get('label', '未匹配')}",
-                      profile.get("scope_note", ""), "",
-                      "| 电机通道 | 指标 | 实测 | 上限 |",
-                      "| --- | --- | ---: | ---: |"])
+        status = quality_status_label(factory_quality["status"], profile.get("basis_kind"))
+        lines.extend(["", f"## 工厂质量筛查：{status}", "", factory_quality["reason"],
+                      f"规程：`{factory_quality['schema_version']}`；工况：{profile.get('label', '未匹配')}",
+                      profile.get("basis", ""), profile.get("scope_note", ""), ""])
+        check_labels = {True: "满足", False: "超限", None: "未比较"}
+        if factory_quality["execution_checks"]:
+            lines.extend(["| 判定前提 | 实测或状态 | 要求 | 结果 |", "| --- | --- | --- | --- |"])
+            for check in factory_quality["execution_checks"]:
+                actual, target = execution_check_values(check)
+                lines.append(f"| {check['label']} | {actual} | {target} | "
+                             f"{'满足' if check['passed'] else '未满足'} |")
+            lines.append("")
+        lines.extend(["| 电机通道 | 指标 | 实测 | 上限 | 对照结果 | 超出量 |",
+                      "| --- | --- | ---: | ---: | --- | ---: |"])
         for motor in factory_quality["metrics"]:
             for check in motor["checks"]:
-                lines.append(f"| {motor['joint_name']} | {check['label']} ({check['unit']}) | "
-                             f"{number(check['value'])} | {number(check['limit'])} |")
+                unit = check["unit"]
+                motor_label = motor.get("motor_label") or motor["joint_name"]
+                excess = check.get("exceedance")
+                lines.append(f"| {motor_label}（ID {motor['motor_id']}） | {check['label']} | "
+                             f"{format_quality_value(check['value'], unit)} | "
+                             f"{format_quality_value(check['limit'], unit)} | "
+                             f"{check_labels[check['passed']]} | "
+                             f"{'—' if excess is None else format_quality_value(excess, unit)} |")
     lines.extend(
         [
             "",
@@ -1244,6 +1259,7 @@ class ReportManager:
             if factory_quality := summary.get("factory_quality"):
                 item["factory_quality_status"] = factory_quality["status"]
                 item["factory_quality_reason"] = factory_quality["reason"]
+                item["factory_quality_basis"] = (factory_quality.get("profile") or {}).get("basis_kind")
             try:
                 store = self.local_correction_store(item['test_id'])
                 item.update(view_values(store.original))

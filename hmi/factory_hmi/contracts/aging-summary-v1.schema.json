@@ -86,7 +86,7 @@
       "additionalProperties": false,
       "required": ["schema_version", "status", "reason", "profile", "metrics", "execution_checks"],
       "properties": {
-        "schema_version": {"const": "factory-quality-v1"},
+        "schema_version": {"enum": ["factory-quality-v1", "factory-quality-v2"]},
         "status": {"enum": ["passed", "failed", "not_evaluated"]},
         "reason": {"type": "string"},
         "profile": {"type": ["object", "null"]},
@@ -99,6 +99,9 @@
             "properties": {
               "joint_name": {"type": "string"},
               "motor_id": {"type": "integer", "minimum": 0},
+              "motor_label": {"type": "string"},
+              "sample_count": {"type": ["integer", "null"], "minimum": 0},
+              "valid_metric_sample_count": {"type": ["integer", "null"], "minimum": 0},
               "checks": {
                 "type": "array",
                 "minItems": 5,
@@ -125,7 +128,9 @@
         "value": {"$ref": "#/$defs/nullableMetric"},
         "limit": {"$ref": "#/$defs/nullableMetric"},
         "unit": {"enum": ["rad", "°C", "N·m"]},
-        "passed": {"type": ["boolean", "null"]}
+        "passed": {"type": ["boolean", "null"]},
+        "comparison": {"const": "<="},
+        "exceedance": {"type": ["number", "null"], "exclusiveMinimum": 0}
       }
     },
     "moduleMetric": {

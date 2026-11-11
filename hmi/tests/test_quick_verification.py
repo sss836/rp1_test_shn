@@ -169,16 +169,18 @@ def test_quick_playback_rejects_overspeed_return_connection_before_enabling(gate
     assert not runtime.snapshot()['can']['all_up']
 
 
-def test_factory_waist_quick_run_seals_quality_from_builtin_trajectory(gateway):
-    prepare(gateway, profile='waist_hip')
+@pytest.mark.parametrize("profile", ["waist_hip", "left_arm", "left_short_leg"])
+def test_factory_quick_run_seals_quality_from_builtin_trajectory(gateway, profile):
+    preset_info = preset(profile)
+    prepare(gateway, profile=profile)
     response = gateway.post('/api/v1/quick/start', headers=headers(), json={
         'duration_hours': .0002, 'physical_estop_confirmed': True,
         'sample_id': '000024', 'bench_id': 'MP-01', 'data_domain': 'FACTORY',
-        'power_source': 'external',
+        'power_source': 'external', 'parking_pose_confirmed': profile == 'left_arm',
     })
     assert response.status_code == 200, response.text
     runtime = gateway.app.state.runtime.session('quick-a')
-    completed = wait_for_status(gateway, 'holding', 'completed', 'fault')
+    completed = wait_for_status(gateway, 'holding', 'completed', 'fault', timeout=26.)
     assert completed['phase'] in {'holding', 'completed'}, completed
     service = runtime.controller
     service.wait_for_reports(timeout=10)
@@ -186,8 +188,9 @@ def test_factory_waist_quick_run_seals_quality_from_builtin_trajectory(gateway):
     summary = service.report_manager.summary(item['test_id'])
     quality = summary['factory_quality']
     assert item['factory_quality_status'] == quality['status'] == 'passed', quality
-    assert quality['profile']['id'] == 'waist-hip-reference-v1'
-    assert len(quality['metrics']) == 4
+    assert quality['profile']['test_case_id'] == preset_info['test_case_id']
+    assert item['factory_quality_basis'] == ('reference' if profile == 'waist_hip' else 'trial')
+    assert len(quality['metrics']) == preset_info['motor_count']
     assert summary['timing']['completed_cycles'] == 1
     assert not service.outbox.list()
 
