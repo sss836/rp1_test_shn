@@ -25,4 +25,24 @@ v3.0.27 的 gateway/station_process.py::_Channel.call 在请求超时后保留 p
 
 连接操作回执与随后状态刷新分别报告；只读刷新慢时提示状态待刷新，避免把它直接呈现成动作失败。为pending记录通道、方法、请求编号、开始时间和耗时，以便区分等待授权、netlink、锁与回执。只读状态可使用带新鲜度的缓存，控制动作结果未知时继续保留互斥和确认流程，不直接清空pending重发设备动作。CAN初始化校验模式和时序，匹配且健康时避免重复重置。
 
+## 与旧版的代码差异和逻辑修正范围
+
+双工位改造提交 `c9a1b5a` 新增了 station_process.py，在v3.0.26正式发布中启用。旧的同进程版本由gateway直接调用FactoryService，没有此文件的IPC pending状态和“工位仍在处理此前请求”错误。旧版仍可能发生接口故障、HTTP超时或界面等待，不能从旧版没有这句提示推断设备层从未延迟。
+
+新版把工位放入不同进程，控制和只读请求已分通道，但worker内部的状态采集与CAN连接仍共享FactoryService._lock。can_connect持有该锁等待helper/netlink，collect_display_snapshot和display_snapshot也会取它。连接可能合法耗时超过1秒，期间只读RPC先超时并保留pending；连接完成后，gateway mutate还会读取display_snapshot，之前未完成的只读回复能再次触发503。这条路径把“显示状态未刷新”与“设备动作失败”混在同一HTTP返回中。
+
+隔离实验进一步用实际FactoryService的锁和_Channel模拟上述竞争：持有初始化锁时，display_snapshot第一次超时、第二次出现截图文字；释放初始化锁后状态读取恢复且pending清除。没有启动真实PLC/CAN。实验复现了代码路径，现场最初触发的具体阻塞仍须用操作日志判定。
+
+应从以下调用边界修正，而非仅放大总超时：
+
+| 代码位置 | 修正逻辑 |
+| --- | --- |
+| core/service.py::can_connect | 小锁只冻结配置、revision和连接状态；使用独立生命周期/设备操作互斥执行helper与netlink；操作完成后再短锁发布结果，旧配置epoch不接受晚结果 |
+| gateway/app.py::mutate | 成功动作按独立回执返回，不强制等待新的显示快照；显示缓存注明采集时间和过期，状态缺失不改写已确认的动作结果 |
+| gateway/station_process.py::_Channel | 请求带唯一编号，独立接收与匹配晚回执；只读超时与动作结果未知分别表达，控制结果未知时查询原回执，禁止自动重发 |
+| desktop/app.py::_connect_can | 一次点击对应一个操作编号；处理中保持单在途并查询进度，明确显示已连接、等待确认、真实失败三种状态 |
+| core/can_manager.py | 校验实际UP状态、CAN/FD模式及时序；健康且完全匹配时复用，需重配时遵循工位生命周期，不因状态刷新慢反复down/up |
+
+验收需注入慢初始化、慢状态、迟到/分片回复、真实helper失败和双工位并发，分别验证命令只执行一次、回执不串号、状态慢不误报连接失败、CAN0慢不挡CAN1及心跳。以上逻辑修正尚未实施。
+
 参考：[Linux SocketCAN](https://docs.kernel.org/networking/can.html)、[candump手册](https://manpages.debian.org/bookworm/can-utils/candump.1.en.html)。
