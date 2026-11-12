@@ -368,6 +368,11 @@ class GatewayRuntime:
         self._cleanup_job: dict[str, Any] | None = None
         self._cleanup_timeout_s = 2.0
         self._close_generation: int | None = None
+        self.local_maintenance_actor = {
+            "username": "local-operator",
+            "client_session": secrets.token_hex(16),
+            "role": "LOCAL_MAINTENANCE",
+        }
         self.quick = None
         self.outbox = outbox
         self._platform = platform
@@ -390,6 +395,13 @@ class GatewayRuntime:
             daemon=True,
         )
         self._lease_thread.start()
+
+    def authorize_local_maintenance(self) -> dict[str, Any]:
+        lease = self.lease.snapshot()
+        if lease.owner is None or lease.expired or lease.revoked:
+            raise LeaseConflict("本机维护的工位控制权已失效")
+        return {**self.local_maintenance_actor, "lease_owner": lease.owner,
+                "lease_generation": lease.generation}
 
     def _require_shutdown_support(self) -> None:
         observe = getattr(self.controller, "protective_damping_snapshot", None)
@@ -1266,6 +1278,7 @@ def create_app(
     app.state.platform_connection = platform_connection_diagnostics()
     app.state.trajectory_max_bytes = trajectory_limit
     monitor_only = os.environ.get("RP1_HMI_UPDATE_MONITOR_ONLY") == "1"
+    local_maintenance_token = os.environ.get("RP1_HMI_LOCAL_MAINTENANCE_TOKEN", "")
 
     def owner_id(request: Request, explicit: str | None) -> str:
         if explicit and explicit.strip():
@@ -1279,6 +1292,16 @@ def create_app(
         if expected and value != expected:
             raise HTTPException(status_code=401, detail="invalid operator token")
 
+    def local_maintenance_allowed(request: Request, client_id: str | None) -> bool:
+        provided = request.headers.get("X-RP1-Local-Maintenance", "")
+        return bool(not monitor_only and client_id and client_id.strip() and request.client
+                    and request.client.host in {"127.0.0.1", "::1"} and local_maintenance_token
+                    and secrets.compare_digest(provided.encode(), local_maintenance_token.encode()))
+
+    def require_local_maintenance(request: Request, client_id: str | None) -> None:
+        if not local_maintenance_allowed(request, client_id):
+            raise HTTPException(status_code=403, detail="本机维护需要从当前常规桌面上位机窗口操作")
+
     def mutate(
         request: Request,
         client_id: str | None,
@@ -1291,6 +1314,7 @@ def create_app(
         after_command: Callable[[], None] | None = None,
         action_receipt_only: bool = False,
         expected_lease_generation: int | None = None,
+        require_active_lease: bool = False,
     ) -> dict[str, Any]:
         require_token(token)
         shutdown_safety = (request.url.path in SAFETY_PATHS
@@ -1336,6 +1360,8 @@ def create_app(
                     runtime.lease.claim(owner)
                 elif expected_lease_generation is not None:
                     runtime.lease.refresh(owner, generation=expected_lease_generation, require_active=True)
+                elif require_active_lease:
+                    runtime.lease.refresh(owner, require_active=True)
                 else:
                     runtime.lease.refresh(owner)
                 result = operation(runtime)
@@ -1537,50 +1563,67 @@ def create_app(
                     lambda: service.controller.backend.motor_versions(),
                     lambda: authorize(hub.motor_firmware),
                     lambda release_id, row: artifact(hub.motor_firmware, release_id, row),
-                    Reservation, write_firmware, read_version)
+                    Reservation, write_firmware, read_version,
+                    authorize_local=runtime.authorize_local_maintenance)
         return runtime, service, service._maintenance
 
     app.state.motor_maintenance_guard = threading.Lock()
 
     @app.get("/api/v1/motor-maintenance")
     def maintenance_status(request: Request, x_rp1_client_id: str | None = Header(default=None),
-                           x_rp1_operator_token: str | None = Header(default=None)):
+                           x_rp1_operator_token: str | None = Header(default=None), local: bool = False):
         require_token(x_rp1_operator_token)
         try:
             runtime, service, task = maintenance(request, x_rp1_client_id)
-            actor = task.authorize()
+            local_allowed = local and local_maintenance_allowed(request, x_rp1_client_id)
+            actor = ({**runtime.local_maintenance_actor, "lease_owner": owner_id(request, x_rp1_client_id)}
+                     if local_allowed else None) if local else task.authorize()
             from .motor_maintenance import visible_job
             job = visible_job(task, actor)
             from .motor_maintenance import cached_releases, cached_109_releases
-            from factory_hmi.core.motor_maintenance import digest, generation_for_target
+            from factory_hmi.core.motor_maintenance import confirmed_legacy_108, digest, generation_for_target
             observed = {r["index"]: r for r in service.controller.backend.motor_versions()}
             targets = service.maintenance_targets()
             configuration = digest(targets)
             for row in targets:
                 observation = observed.get(row["index"], {})
                 generation = generation_for_target(row, observation)
+                numeric_108 = generation is None and confirmed_legacy_108(row, observation)
                 row.update(observation=observation, firmware_generation=generation,
                            cached_releases=[], upgrade_109_releases=[])
+                if numeric_108:
+                    row.update(confirmed_firmware_generation=108,
+                               firmware_confirmation_source="local_numeric_evidence")
+                    if not local:
+                        row["eligibility_error"] = "请切换到本机维护方式，使用已签名的 0.1.8 OTA 映射"
                 # Polling during a job needs no repeated disk/openssl lookups.
                 if job["active"]:
                     continue
                 try:
-                    row["cached_releases"] = cached_releases(hub.motor_firmware, observation)
-                    if generation == 108:
+                    choices = cached_releases(hub.motor_firmware, observation)
+                    if not numeric_108:
+                        row["cached_releases"] = choices
+                    if generation == 108 or local and numeric_108:
                         row["upgrade_109_releases"] = cached_109_releases(
-                            hub.motor_firmware, observation, row["cached_releases"])
+                            hub.motor_firmware, observation, choices)
                         if not row["upgrade_109_releases"]:
-                            row["eligibility_error"] = "本机尚无适配此电机的签名 109 固件；请先查询并下载"
+                            row["eligibility_error"] = ("缺少适用 0.1.8 的签名 109 固件或 OTA 映射" if numeric_108
+                                                        else "本机尚无适配此电机的签名 109 固件；请导入或从平台下载")
                 except (ValueError, OSError) as exc:
                     row["eligibility_error"] = str(exc)
-            return {"ok": True, "result": {"targets": targets, "job": job, "configuration_sha256": configuration}}
+            return {"ok": True, "result": {"targets": targets, "job": job,
+                                            "configuration_sha256": configuration,
+                                            "scan_required": not service.controller.backend.connected,
+                                            "write_authorized": not local or local_allowed}}
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/motor-maintenance/{action}")
     def maintenance_action(action: str, payload: dict, request: Request,
                            x_rp1_client_id: str | None = Header(default=None),
-                           x_rp1_operator_token: str | None = Header(default=None)):
+                           x_rp1_operator_token: str | None = Header(default=None), local: bool = False):
+        if local:
+            require_local_maintenance(request, x_rp1_client_id)
         def perform(runtime):
             _, service, task = maintenance(request, x_rp1_client_id)
             with service._lifecycle_lock:
@@ -1589,19 +1632,23 @@ def create_app(
                     raise RuntimeError("当前实例正在维护参数")
                 if action == "preview":
                     service.maintenance_ready()
+                    if not service.controller.backend.connected:
+                        raise ValueError("电机扫描连接已关闭，请点击刷新版本后再更新")
                     return task.preview(payload["selections"], mode=payload.get("mode"),
-                                        configuration_sha256=payload.get("configuration_sha256"))
+                                        configuration_sha256=payload.get("configuration_sha256"), local=local)
                 if action == "start":
                     service.maintenance_ready()
-                    return task.start(payload["preview_id"], payload.get("confirmed"))
+                    return task.start(payload["preview_id"], payload.get("confirmed"), local=local)
+                if action == "confirm-power-and-readback":
+                    return task.confirm_power_and_readback(payload["job_id"], payload.get("confirmed"), local=local)
                 if action == "acknowledge":
                     if payload.get("confirmed") is not True:
                         raise ValueError("需人工明确确认已重新上下电")
-                    return task.acknowledge(payload["job_id"])
+                    return task.acknowledge(payload["job_id"], local=local)
                 if action == "readback":
-                    return task.readback(payload["job_id"])
+                    return task.readback(payload["job_id"], local=local)
                 if action == "cancel":
-                    task._require_job(payload["job_id"])
+                    task._require_job(payload["job_id"], local=local)
                     return task.cancel()
                 raise ValueError("未知的固件维护动作")
         try:
@@ -1610,7 +1657,7 @@ def create_app(
             # revocation. The worker never takes it, so cancellation can join.
             # Heartbeat uses neither this boundary nor the service/task locks.
             with hub.diagnostics.login_lock:
-                return mutate(request, x_rp1_client_id, x_rp1_operator_token, perform)
+                return mutate(request, x_rp1_client_id, x_rp1_operator_token, perform, require_active_lease=local)
         except (KeyError, TypeError) as exc:
             raise HTTPException(status_code=422, detail="维护请求字段不完整") from exc
 
@@ -1618,7 +1665,7 @@ def create_app(
         from factory_hmi.core.motor_parameters import ModuleParameterMaintenance
         from factory_hmi.core.motor_parameter_transport import read_parameter, write_parameter
         from factory_hmi.core.motor_ota_transport import read_version
-        from .motor_parameters import Templates
+        from .motor_parameters import Templates, LocalTemplates
         from .motor_maintenance import authorize
         runtime = hub.session(owner_id(request, client_id))
         service = runtime.controller
@@ -1649,22 +1696,28 @@ def create_app(
                     def __exit__(self, *args):
                         self.close()
                 templates = Templates(hub.motor_firmware)
+                local_templates = LocalTemplates(hub.motor_firmware, root=hub.data_root / "motor-parameter-templates")
                 service._parameters = ModuleParameterMaintenance(
                     service.data_root / "motor-parameters", service.maintenance_targets,
                     lambda: service.controller.backend.motor_versions(),
                     lambda: authorize(hub.motor_firmware), templates.get,
                     Reservation, write_parameter, read_parameter, read_version,
-                    pn_quarantine_root=service.report_manager.data_root / 'pn-quarantine')
+                    pn_quarantine_root=service.report_manager.data_root / 'pn-quarantine',
+                    authorize_local=runtime.authorize_local_maintenance,
+                    local_template=local_templates.get)
         return runtime, service, service._parameters
 
     @app.get("/api/v1/motor-parameters")
     def parameters_status(request: Request, x_rp1_client_id: str | None = Header(default=None),
-                          x_rp1_operator_token: str | None = Header(default=None)):
+                          x_rp1_operator_token: str | None = Header(default=None), local: bool = False):
         require_token(x_rp1_operator_token)
         try:
-            _, service, task = parameters(request, x_rp1_client_id)
+            runtime, service, task = parameters(request, x_rp1_client_id)
+            local_allowed = local and local_maintenance_allowed(request, x_rp1_client_id)
+            actor = ({**runtime.local_maintenance_actor, "lease_owner": owner_id(request, x_rp1_client_id)}
+                     if local_allowed else None) if local else task.authorize()
             from .motor_maintenance import visible_job
-            from factory_hmi.core.motor_maintenance import digest, generation_for_target
+            from factory_hmi.core.motor_maintenance import confirmed_legacy_108, digest, generation_for_target
             observed = {r["index"]: r for r in service.controller.backend.motor_versions()}
             targets = service.maintenance_targets()
             configuration = digest(targets)
@@ -1673,27 +1726,56 @@ def create_app(
                 generation = generation_for_target(row, observation)
                 if generation is None and generation_for_target(row, observation, require_protocol=False) == 108:
                     generation = 108
+                if local and generation is None and confirmed_legacy_108(row, observation):
+                    generation = 108
                 row.update(observation=observation, firmware_generation=generation)
             return {"ok": True, "result": {"targets": targets,
-                                            "job": visible_job(task, task.authorize()),
-                                            "configuration_sha256": configuration}}
+                                            "job": visible_job(task, actor),
+                                            "configuration_sha256": configuration,
+                                            "write_authorized": not local or local_allowed}}
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/v1/motor-parameters/{index}/templates")
     def parameter_templates(index: int, request: Request, x_rp1_client_id: str | None = Header(default=None),
-                            x_rp1_operator_token: str | None = Header(default=None)):
+                            x_rp1_operator_token: str | None = Header(default=None), local: bool = False):
         require_token(x_rp1_operator_token)
-        from .motor_parameters import Templates
+        from .motor_parameters import Templates, LocalTemplates
+        if local:
+            require_local_maintenance(request, x_rp1_client_id)
         try:
-            return {"ok": True, "result": {"templates": Templates(hub.motor_firmware).query(motor_observation(request, x_rp1_client_id, index))}}
+            templates = (LocalTemplates(hub.motor_firmware, root=hub.data_root / "motor-parameter-templates")
+                         if local else Templates(hub.motor_firmware))
+            return {"ok": True, "result": {"templates": templates.query(motor_observation(request, x_rp1_client_id, index))}}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/motor-parameters/import")
+    def parameter_import(payload: dict, request: Request, x_rp1_client_id: str | None = Header(default=None),
+                         x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        require_local_maintenance(request, x_rp1_client_id)
+        from .motor_parameters import LocalTemplates
+        path = payload.get("manifest_path")
+        if not isinstance(path, str) or not path:
+            raise HTTPException(422, "请选择本机签名参数模板")
+        try:
+            templates = LocalTemplates(hub.motor_firmware, root=hub.data_root / "motor-parameter-templates")
+            if not app.state.motor_maintenance_guard.acquire(blocking=False):
+                raise ValueError("请等待本机维护任务结束后再导入模板")
+            try:
+                return {"ok": True, "result": templates.install(path)}
+            finally:
+                app.state.motor_maintenance_guard.release()
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/motor-parameters/{action}")
     def parameter_action(action: str, payload: dict, request: Request,
                          x_rp1_client_id: str | None = Header(default=None),
-                         x_rp1_operator_token: str | None = Header(default=None)):
+                         x_rp1_operator_token: str | None = Header(default=None), local: bool = False):
+        if local:
+            require_local_maintenance(request, x_rp1_client_id)
         def perform(runtime):
             _, service, task = parameters(request, x_rp1_client_id)
             with service._lifecycle_lock:
@@ -1702,21 +1784,28 @@ def create_app(
                     service.maintenance_ready()
                     if service._maintenance is not None and service._maintenance.active:
                         raise RuntimeError("当前实例正在维护固件")
-                if action == "read": return task.read(payload["selections"], configuration_sha256=payload.get("configuration_sha256"))
-                if action == "read-reference": return task.read_reference(payload["indices"], payload["configuration_sha256"])
-                if action == "preview": return task.preview(payload["read_job_id"])
-                if action == "start": return task.start(payload["preview_id"], payload.get("confirmed"))
+                if action == "read":
+                    return task.read(payload["selections"], configuration_sha256=payload.get("configuration_sha256"), local=local)
+                if action == "read-reference":
+                    return task.read_reference(payload["indices"], payload["configuration_sha256"], local=local)
+                if action == "preview":
+                    if "selections" not in payload:
+                        return task.preview(payload["read_job_id"], local=local)
+                    if not isinstance(payload["selections"], list):
+                        raise ValueError("请选择需要更新的电机")
+                    return task.preview(payload["read_job_id"], selections=payload["selections"], local=local)
+                if action == "start": return task.start(payload["preview_id"], payload.get("confirmed"), local=local)
                 if action == "acknowledge":
                     if payload.get("confirmed") is not True: raise ValueError("需人工明确确认重新上下电")
-                    return task.acknowledge(payload["job_id"])
-                if action == "readback": return task.readback(payload["job_id"])
+                    return task.acknowledge(payload["job_id"], local=local)
+                if action == "readback": return task.readback(payload["job_id"], local=local)
                 if action == "cancel":
-                    task._require_job(payload["job_id"])
+                    task._require_job(payload["job_id"], local=local)
                     return task.cancel()
                 raise ValueError("未知参数维护动作")
         try:
             with hub.diagnostics.login_lock:
-                return mutate(request, x_rp1_client_id, x_rp1_operator_token, perform)
+                return mutate(request, x_rp1_client_id, x_rp1_operator_token, perform, require_active_lease=local)
         except (KeyError, TypeError) as exc:
             raise HTTPException(status_code=422, detail="参数维护请求字段不完整") from exc
 
@@ -1726,6 +1815,37 @@ def create_app(
         require_token(x_rp1_operator_token)
         try:
             return {"ok": True, "result": hub.motor_firmware.check(motor_observation(request, x_rp1_client_id, index))}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/motor-firmware/{index}/cached-releases")
+    def motor_cached_releases(index: int, request: Request, x_rp1_client_id: str | None = Header(default=None),
+                              x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        from .motor_maintenance import cached_releases
+        try:
+            observation = motor_observation(request, x_rp1_client_id, index)
+            releases = cached_releases(hub.motor_firmware, observation, verify_bytes=True)
+            return {"ok": True, "result": {"releases": [{"manifest": item} for item in releases]}}
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/motor-firmware/{index}/import")
+    def motor_import(index: int, payload: dict, request: Request, x_rp1_client_id: str | None = Header(default=None),
+                     x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        require_local_maintenance(request, x_rp1_client_id)
+        path = payload.get("manifest_path")
+        if not isinstance(path, str) or not path:
+            raise HTTPException(422, "请选择本机签名固件清单")
+        try:
+            observation = motor_observation(request, x_rp1_client_id, index)
+            if not app.state.motor_maintenance_guard.acquire(blocking=False):
+                raise ValueError("请等待本机维护任务结束后再导入固件")
+            try:
+                return {"ok": True, "result": hub.motor_firmware.import_signed_release(path, observation)}
+            finally:
+                app.state.motor_maintenance_guard.release()
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -2077,6 +2197,31 @@ def create_app(
     simple_route("/api/v1/can/disconnect", ("can_disconnect",))
     simple_route("/api/v1/can/recover", ("can_recover",))
     simple_route("/api/v1/motors/discover", ("discover_motors",))
+
+    @app.post("/api/v1/motor-versions/refresh")
+    def request_motor_version_refresh(request: Request, x_rp1_client_id: str | None = Header(default=None),
+                                      x_rp1_operator_token: str | None = Header(default=None)):
+        if not x_rp1_client_id or not x_rp1_client_id.strip():
+            raise HTTPException(422, "缺少工位窗口身份")
+        return mutate(request, x_rp1_client_id, x_rp1_operator_token,
+                      lambda runtime: runtime._invoke(("request_motor_version_refresh",)),
+                      require_active_lease=True, action_receipt_only=True)
+
+    @app.get("/api/v1/motor-versions/refresh")
+    def motor_version_refresh_status(request: Request, x_rp1_client_id: str | None = Header(default=None),
+                                     x_rp1_operator_token: str | None = Header(default=None)):
+        require_token(x_rp1_operator_token)
+        if not x_rp1_client_id or not x_rp1_client_id.strip():
+            raise HTTPException(422, "缺少工位窗口身份")
+        runtime = hub.session(owner_id(request, x_rp1_client_id), create=False)
+        if runtime is None:
+            raise HTTPException(404, "工位已关闭，请重新连接并扫描")
+        try:
+            result = runtime._invoke(("motor_version_refresh_status",))
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
+        return {"ok": True, "result": result}
+
     simple_route("/api/v1/motors/reset-fault", ("reset_motor_fault",))
     simple_route("/api/v1/motors/disable", ("disable_motors", "disable"), preempt_motion=True)
     simple_route("/api/v1/disconnect", ("disconnect",), release=True, preempt_motion=True)
@@ -2338,7 +2483,7 @@ def create_app(
             services = [r.controller for r in hub._sessions.values()]
         for service in services:
             for task in (getattr(service, "_maintenance", None), getattr(service, "_parameters", None)):
-                if task is not None and task.active:
+                if task is not None and task.active and not task.snapshot().get("local"):
                     task.cancel()
 
     @app.post("/api/v1/platform/login")

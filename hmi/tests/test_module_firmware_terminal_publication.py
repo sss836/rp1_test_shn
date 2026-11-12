@@ -12,7 +12,7 @@ def test_terminal_snapshot_never_overtakes_its_journal(tmp_path, terminal):
     entered, release = threading.Event(), threading.Event()
     kwargs = {}
     if terminal == 'failed':
-        kwargs['writer'] = lambda *args: {'selfcheck_response': 'ff0202'}
+        kwargs['writer'] = lambda *args: {'selfcheck_response': 'ff0203'}
     if terminal == 'version_unknown':
         kwargs['reader'] = lambda row, stop: {**observation(row['index']), 'status': 'timeout'}
     task, selections, written, _ = make_task(tmp_path, n=1, **kwargs)

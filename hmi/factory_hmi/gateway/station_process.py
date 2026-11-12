@@ -22,12 +22,14 @@ import time
 
 from .lease import LeaseConflict
 from factory_hmi.core.can_manager import CanConnectOutcomeUnknown
+from factory_hmi.core.backend import MotorProtocolPending
 
 logger = logging.getLogger(__name__)
 
 _CONTROL = frozenset({
     "configure", "clear_configuration", "can_connect", "can_disconnect", "can_recover",
     "connect", "discover_motors", "enable_motors", "disable_motors", "disconnect",
+    "request_motor_version_refresh",
     "import_trajectory", "arm", "start", "pause", "resume", "finish", "stop", "disable",
     "prepare_next_run", "manual_move", "manual_stop", "reset", "reset_motor_fault",
     "zero_motor", "zero_all_motors", "zero_prepare", "zero_read", "zero_confirm", "zero_skip", "zero_abort",
@@ -40,7 +42,7 @@ _RECORDS = frozenset({
     "adopt_platform_execution_code", "preview_record_identity",
 })
 _READS = frozenset({"snapshot", "display_snapshot", "collect_display_snapshot", "can_status", "can_interfaces",
-                   "maintenance_targets", "maintenance_ready"})
+                   "maintenance_targets", "maintenance_ready", "motor_version_refresh_status"})
 _SAFETY = frozenset({"request_motion_stop", "protective_damping_snapshot"})
 _LEASE = frozenset({"claim", "refresh", "release", "snapshot", "expired"})
 _MAX_MESSAGE = 32 * 1024 * 1024
@@ -56,7 +58,7 @@ class StationOutcomeUnknown(StationUnavailable):
 
 
 _ERROR_TYPES = {error.__name__: error for error in
-                (CanConnectOutcomeUnknown, LeaseConflict, ValueError, KeyError, TypeError, FileNotFoundError, PermissionError,
+                (CanConnectOutcomeUnknown, MotorProtocolPending, LeaseConflict, ValueError, KeyError, TypeError, FileNotFoundError, PermissionError,
                  TimeoutError, OSError, RuntimeError)}
 
 
@@ -283,7 +285,8 @@ def _run_station(channels, ready, data_root, report_root, outbox_path, lease_tim
                         release_can(wanted)
                         return result
                     if name in {"can_connect", "can_recover", "connect", "discover_motors", "enable_motors",
-                                "can_disconnect", "clear_configuration"} and service._can_interfaces:
+                                "can_disconnect", "clear_configuration",
+                                "request_motor_version_refresh"} and service._can_interfaces:
                         reserve_can(service._backend_name, service._can_interfaces)
                     result = getattr(service, name)(*args, **kwargs)
                     if name in {"can_disconnect", "clear_configuration"}:
@@ -311,8 +314,12 @@ def _run_station(channels, ready, data_root, report_root, outbox_path, lease_tim
                 return getattr(service, name)(*args, **kwargs)
             if name == "controller_state":
                 return service.controller.state
+            if name == "motor_backend_connected":
+                return service.controller.backend.connected
             if name == "motor_versions":
                 return service.controller.backend.motor_versions()
+            if name == "motor_protocols_pending":
+                return service.controller.backend.motor_protocols_pending()
             if name in {"preview_run", "preview_read", "preview_capabilities"}:
                 cache = service.controller.telemetry_hub
                 if name == "preview_run":
@@ -460,11 +467,18 @@ class _ControllerView:
     def state(self):
         return self.station._call("read", "controller_state")
 
+    @property
+    def connected(self):
+        return self.station._call("read", "motor_backend_connected")
+
     def snapshot(self):
         return self.station.display_snapshot()
 
     def motor_versions(self):
         return self.station._call("read", "motor_versions")
+
+    def motor_protocols_pending(self):
+        return self.station._call("read", "motor_protocols_pending")
 
     def maintenance_transport(self):
         return _MaintenanceHandle(self.station)

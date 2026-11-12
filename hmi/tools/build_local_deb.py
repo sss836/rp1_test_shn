@@ -114,16 +114,17 @@ def main() -> None:
     for directory in ("factory_hmi", "scripts"):
         shutil.copytree(SOURCE / directory, target_source / directory, ignore=ignored)
     validate_preview_assets(target_source / "factory_hmi/resources/local-preview")
-    # Checked-in protocol primitives; the HMI adapter disables retries/reset.
+    # Production protocol scripts shipped with the HMI for offline maintenance.
     (target_source / "motors/scripts").mkdir(parents=True)
     shutil.copy2(SOURCE / "motors/scripts/motor_ota.py", target_source / "motors/scripts/motor_ota.py")
+    shutil.copy2(SOURCE / "motors/scripts/deploy_motorlro_params.py", target_source / "motors/scripts/deploy_motorlro_params.py")
     shutil.copy2(SOURCE / "pyproject.toml", target_source / "pyproject.toml")
     (target_source / "docs").mkdir()
     for name in ("NPZ_UPLOAD_LIMITS.md", "QUICK_VERIFICATION.md", "SAMPLE_SELECTION.md",
                  "WAISTHIP_SUPPORT.md", "UBUNTU22_DEPLOYMENT.md", "LONG_RUN_SAFETY.md",
                  "MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md",
-                 "MODULE_FIRMWARE_MAINTENANCE.md", "MODULE_PARAMETERS.md", "PLC_HMI_LRO_108_109.md",
-                 "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
+                 "MODULE_FIRMWARE_MAINTENANCE.md", "MODULE_PARAMETERS.md", "MOTOR_MAINTENANCE_OFFLINE_20261112.md", "PLC_HMI_LRO_108_109.md",
+                 "TORQUE_ESTIMATION_3.0.31.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, target_source / "docs" / name)
     (target_source / "config/examples").mkdir(parents=True)
     shutil.copy2(SOURCE / "config/examples/motion_completion.unverified.yaml",
@@ -133,6 +134,7 @@ def main() -> None:
     shutil.copy2(SOURCE / "tools/prepare_motor_firmware.py", target_source / "tools/prepare_motor_firmware.py")
     shutil.copy2(SOURCE / "tools/prepare_motor_ota_policy.py", target_source / "tools/prepare_motor_ota_policy.py")
     shutil.copy2(SOURCE / "tools/prepare_motor_parameters.py", target_source / "tools/prepare_motor_parameters.py")
+    shutil.copy2(SOURCE / "tools/prepare_local_motor_parameter_catalog.py", target_source / "tools/prepare_local_motor_parameter_catalog.py")
     for name in ("can-disabled", "local-can-policy.yaml", "platform-ca.crt", "LOCAL_VERSION",
                  "can-helper", "installer-helper", "physical-can-policy.yaml", "com.rp1.test-hmi.can.policy",
                  "rp1-test-hmi.desktop", "native-sdk-runtime.json"):
@@ -189,7 +191,7 @@ def main() -> None:
     shutil.copy2(SOURCE / "docs/LOCAL_CONTROL_BUILD.md", doc / "README.zh_CN.md")
     shutil.copy2(SOURCE / "docs/UBUNTU22_DEPLOYMENT.md", doc)
     shutil.copy2(SOURCE / "docs/LONG_RUN_SAFETY.md", doc)
-    for name in ("MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
+    for name in ("MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md", "TORQUE_ESTIMATION_3.0.31.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, doc / name)
     examples = doc / "examples"
     examples.mkdir()
@@ -226,7 +228,7 @@ Priority: optional
 Architecture: amd64
 Installed-Size: {installed_size}
 Maintainer: RP1 Test SHN
-Depends: {("openssl, iproute2, policykit-1, ca-certificates, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libdbus-1-3, libgssapi-krb5-2, fonts-noto-cjk, zlib1g, libexpat1, libbz2-1.0, liblzma5, libssl3, libffi8, libsqlite3-0, libreadline8, libncursesw6, libgdbm6, libgdbm-compat4, libuuid1, tk8.6" if args.depends_profile == "jammy" else "python3 (>= 3.12), python3 (<< 3.13), python3-yaml, openssl, iproute2, pkexec, polkitd, ca-certificates, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libdbus-1-3, libgssapi-krb5-2, fonts-noto-cjk")}
+Depends: {("openssl, can-utils, iproute2, policykit-1, ca-certificates, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libdbus-1-3, libgssapi-krb5-2, fonts-noto-cjk, zlib1g, libexpat1, libbz2-1.0, liblzma5, libssl3, libffi8, libsqlite3-0, libreadline8, libncursesw6, libgdbm6, libgdbm-compat4, libuuid1, tk8.6" if args.depends_profile == "jammy" else "python3 (>= 3.12), python3 (<< 3.13), python3-yaml, openssl, can-utils, iproute2, pkexec, polkitd, ca-certificates, libxcb-cursor0, libxcb-icccm4, libxcb-keysyms1, libxcb-shape0, libxcb-xinerama0, libxkbcommon-x11-0, libegl1, libgl1, libfontconfig1, libdbus-1-3, libgssapi-krb5-2, fonts-noto-cjk")}
 Description: RP1 Modbus TCP PLC and physical SocketCAN HMI
  Protocol V1.2 control with V1.0 and V1.1 monitoring only.
  Motor fault reset requires fresh feedback and keeps motors disabled.

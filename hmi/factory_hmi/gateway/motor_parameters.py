@@ -1,9 +1,17 @@
-"""Fetch current immutable templates with the current authenticated session.
+"""Read immutable templates from the platform or an installed signed catalog.
 No request may supply expected values, device frames or a different instance.
 """
+import fcntl
 import json
+import os
+from pathlib import Path
 from urllib import parse,request
+
+from factory_hmi.core.motor_parameters import parameter_template_applicable
+from factory_hmi.core.production_parameters import production_record
+from factory_hmi.motor_parameter_catalog import MAX_CATALOG_BYTES, read_catalog_json, verify_catalog
 from factory_hmi.motor_parameter_contract import validate,sha,applicable
+from factory_hmi.updates import _atomic_json, _private_directory
 from .motor_maintenance import authorize
 
 class Templates:
@@ -28,3 +36,67 @@ class Templates:
         for row in self.query(observation):
             if row['template']['template_id']==template_id:return row
         raise ValueError('模板未发布、已变化或不适用当前实际型号及版本')
+
+
+class LocalTemplates:
+    def __init__(self, downloads, *, root):
+        self.downloads = downloads
+        self.root = Path(root).expanduser().absolute()
+        self.path = self.root / "catalog.json"
+
+    def _records(self):
+        try:
+            value = read_catalog_json(self.path)
+        except FileNotFoundError:
+            return []
+        return verify_catalog(value, self.downloads.key())
+
+    def query(self, observation):
+        if observation.get("status") != "known":
+            raise ValueError("实际版本未知，无法选用本机参数模板")
+        builtin = production_record(observation)
+        try:
+            installed = self._records()
+        except ValueError:
+            if builtin is None:
+                raise
+            # The package's exact script is an independent source. A damaged
+            # imported catalog does not change or authorize any of its values.
+            installed = []
+        return ([builtin] if builtin else []) + [row for row in installed
+                if parameter_template_applicable(row["template"], observation, local=True)]
+
+    def get(self, template_id, observation):
+        for row in self.query(observation):
+            if row["template"]["template_id"] == template_id:
+                return row
+        raise ValueError("本机签名目录中没有适用于当前实际型号及版本的模板")
+
+    def install(self, manifest_path):
+        if not isinstance(manifest_path, str) or not manifest_path:
+            raise ValueError("请选择本机签名参数模板目录")
+        envelope = read_catalog_json(manifest_path)
+        records = verify_catalog(envelope, self.downloads.key())
+        if len(json.dumps(envelope, ensure_ascii=False, allow_nan=False).encode()) > MAX_CATALOG_BYTES:
+            raise ValueError("参数模板目录不超过 1 MiB")
+        root = _private_directory(self.root)
+        fd = os.open(root / "catalog.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self.path.is_symlink():
+                raise ValueError("本机参数目录不能为符号链接")
+            try:
+                previous = self._records()
+            except ValueError:
+                # A trusted import can repair a damaged or obsolete signature.
+                previous = []
+            old_ids = {row["template"]["template_id"]: row["sha256"] for row in previous}
+            old_versions = {(row["template"]["model"], row["template"]["version"]): row["sha256"] for row in previous}
+            for row in records:
+                template = row["template"]
+                digest = row["sha256"]
+                if (old_ids.get(template["template_id"], digest) != digest
+                        or old_versions.get((template["model"], template["version"]), digest) != digest):
+                    raise ValueError("已导入的模板编号或型号版本不可覆盖，请签发新编号与版本")
+            _atomic_json(self.path, envelope)
+        return {"installed": True, "template_count": len(records)}

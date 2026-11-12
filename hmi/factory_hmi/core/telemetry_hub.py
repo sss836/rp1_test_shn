@@ -10,6 +10,8 @@ METRICS = {
  "temperature_c": ("°C", "measured"), "bus_voltage_v": ("V", "optional_bus_measurement"),
  "bus_current_a": ("A", "optional_bus_measurement"), "error_id": ("code", "drive_event"),
  "iq_current_a": ("A", "drive_reported_iq_current"),
+ "estimated_torque_nm": ("N·m", "device_kt_times_iq"),
+ "torque_kt_nm_a": ("N·m/A", "device_parameter_0x16"),
  "feedback_age_s": ("s", "host_derived"),
 }
 class TelemetryHub:
@@ -34,6 +36,7 @@ class TelemetryHub:
     source_times.append(d.get("timestamp_s"))
     for metric in METRICS:
      key=f"{name}/{metric}"; value=d.get(metric); age=d.get("feedback_age_s")
+     if metric == "torque_nm" and d.get("torque_is_estimated"): value=None
      values[key]=value
      quality[key]="missing" if value is None else "stale" if age is None or age>.5 else "valid"
    frame=dict(schema_version="telemetry-v1",boot_id=self.boot_id,stream_id=self.stream_id,

@@ -6,7 +6,8 @@ from pathlib import Path
 import threading
 import time
 import pytest
-from factory_hmi.motor_parameter_contract import validate,sha,spec,SOURCE_SHA256,compare
+from factory_hmi.motor_parameter_contract import validate,sha,spec,SOURCE_SHA256,compare,SCHEMA_V2,PN_SCRIPT_PROFILE
+from factory_hmi.core.motor_maintenance import digest
 from factory_hmi.core.motor_parameters import ModuleParameterMaintenance
 from factory_hmi.core.motor_parameter_transport import decode,query_payload,write_payload,exchange,FRAME
 from test_module_firmware_maintenance import observation,target,wait
@@ -20,6 +21,37 @@ def template():
 
 def record(t=None):
     t=t or template();return dict(template=validate(t,published=True),sha256=sha(t),published_by='synthetic-admin',published_at='2026-10-30T01:00:00Z',request_id='synthetic')
+
+
+def local_numeric_observation(index=0, **updates):
+    return {**observation(index), 'raw_firmware': None, 'software': '0.1.8', 'numeric_software': '0.1.8',
+            'hardware': '0.1.0', 'protocol': '0.0.1.17', 'confirmed_firmware_generation': 108,
+            'firmware_confirmation_source': 'local_numeric_evidence',
+            'raw_responses': {'0x1e': 'a01e00010800010000000111'}, 'errors': {'0x31': '版本查询超时'},
+            **updates}
+
+
+def numeric_legacy_template():
+    t = template()
+    t['applicability'] = [dict(raw_firmware='108', software='0.1.8', hardware='0.1.0', protocol='0.0.1.17')]
+    return t
+
+
+def numeric_legacy_task(tmp_path, t=None):
+    task, selections, writes, *_ = make(tmp_path, 2)
+    rec = record(t or numeric_legacy_template())
+    task.authorize_local = lambda: {'username': 'local-operator', 'client_session': 'synthetic'}
+    task.local_template = lambda *_: deepcopy(rec)
+    task.observations = lambda: [local_numeric_observation(i) for i in range(2)]
+
+    def readback(row, stop):
+        result = local_numeric_observation(row['index'], status='unknown')
+        result.pop('confirmed_firmware_generation')
+        result.pop('firmware_confirmation_source')
+        return result
+
+    task.version_reader = readback
+    return task, selections, writes
 
 
 def make(tmp_path,n=1):
@@ -65,6 +97,115 @@ def test_independent_read_preview_write_power_and_recheck(tmp_path):
         assert j['summary']['written_verified']==4 and not j['atomic_rollback']
         stored=json.loads((task.root/(j['job_id']+'.json')).read_text());assert stored['summary']==j['summary']
     finally:task.cancel()
+
+
+def test_update_preview_is_bound_to_selected_motor_and_read_template(tmp_path):
+    task, selections, writes, *_ = make(tmp_path, 2)
+    task.read(selections)
+    job = finish(task)
+    with pytest.raises(ValueError, match='不在本次读取'):
+        task.preview(job['job_id'], selections=[{'index': 1, 'template_id': 'wrong'}])
+    with pytest.raises(ValueError, match='无效或重复'):
+        task.preview(job['job_id'], selections=[selections[1], selections[1]])
+    plan = task.preview(job['job_id'], selections=[selections[1]])
+    assert [row['index'] for row in plan['targets']] == [1]
+    assert [row['index'] for row in task.snapshot()['targets']] == [0, 1]
+    assert not writes
+
+
+def test_local_parameter_write_rechecks_catalog_and_binds_all_actions_to_scope(tmp_path):
+    task, selections, writes, _, _, rec, _ = make(tmp_path, 2)
+    task.authorize = lambda: pytest.fail('local maintenance called platform authorization')
+    task.template = lambda *_: pytest.fail('local maintenance queried a platform template')
+    task.authorize_local = lambda: {'username': 'local-operator', 'client_session': 'station-one'}
+    task.local_template = lambda *_: deepcopy(rec)
+    try:
+        task.read(selections, local=True)
+        job = finish(task)
+        assert job['status'] == 'checked_with_differences' and job['local']
+        with pytest.raises(ValueError):
+            task.preview(job['job_id'], selections=selections[1:])
+        plan = task.preview(job['job_id'], selections=selections[1:], local=True)
+        assert plan['local'] and [row['index'] for row in plan['targets']] == [1]
+        with pytest.raises(ValueError):
+            task.start(plan['preview_id'], True)
+        rec['published_at'] = 'changed after preview'
+        with pytest.raises(ValueError, match='模板已变化'):
+            task.start(plan['preview_id'], True, local=True)
+        rec['published_at'] = '2026-10-30T01:00:00Z'
+        task.start(plan['preview_id'], True, local=True)
+        job = wait(task, 'awaiting_power')
+        with pytest.raises(ValueError):
+            task.acknowledge(job['job_id'])
+        task.acknowledge(job['job_id'], local=True)
+        with pytest.raises(ValueError):
+            task.readback(job['job_id'])
+        task.readback(job['job_id'], local=True)
+        assert finish(task)['status'] == 'verified'
+        assert writes == [(1, 'kt'), (1, 'kp')]
+    finally:
+        task.cancel()
+
+
+def test_local_108_numeric_read_compare_write_and_post_power_readback(tmp_path):
+    task, selections, writes = numeric_legacy_task(tmp_path)
+    try:
+        task.read(selections, local=True)
+        read_job = finish(task)
+        assert read_job['status'] == 'checked_with_differences'
+        assert writes == []
+        plan = task.preview(read_job['job_id'], selections=selections[1:], local=True)
+        assert plan['targets'][0]['before']['raw_firmware'] is None
+        task.start(plan['preview_id'], True, local=True)
+        awaiting = wait(task, 'awaiting_power')
+        task.acknowledge(awaiting['job_id'], local=True)
+        task.readback(awaiting['job_id'], local=True)
+        done = finish(task)
+        assert done['status'] == 'verified' and done['targets'][0]['post_power_verified']
+        assert done['targets'][0]['version_before_operation']['raw_firmware'] is None
+        assert writes == [(1, 'kt'), (1, 'kp')]
+    finally:
+        task.cancel()
+
+
+@pytest.mark.parametrize('change', ['version', 'pn', 'v2', 'missing_response'])
+def test_local_108_numeric_write_requires_current_identity_and_ordinary_template(tmp_path, change):
+    t = numeric_legacy_template()
+    if change == 'pn':
+        t['entries'].append(dict(key='pn_0401', expected_raw=[2], tolerance_raw=0))
+    elif change == 'v2':
+        t.update(schema=SCHEMA_V2, protocol_profile=PN_SCRIPT_PROFILE)
+    task, selections, writes = numeric_legacy_task(tmp_path, t)
+    if change == 'missing_response':
+        task.observations = lambda: [local_numeric_observation(i, raw_responses={}) for i in range(2)]
+    if change != 'version':
+        with pytest.raises(ValueError, match='模板哈希或实际版本适用性不符'):
+            task.read(selections, local=True)
+    else:
+        task.read(selections, local=True)
+        plan = task.preview(finish(task)['job_id'], local=True)
+        original = task.version_reader
+
+        def changed(row, stop):
+            return {**original(row, stop), 'protocol': '0.0.1.18',
+                    'raw_responses': {'0x1e': 'a01e00010800010000000112'}}
+
+        task.version_reader = changed
+        task.start(plan['preview_id'], True, local=True)
+        assert finish(task)['status'] == 'failed'
+    assert writes == []
+
+
+def test_local_108_numeric_reference_checks_ordinary_values_without_template(tmp_path):
+    task, _, writes = numeric_legacy_task(tmp_path)
+    task.local_template = None
+    task.reader = lambda _row, item, _stop: dict(status='read', raw=deepcopy(item['expected_raw']))
+    task.read_reference([0], digest(task.targets()), local=True)
+    done = finish(task)
+    assert done['status'] == 'reference_checked'
+    assert done['targets'][0]['firmware_generation'] == 108
+    assert all(spec(item['key'])['pn'] is None and item['status'] == 'read' for item in done['targets'][0]['items'])
+    assert writes == []
 
 
 @pytest.mark.parametrize('status',['timeout','unknown','skipped','association_unknown'])

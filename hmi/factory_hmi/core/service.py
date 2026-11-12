@@ -21,7 +21,8 @@ import numpy as np
 from factory_hmi.models import MotorZeroResult, StationConfig, StationState
 
 from ._legacy import motor_default_positions
-from .backend import FakeMotorBackend, MotorsPyBackend
+from .backend import FakeMotorBackend, MotorProtocolPending, MotorsPyBackend
+from .lro_local_evidence import read_local_legacy_evidence
 from .can_manager import (
     ALLOWED_ARBITRATION_BITRATES,
     ALLOWED_DATA_BITRATES,
@@ -328,7 +329,11 @@ class FactoryService:
                     initial_positions=initial,
                 )
             else:
-                motor_backend = MotorsPyBackend(station_config.entries)
+                motor_backend = MotorsPyBackend(
+                    station_config.entries,
+                    station_config=station_config,
+                    local_evidence=read_local_legacy_evidence(os.environ.get("RP1_HMI_STATE_ROOT")),
+                )
             self._controller = FactoryController(
                 station_config,
                 motor_backend,
@@ -680,6 +685,20 @@ class FactoryService:
         return self.snapshot()
 
     @_open_service_operation
+    def request_motor_version_refresh(self) -> dict[str, Any]:
+        controller = self.controller
+        self.maintenance_ready(allow_version_refresh=True)
+        if not controller.backend.connected:
+            controller.discover_motors()
+        if not controller.snapshot()["station"]["motors_discovered"]:
+            raise ValueError("请先连接 CAN 并完成电机扫描，再重新读取版本")
+        return controller.backend.request_motor_version_refresh()
+
+    def motor_version_refresh_status(self) -> dict[str, Any]:
+        self._require_open()
+        return self.controller.backend.motor_version_refresh_status()
+
+    @_open_service_operation
     def enable_motors(
         self,
         *,
@@ -693,6 +712,9 @@ class FactoryService:
         was_enabled = controller.backend.motors_enabled
         try:
             controller.enable_motors()
+        except MotorProtocolPending:
+            # No enable was issued: keep the background reader alive.
+            raise
         except Exception:
             # A partially failed all-motor enable leaves the transport open and
             # makes subsequent discover/configure actions report confusing
@@ -1617,18 +1639,23 @@ class FactoryService:
         from .motor_maintenance import effective_targets
         return effective_targets(self.controller.config)
 
-    def maintenance_ready(self):
+    def maintenance_ready(self, *, allow_version_refresh=False):
         self._require_open()
         controller = self.controller
         value = controller.snapshot()
         playback = value.get("playback") or {}
+        station = value.get("station") or {}
         if (controller.backend.motors_enabled or controller.position_hold_active
+                or station.get("manual_control_active")
+                or (station.get("protective_damping") or {}).get("active")
                 or controller.state in {StationState.RUNNING, StationState.PAUSED, StationState.ARMED, StationState.STOPPING}
                 or (playback.get("completion") or {}).get("active")
                 or self._zeroing is not None and self._zeroing.snapshot().get("state") in {"prepared", "reading"}):
-            raise RuntimeError("请先停止测试、失能并结束归零/保持动作，再维护固件")
+            raise RuntimeError("请先停止测试、失能并结束归零或保持动作")
         if not self.can_status()["all_up"]:
             raise RuntimeError("CAN接口未就绪；维护不会自动配置或启动接口")
+        if not allow_version_refresh and controller.backend.motor_version_refresh_status()["state"] in {"queued", "reading"}:
+            raise RuntimeError("正在重新读取电机版本，请等待完成后再维护")
 
     def collect_display_snapshot(self) -> dict[str, Any]:
         """Called only by this runtime's periodic display producer."""

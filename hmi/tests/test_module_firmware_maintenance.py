@@ -95,6 +95,45 @@ def begin(task, selections):
     return task.start(preview['preview_id'],True)
 
 
+def test_local_firmware_update_and_readback_need_no_platform(tmp_path):
+    def reject_platform():
+        raise AssertionError("offline task must not call the platform")
+
+    task, selections, written, _targets = make_task(tmp_path, auth=reject_platform)
+    task.authorize_local = lambda: {"username": "local-operator", "lease_generation": 7}
+    preview = task.preview(selections[:1], local=True)
+    with pytest.raises(ValueError, match="来源"):
+        task.start(preview["preview_id"], True)
+    job = task.start(preview["preview_id"], True, local=True)
+    wait(task, "awaiting_power")
+    with pytest.raises(ValueError, match="不匹配"):
+        task.acknowledge(job["job_id"])
+    task.acknowledge(job["job_id"], local=True)
+    task.readback(job["job_id"], local=True)
+    verified = wait(task, "verified")
+    assert written == [0]
+    assert verified["local"] is True and verified["targets"][0]["actual_version_verified"]
+
+
+def test_signed_local_firmware_import_installs_verified_policy(signed, tmp_path, monkeypatch):
+    from factory_hmi.gateway.motor_firmware import MotorFirmwareDownloads
+    from factory_hmi.gateway.motor_maintenance import cached_releases
+
+    original, manifest, content, _policy, _save, source = signed
+    (source / "motor-ota-policy.json").write_bytes((tmp_path / "policy.json").read_bytes())
+    local = tmp_path / "state"
+    (local / "config").mkdir(parents=True)
+    monkeypatch.setenv("RP1_HMI_STATE_ROOT", str(local))
+    monkeypatch.setenv("RP1_MOTOR_FIRMWARE_PUBLIC_KEY", str(original.key()))
+    monkeypatch.delenv("RP1_MOTOR_OTA_POLICY")
+    downloads = MotorFirmwareDownloads(None, local / "data")
+
+    imported = downloads.import_signed_release(source / "release.json", observation())
+    assert imported["policy_imported"] and not imported["installed"]
+    assert cached_releases(downloads, observation(), verify_bytes=True) == [manifest]
+    assert artifact(downloads, manifest["release_id"], observation())["data"] == content
+
+
 def test_signed_cache_policy_and_hash(signed):
     downloads, manifest, data, policy, save, root=signed
     result=artifact(downloads,'a'*32,observation())
@@ -147,45 +186,46 @@ def test_final_config_overrides_nested_and_duplicate_rejection(tmp_path):
     with pytest.raises(ValueError,match='重复'):effective_targets(duplicate)
 
 
-def test_serial_write_human_ack_readback_and_per_target_receipts(tmp_path):
+def test_serial_batch_write_one_human_ack_and_per_target_receipts(tmp_path):
     task,selections,written,targets=make_task(tmp_path)
     try:
-        job=begin(task,selections);first=wait(task,'awaiting_power')
-        assert written==[0] and first['targets'][1]['status']=='pending'
+        job=begin(task,selections);pending=wait(task,'awaiting_power')
+        assert written==[0,1] and all(r['status']=='awaiting_power' for r in pending['targets'])
         with pytest.raises(ValueError):task.readback(job['job_id'])
         task.acknowledge(job['job_id'])
-        assert not task.snapshot()['targets'][0]['actual_version_verified'] and written==[0]
+        assert all(r['human_acknowledged_at'] and not r['actual_version_verified'] for r in task.snapshot()['targets'])
         task.readback(job['job_id'])
-        end=time.monotonic()+3
-        while time.monotonic()<end and len(written)<2:time.sleep(.005)
-        assert written==[0,1];wait(task,'awaiting_power')
-        task.acknowledge(job['job_id']);task.readback(job['job_id'])
         done=wait(task,'verified')
         assert all(r['actual_version_verified'] and r['human_acknowledged_at'] and r['readback_at'] for r in done['targets'])
+        assert len({r['human_acknowledged_at'] for r in done['targets']})==1
         assert json.loads((tmp_path/(job['job_id']+'.json')).read_text())['status']=='verified'
     finally:task.cancel()
 
 
-@pytest.mark.parametrize('mode',['unknown-before','unknown-after','mismatch','write-failed','check-02'])
+@pytest.mark.parametrize('mode',['unknown-before','unknown-after','mismatch','write-failed','check-03'])
 def test_failure_unknown_mismatch_stop_later_targets(tmp_path,mode):
     calls=[]
     def reader(row,stop):
         calls.append(('read',row['index']))
         value=observation(row['index'])
-        if mode=='unknown-before' or mode=='unknown-after' and len(calls)>2:value['status']='timeout'
+        if mode=='unknown-before' or mode=='unknown-after' and row['status']=='verifying':value['status']='timeout'
         return value
     def writer(row,data,stop,progress):
         calls.append(('write',row['index']))
         if mode=='write-failed':raise OSError('synthetic interruption')
-        return dict(selfcheck_response='ff0202' if mode=='check-02' else 'ff0201')
+        return dict(selfcheck_response='ff0203' if mode=='check-03' else 'ff0201')
     task,selections,_,_=make_task(tmp_path,reader=reader,writer=writer)
     try:
         job=begin(task,selections)
         if mode in {'unknown-after','mismatch'}:
             wait(task,'awaiting_power');task.acknowledge(job['job_id']);task.readback(job['job_id'])
         result=wait(task,'version_unknown' if mode.startswith('unknown') else 'failed')
-        assert result['targets'][1]['status']=='not_run'
-        assert all(index==0 for action,index in calls)
+        if mode in {'unknown-after','mismatch'}:
+            assert [index for action,index in calls if action=='write']==[0,1]
+            assert all(r['status'] in {'failed','version_unknown'} for r in result['targets'])
+        else:
+            assert result['targets'][1]['status']=='not_run'
+            assert all(index==0 for action,index in calls)
         assert not any(r['actual_version_verified'] for r in result['targets'])
     finally:task.cancel()
 
@@ -243,11 +283,11 @@ def test_global_batch_lock_prevents_cross_bus_parallel_writes(tmp_path):
     try:
         begin(one,s1);wait(one,'awaiting_power')
         begin(two,s2);wait(two,'failed')
-        assert w1==[0] and w2==[]
+        assert w1==[0,1] and w2==[]
     finally:one.cancel();two.cancel()
 
 
-def test_protocol_adapter_uses_real_segmentation_no_reset_and_strict_check():
+def test_protocol_adapter_uses_vendor_flash_reset_and_vendor_check():
     p=protocol()
     class Adapter:
         instances=[]
@@ -269,13 +309,14 @@ def test_protocol_adapter_uses_real_segmentation_no_reset_and_strict_check():
     stop=threading.Event();progress=[]
     receipt=write_firmware(target(),b'X'*600,stop,lambda a,b:progress.append((a,b)),adapter_factory=Adapter)
     adapter=Adapter.instances[-1]
-    assert receipt['bytes_written']==600 and not receipt['reset_sent'] and adapter.closed
+    assert receipt['bytes_written']==600 and receipt['reset_sent'] and adapter.closed
     assert progress==[(256,600),(512,600),(600,600)]
     codes=[command[0] for command in adapter.commands]
-    assert codes.count(p.CMD_CONNECT)==1 and p.CMD_PROGRAM_RESET not in codes
-    Adapter.response=b'\xff\x02\x02'
-    with pytest.raises(p.VerifyError,match='ff0202'):write_firmware(target(),b'X',stop,lambda *a:None,adapter_factory=Adapter)
+    assert codes.count(p.CMD_CONNECT)==1 and codes[-1]==p.CMD_PROGRAM_RESET
+    Adapter.response=b'\xff\x02\x03'
+    with pytest.raises(p.VerifyError,match='自校验'):write_firmware(target(),b'X',stop,lambda *a:None,adapter_factory=Adapter)
     assert Adapter.instances[-1].closed
+    assert p.CMD_PROGRAM_RESET not in [c[0] for c in Adapter.instances[-1].commands]
 
 
 def test_selected_subset_only_and_no_empty_target_pass(tmp_path):
@@ -316,7 +357,8 @@ def test_service_maintenance_blocks_config_enable_and_drains_on_close(tmp_path):
         with pytest.raises(RuntimeError,match='维护占用'):operation()
     assert service.close()['closed']
     assert not task.active and not task._thread.is_alive()
-    assert task.snapshot()['targets'][1]['status']=='not_run'
+    assert task.snapshot()['targets'][0]['status']=='written_unverified'
+    assert task.snapshot()['targets'][1]['status']=='interrupted'
 
 
 def test_read_only_version_transport_correlates_and_never_enables(monkeypatch):
@@ -344,24 +386,14 @@ def test_read_only_version_transport_correlates_and_never_enables(monkeypatch):
     assert bus.sent==[b'\xe0\x31',b'\xe0\x1e']
 
 
-def test_duplicate_readback_cannot_skip_next_manual_confirmation(tmp_path):
+def test_duplicate_readback_does_not_trigger_second_batch(tmp_path):
     task,selections,written,_=make_task(tmp_path)
-    original=task.authorize
-    block_auth=threading.Event();auth_entered=threading.Event()
-    def authorize():
-        if threading.current_thread().name=='factory-motor-maintenance' and block_auth.is_set():
-            auth_entered.set();block_auth.wait(.2)
-        return original()
-    task.authorize=authorize
     try:
         job=begin(task,selections);wait(task,'awaiting_power');task.acknowledge(job['job_id'])
-        block_auth.set();task.readback(job['job_id'])
+        task.readback(job['job_id'])
         with pytest.raises(ValueError):task.readback(job['job_id'])
-        end=time.monotonic()+2
-        while time.monotonic()<end and len(written)<2:time.sleep(.005)
-        second=wait(task,'awaiting_power')
-        assert not second['targets'][1]['human_acknowledged_at'] and not second['targets'][1]['actual_version_verified']
-    finally:block_auth.clear();task.cancel()
+        wait(task,'verified');assert written==[0,1]
+    finally:task.cancel()
 
 
 def test_backend_failed_close_quarantines_until_normal_disconnect():
@@ -429,3 +461,20 @@ def test_reauthenticated_owner_can_read_interruption_but_cannot_replay(tmp_path)
     assert visible_job(task,actor)['job_id']==job['job_id']
     with pytest.raises(ValueError):task.acknowledge(job['job_id'])
     assert visible_job(task,{'username':'other'})['status']=='other_account'
+
+
+def test_ota_failure_diagnostics_saved_with_unstarted_following_motors(tmp_path):
+    def writer(row, data, stop, progress):
+        error = RuntimeError('升级握手失败，未发送擦除或固件数据')
+        error.ota_diagnostics = {'stage': 'connect', 'bytes_written': 0, 'rx_frames': 0}
+        raise error
+    task, selections, _, _ = make_task(tmp_path, writer=writer)
+    try:
+        job = begin(task, selections)
+        wait(task, 'failed')
+        saved = json.loads((tmp_path / (job['job_id'] + '.json')).read_text())
+        assert saved['targets'][0]['ota_diagnostics']['stage'] == 'connect'
+        assert saved['targets'][0]['bytes_written'] == 0
+        assert saved['targets'][1]['status'] == 'not_run'
+    finally:
+        task.cancel()

@@ -79,6 +79,9 @@ class _RunStatistics:
         self._torque_abs_sum = np.zeros(count, dtype=np.float64)
         self._torque_peak = np.zeros(count, dtype=np.float64)
         self._torque_samples = np.zeros(count, dtype=np.int64)
+        self._torque_estimated = np.zeros(count, dtype=bool)
+        self._torque_missing = np.zeros(count, dtype=np.int64)
+        self._iq_peak = np.full(count, np.nan, dtype=np.float64)
         self._temperature_start = np.full(count, np.nan, dtype=np.float64)
         self._temperature_current = np.full(count, np.nan, dtype=np.float64)
         self._temperature_peak = np.full(count, np.nan, dtype=np.float64)
@@ -104,6 +107,11 @@ class _RunStatistics:
                         self._tracking_max[index],
                         error,
                     )
+                self._torque_estimated[index] |= sample.torque_is_estimated
+                if math.isfinite(sample.iq_current_a):
+                    self._iq_peak[index] = max(abs(sample.iq_current_a), self._iq_peak[index]) if math.isfinite(self._iq_peak[index]) else abs(sample.iq_current_a)
+                if not math.isfinite(torque):
+                    self._torque_missing[index] += 1
                 if math.isfinite(torque):
                     self._torque_samples[index] += 1
                     absolute_torque = abs(torque)
@@ -149,6 +157,10 @@ class _RunStatistics:
                         "tracking_max_rad": json_number(
                             self._tracking_max[index] if count else None
                         ),
+                        "torque_is_estimated": bool(self._torque_estimated[index]),
+                        "torque_sample_count": torque_count,
+                        "torque_missing_samples": int(self._torque_missing[index]),
+                        "iq_peak_a": json_number(self._iq_peak[index]),
                         "torque_peak_nm": json_number(
                             self._torque_peak[index] if torque_count else None
                         ),

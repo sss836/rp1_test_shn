@@ -80,9 +80,12 @@ def test_full_gateway_job_paired_session_and_independent_heartbeat(tmp_path,sign
                         await asyncio.sleep(.01)
                     assert status['status']=='awaiting_power',status
                     early=await client.post('/api/v1/motor-maintenance/readback',json={'job_id':job});assert early.status_code==409
-                    ack=await client.post('/api/v1/motor-maintenance/acknowledge',json={'job_id':job,'confirmed':True})
-                    assert ack.status_code==200 and not ack.json()['result']['targets'][0]['actual_version_verified']
-                    read=await client.post('/api/v1/motor-maintenance/readback',json={'job_id':job});assert read.status_code==200,read.text
+                    bad=await client.post('/api/v1/motor-maintenance/confirm-power-and-readback',json={'job_id':job,'confirmed':False})
+                    assert bad.status_code==409
+                    ack=await client.post('/api/v1/motor-maintenance/confirm-power-and-readback',json={'job_id':job,'confirmed':True})
+                    assert ack.status_code==200,ack.text
+                    repeat=await client.post('/api/v1/motor-maintenance/confirm-power-and-readback',json={'job_id':job,'confirmed':True})
+                    assert repeat.status_code==200,repeat.text
                     for _ in range(100):
                         status=(await client.get('/api/v1/motor-maintenance')).json()['result']['job']
                         if not status['active']:break
@@ -94,6 +97,78 @@ def test_full_gateway_job_paired_session_and_independent_heartbeat(tmp_path,sign
             except asyncio.CancelledError:pass
     asyncio.run(run())
     assert service._closed and not service._maintenance._thread.is_alive()
+
+
+def test_refresh_rescans_after_readback_failure_without_enabling(tmp_path, signed, monkeypatch):
+    import httpx
+    from factory_hmi.gateway import motor_maintenance as permissions
+    from factory_hmi.core import motor_ota_transport as transport
+
+    service = setup_service(tmp_path)
+    backend = service.controller.backend
+    monkeypatch.setattr(permissions, "authorize", lambda _: {"username": "executor"})
+    monkeypatch.setattr(transport, "read_version", lambda row, _: {
+        **observation(row["index"]), "status": "timeout",
+    })
+    def no_write(*args):
+        pytest.fail("version timeout must prevent firmware writes")
+    monkeypatch.setattr(transport, "write_firmware", no_write)
+    def refresh():
+        assert backend.connected and not backend.motors_enabled
+        return {"request_id": "fixture-refresh", "state": "queued"}
+    monkeypatch.setattr(backend, "request_motor_version_refresh", refresh)
+
+    with patch("factory_hmi.gateway.app.PlcCabinetService"):
+        app = create_app(service, data_root=tmp_path / "gateway")
+    hub = app.state.runtime
+    hub.motor_firmware = signed[0]
+    hub.session("client").lease.claim("client")
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="http://isolated", headers={"X-RP1-Client-ID": "client"}) as client:
+                path = "/api/v1/motor-maintenance"
+                selection = {"selections": [{"index": 0, "release_id": "a" * 32}]}
+                preview = await client.post(path + "/preview", json=selection)
+                assert preview.status_code == 200, preview.text
+                start = await client.post(path + "/start", json={
+                    "preview_id": preview.json()["result"]["preview_id"], "confirmed": True,
+                })
+                assert start.status_code == 200, start.text
+                for _ in range(100):
+                    status = (await client.get(path)).json()["result"]
+                    if not status["job"]["active"]:
+                        break
+                    await asyncio.sleep(.01)
+                assert status["job"]["status"] == "version_unknown"
+                assert status["scan_required"] is True
+                assert status["job"]["targets"][0]["bytes_written"] == 0
+                rejected = await client.post(path + "/preview", json=selection)
+                assert rejected.status_code == 409 and "刷新版本" in rejected.text
+                refreshed = await client.post("/api/v1/motor-versions/refresh")
+                assert refreshed.status_code == 200, refreshed.text
+                status = (await client.get(path)).json()["result"]
+                assert status["scan_required"] is False
+                assert not backend.motors_enabled
+                preview = await client.post(path + "/preview", json=selection)
+                assert preview.status_code == 200, preview.text
+
+    async def run_with_pulse():
+        async def pulse():
+            while True:
+                await asyncio.sleep(.01)
+        timer = asyncio.create_task(pulse())
+        try:
+            await asyncio.wait_for(run(), timeout=10)
+        finally:
+            timer.cancel()
+            try:
+                await timer
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run_with_pulse())
 
 
 @pytest.mark.parametrize('ending',['cancel','logout','lease-expiry'])

@@ -3,6 +3,9 @@ import re
 
 V1 = "rp1-lro-ota-compatibility-v1"
 V2 = "rp1-lro-ota-compatibility-v2"
+V3 = "rp1-lro-ota-compatibility-v3"
+TRANSITION_SCHEMAS = (V2, V3)
+NUMERIC_LEGACY_108 = "numeric_legacy_108"
 MODEL_NAMES = {0: "LRO_5550", 1: "LRO_6562", 2: "LRO_8462", 3: "LRO_10062"}
 # The 2026-10-28 15:37 binary pinned by RoboParty's deployment. This
 # identifies the file only; it does not authorize any source motor.
@@ -38,11 +41,11 @@ def _sha256(value):
 
 
 def validate_policy(policy):
-    if (not isinstance(policy, dict) or policy.get("schema") not in (V1, V2)
+    if (not isinstance(policy, dict) or policy.get("schema") not in (V1, *TRANSITION_SCHEMAS)
             or not isinstance(policy.get("entries"), list)
             or not 1 <= len(policy["entries"]) <= 1024):
         raise ValueError("OTA兼容映射结构无效")
-    transition = policy["schema"] == V2
+    transition = policy["schema"] in TRANSITION_SCHEMAS
     keys_expected = {"schema", "entries"}
     if transition and "preferred_109_sha256" in policy:
         keys_expected.add("preferred_109_sha256")
@@ -54,18 +57,25 @@ def validate_policy(policy):
     keys = set()
     target_hashes = set()
     for row in policy["entries"]:
-        if (not isinstance(row, dict) or set(row) != (_SOURCE | {"target"} if transition else _SOURCE)
-                or any(not isinstance(row[k], str) for k in _SOURCE)
+        if not isinstance(row, dict):
+            raise ValueError("OTA兼容映射条目无效")
+        numeric_only = policy["schema"] == V3 and row.get("source_identity") == NUMERIC_LEGACY_108
+        source_fields = (_SOURCE - {"raw_version"}) | {"source_identity"} if numeric_only else _SOURCE
+        if (set(row) != (source_fields | {"target"} if transition else source_fields)
+                or any(not isinstance(row[k], str) for k in source_fields)
                 or row["model"] not in MODEL_NAMES.values()
                 or row["ota_protocol"] != "lro-canfd-xcp-v1"
-                or not all(_exact(row[k]) for k in ("hardware", "protocol", "raw_version"))
+                or not all(_exact(row[k]) for k in ("hardware", "protocol"))
+                or (not numeric_only and not _exact(row["raw_version"]))
                 or not re.fullmatch(r"https://[^\s]+", row["evidence_url"])
                 or not _sha256(row["evidence_sha256"])):
             raise ValueError("OTA兼容映射条目缺少明确版本或来源证据")
         current = numeric_version(row["software_version"])
-        if current < (1, 0, 8):
+        if numeric_only and row["software_version"] != "0.1.8":
+            raise ValueError("108 数值来源必须明确签署软件版本 0.1.8")
+        if not numeric_only and current < (1, 0, 8):
             raise ValueError("OTA兼容映射的数值软件版本低于支持范围")
-        identity = tuple(row[k] for k in ("model", "hardware", "protocol", "raw_version"))
+        identity = (row["model"], row["hardware"], row["protocol"], row.get("raw_version"), numeric_only)
         if transition:
             dest = row["target"]
             if (not isinstance(dest, dict) or set(dest) != _DESTINATION
@@ -73,7 +83,7 @@ def validate_policy(policy):
                     or not all(_exact(dest[k]) for k in ("hardware", "protocol", "raw_version"))
                     or not _sha256(dest["firmware_sha256"])
                     or dest["hardware"] != row["hardware"]
-                    or firmware_generation(row["raw_version"]) != 108
+                    or (not numeric_only and firmware_generation(row["raw_version"]) != 108)
                     or firmware_generation(dest["raw_version"]) != 109
                     or numeric_version(dest["software_version"]) < current):
                 raise ValueError("需要精确的108→109目标版本、原硬件及固件哈希")

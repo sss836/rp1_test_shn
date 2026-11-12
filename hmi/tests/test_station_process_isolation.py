@@ -34,7 +34,59 @@ def isolated_app(tmp_path, monkeypatch):
     monkeypatch.delenv("RP1_FACTORY_OPERATOR_TOKEN", raising=False)
     monkeypatch.delenv("RP1_FACTORY_SHUTDOWN_TOKEN", raising=False)
     monkeypatch.delenv("RP1_HMI_UPDATE_MONITOR_ONLY", raising=False)
+    monkeypatch.setenv("RP1_HMI_LOCAL_MAINTENANCE_TOKEN", "fixture-local-maintenance")
     return create_app(data_root=tmp_path / "state", isolate_stations=True)
+
+
+def test_firmware_maintenance_reads_live_scan_state_from_station_process(isolated_app):
+    owner = "firmware-maintenance-worker"
+    headers = {"X-RP1-Client-ID": owner, "X-RP1-Local-Maintenance": "fixture-local-maintenance"}
+    path = "/api/v1/motor-maintenance"
+    params = {"local": "true"}
+    with TestClient(isolated_app, client=("127.0.0.1", 50000),
+                    raise_server_exceptions=False) as client:
+        configured = client.post("/api/v1/configure", headers=headers, json={
+            "config_path": "left_arm_motors.yaml", "limb": "left_arm", "backend": "fake",
+            "bus_bindings": [{"index": 0, "interface": "can0", "mode": "canfd",
+                              "bitrate": 1_000_000, "dbitrate": 5_000_000}],
+        })
+        assert configured.status_code == 200, configured.text
+        headers["X-RP1-Lease-Generation"] = str(configured.json()["snapshot"]["lease"]["generation"])
+        worker = isolated_app.state.runtime.session(owner, create=False)._process
+        assert worker.pid != os.getpid()
+
+        def scan_required():
+            response = client.get(path, headers=headers, params=params)
+            assert response.status_code == 200, response.text
+            result = response.json()["result"]
+            assert len(result["targets"]) == 7 and result["write_authorized"] is True
+            return result["scan_required"]
+
+        def preview():
+            return client.post(path + "/preview", headers=headers, params=params,
+                               json={"selections": []})
+
+        assert scan_required() is True
+        can = client.post("/api/v1/can/connect", headers=headers)
+        assert can.status_code == 200, can.text
+        rejected = preview()
+        assert rejected.status_code == 409 and "刷新版本" in rejected.text
+        scanned = client.post("/api/v1/motors/discover", headers=headers)
+        assert scanned.status_code == 200, scanned.text
+        assert scan_required() is False
+        empty = preview()
+        assert empty.status_code == 409 and "请选择非空" in empty.text
+
+        transport = worker.controller.backend.maintenance_transport()
+        transport.__enter__()
+        try:
+            assert scan_required() is True
+        finally:
+            transport.close()
+        rescanned = client.post("/api/v1/motors/discover", headers=headers)
+        assert rescanned.status_code == 200, rescanned.text
+        assert rescanned.json()["snapshot"]["station"]["motors_enabled"] is False
+        assert scan_required() is False
 
 
 def test_quick_arm_finishes_one_cycle_then_disables_and_seals_its_record(isolated_app, tmp_path):

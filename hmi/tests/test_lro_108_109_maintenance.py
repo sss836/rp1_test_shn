@@ -68,11 +68,9 @@ def test_mixed_module_requires_every_108_skips_109_and_verifies_target_protocol(
         assert [r["index"] for r in preview["targets"]] == [0, 2]
         assert [(r["index"], r["status"]) for r in preview["skipped_targets"]] == [(1, "already_109")]
         job = task.start(preview["preview_id"], True)
-        for index, row_count in ((0, 1), (2, 2)):
-            current = wait(task, "awaiting_power")
-            assert len(written) == row_count and written[-1] == index
-            task.acknowledge(job["job_id"])
-            task.readback(job["job_id"])
+        current = wait(task, "awaiting_power")
+        assert written == [0,2] and all(r['status']=='awaiting_power' for r in current['targets'])
+        task.confirm_power_and_readback(job["job_id"], True)
         done = wait(task, "verified")
         assert all(r["readback"]["protocol"] == "1.0.3.0" for r in done["targets"])
         assert done["skipped_targets"][0]["skip_readback"]["raw_firmware"] == "5.0.0.109"
@@ -152,7 +150,9 @@ def test_108_classic_version_reply_keeps_protocol_unknown(monkeypatch):
     class Bus:
         def __enter__(self): return self
         def __exit__(self, *exc): pass
-        def setsockopt(self, *args): pass
+        def setsockopt(self, _level, option, value):
+            if option == 1:
+                assert struct.unpack("=II", value) == (1, 0xC00007FF)
         def bind(self, address): pass
         def setblocking(self, enabled): pass
         def send(self, frame):

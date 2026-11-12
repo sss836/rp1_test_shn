@@ -110,6 +110,23 @@ class QuickRun:
         if self.runtime.lease.snapshot().expired:
             raise RuntimeError('窗口心跳已失效，停止快速验证')
 
+    def _enable_when_protocol_ready(self, *, timeout_s: float = 20.0):
+        """Wait on read-only discovery; issue the enable exactly once."""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self._checkpoint()
+            self._check_power()
+            if not self.runtime.controller.controller.backend.motor_protocols_pending():
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError('电机版本读取等待超时，本次未下发使能')
+            self._state('enabling', '正在读取电机固件和协议，确认后继续')
+            self._stop.wait(min(.1, max(0., deadline - time.monotonic())))
+        self._checkpoint()
+        self._check_power()
+        self._checkpoint()
+        return self.runtime._invoke(('enable_motors',), physical_estop_confirmed=True)
+
     def _plc_request(self, operation: str, payload: dict):
         self._checkpoint()
         plc = self.hub.plc
@@ -234,7 +251,10 @@ class QuickRun:
                 self._checkpoint()
                 self._check_power()
                 self._state(phase, detail)
-                self.runtime._invoke(names, **kwargs)
+                if phase == 'enabling':
+                    self._enable_when_protocol_ready()
+                else:
+                    self.runtime._invoke(names, **kwargs)
             self._checkpoint()
             self._check_power()
             self.runtime._invoke(('start',), speed=1.0, loop=True, cycles=0, duration_hours=hours,

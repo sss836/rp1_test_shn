@@ -38,6 +38,51 @@ def test_actual_versions_visible_and_download_separate(dialog):
     assert "1.0.8" in d.versions.toPlainText()
 
 
+def test_cached_firmware_query_without_login_cannot_download(dialog):
+    d, run, state, app = dialog
+    state["identity"] = None
+    d.refresh()
+    assert d.cached_check_button.isEnabled() and not d.check_button.isEnabled()
+    d.cached_check_button.click()
+    run.call_args.args[1]()
+    d.client.motor_firmware_cached_releases.assert_called_once_with(0)
+    d.client.motor_firmware_releases.assert_not_called()
+    release = {"manifest": {"release_id": "a" * 32, "version": "5.0.0.109", "model": "LRO_5550", "notes": "模拟"}}
+    run.call_args.args[2]({"result": {"releases": [release]}})
+    run.call_args.kwargs["on_finished"]()
+    assert "本机" in d.files.currentText() and "5.0.0.109" in d.files.currentText()
+    assert not d.download_button.isEnabled()
+    d.download()
+    d.client.motor_firmware_download.assert_not_called()
+
+    state["identity"] = ("executor", 2)
+    d.refresh()
+    assert d.check_button.isEnabled() and not d.files.count()
+    d.check_button.click()
+    run.call_args.args[1]()
+    d.client.motor_firmware_releases.assert_called_once_with(0)
+    run.call_args.args[2]({"result": {"releases": [release]}})
+    run.call_args.kwargs["on_finished"]()
+    assert d.download_button.isEnabled()
+
+
+def test_signed_firmware_import_without_login_only_caches(dialog, monkeypatch):
+    d, run, state, app = dialog
+    state["identity"] = None
+    d.refresh()
+    assert d.import_button.isEnabled()
+    monkeypatch.setattr("factory_hmi.desktop.motor_firmware_dialog.QFileDialog.getOpenFileName",
+                        lambda *args: ("/tmp/signed-release.json", ""))
+    d.import_button.click()
+    run.call_args.args[1]()
+    d.client.motor_firmware_import.assert_called_once_with(0, "/tmp/signed-release.json")
+    run.call_args.args[2]({"result": {"firmware_path": "/tmp/motor.lsepbin"}})
+    run.call_args.kwargs["on_finished"]()
+    assert "已验签" in d.receipt.toPlainText() and "motor.lsepbin" in d.receipt.toPlainText()
+    d.client.motor_firmware_download.assert_not_called()
+    d.client.motor_maintenance_action.assert_not_called()
+
+
 def test_account_change_or_dialog_close_drops_pending_callbacks(dialog):
     d, run, state, app = dialog
     d.check()

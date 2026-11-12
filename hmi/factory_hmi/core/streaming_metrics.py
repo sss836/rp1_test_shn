@@ -17,7 +17,7 @@ def analyze(path, context):
    with path.open(encoding="utf-8-sig",newline="") as handle:
     reader=csv.DictReader(handle); names=_joint_names(reader.fieldnames or [])
     if not names: raise ValueError("telemetry CSV contains no joint position columns")
-    faults=[0]*len(names); fault_active=[False]*len(names); factory_valid=[0]*len(names)
+    faults=[0]*len(names); fault_active=[False]*len(names); factory_valid=[0]*len(names); estimated_counts=[0]*len(names)
     for row in reader:
      t=_finite(row.get("time_s"))
      if t is None:
@@ -28,6 +28,9 @@ def analyze(path, context):
      db.execute("INSERT INTO times VALUES (?)",(t,))
      for j,name in enumerate(names):
       temp=_finite(row.get(name+"_temp_c")); torque=_finite(row.get(name+"_torque_nm")); cmd=_finite(row.get(name+"_cmd_pos_rad")); pos=_finite(row.get(name+"_pos_rad"))
+      estimated=_finite(row.get(name+"_estimated_torque_nm"))
+      if torque is None and estimated is not None:
+       torque=estimated; estimated_counts[j]+=1
       err=_finite(row.get(name+"_error_id")); fault=err is not None and int(err)!=0
       faults[j]+=int(fault and not fault_active[j]); fault_active[j]=fault
       tracking=_finite(cmd-pos) if cmd is not None and pos is not None else None
@@ -55,6 +58,9 @@ def analyze(path, context):
     peak,torque_peak,mean,track_sq,track_max=db.execute("SELECT max(temp),max(torque),avg(torque),avg(tracking*tracking),max(abs(tracking)) FROM metrics WHERE j=?",(j,)).fetchone()
     rated=_finite(ratings.get(name)); p999=quantile(j,"torque",.999); entry=entries.get(name,{})
     joints.append(dict(module_name=str(entry.get("module_name") or context.get("module_name") or context.get("limb") or "unknown"),joint_name=name,motor_id=int(entry.get("motor_id",j)),sample_count=count,sample_completeness=min(1.,count/expected if expected else 0.),max_gap_seconds=gap,temperature_start_c=start,temperature_end_c=end,temperature_peak_c=peak,temperature_rise_c=end-start if end is not None and start is not None else None,temperature_peak_rise_c=peak-start if peak is not None and start is not None else None,torque_peak_abs_nm=torque_peak,torque_p999_abs_nm=p999,torque_mean_abs_nm=mean,rated_torque_nm=rated,torque_utilization=p999/rated if p999 is not None and rated is not None and rated>0 else None,tracking_rms_rad=math.sqrt(track_sq) if track_sq is not None else None,tracking_max_rad=track_max,fault_count=faults[j]))
+    if estimated_counts[j]:
+     joints[-1]["torque_is_estimated"]=True
+     joints[-1]["torque_estimated_sample_count"]=estimated_counts[j]
     if factory_quality:
      joints[-1].update(tracking_p99_abs_rad=quantile(j,"abs(tracking)",.99),
                        factory_metric_sample_count=factory_valid[j])

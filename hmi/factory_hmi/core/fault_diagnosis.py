@@ -262,7 +262,7 @@ class FaultDiagnosisEngine:
             return FaultDiagnosis(
                 suspected_component=f"load_or_mechanics:{self._motor_label(sample)}",
                 evidence=(
-                    f"|torque|={torque:.2f} Nm for {torque_duration:.2f} s",
+                    f"|{'estimated torque (Iq × device Kt)' if sample.torque_is_estimated else 'torque'}|={torque:.2f} Nm for {torque_duration:.2f} s",
                     f"temperature rise={rise:.1f} C within {self.thresholds.temperature_window_s:.1f} s",
                 ),
                 action="Pause and inspect binding, excess external load, lubrication, and commanded gains.",
@@ -278,7 +278,7 @@ class FaultDiagnosisEngine:
             return FaultDiagnosis(
                 suspected_component=f"load_or_mechanics:{self._motor_label(sample)}",
                 evidence=(
-                    f"|torque|={torque:.2f} Nm for {torque_duration:.2f} s",
+                    f"|{'estimated torque (Iq × device Kt)' if sample.torque_is_estimated else 'torque'}|={torque:.2f} Nm for {torque_duration:.2f} s",
                     f"threshold={self.thresholds.high_torque_nm:.2f} Nm for "
                     f"{self.thresholds.high_torque_seconds:.2f} s",
                 ),

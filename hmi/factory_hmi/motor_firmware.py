@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 import time
 
@@ -48,13 +49,15 @@ def verify_firmware(release, key, target):
 
 
 def _valid_package(path, m):
-    if path.is_symlink():
-        raise ValueError("电机固件缓存不能是符号链接")
-    with path.open("rb") as stream:
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size != m["size_bytes"]:
+            raise ValueError("电机固件缓存不是有效长度的普通文件")
         if stream.read(8) == b"!<arch>\n":
             raise ValueError("DEB包不能用作电机固件")
         stream.seek(0)
-        if os.fstat(stream.fileno()).st_size != m["size_bytes"] or hashlib.file_digest(stream, "sha256").hexdigest() != m["sha256"]:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != m["sha256"]:
             raise ValueError("电机固件缓存长度或SHA256不符")
 
 

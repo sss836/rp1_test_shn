@@ -77,6 +77,9 @@ class MotorSample:
     feedback_header: int | None = None
     lro_protocol_profile: str | None = None
     fault_code_available: bool = True
+    torque_is_estimated: bool = False
+    torque_kt_nm_a: float = float("nan")
+    torque_source: str = "drive_reported"
 
     @property
     def position(self) -> float:
@@ -106,6 +109,10 @@ class MotorSample:
             "command_position_rad": json_number(self.cmd_pos_rad),
             "speed_rad_s": json_number(self.spd_rad_s),
             "torque_nm": json_number(self.torque_nm),
+            "estimated_torque_nm": json_number(self.torque_nm) if self.torque_is_estimated else None,
+            "torque_is_estimated": self.torque_is_estimated,
+            "torque_kt_nm_a": json_number(self.torque_kt_nm_a),
+            "torque_source": self.torque_source,
             "temperature_c": json_number(self.temp_c),
             "error_id": int(self.error_id) if self.fault_code_available else None,
             "bus_voltage_v": json_number(self.bus_voltage_v),

@@ -1,7 +1,7 @@
 {
   "sdk_source_files_sha256": {
     "motors/CMakeLists.txt": "9fae732c7e2a1b2288dc3cb16cff9890c041857f193580b9cbbc8bd752d98c64",
-    "motors/include/motor_driver.hpp": "a82fe3d42a442d8a49b8b783fcb3bf884186c8da89d2ccda21a28c02ede04e4c",
+    "motors/include/motor_driver.hpp": "c622af8a71ef9211b6ea1e24328e42b3ed622a2df92ce71b08554361f0b28523",
     "motors/package.xml": "5359b062fd9fbabb53090a8ba84e5b9c129583d733cbae381539b99edc5823ab",
     "motors/src/CMakeLists.txt": "0dc6731702190a77c0fd62d289d9c9e70f80d5f1c070394d7941e4a1c64ef83d",
     "motors/src/drivers/CMakeLists.txt": "632e6ce5ddffbe48490d6e2ad08cdeb43e43cf365e8bbbf1327a6967cd97293c",
@@ -12,8 +12,8 @@
     "motors/src/drivers/evo/evo_motor_driver.cpp": "ba5e7456dff711b0aa73fb05748a666be52047aa30a7740d6b89f6e846d96b9c",
     "motors/src/drivers/evo/evo_motor_driver.hpp": "25bc729b5f56f84574d038492c5a9ce8db52ffa2646b9cf4b338cdb72fcf0e0d",
     "motors/src/drivers/lro/CMakeLists.txt": "b6b9187ade64e321572325f81b1cf66370b5088cf08a7b657aac508a9af313a9",
-    "motors/src/drivers/lro/lro_motor_driver.cpp": "0361103bc9e9ff64c8f01334c5a418f80fa63f598936c52eb24a15de30e0abf9",
-    "motors/src/drivers/lro/lro_motor_driver.hpp": "7d10d8207923da43d01d65d671e9aecf818042e53c393eb9f7fcffdcdb8d9b14",
+    "motors/src/drivers/lro/lro_motor_driver.cpp": "cf7bac3c9c30a4117994a3144ce46c5d05458d991d2064a1cd5ba957652c2b62",
+    "motors/src/drivers/lro/lro_motor_driver.hpp": "1929b85cebf5bf2306979684b559d84021550313c81c5ea685f6df6506160487",
     "motors/src/drivers/xyn/CMakeLists.txt": "ec9caac25bcc3774832729d15c510e250ddfc768db59bb66fa8e75bc65f8fc11",
     "motors/src/drivers/xyn/xyn_motor_driver.cpp": "49836603e91072e621d12b485cd380139ee53674d00337bcf1c076217f7030e2",
     "motors/src/drivers/xyn/xyn_motor_driver.hpp": "c57049685aba232d0bc0a6107e26ca44453e7e869835b5ca4950b8e70c8538d1",
@@ -24,16 +24,18 @@
     "motors/src/protocol/can/socket_can.hpp": "a11349dd202dea0772844669db8d7bda0ec42d32f1ba4a8f5668c4f58dfc449e",
     "motors/src/protocol/can_iso.hpp": "7f13d0844438a261cc9d0364ca64f61ac9ec288335cfaba10600beb408c12684",
     "motors/src/protocol/canfd/CMakeLists.txt": "fa972c9449d45f050d37b3d23cc8e25020ffbfbf38c3929a3e9f1863a37894f4",
-    "motors/src/protocol/canfd/socket_canfd.cpp": "c1f0767f5bfd9818d3c8c9d83553ccec0a70a5cb02122adb5ebc66724830f965",
-    "motors/src/protocol/canfd/socket_canfd.hpp": "01d76a3e2e6f3c89d437a894b378c1ea945196883632e7ef627c56f6c7b63ceb",
-    "motors/src/protocol/canfd_iso.hpp": "bf025372b526526b3c4b70279c68f664797862d27383292ff15238bd6e2faff3",
+    "motors/src/protocol/canfd/socket_canfd.cpp": "d7ba224808d94ee7c671a7a0d828b1ee75a4ff7b6b02a5cb8d139dd66fb06eba",
+    "motors/src/protocol/canfd/socket_canfd.hpp": "757a16e310ea51af8bba096075e21aade06b2090832c6d4646251729b9aa4e1b",
+    "motors/src/protocol/canfd_iso.hpp": "109e9bcb0902f31332656ee6aa584da1255d2a4b503e3c5021d3cf853d7b44f4",
     "motors/src/protocol/ethercat_iso.hpp": "a80556263a97a3cd44f1610bfb712315df2eab46c81550f61f821fe4ab1f985f",
-    "motors/src/pybind_module.cpp": "648a2906e55ab3cb609315e8220c0a32e96afdba7e3db0f5963aef249063f9dd",
+    "motors/src/pybind_module.cpp": "c9f56fc4c2430eaa18bdeef1b77e6ed5e197583871e4d6945dc98bf0b9e796d0",
     "motors/src/utils.hpp": "3cc6b43d0dee2ba5338bc9068c786819d590228f3a0b5e113c47638d1a4bf45e",
-    "motors/tests/fake_motor.hpp": "84fcd016c65a4c59c1a62251c516ef4e1df4df8bdbe53aae3612514a610cf03a"
+    "motors/tests/fake_motor.hpp": "84fcd016c65a4c59c1a62251c516ef4e1df4df8bdbe53aae3612514a610cf03a",
+    "motors/tests/lro_protocol.hpp": "bca015cee7cbbde6d96e3abddf7bdefdd09c84d9224be8c81e49144fbcdb71a5",
+    "motors/tests/version_transport.hpp": "773b9840b1f9f1aebd014d98a1add2bbfe51bc814db055107fbcf91e1d5d1297"
   },
   "libraries_sha256": {
-    "motors_py.cpython-312-x86_64-linux-gnu.so": "00a945425449d6bd102a9444177080361a92453b5519eb9c3c860fa0b8b556f4",
+    "motors_py.cpython-312-x86_64-linux-gnu.so": "056641975d99bce70ca5b73e49494f11d5eff31af8e49fb9aa9b491aa34d881c",
     "libspdlog.so.1.12": "62bb2fbc92edc05b35888e624882b78f5b38c0aca6a3df7ab7db32bb9c2629b6",
     "libfmt.so.9": "da008b908b32e428eaa1c09e36d6894c8f88362e254b503c7c2c6112b4ec9ed0"
   },

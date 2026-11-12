@@ -107,13 +107,13 @@ def test_template_selector_discloses_profile_and_complete_applicability(dialog):
     tooltip=combo.itemData(0,Qt.ItemDataRole.ToolTipRole)
     assert 'raw_firmware=1.0.9-full' in tooltip and 'b'*64 in tooltip
     assert 'Pn参考资料的显示倍率不用于换算发送值' in window.details.toPlainText()
-    assert not window.start_button.isEnabled()
+    assert not window.preview_button.isEnabled()
 
 
 def test_write_confirmation_preserves_existing_explicit_action(dialog):
     window,run,client,*_=dialog
     window.preview_value={'preview_id':'reviewed-preview','targets':script_receipt()['targets']}
-    with patch.object(QMessageBox,'question',return_value=QMessageBox.StandardButton.Yes):window.start()
+    with patch.object(QMessageBox,'exec',return_value=QMessageBox.StandardButton.Yes):window.start()
     run.call_args.args[1]()
     assert client.motor_parameter_action.call_args.args==('start',{'preview_id':'reviewed-preview','confirmed':True})
     assert window.preview_value is None
@@ -124,4 +124,4 @@ def test_account_change_discards_pn_evidence_and_preview(dialog):
     window.show_job(script_receipt());window.preview_value={'preview_id':'old-account'}
     identity['value']='other-fixture';window.poll()
     assert window.preview_value is None and window.details.toPlainText()==''
-    assert window.table.rowCount()==0 and not window.start_button.isEnabled()
+    assert window.table.rowCount()==0 and not window.preview_button.isEnabled()

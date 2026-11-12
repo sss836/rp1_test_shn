@@ -23,7 +23,7 @@ from factory_hmi.models import (
 )
 
 from ._legacy import motor_default_positions
-from .backend import MotorBackend, MotorsPyBackend
+from .backend import MotorBackend, MotorProtocolPending, MotorsPyBackend
 from .telemetry_hub import TelemetryHub
 from .config import build_station_config, load_station_config
 from .fault_response import new_fault_response, request_fault_disable
@@ -183,6 +183,10 @@ class FactoryController:
 
     def discover_motors(self) -> None:
         with self._lock:
+            # Maintenance takes exclusive ownership by closing the discovery
+            # transport. A later explicit scan must reopen it without enabling.
+            if self.state_machine.state is StationState.CONNECTED and not self.backend.connected:
+                self.state_machine.transition(StationState.DISCONNECTED, expected=StationState.CONNECTED)
             self.state_machine.require(StationState.DISCONNECTED)
             self._default_return_stop.clear()
             self._motor_recovery_active.set()
@@ -210,6 +214,10 @@ class FactoryController:
             self.state_machine.require(StationState.CONNECTED)
             if self.backend.motors_enabled:
                 raise FactoryControllerError("motors are already enabled")
+            # Never leave a pending physical enable behind a client timeout
+            # while read-only version discovery is still in progress.
+            if self.backend.motor_protocols_pending():
+                raise MotorProtocolPending("电机固件和协议正在读取，本次未下发使能；请稍后重试")
             self._default_return_stop.clear()
             self._motor_recovery_active.set()
             try:
@@ -309,7 +317,7 @@ class FactoryController:
                     and 0 <= sample.feedback_age_s < stale_seconds
                 )
                 if (not fresh or (not allow_errors and not sample.fault_code_available)
-                        or (require_drive_enabled and self.config.entries[index].lro_protocol_profile == "v1.03"
+                        or (require_drive_enabled and sample.lro_protocol_profile == "v1.03"
                             and sample.drive_enabled is not True)):
                     progress[index] = 0
                 elif sample.timestamp_s > stamps[index]:
@@ -1186,6 +1194,7 @@ class FactoryController:
                     "backend_connected": bool(self.backend.connected),
                     "motors_discovered": bool(self._motors_discovered and self.backend.connected),
                     "motors_enabled": bool(self.backend.motors_enabled),
+                    "motor_protocols_pending": self.backend.connected and self.backend.motor_protocols_pending(),
                     "position_hold_active": self.position_hold_active,
                     "protective_damping": self._protective_damping.snapshot() if self._protective_damping else None,
                     "manual_control_active": bool(

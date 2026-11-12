@@ -7,6 +7,7 @@ from factory_hmi.core.telemetry_hub import METRICS
 
 CSV_METRIC_COLUMNS = {
  'position_rad':'pos_rad','command_position_rad':'cmd_pos_rad','speed_rad_s':'spd_rad_s',
+ 'estimated_torque_nm':'estimated_torque_nm','torque_kt_nm_a':'torque_kt_nm_a',
  'torque_nm':'torque_nm','temperature_c':'temp_c','bus_voltage_v':'bus_voltage_v',
  'bus_current_a':'bus_current_a','iq_current_a':'iq_current_a',
  'error_id':'error_id','feedback_age_s':'feedback_age_s',

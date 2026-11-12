@@ -57,7 +57,7 @@ def test_terminal_persistence_and_close_keep_cross_object_reservations(tmp_path,
         with pytest.raises(BackendInUseError):second.open_transport()
         other, selection2, written2, _ = make_task(tmp_path/'second')
         begin(other, selection2);wait(other,'failed')
-        assert written2 == [] and written == [0]
+        assert written2 == [] and written == [0,1]
         other.cancel()
         finish_save.set();fail.update(save=False,close=False)
         assert service.close()['closed']
@@ -66,7 +66,7 @@ def test_terminal_persistence_and_close_keep_cross_object_reservations(tmp_path,
         # Explicit new work is allowed only after the previous terminal save
         # and resource close succeeded. No OTA was retried during cleanup.
         begin(other, selection2);wait(other,'awaiting_power')
-        assert written2 == [0] and written == [0]
+        assert written2 == [0,1] and written == [0,1]
     finally:
         finish_save.set();fail.update(save=False,close=False)
         task.cancel()
@@ -197,7 +197,7 @@ def test_backend_release_error_retains_the_actual_handle_until_explicit_retry(tm
         assert not task._thread.is_alive() and task.active and first._maintenance_active
         with pytest.raises(BackendInUseError):second.open_transport()
         with pytest.raises(RuntimeError,match='收尾失败'):task.cancel()
-        assert task._serial_owned and written==[0]
+        assert task._serial_owned and written==[0,1]
         failure['enabled']=False;task.cancel()
         assert not task.active and not first._maintenance_active
         second.open_transport();second.close_transport()

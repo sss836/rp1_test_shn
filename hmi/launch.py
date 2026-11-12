@@ -489,6 +489,7 @@ def gateway_environment(root: Path, runtime: Path | None, *, offline: bool, driv
         "RP1_RELIABILITY_PROFILES": "config/reliability_platform.yaml",
         "PYTHONPATH": str(SOURCE_ROOT),
         "RP1_HMI_STATE_ROOT": str(root),
+        "RP1_HMI_LOCAL_MAINTENANCE_TOKEN": secrets.token_urlsafe(32),
     })
     # Keep the workstation's selected platform across software upgrades. The
     # The package default is the site platform. Other sites may set an

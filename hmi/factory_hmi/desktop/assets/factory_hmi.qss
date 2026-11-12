@@ -511,6 +511,23 @@ QDialog#moduleConfigDialog {
 QDialogButtonBox QPushButton {
     min-width: 88px;
 }
+QDialog#maintenanceDialog QLabel#maintenanceHint {
+    background: #EAF2FA;
+    color: #244765;
+    border: 1px solid #D5E3F1;
+    border-radius: 6px;
+    padding: 8px 12px;
+}
+QDialog#maintenanceDialog QTableWidget#maintenanceTable::item {
+    padding: 2px 8px;
+}
+QDialog#maintenanceDialog QTableWidget#maintenanceTable QHeaderView::section {
+    background: #EDF3F9;
+    min-height: 36px;
+}
+QDialog#maintenanceDialog QPushButton#primaryButton {
+    min-width: 112px;
+}
 QStatusBar#appStatusBar {
     min-height: 26px;
     color: #667789;

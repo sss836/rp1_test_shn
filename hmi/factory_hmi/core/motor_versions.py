@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import re
 import threading
 import time
+from uuid import uuid4
 
 from ..motor_ota_policy import MODEL_NAMES, firmware_generation
 
@@ -35,13 +36,26 @@ def decode_version(payload: bytes) -> dict:
     raise ValueError("版本响应命令或长度不支持")
 
 
+def version_relation(raw_firmware, numeric_software):
+    if raw_firmware == numeric_software:return 'equal'
+    generation=firmware_generation(raw_firmware)
+    numeric_generation={'0.1.8':108,'0.1.9':109}.get(numeric_software)
+    if generation is not None and numeric_generation is not None:
+        return 'same_generation' if generation == numeric_generation else 'conflict'
+    return 'unverified'
+
+
 class MotorVersions:
-    def __init__(self, entries, motors, *, timeout=.35, refresh=60., stale=180., on_observation=None):
+    # Match the native SDK's 500 ms receive window. Starting the next command
+    # earlier replaces the pending query and discards matching late replies.
+    def __init__(self, entries, motors, *, timeout=.5, refresh=60., stale=180., on_observation=None):
         self.entries, self.motors = tuple(entries), tuple(motors)
         self.timeout, self.refresh, self.stale = timeout, refresh, stale
         self._on_observation = on_observation
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._refresh = self.idle_refresh(len(self.entries))
         self._rows = [self._empty(e) for e in self.entries]
         self._thread = threading.Thread(target=self._run, name="motor-versions", daemon=True)
 
@@ -57,8 +71,32 @@ class MotorVersions:
     def start(self):
         self._thread.start()
 
+    @staticmethod
+    def idle_refresh(total_motors=0):
+        return {"request_id": None, "state": "idle", "completed_motors": 0, "total_motors": total_motors}
+
+    def request_refresh(self):
+        with self._lock:
+            if self._stop.is_set() or not self._thread.is_alive():
+                raise ValueError("当前电机版本查询未运行，请先连接并扫描电机")
+            if self._refresh["state"] not in {"queued", "reading"}:
+                self._refresh.update(request_id=str(uuid4()), state="queued", completed_motors=0)
+                self._wake.set()
+            return dict(self._refresh)
+
+    def refresh_status(self):
+        with self._lock:
+            if self._stop.is_set() or not self._thread.is_alive():
+                return self.idle_refresh(len(self.entries))
+            return dict(self._refresh)
+
+    @property
+    def refresh_pending(self):
+        return self.refresh_status()["state"] in {"queued", "reading"}
+
     def close(self):
         self._stop.set()
+        self._wake.set()
         self._thread.join(timeout=1)
         if self._thread.is_alive():
             raise RuntimeError("版本查询线程尚未退出，不能释放当前驱动")
@@ -91,6 +129,11 @@ class MotorVersions:
 
     def _run(self):
         while not self._stop.is_set():
+            with self._lock:
+                requested = self._refresh["state"] == "queued"
+                if requested:
+                    self._refresh["state"] = "reading"
+                self._wake.clear()
             for i, e in enumerate(self.entries):
                 if self._stop.is_set():
                     return
@@ -102,6 +145,8 @@ class MotorVersions:
                     successes = 0
                     unsupported = False
                     for code in (0x31, 0x1E):
+                        if self._stop.is_set():
+                            break
                         try:
                             raw = self._query(self.motors[i], code)
                             row["raw_responses"][hex(code)] = raw.hex()
@@ -119,7 +164,20 @@ class MotorVersions:
                             row["errors"][hex(code)] = str(exc)
                     row["status"] = "known" if successes else ("unsupported" if unsupported else ("timeout" if not row["raw_responses"] else "unknown"))
                     if row.get("raw_firmware") and row.get("numeric_software"):
-                        row["version_relation"] = ("equal" if row["raw_firmware"] == row["numeric_software"] else "unverified")
+                        row["version_relation"] = version_relation(row["raw_firmware"], row["numeric_software"])
+                    # Serialize this read with version requests on the same receive
+                    # callback; no new sockets, writes, or control-thread waits.
+                    from .lro_fixed_profiles import fixed_profile
+                    from .torque_estimation import SUPPORTED_MODELS, decode_kt
+                    if fixed_profile(row) == "v1.03" and e.motor_model in SUPPORTED_MODELS:
+                        try:
+                            raw = self._query(self.motors[i], 0x16)
+                            row["torque_kt_nm_a"] = decode_kt(raw)
+                            row["kt_raw_response"] = raw.hex()
+                            row["kt_monotonic"] = time.monotonic()
+                            row["kt_observed_at"] = datetime.now(timezone.utc).isoformat()
+                        except (OSError, ValueError, RuntimeError, TypeError, AttributeError) as exc:
+                            row["kt_error"] = "Kt读取失败：" + str(exc)
                     if successes:
                         row["observed_at"] = datetime.now(timezone.utc).isoformat()
                         row["_monotonic"] = time.monotonic()
@@ -128,5 +186,10 @@ class MotorVersions:
                 if self._on_observation is not None and not self._stop.is_set():
                     self._on_observation(i, {**row, "raw_responses": dict(row["raw_responses"]),
                                              "errors": dict(row["errors"])})
-            if self._stop.wait(self.refresh):
-                return
+                if requested:
+                    with self._lock:
+                        self._refresh["completed_motors"] = i + 1
+            if requested:
+                with self._lock:
+                    self._refresh["state"] = "complete"
+            self._wake.wait(self.refresh)

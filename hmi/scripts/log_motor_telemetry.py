@@ -123,6 +123,9 @@ class MotorSample:
     feedback_header: int | None = None
     lro_protocol_profile: str | None = None
     fault_code_available: bool = True
+    torque_is_estimated: bool = False
+    torque_kt_nm_a: float = float("nan")
+    torque_source: str = "drive_reported"
 
 
 class ControllerHeartbeat:
@@ -281,8 +284,8 @@ def csv_fieldnames(entries: list[MotorEntry]) -> list[str]:
                 f"{prefix}_bus_current_a",
             ]
         )
-        if entry.lro_protocol_profile == "v1.03":
-            fields.extend([f"{prefix}_iq_current_a", f"{prefix}_drive_enabled", f"{prefix}_feedback_header"])
+        if entry.lro_protocol_profile == "v1.03" or (entry.motor_type.upper() == "LRO" and entry.lro_protocol is None):
+            fields.extend([f"{prefix}_iq_current_a", f"{prefix}_drive_enabled", f"{prefix}_feedback_header", f"{prefix}_estimated_torque_nm", f"{prefix}_torque_kt_nm_a", f"{prefix}_torque_is_estimated"])
     return fields
 
 
@@ -304,12 +307,17 @@ def sample_row(
         row[f"{prefix}_cmd_pos_rad"] = item.cmd_pos_rad
         row[f"{prefix}_pos_rad"] = item.pos_rad
         row[f"{prefix}_spd_rad_s"] = item.spd_rad_s
-        row[f"{prefix}_torque_nm"] = item.torque_nm
+        # Keep legacy column semantics: derived 109 torque has an explicitly
+        # named column, alongside original Iq and the actual Kt used per row.
+        row[f"{prefix}_torque_nm"] = float("nan") if item.torque_is_estimated else item.torque_nm
         row[f"{prefix}_temp_c"] = item.temp_c
         row[f"{prefix}_error_id"] = item.error_id if item.fault_code_available else None
         row[f"{prefix}_bus_voltage_v"] = item.bus_voltage_v
         row[f"{prefix}_bus_current_a"] = item.bus_current_a
-        if entry.lro_protocol_profile == "v1.03":
+        if entry.lro_protocol_profile == "v1.03" or (entry.motor_type.upper() == "LRO" and entry.lro_protocol is None):
+            row[f"{prefix}_torque_is_estimated"] = int(item.torque_is_estimated)
+            row[f"{prefix}_estimated_torque_nm"] = item.torque_nm if item.torque_is_estimated else float("nan")
+            row[f"{prefix}_torque_kt_nm_a"] = item.torque_kt_nm_a
             row[f"{prefix}_iq_current_a"] = item.iq_current_a
             row[f"{prefix}_drive_enabled"] = None if item.drive_enabled is None else int(item.drive_enabled)
             row[f"{prefix}_feedback_header"] = item.feedback_header
@@ -676,7 +684,8 @@ def samples_to_line_protocol(
             ("pos_rad", item.pos_rad),
             ("cmd_pos_rad", item.cmd_pos_rad),
             ("spd_rad_s", item.spd_rad_s),
-            ("torque_nm", item.torque_nm),
+            ("estimated_torque_nm" if item.torque_is_estimated else "torque_nm", item.torque_nm),
+            ("torque_kt_nm_a", item.torque_kt_nm_a),
             ("iq_current_a", item.iq_current_a),
             ("temp_c", item.temp_c),
             ("bus_voltage_v", item.bus_voltage_v),

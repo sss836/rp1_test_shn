@@ -80,6 +80,68 @@ class GatewayClientTest(unittest.TestCase):
         )
 
     @mock.patch("factory_hmi.client.GatewayClient._open")
+    def test_local_maintenance_routes_keep_mode_in_query(self, urlopen: mock.Mock) -> None:
+        urlopen.return_value = FakeResponse(b'{"ok":true}')
+
+        self.client.motor_maintenance_status(local=True)
+        self.client.motor_maintenance_action("start", {"confirmed": True}, local=True)
+        self.client.motor_parameter_status(local=True)
+        self.client.motor_parameter_templates(2, local=True)
+        self.client.motor_parameter_action("read-reference", {"indices": [2]}, local=True)
+        self.client.motor_firmware_cached_releases(2)
+        self.client.motor_firmware_import(2, "/tmp/release.json")
+        self.client.motor_parameter_import("/tmp/template.json")
+        self.client.motor_maintenance_status()
+
+        requests = [call.args[0] for call in urlopen.call_args_list]
+        self.assertEqual([(r.method, r.selector) for r in requests], [
+            ("GET", "/api/v1/motor-maintenance?local=true"),
+            ("POST", "/api/v1/motor-maintenance/start?local=true"),
+            ("GET", "/api/v1/motor-parameters?local=true"),
+            ("GET", "/api/v1/motor-parameters/2/templates?local=true"),
+            ("POST", "/api/v1/motor-parameters/read-reference?local=true"),
+            ("GET", "/api/v1/motor-firmware/2/cached-releases"),
+            ("POST", "/api/v1/motor-firmware/2/import"),
+            ("POST", "/api/v1/motor-parameters/import"),
+            ("GET", "/api/v1/motor-maintenance"),
+        ])
+        self.assertEqual(json.loads(requests[1].data), {"confirmed": True})
+        self.assertEqual(json.loads(requests[4].data), {"indices": [2]})
+        self.assertEqual(json.loads(requests[6].data), {"manifest_path": "/tmp/release.json"})
+        self.assertEqual(json.loads(requests[7].data), {"manifest_path": "/tmp/template.json"})
+
+    @mock.patch("factory_hmi.client.GatewayClient._open")
+    def test_local_maintenance_credential_stays_on_direct_loopback_requests(self, urlopen: mock.Mock) -> None:
+        urlopen.return_value = FakeResponse(b'{"ok":true}')
+        with mock.patch.dict("os.environ", {"RP1_HMI_LOCAL_MAINTENANCE_TOKEN": "test-local-token"}):
+            local = GatewayClient("http://127.0.0.1:8766")
+            remote = GatewayClient("https://gateway.example.test")
+        local.motor_maintenance_status(local=True)
+        local.health()
+        remote.motor_maintenance_status(local=True)
+
+        maintenance, health, remote_maintenance = [call.args[0] for call in urlopen.call_args_list]
+        header = "X-rp1-local-maintenance"
+        self.assertEqual(maintenance.unredirected_hdrs[header], "test-local-token")
+        self.assertNotIn(header, maintenance.headers)
+        self.assertFalse(health.has_header(header))
+        self.assertFalse(remote_maintenance.has_header(header))
+
+    @mock.patch("factory_hmi.client.GatewayClient._open")
+    def test_motor_version_refresh_is_separate_from_status(self, urlopen: mock.Mock) -> None:
+        urlopen.return_value = FakeResponse(b'{"ok":true}')
+        client = GatewayClient("http://127.0.0.1:8766", operator_token="operator-token")
+        client.refresh_motor_versions()
+        client.motor_version_refresh_status()
+        trigger, status = [call.args[0] for call in urlopen.call_args_list]
+        self.assertEqual((trigger.method, trigger.selector), ("POST", "/api/v1/motor-versions/refresh"))
+        self.assertEqual(json.loads(trigger.data), {})
+        self.assertEqual((status.method, status.selector), ("GET", "/api/v1/motor-versions/refresh"))
+        for req in (trigger, status):
+            self.assertEqual(req.get_header("X-rp1-operator-token"), "operator-token")
+            self.assertEqual(req.get_header("X-rp1-client-id"), client.client_id)
+
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_standalone_can_and_enable_endpoints(self, urlopen: mock.Mock) -> None:
         urlopen.return_value = FakeResponse(b'{"ok":true}')
 

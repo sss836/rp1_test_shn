@@ -71,5 +71,15 @@ inline bool version_native_checks() {
     bus->feed(reply); check(motor->version_payload(0x31).empty());
     motor->request_version(0x1E);
     reply.data[1] = 0x31; bus->feed(reply); check(motor->version_payload(0x31).empty());
+    // Kt is a read-only query. Correlate node/code and do not count it as motion feedback.
+    check(motor->request_version(0x16));
+    check(bus->sent.back().data[0] == 0xE0 && bus->sent.back().data[1] == 0x16);
+    reply.len = 4; reply.data[0] = 0xA0; reply.data[1] = 0x16;
+    reply.data[2] = 0x01; reply.data[3] = 0x34; reply.can_id = 4;
+    bus->feed(reply); check(motor->version_payload(0x16).empty());
+    reply.can_id = 3; bus->feed(reply);
+    check(motor->version_payload(0x16)[3] == 0x34);
+    check(motor->get_feedback_count() == 0);
+    check(!motor->request_version(0x04)); // Kt write command never allowed here.
     return true;
 }

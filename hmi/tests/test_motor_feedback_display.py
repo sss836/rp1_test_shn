@@ -47,6 +47,9 @@ def receive(window, **overrides):
 
 
 def cell(window, column):
+    # The four columns after CAN show firmware, status, 0x1E data and confirmation.
+    if column >= 3:
+        column += 4
     return window.motor_table_model.index(0, column).data(Qt.DisplayRole)
 
 
@@ -150,3 +153,44 @@ def test_scan_success_uses_confirmed_snapshot_and_ends_waiting_notice(window):
     assert not window._motor_discovery_pending
     assert window._motors_discovered
     assert "扫描中" not in window.motor_discovery_label.text()
+
+
+def test_enable_waits_for_protocol_readback_and_ignores_duplicate_clicks(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    snapshot = {
+        "configured": True,
+        "connected": True,
+        "station": {"state": "connected", "motors_discovered": True,
+                    "motors_enabled": False, "motor_protocols_pending": True},
+        "motors": [],
+    }
+    calls = []
+    confirmations = []
+
+    def confirm(*args):
+        confirmations.append(args)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    monkeypatch.setattr(window, "_run_rest", lambda *args, **kwargs: calls.append((args, kwargs)))
+    window._motors_discovered_ok(snapshot)
+    assert window._motors_discovered
+    assert not window.enable_motors_button.isEnabled()
+    assert "读取固件与协议" in window.feedback_read_label.text()
+    window._enable_motors()
+    assert not confirmations and not calls
+
+    snapshot["station"]["motor_protocols_pending"] = False
+    window._render_snapshot(snapshot)
+    assert window.enable_motors_button.isEnabled()
+    assert not confirmations and not calls
+
+    window._enable_motors()
+    assert len(confirmations) == len(calls) == 1
+    window._render_snapshot(snapshot)
+    assert not window.enable_motors_button.isEnabled()
+    window._enable_motors()
+    assert len(confirmations) == len(calls) == 1
+    calls[0][1]["on_finished"]()
+    assert window.enable_motors_button.isEnabled()

@@ -17,6 +17,7 @@ import time
 import threading
 from factory_hmi.motor_parameter_contract import spec, PN_SCRIPT_PROFILE
 from .motor_maintenance import now
+from .motor_ota_transport import STANDARD_DATA_FRAME_MASK
 
 FRAME=struct.Struct('<IBB2x64s')
 
@@ -52,7 +53,7 @@ def exchange(target,payload,stop,key=None,*,socket_factory=socket.socket,ready=s
     cancelled(stop)
     with socket_factory(socket.AF_CAN,socket.SOCK_RAW,socket.CAN_RAW) as bus:
         bus.setsockopt(getattr(socket,'SOL_CAN_RAW',101),getattr(socket,'CAN_RAW_FD_FRAMES',5),1)
-        bus.setsockopt(getattr(socket,'SOL_CAN_RAW',101),1,struct.pack('=II',target['motor_id'],0xffffffff))
+        bus.setsockopt(getattr(socket,'SOL_CAN_RAW',101),1,struct.pack('=II',target['motor_id'],STANDARD_DATA_FRAME_MASK))
         bus.bind((target['interface'],));bus.setblocking(False)
         for _ in range(256):
             cancelled(stop)

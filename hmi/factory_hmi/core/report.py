@@ -350,7 +350,7 @@ def _joint_metrics(
         torques = [
             abs(value)
             for _, row in samples
-            if (value := _finite(row.get(f"{name}_torque_nm"))) is not None
+            if (value := (_finite(row.get(f"{name}_torque_nm")) if _finite(row.get(f"{name}_torque_nm")) is not None else _finite(row.get(f"{name}_estimated_torque_nm")))) is not None
         ]
         tracking = [
             command - position
@@ -398,6 +398,7 @@ def _joint_metrics(
                     if start_temperature is not None and peak_temperature is not None
                     else None
                 ),
+                "torque_is_estimated": any(_finite(row.get(f"{name}_estimated_torque_nm")) is not None for row in rows),
                 "torque_peak_abs_nm": max(torques) if torques else None,
                 "torque_p999_abs_nm": p999,
                 "torque_mean_abs_nm": (
@@ -791,7 +792,7 @@ def _render_report(summary: Mapping[str, Any], manifest_identity: Mapping[str, A
                 f"### {joint['joint_name']}",
                 f"- Temperature start/end/peak: {joint['temperature_start_c']} / {joint['temperature_end_c']} / {joint['temperature_peak_c']} °C",
                 f"- Temperature end/peak rise: {joint['temperature_rise_c']} / {joint['temperature_peak_rise_c']} °C",
-                f"- Torque peak/P99.9/mean absolute: {joint['torque_peak_abs_nm']} / {joint['torque_p999_abs_nm']} / {joint['torque_mean_abs_nm']} N·m",
+                f"- {'Estimated torque (Iq × device-read Kt)' if joint.get('torque_is_estimated') else 'Torque'} peak/P99.9/mean absolute: {joint['torque_peak_abs_nm']} / {joint['torque_p999_abs_nm']} / {joint['torque_mean_abs_nm']} N·m",
                 f"- Rated torque/utilization: {joint['rated_torque_nm']} N·m / {joint['torque_utilization']}",
                 f"- Tracking RMS/max: {joint['tracking_rms_rad']} / {joint['tracking_max_rad']} rad",
                 f"- Fault intervals: {joint['fault_count']}",

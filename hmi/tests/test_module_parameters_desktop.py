@@ -1,6 +1,6 @@
 from copy import deepcopy
 from unittest.mock import Mock,patch
-from PySide6.QtWidgets import QApplication,QMessageBox
+from PySide6.QtWidgets import QApplication,QFileDialog,QMessageBox
 from PySide6.QtCore import QCoreApplication,QEvent,Qt
 from shiboken6 import isValid
 import pytest
@@ -23,11 +23,11 @@ def test_distinct_read_and_write_no_value_editor(dialog):
     d.table.cellWidget(0,5).addItem('synthetic-template','a'*32)
     d.table.cellWidget(0,5).setCurrentIndex(0)
     d.read();run.call_args.args[1]();assert client.motor_parameter_action.call_args.args==('read',{'selections':[{'index':0,'template_id':'a'*32}]})
-    assert d.preview_value is None and not d.start_button.isEnabled()
+    assert d.preview_value is None and not d.preview_button.isEnabled()
 
 def test_confirmation_cancel_does_not_start(dialog):
     d,run,client,*_=dialog;d.preview_value={'preview_id':'x'}
-    with patch.object(QMessageBox,'question',return_value=QMessageBox.StandardButton.No):d.start()
+    with patch.object(QMessageBox,'exec',return_value=QMessageBox.StandardButton.No):d.start()
     client.motor_parameter_action.assert_not_called()
 
 def test_preview_human_units_and_power_statement_distinct(tmp_path,dialog):
@@ -58,7 +58,7 @@ def test_deleted_dialog_late_callback_safe(dialog):
 def test_missing_template_and_selection_have_clear_reasons(dialog):
     from PySide6.QtWidgets import QHeaderView
     d,run,client,*_=dialog
-    assert not d.read_button.isEnabled() and '模板' in d.step_hint.text()
+    assert d.read_button.isEnabled() and '模板' in d.step_hint.text()
     assert d.table.cellWidget(0,5).placeholderText()=='先获取适用模板'
     count=run.call_count;d.read();assert run.call_count==count
     assert d.write_group.isHidden()
@@ -71,11 +71,12 @@ def test_missing_template_and_selection_have_clear_reasons(dialog):
     client.motor_parameter_action.assert_not_called()
 
 
-def test_comparison_is_readonly_and_changed_selection_requires_fresh_read(tmp_path,dialog):
+def test_comparison_is_readonly_and_checkbox_scopes_update(tmp_path,dialog):
     from PySide6.QtWidgets import QAbstractItemView
     task,selections,*_=make(tmp_path)
     p=preview(task,selections);job=task.snapshot()
     d,run,client,*_=dialog
+    d.configuration_sha256=job['configuration_sha256']
     d.table.cellWidget(0,5).addItem('synthetic-template','a'*32);d.table.cellWidget(0,5).setCurrentIndex(0)
     d.read();call=run.call_args
     call.args[2]({'result':job});call.kwargs['on_finished']()
@@ -83,9 +84,16 @@ def test_comparison_is_readonly_and_changed_selection_requires_fresh_read(tmp_pa
     assert 'N·m/A' in d.comparison.item(0,2).text() and '1.74' in d.comparison.item(0,3).text()
     assert d.comparison.editTriggers()==QAbstractItemView.EditTrigger.NoEditTriggers
     assert d.preview_button.isEnabled()
-    d.preview_value=p;d.controls();assert d.start_button.isEnabled()
+    assert d.table.item(0,10).text() == '有差异 2 项'
+    assert '1.74' in d.table.item(0,9).text()
+    d.preview_value=p
+    d.update_selected()
+    run.call_args.args[1]()
+    client.refresh_motor_versions.assert_called_once()
+    assert d._comparison_read_job_id is None  # old comparison cannot directly authorize a write
+    run.call_args.kwargs['on_finished']()
     d.table.item(0,0).setCheckState(Qt.CheckState.Unchecked)
-    assert d.preview_value is None and not d.start_button.isEnabled() and not d.preview_button.isEnabled()
+    assert d.preview_value is None and not d.preview_button.isEnabled()
     task.cancel()
 
 
@@ -101,11 +109,14 @@ def test_closed_parameter_dialog_drops_pending_reply(dialog):
 def test_failed_new_read_cannot_reuse_old_job_for_write_preview(dialog):
     d,run,client,*_=dialog
     combo=d.table.cellWidget(0,5);combo.addItem('synthetic-template','a'*32);combo.setCurrentIndex(0)
-    d.show_job(dict(job_id='previous-read',mode='read',active=False,status='checked',targets=[]))
-    d._read_revision=d._selection_revision;d.controls();assert d.preview_button.isEnabled()
+    d._comparison_read_job_id='previous-read'
+    receipt=dict(d.rows[0], template_record=record(), before={}, items=[dict(key='kt', expected_raw=[174], tolerance_raw=1, status='mismatch', write_status='not_written', actual={'status':'read','raw':[100]})])
+    d.show_job(dict(job_id='previous-read',mode='read',active=False,status='checked_with_differences',targets=[receipt]))
+    assert d.preview_button.isEnabled()
     d.read();call=run.call_args
     call.kwargs['on_finished']()  # failed operation: no success callback
-    assert not d.preview_button.isEnabled() and d.preview_value is None
+    assert d.preview_button.isEnabled() and d.preview_value is None
+    assert d.update_selections()==[]  # retry is enabled, old read is not reusable
 
 
 def test_selected_motor_template_query_and_comparison_stay_in_scope(dialog):
@@ -147,7 +158,7 @@ def test_selected_motor_template_query_and_comparison_stay_in_scope(dialog):
     call.args[2](call.args[1]())
     call.kwargs['on_finished']()
     assert 'can-fixture ID 1：版本证据缺失' in d.details.toPlainText()
-    assert not d.read_button.isEnabled()
+    assert d.read_button.isEnabled()
     d.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
     assert d.read_button.isEnabled()
     d.clear_selection_button.click()
@@ -166,6 +177,21 @@ def test_parameter_scope_does_not_follow_reused_index(dialog):
     assert not d.templates_button.isEnabled()
 
 
+
+def complete_version_preparation(d, run, client):
+    d.show()
+    call=run.call_args
+    call.args[1]()
+    client.refresh_motor_versions.assert_called()
+    call.args[2]({'result':{'request_id':'fresh','state':'complete'}})
+    call.kwargs['on_finished']()
+    call=run.call_args
+    targets=[dict(row,observation={'status':'known'}) for row in d.rows]
+    call.args[2]({'result':{'targets':targets,'job':{'active':False,'status':'idle'},
+                           'configuration_sha256':d.configuration_sha256,'write_authorized':True}})
+    call.kwargs['on_finished']()
+    return run.call_args
+
 def test_read_reference_checks_selected_motor_without_template_or_write_preview(dialog):
     d, run, client, *_ = dialog
     row = dict(d.rows[0], firmware_generation=108)
@@ -175,12 +201,12 @@ def test_read_reference_checks_selected_motor_without_template_or_write_preview(
                              'job': {'active': False, 'status': 'idle'}, 'configuration_sha256': 'e'*64}})
     call.kwargs['on_finished']()
     assert d._selected() == [0]
-    assert d.read_reference_button.isEnabled() and not d.read_button.isEnabled()
+    assert d.read_reference_button.isEnabled() and d.read_button.isEnabled()
     d.select_all_button.click()
-    assert not d.read_reference_button.isEnabled() and '1 台待核实' in d.step_hint.text()
+    assert d.read_reference_button.isEnabled() and '版本需刷新' in d.step_hint.text()
     d.table.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
     d.read_reference_button.click()
-    call = run.call_args
+    call = complete_version_preparation(d,run,client)
     call.args[1]()
     assert client.motor_parameter_action.call_args.args == (
         'read-reference', {'indices': [0], 'configuration_sha256': 'e'*64})
@@ -204,7 +230,104 @@ def test_read_reference_checks_selected_motor_without_template_or_write_preview(
     assert d.comparison.item(1, 3).text() == '—'
     assert d.comparison.item(1, 5).text() == '已记录实测值'
     assert '差异仅供检查' in d.details.toPlainText()
-    assert not d.preview_button.isEnabled() and d.write_group.isHidden()
-    count = run.call_count
-    d.preview()
-    assert run.call_count == count
+    assert d.preview_button.isEnabled() and d.write_group.isHidden()
+    assert not d.update_selections()  # reference findings still are not a write preview
+    d.update_selected()
+    run.call_args.args[1]()
+    assert client.refresh_motor_versions.call_count==2
+
+
+def test_logged_out_parameter_dialog_uses_local_status_import_and_read(dialog):
+    d, run, client, identity, _ = dialog
+    identity['value'] = None
+    d.poll()
+    call = run.call_args
+    call.args[1]()
+    client.motor_parameter_status.assert_called_once_with(local=True)
+    row = dict(index=0,module='left',joint_name='joint',interface='can-fixture',motor_id=1,
+               model='LRO_5550',firmware_generation=108)
+    call.args[2]({'result': {'targets': [row], 'configuration_sha256': 'e'*64,
+                             'job': {'active': False, 'status': 'idle'}, 'write_authorized': True}})
+    call.kwargs['on_finished']()
+    assert d.read_reference_button.isEnabled() and d.read_button.isEnabled()
+    with patch.object(QFileDialog,'getOpenFileName',return_value=('/fixture/catalog.json','')):
+        d.import_button.click()
+    call = run.call_args
+    call.args[1]()
+    call.kwargs['on_finished']()
+    client.motor_parameter_import.assert_called_once_with('/fixture/catalog.json')
+    d.read_reference_button.click()
+    call = complete_version_preparation(d,run,client)
+    call.args[1]()
+    call.kwargs['on_finished']()
+    client.motor_parameter_action.assert_called_once_with(
+        'read-reference', {'indices': [0], 'configuration_sha256': 'e'*64}, local=True)
+    client.motor_parameter_templates.return_value = {'result': {'templates': [record()]}}
+    d.templates()
+    call = run.call_args
+    call.args[2](call.args[1]())
+    call.kwargs['on_finished']()
+    client.motor_parameter_templates.assert_called_once_with(0, local=True)
+    d.read_button.click()
+    call = complete_version_preparation(d,run,client)
+    call.args[2](call.args[1]())  # templates after fresh version, before read
+    call.kwargs['on_finished']()
+    call = run.call_args
+    call.args[1]()
+    call.kwargs['on_finished']()
+    client.motor_parameter_action.assert_called_with(
+        'read', {'selections': [{'index': 0, 'template_id': 'a'*32}],
+                 'configuration_sha256': 'e'*64}, local=True)
+
+
+def test_local_scope_available_while_logged_in_and_keeps_own_job(dialog):
+    d, run, client, identity, _ = dialog
+    assert d.source.currentText() == '测试平台'
+    d.source.setCurrentIndex(0)
+    call = run.call_args
+    call.args[1]()
+    client.motor_parameter_status.assert_called_once_with(local=True)
+    job = {'job_id': 'local-read', 'active': True, 'mode': 'read_reference', 'status': 'reading',
+           'targets': [], 'local': True}
+    call.args[2]({'result': {'targets': [], 'job': job, 'write_authorized': True}})
+    call.kwargs['on_finished']()
+    assert not d.source.isEnabled() and d.cancel_button.isEnabled()
+    identity['value'] = 'another-platform-account'
+    d.poll()
+    call = run.call_args
+    call.args[2]({'result': {'job': job}})
+    call.kwargs['on_finished']()
+    assert d.job == job and d.cancel_button.isEnabled()
+    d.cancel_button.click()
+    call = run.call_args
+    call.args[1]()
+    call.kwargs['on_finished']()
+    client.motor_parameter_action.assert_called_once_with('cancel', {'job_id': 'local-read'}, local=True)
+
+
+def test_builtin_model_template_defaults_with_imported_alternative(dialog):
+    from factory_hmi.core.production_parameters import production_record
+    from test_production_parameters import obs
+    d,run,client,*_=dialog
+    builtin=production_record(obs(model='LRO_5550'))
+    client.motor_parameter_templates.return_value={'result':{'templates':[builtin,record()]}}
+    d.templates();call=run.call_args;call.args[2](call.args[1]());call.kwargs['on_finished']()
+    combo=d.table.cellWidget(0,5)
+    assert combo.currentData()==builtin['template']['template_id']
+    assert combo.currentText()=='产线参数 · LRO_5550 · 109全量'
+    d.clear_selection_button.click();assert d._selected()==[]
+    d.select_all_button.click();assert d._selected()==[0]
+
+
+def test_batch_parameter_completion_only_prompts_once(dialog,tmp_path):
+    task,selections,*_=make(tmp_path,2);p=preview(task,selections)
+    d,run,*_=dialog
+    for row in p['targets']:
+        row.update(power_cycle_required=True,status='written_awaiting_batch_power')
+    job=dict(job_id='batch',mode='write',active=True,status='writing',targets=p['targets'])
+    with patch.object(QMessageBox,'information') as message:
+        d.show_job(job);assert message.call_count==0
+        job['status']='awaiting_power';job['production_batch_power']=True
+        for row in job['targets']:row['status']='awaiting_power'
+        d.show_job(job);d.show_job(job);assert message.call_count==1
+    task.cancel()

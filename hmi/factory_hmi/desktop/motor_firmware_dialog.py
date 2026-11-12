@@ -3,7 +3,7 @@ from datetime import datetime
 from shiboken6 import isValid
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QPushButton, QPlainTextEdit, QCheckBox, QHBoxLayout, QTabWidget, QWidget, QFormLayout, QGroupBox
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QPushButton, QPlainTextEdit, QCheckBox, QHBoxLayout, QTabWidget, QWidget, QFormLayout, QGroupBox, QFileDialog
 
 
 def motor_target_key(row):
@@ -22,7 +22,7 @@ class MotorFirmwareDialog(QDialog):
         self.resource_dialog = None
         self.account = self.identity()
         layout = QVBoxLayout(self)
-        intro = QLabel("扫描后自动读取实际版本。文件版本标签与设备读回版本分别显示。", self)
+        intro = QLabel("扫描后自动读取实际版本。查询本机固件无需登录，从平台获取固件时请登录测试平台。", self)
         intro.setWordWrap(True)
         layout.addWidget(intro)
         self.targets = QComboBox(self)
@@ -37,23 +37,30 @@ class MotorFirmwareDialog(QDialog):
         for scrollbar in (self.versions.verticalScrollBar(), self.versions.horizontalScrollBar()):
             scrollbar.sliderReleased.connect(self.refresh)
         layout.addWidget(self.versions, 2)
-        downloads = QGroupBox("按所选电机查询适用固件", self)
+        downloads = QGroupBox("按所选电机查询固件", self)
         download_layout = QVBoxLayout(downloads)
         target_row = QHBoxLayout()
         target_row.addWidget(QLabel("当前电机", self))
         target_row.addWidget(self.targets, 1)
-        self.check_button = QPushButton("查询适用固件", self)
-        self.check_button.setObjectName("outlineButton")
-        target_row.addWidget(self.check_button)
+        self.cached_check_button = QPushButton("查询本机固件", self)
+        self.check_button = QPushButton("查询平台固件", self)
+        for button in (self.cached_check_button, self.check_button):
+            button.setObjectName("outlineButton")
+            target_row.addWidget(button)
         download_layout.addLayout(target_row)
         file_row = QHBoxLayout()
         file_row.addWidget(QLabel("固件", self))
         self.files = QComboBox(self)
         self.files.setPlaceholderText("先选择目标并查询")
         file_row.addWidget(self.files, 1)
-        self.download_button = QPushButton("下载所选固件", self)
+        self.download_button = QPushButton("从平台下载", self)
         self.download_button.setObjectName("primaryButton")
         file_row.addWidget(self.download_button)
+        self.import_button = QPushButton("导入签名固件…", self)
+        self.import_button.setObjectName("outlineButton")
+        self.import_button.setToolTip(
+            "选择签名 release.json。固件文件及可选的签名 motor-ota-policy.json 放在同一目录。")
+        file_row.addWidget(self.import_button)
         download_layout.addLayout(file_row)
         self.receipt = QPlainTextEdit(self)
         self.receipt.setReadOnly(True)
@@ -62,7 +69,7 @@ class MotorFirmwareDialog(QDialog):
         download_layout.addWidget(self.receipt)
         layout.addWidget(downloads)
         more = QHBoxLayout()
-        self.resource_library_button = QPushButton("固件文件下载", self)
+        self.resource_library_button = QPushButton("平台固件文件下载", self)
         self.maintenance_button = QPushButton("108 → 109 升级 / 固件维护…", self)
         self.parameters_button = QPushButton("参数读取与维护…", self)
         self.maintenance_button.setToolTip("带入当前电机，可在维护窗口切换为整组升级。")
@@ -76,8 +83,10 @@ class MotorFirmwareDialog(QDialog):
         more.addStretch(1)
         layout.addLayout(more)
         self.targets.currentIndexChanged.connect(self._target_changed)
+        self.cached_check_button.clicked.connect(self.check_cached)
         self.check_button.clicked.connect(self.check)
         self.download_button.clicked.connect(self.download)
+        self.import_button.clicked.connect(self.import_firmware)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.finished.connect(self.timer.stop)
@@ -89,7 +98,6 @@ class MotorFirmwareDialog(QDialog):
         if account != self.account:
             self.account = account
             self._target_changed()
-            self.receipt.clear()
         selected = self._selected_motor()
         rows = self.observations()
         keys = [motor_target_key(row) for row in rows]
@@ -102,8 +110,10 @@ class MotorFirmwareDialog(QDialog):
             if selected in keys:
                 self.targets.setCurrentIndex(keys.index(selected))
         self._render_versions(rows)
-        self.check_button.setEnabled(bool(self.identity()) and bool(rows) and not self.pending)
-        self.download_button.setEnabled(bool(self.identity()) and bool(self.releases) and not self.pending)
+        self.cached_check_button.setEnabled(bool(rows) and not self.pending)
+        self.import_button.setEnabled(bool(rows) and not self.pending)
+        self.check_button.setEnabled(bool(account) and bool(rows) and not self.pending)
+        self.download_button.setEnabled(bool(account) and bool(self.releases) and not self.pending)
 
     @staticmethod
     def _version_text(row, details):
@@ -128,7 +138,11 @@ class MotorFirmwareDialog(QDialog):
         names = {"0x31": "原始固件字符串（0x31）", "0x1e": "数值版本（0x1E）"}
         for code, error in errors.items():
             lines.append(f'读取提示：{names.get(str(code).lower(), str(code))}：{error}')
-        if row.get("version_relation") == "unverified":
+        if row.get("version_relation") == "same_generation":
+            lines.append("版本对应：完整固件与数值软件版本属于同一 108/109 版本。")
+        elif row.get("version_relation") == "conflict":
+            lines.append("读取提示：完整固件与数值软件版本的 108/109 代际冲突，请重新读取。")
+        elif row.get("version_relation") == "unverified":
             lines.append("读取提示：原始字符串与数值软件版本不同，二者关系尚未核实。")
         if details:
             lines.append("原始读取时间：" + str(observed or "尚未读取"))
@@ -161,6 +175,7 @@ class MotorFirmwareDialog(QDialog):
     def _target_changed(self):
         self.releases = []
         self.files.clear()
+        self.receipt.clear()
         self.download_button.setEnabled(False)
 
     def _target_key(self):
@@ -191,25 +206,62 @@ class MotorFirmwareDialog(QDialog):
 
     def check(self):
         index = self.targets.currentData()
-        if index is None:
+        if index is None or not self.identity() or self.pending:
             return
-        def show(value):
-            self.releases = value.get("releases", [])
-            self.files.clear()
-            for release in self.releases:
-                m = release["manifest"]
-                self.files.addItem(f'{m["version"]} · {m["model"]} · {m["notes"]}', m["release_id"])
-            if self.files.count():
-                self.files.setCurrentIndex(0)
-            self.receipt.setPlainText("找到 " + str(len(self.releases)) + " 个已发布且兼容的固件，请选择版本下载。" if self.releases else "没有已发布且兼容的新固件。")
-        self._request("查询电机固件", lambda: self.client.motor_firmware_releases(index), show)
+        self._target_changed()
+        self._request("查询平台固件", lambda: self.client.motor_firmware_releases(index),
+                      lambda value: self._show_releases(value, local=False))
+
+    def check_cached(self):
+        index = self.targets.currentData()
+        if index is None or self.pending:
+            return
+        self._target_changed()
+        self._request("查询本机固件", lambda: self.client.motor_firmware_cached_releases(index),
+                      lambda value: self._show_releases(value, local=True))
+
+    def _show_releases(self, value, *, local):
+        releases = value.get("releases", [])
+        self.releases = [] if local else releases
+        self.files.clear()
+        for release in releases:
+            manifest = release["manifest"]
+            label = f'{manifest["version"]} · {manifest["model"]} · {manifest["notes"]}'
+            if local:
+                self.files.addItem(f"本机 · {label}")
+            else:
+                self.files.addItem(label, manifest["release_id"])
+        if releases:
+            self.files.setCurrentIndex(0)
+        if local:
+            message = (f"本机有 {len(releases)} 个适用于当前电机的已验签固件。"
+                       if releases else "本机没有适用于当前电机的已验签固件。可导入签名固件或登录平台下载。")
+        else:
+            message = (f"平台有 {len(releases)} 个兼容固件，请选择版本下载。"
+                       if releases else "平台没有已发布且兼容的新固件。")
+        self.receipt.setPlainText(message)
 
     def download(self):
         index, release_id = self.targets.currentData(), self.files.currentData()
-        if index is None or not release_id:
+        if index is None or not release_id or not self.identity():
             return
         self._request("下载电机固件", lambda: self.client.motor_firmware_download(index, release_id),
             lambda value: self.receipt.setPlainText("已下载，尚未刷写；实际版本以上方读取结果为准。\n保存位置：" + str(value.get("firmware_path") or "回执未返回保存位置")))
+
+    def import_firmware(self):
+        index = self.targets.currentData()
+        if index is None or self.pending:
+            return
+        target = self._target_key()
+        path, _ = QFileDialog.getOpenFileName(self, "选择已签名的固件清单", "", "固件清单 (*.json)")
+        if not path or self._target_key() != target or self.pending:
+            return
+        self._target_changed()
+        def show_receipt(value):
+            location = value.get("firmware_path") or "回执未返回保存位置"
+            policy = "\n签名兼容规则已保存。" if value.get("policy_imported") else ""
+            self.receipt.setPlainText(f"已验签并保存到本机，可在固件维护窗口刷新版本。\n保存位置：{location}{policy}")
+        self._request("导入签名固件", lambda: self.client.motor_firmware_import(index, path), show_receipt)
 
     def maintenance(self):
         from .motor_maintenance_dialog import MODULE_UPGRADE, SELECTED_UPGRADE, MotorMaintenanceDialog

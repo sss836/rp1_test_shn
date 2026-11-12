@@ -343,7 +343,7 @@ void LroMotorDriver::get_motor_param(uint8_t param_cmd) {
 }
 
 bool LroMotorDriver::request_version(uint8_t code) {
-    if (comm_type_ != CommType::CANFD || (code != 0x31 && code != 0x1E)) return false;
+    if (comm_type_ != CommType::CANFD || (code != 0x31 && code != 0x1E && code != 0x16)) return false;
     {
         std::lock_guard<std::mutex> guard(version_mutex_);
         versions_.erase(code);

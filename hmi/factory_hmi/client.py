@@ -89,6 +89,7 @@ class GatewayClient:
             raise ValueError("gateway URL must be an absolute http(s) URL")
         self.base_url = base_url
         self._direct_opener = request.build_opener(request.ProxyHandler({})) if is_loopback_gateway(base_url) else None
+        self._local_maintenance_token = os.environ.get("RP1_HMI_LOCAL_MAINTENANCE_TOKEN", "") if self._direct_opener else ""
         self.timeout = timeout
         if not math.isfinite(lease_heartbeat_timeout) or not 0 < lease_heartbeat_timeout <= 2:
             raise ValueError("lease heartbeat timeout must be finite and in (0, 2] seconds")
@@ -190,6 +191,8 @@ class GatewayClient:
             headers["Content-Type"] = "application/json"
 
         req = request.Request(url, data=data, headers=headers, method=method)
+        if self._local_maintenance_token and path.startswith(("/api/v1/motor-maintenance", "/api/v1/motor-parameters", "/api/v1/motor-firmware/")):
+            req.add_unredirected_header("X-RP1-Local-Maintenance", self._local_maintenance_token)
         if path == "/api/v1/lease/heartbeat" and self.lease_generation is not None:
             req.add_header("X-RP1-Lease-Generation", str(self.lease_generation))
         try:
@@ -714,27 +717,49 @@ class GatewayClient:
     def software_update_check(self) -> JsonValue:
         return self._request("GET", "/api/v1/software-updates/check", timeout=5)
 
-    def motor_parameter_status(self) -> JsonValue:
-        return self._request("GET", "/api/v1/motor-parameters")
+    def motor_parameter_status(self, *, local: bool = False) -> JsonValue:
+        path = "/api/v1/motor-parameters?local=true" if local else "/api/v1/motor-parameters"
+        return self._request("GET", path)
 
-    def motor_parameter_templates(self, index: int) -> JsonValue:
-        return self._request("GET", f"/api/v1/motor-parameters/{int(index)}/templates", timeout=10)
+    def motor_parameter_templates(self, index: int, *, local: bool = False) -> JsonValue:
+        suffix = "?local=true" if local else ""
+        return self._request("GET", f"/api/v1/motor-parameters/{int(index)}/templates{suffix}", timeout=10)
 
-    def motor_parameter_action(self, action: str, payload: dict) -> JsonValue:
+    def motor_parameter_import(self, manifest_path: str) -> JsonValue:
+        return self._request("POST", "/api/v1/motor-parameters/import",
+                             payload={"manifest_path": manifest_path}, timeout=30)
+
+    def motor_parameter_action(self, action: str, payload: dict, *, local: bool = False) -> JsonValue:
         if action not in {"read", "read-reference", "preview", "start", "acknowledge", "readback", "cancel"}:
             raise ValueError("unknown parameter action")
-        return self._request("POST", f"/api/v1/motor-parameters/{action}", payload=payload)
+        suffix = "?local=true" if local else ""
+        return self._request("POST", f"/api/v1/motor-parameters/{action}{suffix}", payload=payload)
 
-    def motor_maintenance_status(self) -> JsonValue:
-        return self._request("GET", "/api/v1/motor-maintenance")
+    def motor_maintenance_status(self, *, local: bool = False) -> JsonValue:
+        path = "/api/v1/motor-maintenance?local=true" if local else "/api/v1/motor-maintenance"
+        return self._request("GET", path)
 
-    def motor_maintenance_action(self, action: str, payload: dict) -> JsonValue:
-        if action not in {"preview", "start", "acknowledge", "readback", "cancel"}:
+    def refresh_motor_versions(self) -> JsonValue:
+        return self.post("/api/v1/motor-versions/refresh", {})
+
+    def motor_version_refresh_status(self) -> JsonValue:
+        return self.get("/api/v1/motor-versions/refresh")
+
+    def motor_maintenance_action(self, action: str, payload: dict, *, local: bool = False) -> JsonValue:
+        if action not in {"preview", "start", "acknowledge", "readback", "confirm-power-and-readback", "cancel"}:
             raise ValueError("unknown motor maintenance action")
-        return self._request("POST", f"/api/v1/motor-maintenance/{action}", payload=payload)
+        suffix = "?local=true" if local else ""
+        return self._request("POST", f"/api/v1/motor-maintenance/{action}{suffix}", payload=payload)
 
     def motor_firmware_releases(self, index: int) -> JsonValue:
         return self._request("GET", f"/api/v1/motor-firmware/{int(index)}/releases", timeout=30)
+
+    def motor_firmware_cached_releases(self, index: int) -> JsonValue:
+        return self._request("GET", f"/api/v1/motor-firmware/{int(index)}/cached-releases", timeout=30)
+
+    def motor_firmware_import(self, index: int, manifest_path: str) -> JsonValue:
+        return self._request("POST", f"/api/v1/motor-firmware/{int(index)}/import",
+                             payload={"manifest_path": manifest_path}, timeout=30)
 
     def motor_firmware_download(self, index: int, release_id: str) -> JsonValue:
         if not re.fullmatch(r"[0-9a-f]{32}", release_id):

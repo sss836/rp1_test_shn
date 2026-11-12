@@ -162,6 +162,10 @@ class FactoryMainWindow(QMainWindow):
         "关节",
         "ID",
         "CAN",
+        "固件版本",
+        "读取状态",
+        "软件 / 硬件 / 协议（0x1E）",
+        "协议确认",
         "目标(°)",
         "实际(°)",
         "误差(°)",
@@ -176,6 +180,7 @@ class FactoryMainWindow(QMainWindow):
         "Iq 电流(A)",
         "驱动状态",
         "反馈头",
+        "实测Kt(N·m/A)",
     )
     ZERO_COLUMNS = (
         "关节",
@@ -227,6 +232,7 @@ class FactoryMainWindow(QMainWindow):
         self._configured = False
         self._motor_fault_reset_pending = False
         self._motor_discovery_pending = False
+        self._motor_enable_pending = False
         self._trajectory_imported = False
         self._preflight_ok = False
         self._preflight_pending = False
@@ -1834,7 +1840,10 @@ class FactoryMainWindow(QMainWindow):
         note = QLabel(
             "error_id 仅表示电机驱动器硬件报码；“软件诊断”显示通信超时等"
             "上位机安全诊断，并保留触发时记录。角度单位为度；"
-            "“—”表示尚未收到有效反馈。标零请使用独立的“电机标零”功能。"
+            "“—”表示尚未收到有效反馈。固件版本为自动查询的实际读回，"
+            "0x1E 列依次显示数值软件、硬件和协议读回，与固件字符串分别显示；"
+            "109显示估算力矩=Iq×该电机实测Kt，保留原始Iq；108沿用原力矩反馈。"
+            "读取成功不等于协议已确认。标零请使用独立的“电机标零”功能。"
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -1861,7 +1870,7 @@ class FactoryMainWindow(QMainWindow):
         self.motor_table.horizontalHeader().setMinimumSectionSize(42)
         self.motor_table.horizontalHeader().setDefaultSectionSize(68)
         for column, width in enumerate(
-            (130, 48, 58, 70, 70, 70, 78, 82, 72, 88, 88, 72, 200, 90, 88, 82, 70)
+            (130, 48, 58, 142, 124, 225, 150, 70, 70, 70, 78, 82, 72, 88, 88, 72, 200, 90, 88, 82, 70)
         ):
             if column:
                 self.motor_table.setColumnWidth(column, width)
@@ -2805,6 +2814,19 @@ class FactoryMainWindow(QMainWindow):
         zero_rows: list[tuple[Any, ...]] = []
         zero_tones: dict[tuple[int, int], str] = {}
         zero_metadata: list[dict[str, Any]] = []
+        # Match both bus and ID: multiple buses may contain the same motor ID.
+        # Ambiguous or incomplete identities must never inherit another motor's version.
+        versions: dict[tuple[str, str], Mapping[str, Any] | None] = {}
+        observations = snapshot.get("motor_versions")
+        if isinstance(observations, list):
+            for observation in observations:
+                if not isinstance(observation, Mapping):
+                    continue
+                interface, motor_id = observation.get("interface"), observation.get("motor_id")
+                if interface is None or motor_id is None or not str(interface).strip():
+                    continue
+                identity = (str(interface).strip(), str(motor_id).strip())
+                versions[identity] = observation if identity not in versions else None
         for row, raw_motor in enumerate(motors):
             motor = raw_motor if isinstance(raw_motor, Mapping) else {}
             target = self._pick(
@@ -2903,6 +2925,12 @@ class FactoryMainWindow(QMainWindow):
                 actual = "—"
                 explicit_error = "—"
                 speed = "—"
+            torque_display = "—" if stale else self._pick(motor, "torque", "torque_nm")
+            if motor.get("torque_is_estimated") and not stale:
+                if isinstance(torque_display, (int, float)) and math.isfinite(torque_display):
+                    torque_display = f"{torque_display:.3f}（估算）"
+                else:
+                    torque_display = "—（" + str(motor.get("torque_source") or "Kt待读取") + "）"
             drive_enabled = motor.get("drive_enabled")
             feedback_header = motor.get("feedback_header")
             values = (
@@ -2913,7 +2941,7 @@ class FactoryMainWindow(QMainWindow):
                 actual,
                 explicit_error,
                 speed,
-                ("—" if stale else self._pick(motor, "torque", "torque_nm")),
+                torque_display,
                 (
                     "—"
                     if stale
@@ -2952,9 +2980,56 @@ class FactoryMainWindow(QMainWindow):
                 "—" if stale else self._pick(motor, "iq_current_a"),
                 ("已使能" if drive_enabled else "已失能") if not stale and type(drive_enabled) is bool else "—",
                 f"0x{feedback_header:02X}" if not stale and type(feedback_header) is int else "—",
+                "—" if stale else motor.get("torque_kt_nm_a"),
             )
+            interface = self._pick(motor, "can", "can_interface", "interface", "bus", default=None)
+            identity = (str(interface).strip(), str(motor_id).strip()) if interface is not None and motor_id is not None else None
+            version = versions.get(identity) if identity is not None else None
+            firmware, version_status, numeric_identity, protocol_confirmation = "—", "未读取", "—", "—"
+            if isinstance(version, Mapping):
+                firmware = str(version.get("raw_firmware") or "—")
+                status = version.get("status")
+                protocol_confirmation = "待核实"
+                numeric_fields = tuple(str(version.get(name) or "—") for name in
+                                       ("numeric_software", "hardware", "protocol"))
+                if any(value != "—" for value in numeric_fields):
+                    numeric_identity = " / ".join(numeric_fields)
+                errors = version.get("errors")
+                firmware_error = str(errors.get("0x31") or "") if isinstance(errors, Mapping) else ""
+                if firmware == "—" and firmware_error:
+                    if "超时" in firmware_error or "timeout" in firmware_error.lower():
+                        firmware_failure = "固件超时"
+                    elif "不支持" in firmware_error:
+                        firmware_failure = "固件不支持"
+                    else:
+                        firmware_failure = "固件读取失败"
+                else:
+                    firmware_failure = ""
+                if status == "known":
+                    version_status = firmware_failure or ("部分读取" if errors or firmware == "—" else "已读取")
+                else:
+                    version_status = {"timeout": "读取超时", "stale": "已过期", "unsupported": "不支持", "unknown": "未知"}.get(status, "未知")
+                version_stale = (read_error or local_gap > DISPLAY_STALE_S or
+                    (isinstance(station, Mapping) and station.get("backend_connected") is False) or
+                    snapshot.get("connected") is False or status == "stale")
+                if version_stale:
+                    version_status = "过期·" + firmware_failure if firmware_failure else "已过期"
+                    if numeric_identity != "—":
+                        numeric_identity = "过期 · " + numeric_identity
+                    protocol_confirmation = "待核实（已过期）"
+                elif status == "known":
+                    source = version.get("protocol_confirmation_source")
+                    active_profile = version.get("active_profile")
+                    evidence = version.get("protocol_confirmation_evidence")
+                    if (source == "local_numeric_evidence" and active_profile == "legacy"
+                            and isinstance(evidence, str) and evidence.strip()):
+                        protocol_confirmation = "现场核实旧协议"
+                    elif source == "configured_identity" and active_profile:
+                        protocol_confirmation = "配置身份已核实"
+                    elif source == "firmware_readback" and active_profile:
+                        protocol_confirmation = "固件读回已核实"
             formatted_values = tuple(self._format_value(value) for value in values)
-            motor_rows.append(formatted_values)
+            motor_rows.append((*formatted_values[:3], firmware, version_status, numeric_identity, protocol_confirmation, *formatted_values[3:]))
             try:
                 has_error = int(values[11]) != 0
             except (TypeError, ValueError):
@@ -3007,6 +3082,11 @@ class FactoryMainWindow(QMainWindow):
                 }
             )
 
+        motor_tones = {(row, column + 4 if column >= 3 else column): tone
+                       for (row, column), tone in motor_tones.items()}
+        for row, values in enumerate(motor_rows):
+            if values[4] != "已读取":
+                motor_tones[(row, 4)] = "warning"
         self.motor_table_model.set_rows(motor_rows, tones=motor_tones)
         self.zero_table_model.set_rows(
             zero_rows,
@@ -3131,7 +3211,7 @@ class FactoryMainWindow(QMainWindow):
                 item.get("sample_count", 0),
                 self._degrees(item.get("tracking_rms_rad")),
                 self._degrees(item.get("tracking_max_rad")),
-                item.get("torque_peak_nm"),
+                (f"{item['torque_peak_nm']:.3f}（估算）" if item.get("torque_is_estimated") and isinstance(item.get("torque_peak_nm"), (int,float)) else item.get("torque_peak_nm")),
                 item.get("temperature_current_c"),
                 item.get("temperature_rise_c"),
                 item.get("error_samples", 0),
@@ -3500,6 +3580,7 @@ class FactoryMainWindow(QMainWindow):
             "状态读取\n"
             + (
                 "正在确认反馈，保持未使能" if self._motor_discovery_pending else
+                "正在读取固件与协议，保持未使能" if self._motor_protocols_pending(snapshot) else
                 "只读、未施加力矩"
                 if self._motors_discovered and not self._motors_enabled
                 else ("实时控制反馈" if self._motors_enabled else "等待连接")
@@ -3519,7 +3600,7 @@ class FactoryMainWindow(QMainWindow):
         )
         set_tone(
             self.feedback_read_label,
-            "success" if self._motors_discovered else "warning",
+            "success" if self._motors_discovered and not self._motor_protocols_pending(snapshot) else "warning",
         )
         self._refresh_configuration_buttons()
         self._sync_preflight_controls(state)
@@ -3604,12 +3685,29 @@ class FactoryMainWindow(QMainWindow):
             not pending and command != "failed" and fresh and self._configured and self._can_connected
             and not self._motors_discovered and not self._motor_discovery_pending
         )
-        self.enable_motors_button.setEnabled(
-            not pending and self._motors_discovered and not self._motors_enabled
-            and not self._motor_fault_reset_pending and not self._motor_discovery_pending
-        )
+        self._refresh_motor_enable_button(snapshot)
         self.disconnect_button.setEnabled(
             not pending and (self._can_connected or self._motors_discovered)
+        )
+
+    @staticmethod
+    def _motor_protocols_pending(snapshot: Mapping[str, Any]) -> bool:
+        station = snapshot.get("station")
+        return isinstance(station, Mapping) and station.get("motor_protocols_pending") is True
+
+    def _refresh_motor_enable_button(self, snapshot: Mapping[str, Any]) -> None:
+        reading = self._motors_discovered and self._motor_protocols_pending(snapshot)
+        if self._motor_enable_pending:
+            label = "使能请求处理中…"
+        elif reading:
+            label = "读取固件与协议…"
+        else:
+            label = "3. 确认使能"
+        self.enable_motors_button.setText(label)
+        self.enable_motors_button.setEnabled(
+            self._can_command_id is None and self._motors_discovered and not self._motors_enabled
+            and not reading and not self._motor_enable_pending
+            and not self._motor_fault_reset_pending and not self._motor_discovery_pending
         )
 
     @staticmethod
@@ -4465,11 +4563,12 @@ class FactoryMainWindow(QMainWindow):
             snapshot = payload.get("snapshot", payload)
             if isinstance(snapshot, Mapping):
                 self._render_snapshot(dict(snapshot))
-        self.enable_motors_button.setEnabled(True)
+        self._refresh_motor_enable_button(self._last_snapshot)
         self.disconnect_button.setEnabled(True)
 
     def _enable_motors(self) -> None:
-        if self._can_command_id is not None:
+        self._refresh_motor_enable_button(self._last_snapshot)
+        if not self.enable_motors_button.isEnabled():
             return
         answer = QMessageBox.question(
             self,
@@ -4482,15 +4581,22 @@ class FactoryMainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        self.enable_motors_button.setEnabled(False)
+        # A fresh snapshot can arrive while the confirmation dialog is open.
+        self._refresh_motor_enable_button(self._last_snapshot)
+        if not self.enable_motors_button.isEnabled():
+            return
+        self._motor_enable_pending = True
+        self._refresh_motor_enable_button(self._last_snapshot)
         self._run_rest(
             "确认并使能电机",
             lambda: self.client.enable_motors(physical_estop_confirmed=True),
             self._motors_enabled_ok,
-            on_finished=lambda: self.enable_motors_button.setEnabled(
-                self._motors_discovered and not self._motors_enabled
-            ),
+            on_finished=self._motor_enable_finished,
         )
+
+    def _motor_enable_finished(self) -> None:
+        self._motor_enable_pending = False
+        self._refresh_motor_enable_button(self._last_snapshot)
 
     def _motors_enabled_ok(self, payload: Any) -> None:
         self._motors_enabled = True
@@ -6031,7 +6137,7 @@ class FactoryMainWindow(QMainWindow):
         self._preflight_ok = False
         if isinstance(payload, Mapping):
             self._render_snapshot(dict(payload))
-        self.enable_motors_button.setEnabled(self._motors_discovered)
+        self._refresh_motor_enable_button(self._last_snapshot)
         self.start_button.setEnabled(False)
 
     def _extract_zeroing(self, payload: Any) -> dict[str, Any] | None:
