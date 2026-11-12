@@ -4,27 +4,17 @@ import argparse
 import base64
 import json
 from pathlib import Path
-import re
 import subprocess
+import sys
 import tempfile
+
+# Keep the administrator's signing tool usable with only Python and OpenSSL.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "factory_hmi"))
+from motor_ota_policy import validate_policy
 
 
 def prepare(metadata, private_key, output):
-    fields={'model','hardware','protocol','raw_version','software_version','ota_protocol','evidence_url','evidence_sha256'}
-    if set(metadata)!={'schema','entries'} or metadata['schema']!='rp1-lro-ota-compatibility-v1' or not 1<=len(metadata['entries'])<=1024:
-        raise ValueError('invalid OTA mapping schema or entry count')
-    seen=set()
-    for row in metadata['entries']:
-        if (set(row)!=fields or any(not isinstance(v,str) for v in row.values()) or
-            row['model'] not in {'LRO_5550','LRO_6562','LRO_8462','LRO_10062'} or
-            not re.fullmatch(r'\d+\.\d+\.\d+',row['software_version']) or
-            tuple(map(int,row['software_version'].split('.')))<(1,0,8) or
-            row['ota_protocol']!='lro-canfd-xcp-v1' or not row['evidence_url'].startswith('https://') or
-            not re.fullmatch(r'[0-9a-f]{64}',row['evidence_sha256'])):
-            raise ValueError('explicit 108+ version relationship and source evidence required')
-        identity=tuple(row[k] for k in ('model','hardware','protocol','raw_version'))
-        if identity in seen:raise ValueError('duplicate OTA identity')
-        seen.add(identity)
+    validate_policy(metadata)
     with tempfile.TemporaryDirectory(prefix='motor-ota-sign-') as temp:
         path=Path(temp)/'policy.json'
         path.write_bytes(json.dumps(metadata,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode())

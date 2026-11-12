@@ -10,8 +10,8 @@ import time
 import uuid
 import logging
 from factory_hmi.motor_parameter_contract import validate,applicable,compare,display,sha,pn_profile,spec,PN_SCRIPT_PROFILE
-from .motor_maintenance import ModuleFirmwareMaintenance,SERIAL_LOCK,now,digest
-from .parameter_reference import reference_fields
+from .motor_maintenance import ModuleFirmwareMaintenance,SERIAL_LOCK,now,digest,generation_for_target
+from .parameter_reference import reference_fields,script_reference,SCRIPT_REFERENCE_SHA256
 from .motor_parameter_transport import ScriptParameterSession,SessionQuarantinedError
 
 
@@ -72,12 +72,15 @@ class ModuleParameterMaintenance(ModuleFirmwareMaintenance):
                 elif item.get('status')=='pending':item['status']='not_run'
         value['summary']={key:sum(i.get('write_status')==key for r in value['targets'] for i in r.get('items',[])) for key in ('not_written','send_uncertain_unverified','written_unverified','written_verified')}
 
-    def _selections(self,selections):
+    def _selections(self,selections,configuration_sha256=None):
         if not isinstance(selections,list) or not selections:raise ValueError('请选择至少一台电机与已发布模板')
         if any(not isinstance(s,dict) or set(s)!={'index','template_id'} or type(s['index'])is not int for s in selections):raise ValueError('仅接受当前实例目标索引及模板编号')
         indices=[r['index'] for r in selections]
         if len(set(indices))!=len(indices):raise ValueError('重复维护目标')
-        targets=self.targets();by_index={r['index']:r for r in targets};obs={r['index']:r for r in self.observations()};rows=[]
+        targets=self.targets();configuration=digest(targets)
+        if configuration_sha256 is not None and configuration_sha256!=configuration:
+            raise ValueError('当前有效配置已变化，请刷新电机列表')
+        by_index={r['index']:r for r in targets};obs={r['index']:r for r in self.observations()};rows=[]
         for selection in selections:
             if selection['index'] not in by_index:raise ValueError('目标不属于当前配对实例')
             target=by_index[selection['index']];before=obs.get(target['index'],{})
@@ -95,7 +98,7 @@ class ModuleParameterMaintenance(ModuleFirmwareMaintenance):
             rows.append(dict(target,before=before,template_record=record,status='pending',
                 power_cycle_required=False,human_acknowledged_at=None,post_power_verified=False,
                 items=items))
-        return rows,digest(targets)
+        return rows,configuration
 
     @staticmethod
     def _identity(target,observation):
@@ -105,12 +108,52 @@ class ModuleParameterMaintenance(ModuleFirmwareMaintenance):
         except (ValueError,KeyError,TypeError) as exc:raise ValueError('实际版本时间无效') from exc
         if not 0<=age<=180:raise ValueError('实际版本证据已过期')
 
-    def read(self,selections):
+    def read(self,selections,*,configuration_sha256=None):
         with self._lock:
             if self.active:raise RuntimeError('已有维护任务')
-            actor=self.authorize();rows,configuration=self._selections(selections)
+            actor=self.authorize();rows,configuration=self._selections(selections,configuration_sha256)
             self._preview=None
             return self._launch('read',rows,actor,configuration)
+
+    def read_reference(self, indices, configuration_sha256):
+        """Inspect selected motors without a published template or any write path."""
+        with self._lock:
+            if self.active:
+                raise RuntimeError('已有维护任务')
+            self._preview = None
+            actor = self.authorize()
+            targets = self.targets()
+            configuration = digest(targets)
+            if configuration_sha256 != configuration:
+                raise ValueError('当前有效配置已变化，请刷新电机列表')
+            if (not isinstance(indices, list) or not indices or any(type(i) is not int for i in indices)
+                    or len(indices) != len(set(indices))):
+                raise ValueError('请选择非空且不重复的电机')
+            by_index = {row['index']:row for row in targets}
+            observations = {row['index']:row for row in self.observations()}
+            rows = []
+            for index in indices:
+                if index not in by_index:
+                    raise ValueError('所选电机不属于当前模块')
+                target, before = by_index[index], observations.get(index, {})
+                generation = generation_for_target(target, before, require_protocol=False)
+                if generation not in (108,109) or generation == 109 and not before.get('protocol'):
+                    raise ValueError(f"{target['joint_name']} 未取得所需的 108/109 实际版本")
+                reference = script_reference(target['model'])
+                items = []
+                for entry in reference['entries']:
+                    pn = spec(entry['key'])['pn'] is not None
+                    if pn and generation == 108:
+                        continue
+                    item = dict(entry,status='pending',write_status='not_written',actual=None,
+                                immediate=None,post_power=None,**display(entry,None),**reference_fields(entry['key']))
+                    if pn:
+                        item['_protocol_profile'] = PN_SCRIPT_PROFILE
+                    items.append(item)
+                rows.append(dict(target,before=before,firmware_generation=generation,
+                                 reference_source=reference['source'],reference_sha256=SCRIPT_REFERENCE_SHA256,
+                                 status='pending',power_cycle_required=False,items=items))
+            return self._launch('read_reference',rows,actor,configuration)
 
     def preview(self,read_job_id):
         with self._lock:
@@ -179,8 +222,13 @@ class ModuleParameterMaintenance(ModuleFirmwareMaintenance):
         if digest(self.targets())!=self._job['configuration_sha256']:raise ValueError('当前有效配置已变化')
         observation=self.version_reader(row,self._stop)
         self._identity(row,observation)
-        t=row['template_record']['template']
-        if not applicable(t,observation) or self.template(t['template_id'],observation)!=row['template_record']:raise ValueError('模板发布状态或实际版本适用性已变化')
+        if self._job['mode']=='read_reference':
+            if (generation_for_target(row,observation,require_protocol=row['firmware_generation']==109)!=row['firmware_generation']
+                    or any(observation.get(key)!=row['before'].get(key) for key in ('raw_firmware','software','hardware','protocol'))):
+                raise ValueError('实际版本已变化，请刷新后重新检查')
+        else:
+            t=row['template_record']['template']
+            if not applicable(t,observation) or self.template(t['template_id'],observation)!=row['template_record']:raise ValueError('模板发布状态或实际版本适用性已变化')
         row['version_before_operation']=observation
 
     @staticmethod
@@ -265,7 +313,10 @@ class ModuleParameterMaintenance(ModuleFirmwareMaintenance):
         return receipt
 
     def _run(self):
-        current=None;current_item=None;terminal='checked' if self._job['mode']=='read' else 'verified';error=None
+        mode = self._job['mode']
+        reference_only = mode == 'read_reference'
+        read_only = mode in ('read', 'read_reference')
+        current=None;current_item=None;terminal='reference_checked' if reference_only else ('checked' if read_only else 'verified');error=None
         try:
             if not SERIAL_LOCK.acquire(blocking=False):raise RuntimeError('本机已有固件或参数维护任务')
             self._serial_owned=True;self._script_session=None
@@ -288,15 +339,19 @@ class ModuleParameterMaintenance(ModuleFirmwareMaintenance):
             for row in self._job['targets']:
                 current=row;current_item=None;self._validate_current(row)
                 with self._lock:
-                    row['status']=self._job['status']='reading' if self._job['mode']=='read' else 'writing';self._save()
+                    row['status']=self._job['status']='reading' if read_only else 'writing';self._save()
                 for item in row['items']:
                     current_item=item
                     self._check()
-                    result=self._read_item(row,item,'actual' if self._job['mode']=='read' else 'actual_before_operation')
+                    result=self._read_item(row,item,'actual' if read_only else 'actual_before_operation')
                     with self._lock:
                         item['actual_before_operation']=result
-                        if self._job['mode']=='read':
-                            item.update(actual=result,status=compare(item,result),**display(item,result.get('raw')));self._save()
+                        if read_only:
+                            status=compare(item,result)
+                            if reference_only and status in ('passed','mismatch'):
+                                status = 'read' if row['firmware_generation']==108 else (
+                                    'reference_match' if status=='passed' else 'reference_difference')
+                            item.update(actual=result,status=status,**display(item,result.get('raw')));self._save()
                             continue
                     if result.get('status')!='read' or result.get('raw')!=item['old_raw']:raise ValueError(f"{item['key']} 写前实际值变化或不可核对；停止，需重新读取")
                     self._check()
@@ -312,7 +367,7 @@ class ModuleParameterMaintenance(ModuleFirmwareMaintenance):
                     if item['status']!='passed':raise RuntimeError(f"{item['key']} 写后即时回读未通过；停止后续项，不整体回滚")
                     with self._lock:
                         item['write_status']='written_verified';self._save()
-                if self._job['mode']=='read':
+                if read_only:
                     with self._lock:row['status']='checked';self._save()
                     continue
                 with self._lock:
@@ -329,7 +384,10 @@ class ModuleParameterMaintenance(ModuleFirmwareMaintenance):
                     if item['post_power_status']!='passed':raise RuntimeError('人工确认后独立回读不符或未知；不能宣称重新上电后核验通过')
                 with self._lock:row.update(post_power_verified=True,status='verified');self._save()
             self._check_script_idle(row=current,item=current_item,phase='before_terminal')
-            if self._job['mode']=='read' and any(i['status']!='passed' for r in self._job['targets'] for i in r['items']):terminal='checked_with_differences'
+            if read_only:
+                good = {'read','reference_match'} if reference_only else {'passed'}
+                if any(i['status'] not in good for r in self._job['targets'] for i in r['items']):
+                    terminal = 'reference_checked_with_findings' if reference_only else 'checked_with_differences'
         except Exception as exc:
             terminal='interrupted' if isinstance(exc,InterruptedError) else 'failed';error=str(exc)
         finally:

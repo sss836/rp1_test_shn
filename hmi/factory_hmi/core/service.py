@@ -18,7 +18,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from factory_hmi.models import StationConfig, StationState
+from factory_hmi.models import MotorZeroResult, StationConfig, StationState
 
 from ._legacy import motor_default_positions
 from .backend import FakeMotorBackend, MotorsPyBackend
@@ -1016,6 +1016,8 @@ class FactoryService:
                 ),
                 "trajectory": trajectory.to_dict() if trajectory else {},
             }
+            if any(entry.lro_protocol is not None for entry in controller.config.entries):
+                report_context["motor_protocol_observations"] = controller.backend.motor_versions()
             if data_domain == "FACTORY":
                 from .factory_quality import freeze_factory_quality
                 report_context["factory_quality_policy"] = freeze_factory_quality(report_context)
@@ -1576,7 +1578,8 @@ class FactoryService:
         if allow_on_fault:
             raise ValueError("factory gateway does not permit fault-state zeroing")
         result = self._require_zeroing().confirm(force_on_error=False)
-        return {"zeroed": bool(result), "zeroing": self._require_zeroing().snapshot()}
+        return {"zeroed": result is MotorZeroResult.CONFIRMED, "status": result.value,
+                "zeroing": self._require_zeroing().snapshot()}
 
     def zero_skip(self) -> dict[str, Any]:
         skipped = self._require_zeroing().skip()

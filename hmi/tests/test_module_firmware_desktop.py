@@ -6,7 +6,7 @@ from shiboken6 import isValid
 from PySide6.QtWidgets import QApplication,QMessageBox
 from PySide6.QtCore import Qt,QCoreApplication,QEvent
 import pytest
-from factory_hmi.desktop.motor_maintenance_dialog import MotorMaintenanceDialog
+from factory_hmi.desktop.motor_maintenance_dialog import MODULE_UPGRADE, SELECTED_UPGRADE, MotorMaintenanceDialog
 
 
 @pytest.fixture
@@ -86,3 +86,45 @@ def test_operator_summary_exposes_review_evidence_without_internal_session_field
 def test_cleanup_failure_remains_visible_and_does_not_claim_resource_release():
     text=MotorMaintenanceDialog.describe(dict(status='interrupted',cleanup_quarantined=True,cleanup_error='synthetic journal failure',targets=[]))
     assert '收尾未完成' in text and '资源保持隔离' in text and 'synthetic journal failure' in text
+
+
+def test_108_to_109_scope_sends_only_approved_108_targets(dialog):
+    parent, run, client, state, app = dialog
+    legacy = parent.rows[0]
+    release = dict(version='fixture-109', model='LRO_8462', sha256='b'*64, release_id='b'*32)
+    first = dict(legacy, firmware_generation=108, observation={'raw_firmware': 'fixture-108'},
+                 upgrade_109_releases=[release])
+    other_108 = dict(first, index=1, motor_id=78, joint_name='关节 2')
+    already = dict(legacy, index=2, motor_id=79, joint_name='关节 3',
+                   firmware_generation=109, observation={'raw_firmware': 'fixture-109'})
+    unknown = dict(legacy, index=3, motor_id=80, joint_name='关节 4', observation={'software': '1.0.8'})
+    d = MotorMaintenanceDialog(client, run, lambda:state['identity'], parent,
+                               selected_motor=(1, 'can9', 78, 'LRO_8462'), scope=SELECTED_UPGRADE)
+    d.timer.stop()
+    idle = {'active': False, 'status': 'idle'}
+    complete(run, {'targets': [first, other_108, already, unknown], 'job': idle})
+    assert d.selected_rows() == [1]
+    assert not d.table.item(2, 0).flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert '108/109 未核实' in d.table.item(3, 8).text()
+    d.preview()
+    run.call_args.args[1]()
+    assert client.motor_maintenance_action.call_args.args == (
+        'preview', {'mode': SELECTED_UPGRADE, 'selections': [{'index': 1, 'release_id': 'b'*32}]})
+    complete(run, {'preview_id': 'selected', 'targets': []})
+    d.scope.setCurrentIndex(d.scope.findData(MODULE_UPGRADE))
+    assert d.preview_value is None
+    assert d.selected_rows() == [0, 1]
+    assert not d.preview_button.isEnabled() and '身份未核实' in d.scope_hint.text()
+
+    d.reload()
+    complete(run, {'targets': [first, other_108, already], 'job': idle, 'configuration_sha256': 'd'*64})
+    assert d.preview_button.isEnabled() and '109 的 1 台将跳过' in d.scope_hint.text()
+    assert not d.table.item(0, 0).flags() & Qt.ItemFlag.ItemIsUserCheckable
+    d.preview()
+    run.call_args.args[1]()
+    assert client.motor_maintenance_action.call_args.args == (
+        'preview', {'mode': MODULE_UPGRADE, 'configuration_sha256': 'd'*64, 'selections': [
+            {'index': 0, 'release_id': 'b'*32}, {'index': 1, 'release_id': 'b'*32}]})
+    complete(run, {'preview_id': 'whole', 'targets': [],
+                   'skipped_targets': [dict(already, before=already['observation'], status='already_109')]})
+    assert '跳过已是 109 的电机：关节 3 · can9 ID 79' in d.details.toPlainText()

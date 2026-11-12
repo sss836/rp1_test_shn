@@ -9,8 +9,10 @@
 #include <iostream>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -110,6 +112,11 @@ class MotorDriver {
     // Read-only version queries. Empty payload means pending/unsupported.
     virtual bool request_version(uint8_t code) { return false; }
     virtual std::vector<uint8_t> version_payload(uint8_t code) { return {}; }
+    // Protocol profiles are selected explicitly using evidence outside the driver.
+    virtual bool set_lro_protocol_profile(const std::string&) { return false; }
+    virtual std::optional<std::string> get_lro_protocol_profile() const { return std::nullopt; }
+    // This submits a marking command. A fresh boot and readback must verify it.
+    virtual bool request_lro_zero() { return false; }
     // to enum and union
 
     /**
@@ -300,6 +307,13 @@ class MotorDriver {
      * @return The current (electric current) of the motor.
      */
     virtual float get_motor_current() { return motor_current_; }
+
+    // Unavailable observations are NaN or nullopt, including before the first frame.
+    virtual float get_motor_iq_current() const { return std::numeric_limits<float>::quiet_NaN(); }
+    virtual float get_motor_dc_bus_voltage() const { return std::numeric_limits<float>::quiet_NaN(); }
+    virtual float get_motor_dc_bus_current() const { return std::numeric_limits<float>::quiet_NaN(); }
+    virtual std::optional<bool> get_motor_drive_enabled() const { return std::nullopt; }
+    virtual std::optional<uint8_t> get_motor_feedback_header() const { return std::nullopt; }
 
     /**
      * @brief Retrieves the temperature of the motor.

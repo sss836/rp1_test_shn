@@ -118,6 +118,11 @@ class MotorSample:
     error_id: int
     bus_voltage_v: float = float("nan")
     bus_current_a: float = float("nan")
+    iq_current_a: float = float("nan")
+    drive_enabled: bool | None = None
+    feedback_header: int | None = None
+    lro_protocol_profile: str | None = None
+    fault_code_available: bool = True
 
 
 class ControllerHeartbeat:
@@ -230,16 +235,24 @@ def read_motor_samples(motors, *, cmd_pos: list[float] | None = None) -> list[Mo
             cmd = float(cmd_pos[index])
         else:
             cmd = _read_motor_cmd_pos(motor)
+        get_profile = getattr(motor, "get_lro_protocol_profile", None)
+        profile = get_profile() if get_profile is not None else None
+        v103 = profile == "v1.03"
+        get_header = getattr(motor, "get_motor_feedback_header", None)
         samples.append(
             MotorSample(
                 pos_rad=float(motor.get_motor_pos()),
                 cmd_pos_rad=cmd,
                 spd_rad_s=float(motor.get_motor_spd()),
-                torque_nm=float(motor.get_motor_current()),
+                torque_nm=float("nan") if v103 else float(motor.get_motor_current()),
                 temp_c=float(motor.get_motor_temperature()),
                 error_id=int(motor.get_error_id()),
                 bus_voltage_v=_read_optional_float(motor, "get_motor_dc_bus_voltage"),
                 bus_current_a=_read_optional_float(motor, "get_motor_dc_bus_current"),
+                iq_current_a=_read_optional_float(motor, "get_motor_iq_current") if v103 else float("nan"),
+                drive_enabled=motor.get_motor_drive_enabled() if v103 else None,
+                feedback_header=get_header() if get_header is not None else None,
+                lro_protocol_profile=profile,
             )
         )
     return samples
@@ -268,6 +281,8 @@ def csv_fieldnames(entries: list[MotorEntry]) -> list[str]:
                 f"{prefix}_bus_current_a",
             ]
         )
+        if entry.lro_protocol_profile == "v1.03":
+            fields.extend([f"{prefix}_iq_current_a", f"{prefix}_drive_enabled", f"{prefix}_feedback_header"])
     return fields
 
 
@@ -277,10 +292,10 @@ def sample_row(
     *,
     elapsed_s: float,
     sample: int,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | None]:
     if len(samples) != len(entries):
         raise ValueError("sample count does not match motor entries")
-    row: dict[str, float | int] = {
+    row: dict[str, float | int | None] = {
         "time_s": elapsed_s,
         "sample": sample,
     }
@@ -291,9 +306,13 @@ def sample_row(
         row[f"{prefix}_spd_rad_s"] = item.spd_rad_s
         row[f"{prefix}_torque_nm"] = item.torque_nm
         row[f"{prefix}_temp_c"] = item.temp_c
-        row[f"{prefix}_error_id"] = item.error_id
+        row[f"{prefix}_error_id"] = item.error_id if item.fault_code_available else None
         row[f"{prefix}_bus_voltage_v"] = item.bus_voltage_v
         row[f"{prefix}_bus_current_a"] = item.bus_current_a
+        if entry.lro_protocol_profile == "v1.03":
+            row[f"{prefix}_iq_current_a"] = item.iq_current_a
+            row[f"{prefix}_drive_enabled"] = None if item.drive_enabled is None else int(item.drive_enabled)
+            row[f"{prefix}_feedback_header"] = item.feedback_header
     return row
 
 
@@ -320,7 +339,7 @@ def print_terminal_status(
         cmd_text = f" cmd={item.cmd_pos_rad:+.4f}" if math.isfinite(item.cmd_pos_rad) else ""
         parts.append(
             f"{label}: pos={item.pos_rad:+.4f}{cmd_text} "
-            f"torque={item.torque_nm:+.2f}Nm temp={item.temp_c:.0f}C"
+            f"{load_text(item)} temp={item.temp_c:.0f}C"
         )
     print(" | ".join(parts))
 
@@ -337,16 +356,27 @@ LRO_ERROR_NAMES: dict[int, str] = {
     0x06: "BRAKE_OVERVOLT",
     0x07: "DRV_ERROR",
 }
+LRO_V103_ERROR_NAMES = {**LRO_ERROR_NAMES, 0x05: "PHASE_LOSS_OR_CURRENT_OFFSET",
+                        0x06: "OVER_VOLTAGE", 0x07: "OTHER_ERROR"}
 
 
-def motor_error_label(error_id: int) -> str:
+def motor_error_label(error_id: int, profile: str | None = "legacy") -> str:
     err = int(error_id)
     if err == 0:
         return "0"
-    name = LRO_ERROR_NAMES.get(err)
+    names = LRO_V103_ERROR_NAMES if profile == "v1.03" else LRO_ERROR_NAMES if profile == "legacy" else {}
+    name = names.get(err)
     if name:
         return f"0x{err:x} ({name})"
     return f"0x{err:x}"
+
+
+def load_text(sample: MotorSample) -> str:
+    if math.isfinite(sample.torque_nm):
+        return f"torque={sample.torque_nm:+.2f}Nm"
+    if math.isfinite(sample.iq_current_a):
+        return f"iq_current={sample.iq_current_a:+.2f}A"
+    return "load=unavailable"
 
 
 @dataclass(frozen=True)
@@ -354,6 +384,7 @@ class FaultRecord:
     motor_id: int
     joint_label: str
     error_id: int
+    lro_protocol_profile: str | None = None
 
 
 class FaultLatch:
@@ -371,6 +402,7 @@ class FaultLatch:
                 motor_id=int(entry.motor_id),
                 joint_label=short_joint_name(entry.joint_name),
                 error_id=err,
+                lro_protocol_profile=item.lro_protocol_profile,
             )
 
     def records(self) -> list[FaultRecord]:
@@ -381,7 +413,7 @@ class FaultLatch:
         if not records:
             return None
         parts = [
-            f"id={record.motor_id}({record.joint_label}) {motor_error_label(record.error_id)}"
+            f"id={record.motor_id}({record.joint_label}) {motor_error_label(record.error_id, record.lro_protocol_profile)}"
             for record in records
         ]
         text = "*** FAULT (latched): " + " | ".join(parts) + " ***"
@@ -452,11 +484,11 @@ def telemetry_live_lines(
         label = short_joint_name(entry.joint_name)
         cmd_text = f"cmd {item.cmd_pos_rad:+.6f}  " if math.isfinite(item.cmd_pos_rad) else ""
         err = int(item.error_id)
-        err_text = f"!! err {motor_error_label(err)} !!" if err else "err 0"
+        err_text = f"!! err {motor_error_label(err, item.lro_protocol_profile)} !!" if err else "err 0"
         lines.append(
             f"[{entry.index}] {label:<14} id={entry.motor_id}  "
             f"pos {item.pos_rad:+.6f}  {cmd_text}"
-            f"torque {item.torque_nm:+.2f}Nm  temp {item.temp_c:.0f}C  "
+            f"{load_text(item)}  temp {item.temp_c:.0f}C  "
             f"spd {item.spd_rad_s:+.4f}  {err_text}"
         )
     return lines
@@ -645,6 +677,7 @@ def samples_to_line_protocol(
             ("cmd_pos_rad", item.cmd_pos_rad),
             ("spd_rad_s", item.spd_rad_s),
             ("torque_nm", item.torque_nm),
+            ("iq_current_a", item.iq_current_a),
             ("temp_c", item.temp_c),
             ("bus_voltage_v", item.bus_voltage_v),
             ("bus_current_a", item.bus_current_a),
@@ -1437,10 +1470,7 @@ def main() -> int:
     print(f"output: {args.output}")
     print_motor_table(entries)
     print("CSV columns:", ", ".join(fieldnames))
-    print(
-        "note: get_motor_current() is motor output torque (Nm) on LRO; "
-        "get_motor_temperature() is coil temperature in deg C"
-    )
+    print("note: LRO legacy reports torque in Nm; V1.03 reports Iq current in A")
 
     if args.query:
         print("mode: active query (refresh_motor_status per motor each sample)")
@@ -1459,6 +1489,10 @@ def main() -> int:
 
     if args.dry_run:
         return 0
+
+    if any(entry.lro_protocol_profile == "v1.03" for entry in entries):
+        print("V1.03 requires node identity verification by the integrated HMI recorder", file=sys.stderr)
+        return 1
 
     add_motors_python_paths()
     try:

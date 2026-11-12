@@ -27,7 +27,7 @@ SUFFIX_UNITS = {
     "tracking_error_rad": "rad", "cmd_pos_rad": "rad", "pos_rad": "rad",
     "spd_rad_s": "rad/s", "vel_rad_s": "rad/s", "torque_nm": "N·m",
     "temp_c": "°C", "error_id": "", "bus_voltage_v": "V", "bus_current_a": "A",
-    "current_a": "A", "voltage_v": "V",
+    "iq_current_a": "A", "current_a": "A", "voltage_v": "V",
 }
 
 

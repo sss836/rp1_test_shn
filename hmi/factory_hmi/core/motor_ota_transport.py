@@ -98,6 +98,7 @@ def write_firmware(target, data, stop, progress, *, adapter_factory=None):
 
 def read_version(target, stop, *, socket_factory=socket.socket, timeout=.5):
     frame = struct.Struct("<IBB2x64s")
+    classic_frame = struct.Struct("<IB3x8s")
     values = {"index": target["index"], "interface": target["interface"],
               "motor_id": target["motor_id"], "model": target["model"],
               "status": "unknown", "raw_responses": {}}
@@ -121,10 +122,13 @@ def read_version(target, stop, *, socket_factory=socket.socket, timeout=.5):
                 if not select.select([bus], [], [], min(.02, max(0, deadline - time.monotonic())))[0]:
                     continue
                 raw = bus.recv(72)
-                if len(raw) != 72:
+                if len(raw) == frame.size:
+                    can_id, length, _, data = frame.unpack(raw)
+                elif len(raw) == classic_frame.size:
+                    can_id, length, data = classic_frame.unpack(raw)
+                else:
                     continue
-                can_id, length, flags, data = frame.unpack(raw)
-                if can_id != target["motor_id"] or not 2 <= length <= 64 or data[:2] != bytes([0xa0, code]):
+                if can_id != target["motor_id"] or not 2 <= length <= len(data) or data[:2] != bytes([0xa0, code]):
                     continue
                 try:
                     decoded = decode_version(data[:length])
@@ -134,10 +138,14 @@ def read_version(target, stop, *, socket_factory=socket.socket, timeout=.5):
                 if code == 0x1e and values.get("software") and decoded.get("software") != values["software"]:
                     values["status"] = "unknown"
                     values["error"] = "原始字符串与数值软件版本不一致；需精确映射"
+                if code == 0x1e:
+                    values["numeric_software"] = decoded["software"]
                 values.update({k: v for k, v in decoded.items() if v is not None})
                 break
     values["observed_at"] = datetime.now(timezone.utc).isoformat()
-    if all(values.get(k) for k in ("raw_firmware", "software", "hardware", "protocol")) and not values.get("error"):
+    # Some legacy replies have only eight bytes. Keep the actual identity
+    # available to read-only diagnostics; OTA still requires a protocol value.
+    if all(values.get(k) for k in ("raw_firmware", "numeric_software", "hardware")) and not values.get("error"):
         values["status"] = "known"
     elif not values["raw_responses"]:
         values["status"] = "timeout"

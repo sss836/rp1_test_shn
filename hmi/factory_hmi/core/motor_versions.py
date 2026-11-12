@@ -11,8 +11,7 @@ import re
 import threading
 import time
 
-
-MODEL_NAMES = {0: "LRO_5550", 1: "LRO_6562", 2: "LRO_8462", 3: "LRO_10062"}
+from ..motor_ota_policy import MODEL_NAMES, firmware_generation
 
 
 def decode_version(payload: bytes) -> dict:
@@ -37,9 +36,10 @@ def decode_version(payload: bytes) -> dict:
 
 
 class MotorVersions:
-    def __init__(self, entries, motors, *, timeout=.35, refresh=60., stale=180.):
+    def __init__(self, entries, motors, *, timeout=.35, refresh=60., stale=180., on_observation=None):
         self.entries, self.motors = tuple(entries), tuple(motors)
         self.timeout, self.refresh, self.stale = timeout, refresh, stale
+        self._on_observation = on_observation
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._rows = [self._empty(e) for e in self.entries]
@@ -125,5 +125,8 @@ class MotorVersions:
                         row["_monotonic"] = time.monotonic()
                 with self._lock:
                     self._rows[i] = row
+                if self._on_observation is not None and not self._stop.is_set():
+                    self._on_observation(i, {**row, "raw_responses": dict(row["raw_responses"]),
+                                             "errors": dict(row["errors"])})
             if self._stop.wait(self.refresh):
                 return

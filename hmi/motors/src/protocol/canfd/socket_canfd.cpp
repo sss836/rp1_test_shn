@@ -275,21 +275,26 @@ void MotorsSocketCANFD::close() {
 }
 
 void MotorsSocketCANFD::transmit(const canfd_frame &frame) {
+    try_transmit(frame);
+}
+
+bool MotorsSocketCANFD::try_transmit(const canfd_frame &frame) {
     bool queued = false;
     {
         std::lock_guard<std::mutex> lock(tx_mutex_);
         if (!receiving_) {
             logger_->error("Unable to transmit: Socket not open");
-            return;
+            return false;
         }
         queued = tx_queue_.bounded_push(frame);
     }
     if (!queued) {
         logger_->error("CAN-FD transmit queue on {} is full; dropping frame 0x{:X}",
                        interface_, frame.can_id);
-        return;
+        return false;
     }
     tx_cv_.notify_one();
+    return true;
 }
 
 void MotorsSocketCANFD::add_canfd_callback(const CanFdCbkFunc& callback, const CanFdCbkId id) {

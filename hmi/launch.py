@@ -446,6 +446,9 @@ def gateway_environment(root: Path, runtime: Path | None, *, offline: bool, driv
     motor_key = root / "config/motor-firmware-public-key.pem"
     if motor_key.is_file():
         env.setdefault("RP1_MOTOR_FIRMWARE_PUBLIC_KEY", str(motor_key))
+    motor_policy = root / "config/motor-ota-policy.json"
+    if motor_policy.is_file() and not motor_policy.is_symlink():
+        env.setdefault("RP1_MOTOR_OTA_POLICY", str(motor_policy))
     if runtime is not None:
         env["PYTHONPATH"] += os.pathsep + str(runtime)
         library_paths = [runtime]

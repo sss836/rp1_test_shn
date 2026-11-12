@@ -21,7 +21,10 @@ import motors_py
 assert Path(motors_py.__file__).resolve().parent == runtime
 required = ['create_motor', 'init_motor', 'deinit_motor', 'get_response_count',
             'get_feedback_count', 'refresh_motor_status', 'set_motor_control_mode',
-            'motor_mit_cmd', 'motors_mit_cmd', 'request_version', 'version_payload']
+            'motor_mit_cmd', 'motors_mit_cmd', 'request_version', 'version_payload',
+            'set_lro_protocol_profile', 'get_lro_protocol_profile', 'get_motor_iq_current',
+            'get_motor_dc_bus_voltage', 'get_motor_dc_bus_current', 'get_motor_drive_enabled',
+            'get_motor_feedback_header', 'request_lro_zero']
 for name in required:
     assert hasattr(motors_py.MotorDriver, name), name
 assert hasattr(motors_py.MotorControlMode, 'MIT')

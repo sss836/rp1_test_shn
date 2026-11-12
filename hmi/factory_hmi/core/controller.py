@@ -14,6 +14,7 @@ import numpy as np
 from factory_hmi.models import (
     FaultStatus,
     MotorSample,
+    MotorZeroResult,
     PlaybackOptions,
     StationConfig,
     StationState,
@@ -212,12 +213,13 @@ class FactoryController:
             self._default_return_stop.clear()
             self._motor_recovery_active.set()
             try:
+                self.backend.prepare_motor_protocols(self._check_motor_operation_cancelled)
                 before = self._confirm_motor_feedback("before motor enable")
                 self._check_motor_positions(before)
                 self._check_motor_operation_cancelled()
                 self.backend.enable_motors()
                 self._last_samples = self._confirm_motor_feedback(
-                    "after motor enable", baseline=before, updates=1
+                    "after motor enable", baseline=before, updates=1, require_drive_enabled=True
                 )
                 self._check_motor_positions(self._last_samples)
                 self._check_motor_operation_cancelled()
@@ -269,6 +271,7 @@ class FactoryController:
         updates: int = 2,
         timeout_s: float | None = None,
         poll_interval_s: float = 0.005,
+        require_drive_enabled: bool = False,
     ) -> list[MotorSample]:
         """Require new replies from every motor; cached zero errors cannot pass.
 
@@ -305,13 +308,18 @@ class FactoryController:
                     and np.isfinite(sample.feedback_age_s)
                     and 0 <= sample.feedback_age_s < stale_seconds
                 )
-                if not fresh:
+                if (not fresh or (not allow_errors and not sample.fault_code_available)
+                        or (require_drive_enabled and self.config.entries[index].lro_protocol_profile == "v1.03"
+                            and sample.drive_enabled is not True)):
                     progress[index] = 0
                 elif sample.timestamp_s > stamps[index]:
                     if not np.isfinite(sample.pos_rad):
                         raise FactoryControllerError(f"{phase}: non-finite position: bus={sample.bus}:id={sample.motor_id}")
                     if not allow_errors and sample.error_id != 0:
-                        raise FactoryControllerError(f"{phase}: motor error: bus={sample.bus}:id={sample.motor_id}:error_id={sample.error_id}")
+                        raise FactoryControllerError(
+                            f"{phase}: motor error: bus={sample.bus}:id={sample.motor_id}:error_id={sample.error_id} "
+                            f"protocol_profile={sample.lro_protocol_profile}"
+                        )
                     # Two replies separated by an expired interval do not
                     # establish stable readiness in the longer startup window.
                     if sample.timestamp_s - stamps[index] >= stale_seconds:
@@ -380,6 +388,7 @@ class FactoryController:
                 if self.backend.connected:
                     self.backend.disconnect()
                 self.backend.open_transport()
+                self.backend.prepare_motor_protocols(self._check_motor_operation_cancelled)
                 before = self._confirm_motor_feedback("before fault reset", allow_errors=True)
                 self._check_motor_operation_cancelled()
                 self.backend.clear_errors()
@@ -1032,22 +1041,26 @@ class FactoryController:
             )
 
         zeroed: list[dict[str, Any]] = []
+        pending_reboot: list[dict[str, Any]] = []
         warnings: list[str] = []
         for index in normalized:
             entry = self.config.entries[index]
-            acknowledged = self.backend.zero_motor(
+            result = self.backend.submit_motor_zero(
                 index,
                 force_on_error=False,
             )
-            zeroed.append(
-                {
-                    "index": index,
-                    "motor_id": int(entry.motor_id),
-                    "joint_name": entry.joint_name,
-                    "acknowledged": bool(acknowledged),
-                }
-            )
-            if not acknowledged:
+            item = {
+                "index": index,
+                "motor_id": int(entry.motor_id),
+                "joint_name": entry.joint_name,
+                "acknowledged": result is MotorZeroResult.CONFIRMED,
+                "status": result.value,
+            }
+            if result is MotorZeroResult.SUBMITTED_PENDING_REBOOT:
+                pending_reboot.append(item)
+                continue
+            zeroed.append(item)
+            if result is MotorZeroResult.UNCONFIRMED:
                 warnings.append(
                     f"{entry.joint_name} (ID {entry.motor_id}) received the "
                     "set-zero command but did not report a near-zero position"
@@ -1062,6 +1075,7 @@ class FactoryController:
             self._last_samples = refreshed
         return {
             "zeroed": zeroed,
+            "pending_reboot": pending_reboot,
             "warnings": warnings,
             "motors_enabled": False,
         }

@@ -1542,15 +1542,29 @@ def create_app(
             actor = task.authorize()
             from .motor_maintenance import visible_job
             job = visible_job(task, actor)
-            from .motor_maintenance import cached_releases
+            from .motor_maintenance import cached_releases, cached_109_releases
+            from factory_hmi.core.motor_maintenance import digest, generation_for_target
             observed = {r["index"]: r for r in service.controller.backend.motor_versions()}
             targets = service.maintenance_targets()
+            configuration = digest(targets)
             for row in targets:
+                observation = observed.get(row["index"], {})
+                generation = generation_for_target(row, observation)
+                row.update(observation=observation, firmware_generation=generation,
+                           cached_releases=[], upgrade_109_releases=[])
+                # Polling during a job needs no repeated disk/openssl lookups.
+                if job["active"]:
+                    continue
                 try:
-                    row["cached_releases"] = cached_releases(hub.motor_firmware, observed.get(row["index"], {}))
-                except ValueError as exc:
-                    row.update(cached_releases=[], eligibility_error=str(exc))
-            return {"ok": True, "result": {"targets": targets, "job": job}}
+                    row["cached_releases"] = cached_releases(hub.motor_firmware, observation)
+                    if generation == 108:
+                        row["upgrade_109_releases"] = cached_109_releases(
+                            hub.motor_firmware, observation, row["cached_releases"])
+                        if not row["upgrade_109_releases"]:
+                            row["eligibility_error"] = "本机尚无适配此电机的签名 109 固件；请先查询并下载"
+                except (ValueError, OSError) as exc:
+                    row["eligibility_error"] = str(exc)
+            return {"ok": True, "result": {"targets": targets, "job": job, "configuration_sha256": configuration}}
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -1566,7 +1580,8 @@ def create_app(
                     raise RuntimeError("当前实例正在维护参数")
                 if action == "preview":
                     service.maintenance_ready()
-                    return task.preview(payload["selections"])
+                    return task.preview(payload["selections"], mode=payload.get("mode"),
+                                        configuration_sha256=payload.get("configuration_sha256"))
                 if action == "start":
                     service.maintenance_ready()
                     return task.start(payload["preview_id"], payload.get("confirmed"))
@@ -1640,8 +1655,19 @@ def create_app(
         try:
             _, service, task = parameters(request, x_rp1_client_id)
             from .motor_maintenance import visible_job
-            return {"ok": True, "result": {"targets": service.maintenance_targets(),
-                                            "job": visible_job(task, task.authorize())}}
+            from factory_hmi.core.motor_maintenance import digest, generation_for_target
+            observed = {r["index"]: r for r in service.controller.backend.motor_versions()}
+            targets = service.maintenance_targets()
+            configuration = digest(targets)
+            for row in targets:
+                observation = observed.get(row["index"], {})
+                generation = generation_for_target(row, observation)
+                if generation is None and generation_for_target(row, observation, require_protocol=False) == 108:
+                    generation = 108
+                row.update(observation=observation, firmware_generation=generation)
+            return {"ok": True, "result": {"targets": targets,
+                                            "job": visible_job(task, task.authorize()),
+                                            "configuration_sha256": configuration}}
         except (ValueError, RuntimeError, OSError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -1663,11 +1689,12 @@ def create_app(
             _, service, task = parameters(request, x_rp1_client_id)
             with service._lifecycle_lock:
                 service._require_open()
-                if action in {"read", "preview", "start"}:
+                if action in {"read", "read-reference", "preview", "start"}:
                     service.maintenance_ready()
                     if service._maintenance is not None and service._maintenance.active:
                         raise RuntimeError("当前实例正在维护固件")
-                if action == "read": return task.read(payload["selections"])
+                if action == "read": return task.read(payload["selections"], configuration_sha256=payload.get("configuration_sha256"))
+                if action == "read-reference": return task.read_reference(payload["indices"], payload["configuration_sha256"])
                 if action == "preview": return task.preview(payload["read_job_id"])
                 if action == "start": return task.start(payload["preview_id"], payload.get("confirmed"))
                 if action == "acknowledge":

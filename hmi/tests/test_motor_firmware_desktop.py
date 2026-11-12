@@ -58,6 +58,7 @@ def test_partial_numeric_version_keeps_timeout_visible_without_raw_json(dialog):
     d, run, state, app = dialog
     rows = [dict(index=0, interface="can0", motor_id=1, joint_name="关节1", status="known",
                  raw_firmware=None, software="0.1.8", hardware="0.1.0", protocol="0.0.1.17",
+                 configured_profile="v1.03", active_profile=None, profile_error="完整版本与配置冲突",
                  observed_at="2026-11-02T05:33:50.510507+00:00",
                  raw_responses={"0x1e": "a01e00010800010000000111"}, errors={"0x31": "版本查询超时"})]
     d.observations = lambda: rows
@@ -65,6 +66,7 @@ def test_partial_numeric_version_keeps_timeout_visible_without_raw_json(dialog):
     text = d.versions.toPlainText()
     assert "已读取（部分）" in text and "软件：0.1.8" in text
     assert "原始固件字符串：未取得" in text and "0x31" in text and "版本查询超时" in text
+    assert "驱动配置：v1.03" in text and "当前协议配置：未应用" in text and "完整版本与配置冲突" in text
     assert "原始响应" not in text and "{'" not in text
     d.version_details.setChecked(True)
     assert rows[0]["raw_responses"]["0x1e"] in d.versions.toPlainText()
@@ -117,3 +119,21 @@ def test_closing_dialog_stops_refresh_timer(dialog):
     assert d.timer.isActive()
     d.close();app.processEvents()
     assert not d.timer.isActive()
+
+
+def test_current_motor_identity_is_passed_to_firmware_and_parameter_windows(dialog):
+    from factory_hmi.desktop.motor_maintenance_dialog import MotorMaintenanceDialog, SELECTED_UPGRADE
+    from factory_hmi.desktop.motor_parameters_dialog import MotorParametersDialog
+
+    d, run, state, app = dialog
+    first = dict(d.rows[0], model='LRO_5550')
+    second = dict(first, index=1, interface='can7', joint_name='关节2')
+    d.observations = lambda: [first, second]
+    d.refresh()
+    d.targets.setCurrentIndex(1)
+    d.maintenance()
+    d.parameters()
+    firmware = d.findChild(MotorMaintenanceDialog)
+    parameters = d.findChild(MotorParametersDialog)
+    assert firmware.scope.currentData() == SELECTED_UPGRADE
+    assert firmware.selected_motor == parameters.selected_motor == (1, 'can7', 3, 'LRO_5550')

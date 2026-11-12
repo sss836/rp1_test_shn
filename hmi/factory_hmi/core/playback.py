@@ -78,6 +78,7 @@ class _RunStatistics:
         self._tracking_max = np.zeros(count, dtype=np.float64)
         self._torque_abs_sum = np.zeros(count, dtype=np.float64)
         self._torque_peak = np.zeros(count, dtype=np.float64)
+        self._torque_samples = np.zeros(count, dtype=np.int64)
         self._temperature_start = np.full(count, np.nan, dtype=np.float64)
         self._temperature_current = np.full(count, np.nan, dtype=np.float64)
         self._temperature_peak = np.full(count, np.nan, dtype=np.float64)
@@ -104,6 +105,7 @@ class _RunStatistics:
                         error,
                     )
                 if math.isfinite(torque):
+                    self._torque_samples[index] += 1
                     absolute_torque = abs(torque)
                     self._torque_abs_sum[index] += absolute_torque
                     self._torque_peak[index] = max(
@@ -130,6 +132,7 @@ class _RunStatistics:
             joints = []
             for index, entry in enumerate(self._entries):
                 count = int(self._samples[index])
+                torque_count = int(self._torque_samples[index])
                 start_temperature = self._temperature_start[index]
                 current_temperature = self._temperature_current[index]
                 joints.append(
@@ -147,11 +150,11 @@ class _RunStatistics:
                             self._tracking_max[index] if count else None
                         ),
                         "torque_peak_nm": json_number(
-                            self._torque_peak[index] if count else None
+                            self._torque_peak[index] if torque_count else None
                         ),
                         "torque_mean_abs_nm": json_number(
-                            self._torque_abs_sum[index] / count
-                            if count
+                            self._torque_abs_sum[index] / torque_count
+                            if torque_count
                             else None
                         ),
                         "temperature_start_c": json_number(start_temperature),

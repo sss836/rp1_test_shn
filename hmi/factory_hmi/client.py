@@ -721,7 +721,7 @@ class GatewayClient:
         return self._request("GET", f"/api/v1/motor-parameters/{int(index)}/templates", timeout=10)
 
     def motor_parameter_action(self, action: str, payload: dict) -> JsonValue:
-        if action not in {"read", "preview", "start", "acknowledge", "readback", "cancel"}:
+        if action not in {"read", "read-reference", "preview", "start", "acknowledge", "readback", "cancel"}:
             raise ValueError("unknown parameter action")
         return self._request("POST", f"/api/v1/motor-parameters/{action}", payload=payload)
 

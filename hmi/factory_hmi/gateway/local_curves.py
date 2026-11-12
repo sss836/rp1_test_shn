@@ -5,6 +5,13 @@ from pathlib import Path
 from fastapi import HTTPException
 from factory_hmi.core.telemetry_hub import METRICS
 
+CSV_METRIC_COLUMNS = {
+ 'position_rad':'pos_rad','command_position_rad':'cmd_pos_rad','speed_rad_s':'spd_rad_s',
+ 'torque_nm':'torque_nm','temperature_c':'temp_c','bus_voltage_v':'bus_voltage_v',
+ 'bus_current_a':'bus_current_a','iq_current_a':'iq_current_a',
+ 'error_id':'error_id','feedback_age_s':'feedback_age_s',
+}
+
 def sealed_raw_curves(service,run_id,metrics,start,end,view):
  manager=getattr(service,'report_manager',None)
  if manager is None:raise HTTPException(404,'尚无本地记录')
@@ -17,9 +24,8 @@ def sealed_raw_curves(service,run_id,metrics,start,end,view):
  except ValueError:raise HTTPException(422,'时间范围须为执行内秒')
  if not math.isfinite(start+end) or not 0<=start<end:raise HTTPException(422,'请输入有效的执行内时间范围')
  columns={};unit={}
- mapping={'position_rad':'pos_rad','command_position_rad':'cmd_pos_rad','speed_rad_s':'spd_rad_s','torque_nm':'torque_nm','temperature_c':'temp_c','bus_voltage_v':'bus_voltage_v','bus_current_a':'bus_current_a','error_id':'error_id','feedback_age_s':'feedback_age_s'}
  for key in selected:
-  try:name,metric=key.rsplit('/',1);columns[key]=name+'_'+mapping[metric];unit[key]=METRICS[metric][0]
+  try:name,metric=key.rsplit('/',1);columns[key]=name+'_'+CSV_METRIC_COLUMNS[metric];unit[key]=METRICS[metric][0]
   except (ValueError,KeyError):raise HTTPException(422,'未知测量通道')
  bins={k:{} for k in selected};points=600;width=(end-start)/points;deadline=time.monotonic()+2.;read_bytes=0;previous=None;gaps=[];count=0
  manifest_path=root/'telemetry/segments/manifest.json'
@@ -92,10 +98,9 @@ def _source(service,run_id):
 def curves(service,run_id,metrics,start,end,view,window=''):
  selected=[key for key in metrics.split(',') if key]
  if not 1<=len(selected)<=12 or len(set(selected))!=len(selected):raise HTTPException(422,'请选择1至12条不同曲线')
- mapping={'position_rad':'pos_rad','command_position_rad':'cmd_pos_rad','speed_rad_s':'spd_rad_s','torque_nm':'torque_nm','temperature_c':'temp_c','bus_voltage_v':'bus_voltage_v','bus_current_a':'bus_current_a','error_id':'error_id','feedback_age_s':'feedback_age_s'}
  columns={};units={}
  for key in selected:
-  try:name,metric=key.rsplit('/',1);columns[key]=name+'_'+mapping[metric];units[key]=METRICS[metric][0]
+  try:name,metric=key.rsplit('/',1);columns[key]=name+'_'+CSV_METRIC_COLUMNS[metric];units[key]=METRICS[metric][0]
   except (ValueError,KeyError):raise HTTPException(422,'未知测量通道')
  source=_source(service,run_id);duration=source['duration']
  try:

@@ -30,8 +30,12 @@ def configuration_sha256(config: StationConfig) -> str:
         if not hmi:
             raw.pop('factory_hmi', None)
     # Effective entries bind GUI sign/zero-offset overrides, not only source YAML.
+    entries = [asdict(entry) for entry in config.entries]
+    for entry in entries:
+        if entry.get('lro_protocol') is None:
+            entry.pop('lro_protocol', None)
     payload = {'limb': config.limb, 'raw': raw,
-               'entries': [asdict(entry) for entry in config.entries],
+               'entries': entries,
                'control_rate_hz': config.control_rate_hz}
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':'),
                                      allow_nan=False).encode()).hexdigest()

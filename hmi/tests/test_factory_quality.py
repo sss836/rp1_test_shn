@@ -215,6 +215,15 @@ def test_missing_required_measurement_column_prevents_factory_quality_pass(tmp_p
     assert summary["factory_quality"]["status"] == "not_evaluated"
 
 
+def test_unavailable_lro_torque_does_not_pass_factory_screening(tmp_path):
+    _, _, summary = finalize_synthetic(tmp_path, overrides={"waist_roll_joint_torque_nm": float("nan")})
+    quality = summary["factory_quality"]
+    assert quality["status"] == "not_evaluated"
+    roll = next(motor for motor in quality["metrics"] if motor["joint_name"] == "waist_roll_joint")
+    torque = next(check for check in roll["checks"] if check["key"] == "torque_p999_abs_nm")
+    assert torque["value"] is None and torque["passed"] is None
+
+
 def test_research_execution_retains_existing_verdict_without_factory_quality(tmp_path):
     _, _, summary = finalize_synthetic(tmp_path, changes=lambda c: c.update(data_domain="RESEARCH"),
                                        overrides={"waist_roll_joint_torque_nm": 100.0})

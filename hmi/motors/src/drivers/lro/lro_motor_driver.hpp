@@ -111,15 +111,15 @@ enum LROQueryCode : uint8_t {
     LRO_QRY_KT_CALIB     = 0x23,  // Torque constant calibration enable
 };
 
-// Parameter ranges for MIT mode (configurable per motor)
-typedef struct {
+// Encoding ranges selected for the verified protocol and model of each motor.
+struct LRO_Limit_Param {
     float PosMax;   // Maximum position (rad), default 12.5
     float SpdMax;   // Maximum velocity (rad/s), default 45
     float TauMax;   // Maximum torque (Nm), default 40
-    // float CurMax;   // Maximum current (A), default 70
+    float CurMax;   // Maximum current (A) for protocol v1.03
     float OKpMax;    // Default 500
-    float OKdMax;    // Default 5
-} LRO_Limit_Param;
+    float OKdMax;
+};
 
 class LroMotorDriver : public MotorDriver {
    public:
@@ -137,6 +137,14 @@ class LroMotorDriver : public MotorDriver {
     virtual void get_motor_param(uint8_t param_cmd) override;
     bool request_version(uint8_t code) override;
     std::vector<uint8_t> version_payload(uint8_t code) override;
+    bool set_lro_protocol_profile(const std::string& profile) override;
+    std::optional<std::string> get_lro_protocol_profile() const override;
+    bool request_lro_zero() override;
+    float get_motor_iq_current() const override { return iq_current_; }
+    float get_motor_dc_bus_voltage() const override { return dc_bus_voltage_; }
+    float get_motor_dc_bus_current() const override { return dc_bus_current_; }
+    std::optional<bool> get_motor_drive_enabled() const override;
+    std::optional<uint8_t> get_motor_feedback_header() const override;
 
     virtual void motor_pos_cmd(float pos, float spd, bool ignore_limit) override;
     virtual void motor_spd_cmd(float spd) override;
@@ -155,20 +163,35 @@ class LroMotorDriver : public MotorDriver {
     virtual void clear_motor_error() override;
 
    private:
+    enum class ProtocolProfile { Legacy, V103 };
+
+    const LRO_Limit_Param& encoding_limits(ProtocolProfile profile) const;
+    void pack_mit(float pos, float spd, float kp, float kd, float torque, uint8_t* data) const;
+    void clear_protocol_feedback();
+
     std::mutex version_mutex_;
     uint8_t pending_version_{0};
     std::chrono::steady_clock::time_point version_deadline_;
     std::unordered_map<uint8_t, std::vector<uint8_t>> versions_;
-    uint8_t motor_index_{0};
+    uint8_t motor_index_{8};
 
-    // std::atomic<float> dc_bus_voltage_{0.f};
-    // std::atomic<float> dc_bus_current_{0.f};
+    std::mutex drive_control_mutex_;
+    mutable std::mutex protocol_mutex_;
+    std::atomic<ProtocolProfile> protocol_profile_{ProtocolProfile::Legacy};
+    bool profile_frozen_{false};
+    bool enable_requested_{false};
+    bool zero_requested_{false};
+    std::chrono::steady_clock::time_point last_feedback_at_;
+    std::chrono::steady_clock::time_point last_disable_queued_at_;
+    std::atomic<int> feedback_header_{-1};
+    std::atomic<float> iq_current_{std::numeric_limits<float>::quiet_NaN()};
+    std::atomic<float> dc_bus_voltage_{std::numeric_limits<float>::quiet_NaN()};
+    std::atomic<float> dc_bus_current_{std::numeric_limits<float>::quiet_NaN()};
     std::atomic<int> response_count_{0};
     std::atomic<uint64_t> feedback_count_{0};
     LRO_Motor_Model motor_model_;
-    LRO_Limit_Param limit_param_;
-    std::atomic<uint8_t> mos_temperature_{0};
-    void set_motor_zero_lro();
+    std::atomic<float> mos_temperature_{0.f};
+    canfd_frame zero_request_frame() const;
     void clear_motor_error_lro();
     void write_register_lro(uint8_t rid, float value);
     void write_register_lro(uint8_t index, int32_t value);

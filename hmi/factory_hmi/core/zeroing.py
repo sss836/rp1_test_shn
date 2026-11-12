@@ -6,7 +6,7 @@ import threading
 import time
 from typing import Any
 
-from factory_hmi.models import MotorSample, StationState, ZeroingState
+from factory_hmi.models import MotorSample, MotorZeroResult, StationState, ZeroingState
 
 from .backend import MotorBackend, MotorSafetyError
 from .state_machine import StationStateMachine
@@ -36,6 +36,7 @@ class MotorZeroingSession:
         self._current_index: int | None = None
         self._next_index = 0
         self._zeroed: list[int] = []
+        self._pending_reboot: list[int] = []
         self._skipped: list[int] = []
         self._last_sample: MotorSample | None = None
         self._abort_reason: str | None = None
@@ -59,7 +60,7 @@ class MotorZeroingSession:
             selected = self._next_index if index is None else int(index)
             if not 0 <= selected < len(self.backend.entries):
                 raise IndexError(f"motor index {selected} is out of range")
-            if selected in self._zeroed or selected in self._skipped:
+            if selected in self._zeroed or selected in self._skipped or selected in self._pending_reboot:
                 raise ZeroingSessionError(f"motor[{selected}] was already handled")
             self.backend.disable(selected)
             self._current_index = selected
@@ -82,7 +83,7 @@ class MotorZeroingSession:
             self._last_sample = self.backend.read_samples()[self._current_index]
             return self._last_sample
 
-    def confirm(self, *, force_on_error: bool = False) -> bool:
+    def confirm(self, *, force_on_error: bool = False) -> MotorZeroResult:
         with self._lock:
             self._require_reading()
             assert self._current_index is not None
@@ -93,16 +94,19 @@ class MotorZeroingSession:
                     f"refusing to zero motor[{self._current_index}] while "
                     f"error_id={sample.error_id}; clear the fault or explicitly force"
                 )
-            result = self.backend.zero_motor(
+            result = self.backend.submit_motor_zero(
                 self._current_index, force_on_error=force_on_error
             )
-            if not result:
+            if result is MotorZeroResult.UNCONFIRMED:
                 raise ZeroingSessionError(
                     f"motor[{self._current_index}] set-zero command was not acknowledged"
                 )
-            self._zeroed.append(self._current_index)
+            if result is MotorZeroResult.SUBMITTED_PENDING_REBOOT:
+                self._pending_reboot.append(self._current_index)
+            else:
+                self._zeroed.append(self._current_index)
             self._advance()
-            return True
+            return result
 
     def skip(self) -> int:
         with self._lock:
@@ -127,7 +131,7 @@ class MotorZeroingSession:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            handled = set(self._zeroed) | set(self._skipped)
+            handled = set(self._zeroed) | set(self._skipped) | set(self._pending_reboot)
             remaining = [
                 index
                 for index in range(len(self.backend.entries))
@@ -138,6 +142,7 @@ class MotorZeroingSession:
                 "current_index": self._current_index,
                 "next_index": self._next_index,
                 "zeroed_indices": list(self._zeroed),
+                "pending_reboot_indices": list(self._pending_reboot),
                 "skipped_indices": list(self._skipped),
                 "remaining_indices": remaining,
                 "last_sample": (
@@ -156,7 +161,7 @@ class MotorZeroingSession:
     def _advance(self) -> None:
         assert self._current_index is not None
         previous = self._current_index
-        handled = set(self._zeroed) | set(self._skipped)
+        handled = set(self._zeroed) | set(self._skipped) | set(self._pending_reboot)
         self._current_index = None
         self._last_sample = None
         total = len(self.backend.entries)

@@ -7,12 +7,13 @@ import threading
 import time
 from dataclasses import replace
 from abc import ABC, abstractmethod
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
-from factory_hmi.models import MotorSample
+from factory_hmi.models import MotorSample, MotorZeroResult
 from .control_watchdog import CommandWatchdog
+from .motor_versions import MotorVersions, firmware_generation
 
 from ._legacy import (
     MotorEntry,
@@ -86,7 +87,6 @@ class MotorBackend(ABC):
     def motor_versions(self) -> list[dict]:
         if self._versions is not None:
             return self._versions.snapshot(connected=self._connected)
-        from .motor_versions import MotorVersions
         return [{k: v for k, v in MotorVersions._empty(e).items() if k != "_monotonic"}
                 for e in self.entries]
 
@@ -178,6 +178,7 @@ class MotorBackend(ABC):
             self._require_connected()
             if self._enabled:
                 raise BackendInUseError("motors are already enabled")
+            self.prepare_motor_protocols()
             try:
                 self._enable_motors_impl()
             except Exception:
@@ -195,6 +196,9 @@ class MotorBackend(ABC):
                 self.control_stop_error = None
                 if self._command_watchdog is not None:
                     self._command_watchdog.arm()
+
+    def prepare_motor_protocols(self, check_cancelled: Callable[[], None] | None = None) -> None:
+        """Confirm any drive-specific control protocols before enabling motors."""
 
     def disable_motors(self) -> None:
         self._revoke_damping()
@@ -413,6 +417,11 @@ class MotorBackend(ABC):
                 self._zero_motor_impl(int(index), force_on_error=force_on_error)
             )
 
+    def submit_motor_zero(self, index: int, *, force_on_error: bool = False) -> MotorZeroResult:
+        if self.zero_motor(index, force_on_error=force_on_error):
+            return MotorZeroResult.CONFIRMED
+        return MotorZeroResult.UNCONFIRMED
+
     def clear_errors(self, index: int | None = None) -> None:
         with self._lock:
             self._require_connected()
@@ -512,6 +521,15 @@ class MotorsPyBackend(MotorBackend):
         self._last_feedback_counts: list[int | None] = [None] * len(self.entries)
         self._last_feedback_at = np.zeros(len(self.entries), dtype=np.float64)
         self._last_mit_command_at = 0.0
+        self._protocol_observation_lock = threading.Lock()
+        self._protocol_observations: list[dict | None] = [None] * len(self.entries)
+        self._protocol_conflicts: list[str | None] = [None] * len(self.entries)
+        self._protocol_conflict = threading.Event()
+        self._selected_protocols: list[str | None] = [None] * len(self.entries)
+        self._configured_v103_protocols = {
+            entry.lro_protocol.protocol for entry in self.entries if entry.lro_protocol_profile == "v1.03"
+        }
+        self._pending_motor_zero: set[int] = set()
 
     @property
     def motors(self) -> list[Any]:
@@ -571,23 +589,139 @@ class MotorsPyBackend(MotorBackend):
             if setter is not None:
                 setter(self._motors_py.MotorControlMode.MIT)
 
-        from .motor_versions import MotorVersions
-        self._versions = MotorVersions(self.entries, self._motors)
+        self._protocol_observations = [None] * len(self.entries)
+        self._protocol_conflicts = [None] * len(self.entries)
+        self._protocol_conflict.clear()
+        self._selected_protocols = [None] * len(self.entries)
+        self._versions = MotorVersions(self.entries, self._motors, on_observation=self._observe_motor_protocol)
         self._versions.start()
+
+    def motor_versions(self) -> list[dict]:
+        rows = super().motor_versions()
+        with self._protocol_observation_lock:
+            for index, (entry, row) in enumerate(zip(self.entries, rows)):
+                if entry.motor_type.upper() != "LRO":
+                    continue
+                row["configured_profile"] = entry.lro_protocol_profile
+                row["active_profile"] = self._selected_protocols[index] if (
+                    self._connected and not self._protocol_conflicts[index]
+                ) else None
+                row["profile_error"] = self._protocol_conflicts[index]
+        return rows
+
+    def _observe_motor_protocol(self, index: int, row: dict) -> None:
+        entry = self.entries[index]
+        if entry.motor_type.upper() != "LRO":
+            return
+        expected = entry.lro_protocol
+        conflict = None
+        generation = firmware_generation(row.get("raw_firmware"))
+        if entry.lro_protocol_profile == "legacy" and (
+            generation == 109 or row.get("protocol") in self._configured_v103_protocols
+        ):
+            conflict = "读到 109 固件或已核实的 V1.03 协议，需为该节点配置并核对 V1.03"
+        elif expected is None and row.get("raw_firmware") is not None and generation != 108:
+            conflict = "固件读回与默认的 108 范围不符，需为该节点配置并核对旧协议身份"
+        elif expected is not None:
+            mismatched = [
+                name for name in ("raw_firmware", "numeric_software", "hardware", "protocol")
+                if row.get(name) is not None and row[name] != getattr(expected, name)
+            ]
+            if mismatched:
+                conflict = "LRO 身份与工位核实值不符（" + ", ".join(mismatched) + "）"
+        with self._protocol_observation_lock:
+            self._protocol_observations[index] = row
+            if conflict is not None:
+                self._protocol_conflicts[index] = conflict
+                self._protocol_conflict.set()
+
+    def _check_protocol_conflicts(self, index: int | None = None) -> None:
+        if not self._protocol_conflict.is_set():
+            return
+        with self._protocol_observation_lock:
+            for motor_index, reason in enumerate(self._protocol_conflicts):
+                if reason and index in (None, motor_index):
+                    entry = self.entries[motor_index]
+                    raise MotorSafetyError(f"{entry.interface}#{entry.motor_id} {reason}")
+
+    def _select_verified_protocol(self, index: int) -> bool:
+        """Apply the profile only when the read-back identity supports it."""
+        entry = self.entries[index]
+        profile = entry.lro_protocol_profile
+        if profile is None:
+            return True
+        expected = entry.lro_protocol
+        with self._protocol_observation_lock:
+            row = self._protocol_observations[index]
+            if self._protocol_conflicts[index] or row is None or row.get("status") != "known":
+                return False
+            observed_at = row.get("_monotonic")
+            if observed_at is None or time.monotonic() - observed_at > self._versions.stale:
+                return False
+            if expected is None:
+                matches = firmware_generation(row.get("raw_firmware")) == 108
+            else:
+                matches = all(row.get(name) == getattr(expected, name)
+                              for name in ("raw_firmware", "numeric_software", "hardware", "protocol"))
+            if not matches:
+                return False
+            if self._selected_protocols[index] == profile:
+                return True
+        motor = self._motors[index]
+        if profile == "v1.03":
+            setter = getattr(motor, "set_lro_protocol_profile", None)
+            if setter is None or not setter(profile):
+                return False
+            self._last_feedback_at[index] = 0.0
+            self._last_feedback_counts[index] = self._feedback_count(entry, motor)
+        with self._protocol_observation_lock:
+            self._selected_protocols[index] = profile
+        return True
+
+    def prepare_motor_protocols(self, check_cancelled: Callable[[], None] | None = None) -> None:
+        with self._lock:
+            self._require_connected()
+            indices = [i for i, entry in enumerate(self.entries) if entry.motor_type.upper() == "LRO"]
+            if not indices:
+                return
+            if self._versions is None:
+                raise MotorSafetyError("LRO 版本查询未启动")
+            deadline = time.monotonic() + 0.25 + 2 * self._versions.timeout * len(indices)
+            while True:
+                if check_cancelled is not None:
+                    check_cancelled()
+                self._check_protocol_conflicts()
+                with self._protocol_observation_lock:
+                    pending = [i for i in indices if self._protocol_observations[i] is None]
+                if not pending or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            for index in indices:
+                entry = self.entries[index]
+                if index in pending or not self._select_verified_protocol(index):
+                    raise MotorSafetyError(
+                        f"{entry.interface}#{entry.motor_id} 电机协议未确认，"
+                        "请核对固件、硬件、协议读回及当前 SDK"
+                    )
+            self._check_protocol_conflicts()
 
     def _enable_motors_impl(self) -> None:
         errors: list[int] = []
         initialized: list[Any] = []
         try:
-            for entry, motor in zip(self.entries, self._motors):
+            self._require_disabled_v103()
+            for index, (entry, motor) in enumerate(zip(self.entries, self._motors)):
+                self._check_protocol_conflicts()
                 error_id = int(motor.init_motor())
                 errors.append(error_id)
                 if error_id != 0:
                     raise MotorSafetyError(
                         f"motor[{entry.index}] id={entry.motor_id} "
-                        f"failed to enable with error_id={error_id}"
+                        f"failed to enable with error_id={error_id} protocol_profile={self._selected_protocols[index]}"
                     )
                 initialized.append(motor)
+                if entry.lro_protocol_profile == "v1.03" and motor.get_motor_drive_enabled() is not True:
+                    raise MotorSafetyError(f"{entry.interface}#{entry.motor_id} 未确认驱动器已使能")
                 motor.set_motor_control_mode(self._motors_py.MotorControlMode.MIT)
         except Exception:
             for motor in reversed(initialized):
@@ -598,6 +732,18 @@ class MotorsPyBackend(MotorBackend):
             self.init_error_ids = errors
             raise
         self.init_error_ids = errors
+
+    def _require_disabled_v103(self) -> None:
+        if "v1.03" not in self._selected_protocols:
+            return
+        before = self._read_samples_impl()
+        self._refresh_feedback_impl()
+        for prior, sample in zip(before, self._read_samples_impl()):
+            if sample.lro_protocol_profile == "v1.03" and (
+                sample.drive_enabled is not False or sample.feedback_age_s > 0.1
+                or sample.timestamp_s <= prior.timestamp_s
+            ):
+                raise MotorSafetyError(f"{sample.bus}#{sample.motor_id} 未收到新鲜的驱动失能反馈")
 
     def _close_transport_impl(self) -> None:
         first_error: Exception | None = None
@@ -620,6 +766,7 @@ class MotorsPyBackend(MotorBackend):
         kp_scale: float,
         kd_scale: float,
     ) -> None:
+        self._check_protocol_conflicts()
         legacy_command_mit(
             self._motors,
             list(self.entries),
@@ -632,6 +779,7 @@ class MotorsPyBackend(MotorBackend):
         self._last_mit_command_at = time.monotonic()
 
     def _command_protective_damping_impl(self, kd: float) -> None:
+        self._check_protocol_conflicts()
         count = len(self.entries)
         damping_entries = [replace(e, kp=0.0, kd=kd) for e in self.entries]
         legacy_command_mit(self._motors, damping_entries, np.zeros(count),
@@ -649,6 +797,8 @@ class MotorsPyBackend(MotorBackend):
             # an enable frame.  Never invoke it from this read-only path.
             if entry.motor_type.upper() not in self._READ_ONLY_REFRESH_TYPES:
                 continue
+            if entry.lro_protocol_profile is not None:
+                self._select_verified_protocol(index)
             refresh = getattr(motor, "refresh_motor_status", None)
             feedback_count = self._feedback_count(entry, motor)
             if (
@@ -723,26 +873,36 @@ class MotorsPyBackend(MotorBackend):
             elif self._enabled:
                 self._last_response_counts[index] = response_count
             feedback_at = float(self._last_feedback_at[index])
+            is_lro = entry.motor_type.upper() == "LRO"
+            profile = self._selected_protocols[index]
+            if is_lro and self._versions is not None and (
+                self._protocol_conflicts[index] or self._protocol_observations[index] is None
+            ):
+                profile = None
+            v103 = profile == "v1.03"
+            known_units = not is_lro or self._versions is None or profile is not None
+            get_header = getattr(motor, "get_motor_feedback_header", None) if is_lro else None
             result.append(
                 MotorSample(
                     pos_rad=float(motor.get_motor_pos()),
                     cmd_pos_rad=float(self._last_command[index]),
-                    spd_rad_s=float(motor.get_motor_spd()),
-                    torque_nm=float(motor.get_motor_current()),
+                    spd_rad_s=float(motor.get_motor_spd()) if known_units else float("nan"),
+                    torque_nm=float(motor.get_motor_current()) if known_units and not v103 else float("nan"),
                     temp_c=float(motor.get_motor_temperature()),
-                    error_id=int(motor.get_error_id()),
-                    bus_voltage_v=_optional_float(
-                        motor, "get_motor_dc_bus_voltage"
-                    ),
-                    bus_current_a=_optional_float(
-                        motor, "get_motor_dc_bus_current"
-                    ),
+                    error_id=int(motor.get_error_id()) if known_units else 0,
+                    bus_voltage_v=_optional_float(motor, "get_motor_dc_bus_voltage") if known_units else float("nan"),
+                    bus_current_a=_optional_float(motor, "get_motor_dc_bus_current") if known_units else float("nan"),
                     motor_id=int(entry.motor_id),
                     index=index,
                     joint_name=entry.joint_name,
                     bus=entry.interface,
                     timestamp_s=feedback_at,
                     feedback_age_s=max(0.0, now - feedback_at),
+                    iq_current_a=_optional_float(motor, "get_motor_iq_current") if v103 else float("nan"),
+                    drive_enabled=motor.get_motor_drive_enabled() if v103 else None,
+                    feedback_header=get_header() if get_header is not None else None,
+                    lro_protocol_profile=profile,
+                    fault_code_available=known_units,
                 )
             )
         return result
@@ -770,6 +930,12 @@ class MotorsPyBackend(MotorBackend):
             return None
 
     def _zero_motor_impl(self, index: int, *, force_on_error: bool) -> bool:
+        self._check_protocol_conflicts(index)
+        if self.entries[index].lro_protocol_profile == "v1.03":
+            raise MotorSafetyError("V1.03 标零必须使用支持待重新上电状态的接口")
+        if (self.entries[index].lro_protocol_profile == "legacy" and self._versions is not None
+                and not self._select_verified_protocol(index)):
+            raise MotorSafetyError("LRO 旧协议身份未核实，不能标零")
         motor = self._motors[index]
         error_id = int(motor.get_error_id())
         if error_id != 0 and not force_on_error:
@@ -787,6 +953,37 @@ class MotorsPyBackend(MotorBackend):
         result = bool(motor.set_motor_zero())
         time.sleep(0.05)
         return result
+
+    def submit_motor_zero(self, index: int, *, force_on_error: bool = False) -> MotorZeroResult:
+        with self._lock:
+            self._require_connected()
+            self._validate_index(index)
+            index = int(index)
+            self._check_protocol_conflicts(index)
+            if self.entries[index].lro_protocol_profile != "v1.03":
+                return super().submit_motor_zero(index, force_on_error=force_on_error)
+            if self._enabled:
+                raise MotorSafetyError("V1.03 标零要求工位驱动处于失能状态")
+            if index in self._pending_motor_zero:
+                raise MotorSafetyError("该节点已提交标零，等待重新上电和现场核验")
+            if not self._select_verified_protocol(index):
+                raise MotorSafetyError("未核实节点 V1.03 身份，不能标零")
+            before = self._read_samples_impl()[index]
+            self._refresh_feedback_impl()
+            sample = self._read_samples_impl()[index]
+            if (sample.drive_enabled is not False or sample.feedback_age_s > 0.1 or sample.error_id != 0
+                    or sample.timestamp_s <= before.timestamp_s):
+                raise MotorSafetyError("V1.03 标零要求新鲜的失能及无故障反馈")
+            self._check_protocol_conflicts(index)
+            self._pending_motor_zero.add(index)
+            try:
+                submitted = self._motors[index].request_lro_zero()
+            except Exception as exc:
+                raise MotorSafetyError("V1.03 标零发送状态不明，需在现场核验") from exc
+            if not submitted:
+                self._pending_motor_zero.remove(index)
+                return MotorZeroResult.UNCONFIRMED
+            return MotorZeroResult.SUBMITTED_PENDING_REBOOT
 
     def _clear_errors_impl(self, index: int | None) -> None:
         motors = self._motors if index is None else [self._motors[index]]

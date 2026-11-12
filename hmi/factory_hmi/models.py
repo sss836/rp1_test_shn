@@ -35,6 +35,12 @@ class ZeroingState(str, Enum):
     ABORTED = "aborted"
 
 
+class MotorZeroResult(str, Enum):
+    CONFIRMED = "confirmed"
+    UNCONFIRMED = "unconfirmed"
+    SUBMITTED_PENDING_REBOOT = "submitted_pending_reboot"
+
+
 def json_number(value: float | int | None) -> float | int | None:
     """Return a strict-JSON number, replacing NaN/inf with ``None``."""
 
@@ -66,6 +72,11 @@ class MotorSample:
     bus: str = ""
     timestamp_s: float = 0.0
     feedback_age_s: float = 0.0
+    iq_current_a: float = float("nan")
+    drive_enabled: bool | None = None
+    feedback_header: int | None = None
+    lro_protocol_profile: str | None = None
+    fault_code_available: bool = True
 
     @property
     def position(self) -> float:
@@ -96,11 +107,15 @@ class MotorSample:
             "speed_rad_s": json_number(self.spd_rad_s),
             "torque_nm": json_number(self.torque_nm),
             "temperature_c": json_number(self.temp_c),
-            "error_id": int(self.error_id),
+            "error_id": int(self.error_id) if self.fault_code_available else None,
             "bus_voltage_v": json_number(self.bus_voltage_v),
             "bus_current_a": json_number(self.bus_current_a),
             "timestamp_s": json_number(self.timestamp_s),
             "feedback_age_s": json_number(self.feedback_age_s),
+            "iq_current_a": json_number(self.iq_current_a),
+            "drive_enabled": self.drive_enabled,
+            "feedback_header": self.feedback_header,
+            "lro_protocol_profile": self.lro_protocol_profile,
         }
 
 

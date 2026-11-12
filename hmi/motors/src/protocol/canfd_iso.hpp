@@ -36,6 +36,9 @@ public:
     /// Send a CANFD frame.
     virtual void transmit(const canfd_frame& frame) = 0;
 
+    /// Queue a frame only when the transport can report acceptance.
+    virtual bool try_transmit(const canfd_frame&) { return false; }
+
     /// Register a receive callback keyed by CAN ID.
     virtual void add_canfd_callback(const CanFdCbkFunc& callback, CanFdCbkId id) = 0;
 

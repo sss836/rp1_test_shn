@@ -6,6 +6,10 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QComboBox, QPushButton, QPlainTextEdit, QCheckBox, QHBoxLayout, QTabWidget, QWidget, QFormLayout, QGroupBox
 
 
+def motor_target_key(row):
+    return tuple(row.get(field) for field in ("index", "interface", "motor_id", "model"))
+
+
 class MotorFirmwareDialog(QDialog):
     def __init__(self, client, run_rest, observations, identity, parent=None):
         super().__init__(parent)
@@ -36,7 +40,7 @@ class MotorFirmwareDialog(QDialog):
         downloads = QGroupBox("按所选电机查询适用固件", self)
         download_layout = QVBoxLayout(downloads)
         target_row = QHBoxLayout()
-        target_row.addWidget(QLabel("目标", self))
+        target_row.addWidget(QLabel("当前电机", self))
         target_row.addWidget(self.targets, 1)
         self.check_button = QPushButton("查询适用固件", self)
         self.check_button.setObjectName("outlineButton")
@@ -59,8 +63,10 @@ class MotorFirmwareDialog(QDialog):
         layout.addWidget(downloads)
         more = QHBoxLayout()
         self.resource_library_button = QPushButton("固件文件下载", self)
-        self.maintenance_button = QPushButton("固件刷写…", self)
-        self.parameters_button = QPushButton("参数维护…", self)
+        self.maintenance_button = QPushButton("108 → 109 升级 / 固件维护…", self)
+        self.parameters_button = QPushButton("参数读取与维护…", self)
+        self.maintenance_button.setToolTip("带入当前电机，可在维护窗口切换为整组升级。")
+        self.parameters_button.setToolTip("带入当前电机，可在参数窗口选择整组或其他电机。")
         for widget, callback in ((self.resource_library_button, self.resource_library),
                                  (self.maintenance_button, self.maintenance),
                                  (self.parameters_button, self.parameters)):
@@ -84,18 +90,17 @@ class MotorFirmwareDialog(QDialog):
             self.account = account
             self._target_changed()
             self.receipt.clear()
-        selected = self.targets.currentData()
+        selected = self._selected_motor()
         rows = self.observations()
-        keys = [(r["index"], r["interface"], r["motor_id"]) for r in rows]
-        old_keys = [(r["index"], r["interface"], r["motor_id"]) for r in self.rows]
+        keys = [motor_target_key(row) for row in rows]
+        old_keys = [motor_target_key(row) for row in self.rows]
         self.rows = rows
         if keys != old_keys:
             self.targets.clear()
             for row in rows:
                 self.targets.addItem(f'{row["joint_name"]} · {row["interface"]} ID {row["motor_id"]}', row["index"])
-            found = self.targets.findData(selected)
-            if found >= 0:
-                self.targets.setCurrentIndex(found)
+            if selected in keys:
+                self.targets.setCurrentIndex(keys.index(selected))
         self._render_versions(rows)
         self.check_button.setEnabled(bool(self.identity()) and bool(rows) and not self.pending)
         self.download_button.setEnabled(bool(self.identity()) and bool(self.releases) and not self.pending)
@@ -110,6 +115,10 @@ class MotorFirmwareDialog(QDialog):
         lines = [f'{row["interface"]} ID {row["motor_id"]} · {status}',
                  f'软件：{row.get("software") or "未取得"}；硬件：{row.get("hardware") or "未取得"}；协议：{row.get("protocol") or "未取得"}',
                  f'原始固件字符串：{row.get("raw_firmware") or "未取得"}']
+        if row.get("configured_profile"):
+            lines.append(f'驱动配置：{row["configured_profile"]}；当前协议配置：{row.get("active_profile") or "未应用"}')
+        if row.get("profile_error"):
+            lines.append("驱动配置提示：" + row["profile_error"])
         observed = row.get("observed_at")
         try:
             stamp = datetime.fromisoformat(observed).astimezone().strftime("%Y-%m-%d %H:%M:%S %z") if observed else "尚未读取"
@@ -159,6 +168,10 @@ class MotorFirmwareDialog(QDialog):
         row = next((r for r in self.observations() if r.get("index") == index), {})
         return tuple(row.get(k) for k in ("index", "interface", "motor_id", "model", "raw_firmware", "software", "hardware", "protocol", "status"))
 
+    def _selected_motor(self):
+        index = self.targets.currentData()
+        return next((motor_target_key(row) for row in self.rows if row["index"] == index), None)
+
     def _request(self, label, operation, success):
         if self.pending:
             return
@@ -199,10 +212,13 @@ class MotorFirmwareDialog(QDialog):
             lambda value: self.receipt.setPlainText("已下载，尚未刷写；实际版本以上方读取结果为准。\n保存位置：" + str(value.get("firmware_path") or "回执未返回保存位置")))
 
     def maintenance(self):
-        from .motor_maintenance_dialog import MotorMaintenanceDialog
+        from .motor_maintenance_dialog import MODULE_UPGRADE, SELECTED_UPGRADE, MotorMaintenanceDialog
         from PySide6.QtCore import Qt
-        dialog = MotorMaintenanceDialog(self.client, self.run_rest, self.identity, self)
+        selected = self._selected_motor()
+        dialog = MotorMaintenanceDialog(self.client, self.run_rest, self.identity, self,
+                                        selected_motor=selected, scope=SELECTED_UPGRADE if selected else MODULE_UPGRADE)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.finished.connect(dialog.close)
         dialog.show()
 
     def resource_library(self):
@@ -217,8 +233,10 @@ class MotorFirmwareDialog(QDialog):
     def parameters(self):
         from .motor_parameters_dialog import MotorParametersDialog
         from PySide6.QtCore import Qt
-        dialog = MotorParametersDialog(self.client, self.run_rest, self.identity, self)
+        dialog = MotorParametersDialog(self.client, self.run_rest, self.identity, self,
+                                       selected_motor=self._selected_motor())
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.finished.connect(dialog.close)
         dialog.show()
 
 

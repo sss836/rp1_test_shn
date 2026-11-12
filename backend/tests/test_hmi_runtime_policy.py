@@ -1,7 +1,14 @@
 """New HMI policy changes acceptance, not measurement facts or old catalog rules."""
 from copy import deepcopy
 
-from app.services.curve_query import CurveProcessor, Statistic
+from app.services.curve_query import CurveProcessor, Statistic, catalog_item
+
+
+def test_archived_lro_iq_current_retains_its_joint_and_metric():
+    key = "left_elbow_joint_iq_current_a"
+    assert catalog_item(key) == {
+        "key": key, "subject": "left_elbow_joint", "metric": "iq_current_a", "unit": "A",
+    }
 
 
 def inputs():

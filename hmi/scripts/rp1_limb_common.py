@@ -139,6 +139,41 @@ LIMB_JOINT_NAMES = {
 
 
 @dataclass(frozen=True)
+class LroProtocolExpectation:
+    """Station-approved identity read back from the configured node."""
+
+    profile: str
+    raw_firmware: str
+    numeric_software: str
+    hardware: str
+    protocol: str
+    verification_evidence: str
+
+    def __post_init__(self) -> None:
+        v103_labels = {"109", "5.0.0.109", "V5.0.0.109"}
+        if self.profile not in {"legacy", "v1.03"}:
+            raise ValueError("LRO profile must be legacy or v1.03")
+        if not isinstance(self.raw_firmware, str) or not 1 <= len(self.raw_firmware) <= 18 or not (
+            self.raw_firmware.isascii() and self.raw_firmware.isprintable() and self.raw_firmware == self.raw_firmware.strip()
+        ):
+            raise ValueError("LRO profile requires an exact firmware response string")
+        if self.profile == "v1.03" and self.raw_firmware not in v103_labels:
+            raise ValueError("LRO V1.03 requires the exact verified 109 firmware label")
+        if self.profile == "legacy" and self.raw_firmware in v103_labels:
+            raise ValueError("LRO legacy profile cannot use a 109 firmware label")
+        for name, count in (("numeric_software", 3), ("hardware", 3), ("protocol", 4)):
+            version = getattr(self, name)
+            parts = version.split(".") if isinstance(version, str) else []
+            if len(parts) != count or not all(
+                p.isascii() and p.isdecimal() and len(p) <= 3
+                and int(p) <= 255 and str(int(p)) == p for p in parts
+            ):
+                raise ValueError(f"LRO profile requires exact numeric {name} bytes as a version string")
+        if not isinstance(self.verification_evidence, str) or not self.verification_evidence.strip():
+            raise ValueError("LRO profile requires station verification evidence")
+
+
+@dataclass(frozen=True)
 class MotorEntry:
     index: int
     motor_id: int
@@ -153,6 +188,22 @@ class MotorEntry:
     sign: float
     joint_name: str
     backend: str = "socketcan"
+    lro_protocol: LroProtocolExpectation | None = None
+
+    def __post_init__(self) -> None:
+        if self.lro_protocol is not None and (
+            not isinstance(self.lro_protocol, LroProtocolExpectation)
+            or self.motor_type.upper() != "LRO"
+            or self.interface_type not in {"canfd", "ethercanfd"}
+            or self.motor_model not in {0, 1, 2, 3}
+        ):
+            raise ValueError("LRO protocol configuration requires a supported LRO CAN FD node")
+
+    @property
+    def lro_protocol_profile(self) -> str | None:
+        if self.lro_protocol is not None:
+            return self.lro_protocol.profile
+        return "legacy" if self.motor_type.upper() == "LRO" else None
 
 
 def add_motors_python_paths(root: Path = MOTORS_ROOT) -> None:
@@ -276,6 +327,20 @@ def limb_motor_entries(config: dict[str, Any], limb: str) -> list[MotorEntry]:
     kd = _exact_list(config, "kd", motor_count, float)
     signs = _exact_list(config, "motor_sign", motor_count, float)
     master_id_offset = int(config.get("master_id_offset", 0))
+    protocols = config.get("lro_protocol_profiles", [None] * motor_count)
+    if not isinstance(protocols, list) or len(protocols) != motor_count:
+        raise ValueError(f"lro_protocol_profiles must contain {motor_count} node entries")
+    expectations = []
+    for index, item in enumerate(protocols):
+        if item is None or item == "legacy":
+            expectations.append(None)
+            continue
+        if not isinstance(item, dict):
+            raise ValueError(f"lro_protocol_profiles[{index}] requires a verified mapping")
+        try:
+            expectations.append(LroProtocolExpectation(**item))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"lro_protocol_profiles[{index}]: {exc}") from exc
 
     entries: list[MotorEntry] = []
     offset = 0
@@ -297,6 +362,7 @@ def limb_motor_entries(config: dict[str, Any], limb: str) -> list[MotorEntry]:
                     sign=signs[motor_index],
                     joint_name=joint_names[motor_index],
                     backend=backends[bus_index],
+                    lro_protocol=expectations[motor_index],
                 )
             )
         offset += count

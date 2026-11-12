@@ -1,5 +1,6 @@
 """Requires explicitly supplied offline native test module; never uses SocketCAN."""
 import asyncio
+import math
 from pathlib import Path
 import sys
 import time
@@ -21,6 +22,30 @@ def test_compiled_lro_response_correlation_and_telemetry_separation():
     assert bytes(motor.version_payload(0x31))[2:7] == b"1.0.8"
     assert motor.get_response_count() == 0
     assert motor.get_feedback_count() == 0
+
+
+def test_compiled_lro_profiles_feedback_and_mixed_batch():
+    sys.path.insert(0, MODULE)
+    import motors_py_testing as sdk
+    assert sdk._test_lro_feedback_profiles()
+    assert sdk._test_lro_command_profiles()
+    assert sdk._test_lro_zero_profile()
+
+    motor = sdk._test_create_version_motor()
+    assert motor.get_lro_protocol_profile() == "legacy"
+    assert motor.set_lro_protocol_profile("v1.03")
+    assert motor.get_lro_protocol_profile() == "v1.03"
+    assert motor.get_motor_drive_enabled() is None
+    assert motor.get_motor_feedback_header() is None
+    assert math.isnan(motor.get_motor_iq_current())
+    assert math.isnan(motor.get_motor_current())
+    assert math.isnan(motor.get_motor_dc_bus_voltage())
+    assert math.isnan(motor.get_motor_dc_bus_current())
+    assert not motor.request_lro_zero()
+
+    other = sdk._test_create_motor()
+    assert other.get_lro_protocol_profile() is None
+    assert not other.set_lro_protocol_profile("v1.03")
 
 
 def test_native_to_backend_service_gateway_chain(tmp_path, monkeypatch):

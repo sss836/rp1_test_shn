@@ -4,8 +4,9 @@ from PySide6.QtWidgets import QApplication,QMessageBox
 from PySide6.QtCore import QCoreApplication,QEvent,Qt
 from shiboken6 import isValid
 import pytest
+from factory_hmi.client import GatewayHTTPError
 from factory_hmi.desktop.motor_parameters_dialog import MotorParametersDialog
-from test_module_parameters import make,preview
+from test_module_parameters import make,preview,record
 
 @pytest.fixture
 def dialog():
@@ -105,3 +106,105 @@ def test_failed_new_read_cannot_reuse_old_job_for_write_preview(dialog):
     d.read();call=run.call_args
     call.kwargs['on_finished']()  # failed operation: no success callback
     assert not d.preview_button.isEnabled() and d.preview_value is None
+
+
+def test_selected_motor_template_query_and_comparison_stay_in_scope(dialog):
+    parent, run, client, identity, app = dialog
+    first = dict(parent.rows[0], observation={'raw_firmware': 'fixture-108'})
+    selected = dict(first, index=1, interface='can-second', observation={'raw_firmware': 'fixture-109'})
+    d = MotorParametersDialog(client, run, lambda:identity['value'], parent,
+                              selected_motor=(1, 'can-second', 1, 'LRO_5550'))
+    d.timer.stop()
+    idle = {'active': False, 'status': 'idle'}
+    call = run.call_args
+    call.args[2]({'result': {'targets': [first, selected], 'job': idle}})
+    call.kwargs['on_finished']()
+    assert d._selected() == [1]
+    assert d.table.item(1, 7).text() == 'fixture-109'
+
+    def catalog(index):
+        if index == 0:
+            raise GatewayHTTPError('模板查询失败', status_code=409, detail='版本证据缺失')
+        return {'result': {'templates': [record()]}}
+
+    client.motor_parameter_templates.side_effect = catalog
+    d.templates()
+    call = run.call_args
+    call.args[2](call.args[1]())
+    call.kwargs['on_finished']()
+    client.motor_parameter_templates.assert_called_once_with(1)
+    assert d.read_button.isEnabled()
+    assert not d.table.cellWidget(0, 5).currentData()
+    d.read()
+    call = run.call_args
+    call.args[1]()
+    assert client.motor_parameter_action.call_args.args == ('read', {'selections': [{'index': 1, 'template_id': 'a'*32}]})
+    call.kwargs['on_finished']()
+
+    d.select_all_button.click()
+    d.templates()
+    call = run.call_args
+    call.args[2](call.args[1]())
+    call.kwargs['on_finished']()
+    assert 'can-fixture ID 1：版本证据缺失' in d.details.toPlainText()
+    assert not d.read_button.isEnabled()
+    d.table.item(0, 0).setCheckState(Qt.CheckState.Unchecked)
+    assert d.read_button.isEnabled()
+    d.clear_selection_button.click()
+    assert not d.templates_button.isEnabled() and not d.read_button.isEnabled()
+
+
+def test_parameter_scope_does_not_follow_reused_index(dialog):
+    parent, run, client, identity, app = dialog
+    d = MotorParametersDialog(client, run, lambda:identity['value'], parent,
+                              selected_motor=(0, 'can-fixture', 1, 'LRO_5550'))
+    d.timer.stop()
+    call = run.call_args
+    call.args[2]({'result': {'targets': [dict(parent.rows[0], motor_id=2)], 'job': {'active': False, 'status': 'idle'}}})
+    call.kwargs['on_finished']()
+    assert not d._selected()
+    assert not d.templates_button.isEnabled()
+
+
+def test_read_reference_checks_selected_motor_without_template_or_write_preview(dialog):
+    d, run, client, *_ = dialog
+    row = dict(d.rows[0], firmware_generation=108)
+    d.reload()
+    call = run.call_args
+    call.args[2]({'result': {'targets': [row, dict(row, index=1, motor_id=2, firmware_generation=None)],
+                             'job': {'active': False, 'status': 'idle'}, 'configuration_sha256': 'e'*64}})
+    call.kwargs['on_finished']()
+    assert d._selected() == [0]
+    assert d.read_reference_button.isEnabled() and not d.read_button.isEnabled()
+    d.select_all_button.click()
+    assert not d.read_reference_button.isEnabled() and '1 台待核实' in d.step_hint.text()
+    d.table.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+    d.read_reference_button.click()
+    call = run.call_args
+    call.args[1]()
+    assert client.motor_parameter_action.call_args.args == (
+        'read-reference', {'indices': [0], 'configuration_sha256': 'e'*64})
+    client.motor_parameter_templates.assert_not_called()
+
+    items = [
+        {'key': 'kt', 'expected_raw': [174], 'tolerance_raw': 0, 'status': 'reference_difference',
+         'actual': {'status': 'read', 'raw': [100]}},
+        {'key': 'kp', 'expected_raw': None, 'tolerance_raw': 0, 'status': 'read',
+         'actual': {'status': 'read', 'raw': [0, 500]}},
+    ]
+    receipt = dict(row, before={'raw_firmware': 'fixture-109'}, items=items,
+                   reference_source='synthetic', reference_sha256='b'*64)
+    call.args[2]({'result': {'mode': 'read_reference', 'status': 'reference_checked_with_findings',
+                             'active': False, 'job_id': 'reference-only', 'targets': [receipt]}})
+    call.kwargs['on_finished']()
+    assert d.comparison.horizontalHeaderItem(3).text() == '109 脚本参考值'
+    assert d.comparison.isColumnHidden(4) and d.comparison.isColumnHidden(6)
+    assert d.comparison.item(0, 3).text() == '1.74 N·m/A'
+    assert d.comparison.item(0, 5).text() == '与参考有差异'
+    assert d.comparison.item(1, 3).text() == '—'
+    assert d.comparison.item(1, 5).text() == '已记录实测值'
+    assert '差异仅供检查' in d.details.toPlainText()
+    assert not d.preview_button.isEnabled() and d.write_group.isHidden()
+    count = run.call_count
+    d.preview()
+    assert run.call_count == count

@@ -94,7 +94,10 @@ def analysis_text(summary: Mapping[str, object] | None) -> str:
     joints = [item for item in summary.get("joint_metrics") or [] if isinstance(item, Mapping)]
     if not joints:
         return _analysis_verdict_lines(summary) + "本机摘要没有关节汇总，不能据此给出关节分析。"
-    peak = max(joints, key=lambda item: float(item.get("torque_peak_abs_nm") or 0))
+    measured_torque = [item for item in joints if item.get("torque_peak_abs_nm") is not None]
+    peak = max(measured_torque, key=lambda item: float(item["torque_peak_abs_nm"]), default=None)
+    torque_text = (f"实测峰值力矩最高为 {_number(peak['torque_peak_abs_nm'])} N·m（{peak.get('joint_name')}）。"
+                   if peak is not None else "本次记录没有可用力矩测量。")
     rise = max(joints, key=lambda item: float(item.get("temperature_peak_rise_c") or 0))
     faults = sum(int(item.get("fault_count") or 0) for item in joints)
     criteria = str((summary.get("verdict") or {}).get("criteria_version") or "UNCONFIGURED")
@@ -105,7 +108,7 @@ def analysis_text(summary: Mapping[str, object] | None) -> str:
         _analysis_verdict_lines(summary)
         + f"运行 {_number(timing.get('active_seconds'), 1)} 秒，完成 {_number(timing.get('completed_cycles'), 0)} 循环，"
         f"样本完整度 {_number(float(quality['sample_completeness']) * 100 if quality.get('sample_completeness') is not None else None, 1)}%。共 {len(joints)} 个关节。"
-        f"峰值力矩最高为 {_number(peak.get('torque_peak_abs_nm'))} N·m（{peak.get('joint_name')}）。"
+        f"{torque_text}"
         f"峰值温升最高为 {_number(rise.get('temperature_peak_rise_c'), 1)} °C（{rise.get('joint_name')}，"
         f"该关节结束温升 {_number(rise.get('temperature_rise_c'), 1)} °C）。"
         f"故障计数 {faults}。"

@@ -99,8 +99,9 @@ def test_script_label_requires_explicit_profile_and_non_echoed_marker():
 
 def test_template_selector_discloses_profile_and_complete_applicability(dialog):
     window,run,client,*_=dialog;record=script_receipt()['targets'][0]['template_record']
+    client.motor_parameter_templates.return_value={'templates':[record]}
     window.templates();call=run.call_args
-    call.args[2]({'catalogs':[(0,{'templates':[record]})]});call.kwargs['on_finished']()
+    call.args[2](call.args[1]());call.kwargs['on_finished']()
     combo=window.table.cellWidget(0,5)
     assert combo.currentData()=='a'*32 and '脚本兼容Pn' in combo.currentText()
     tooltip=combo.itemData(0,Qt.ItemDataRole.ToolTipRole)

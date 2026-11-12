@@ -8,6 +8,7 @@ public:
     CanFdCbkMap callbacks;
     std::vector<canfd_frame> sent;
     bool automatic = false;
+    bool accept_checked_tx = true;
     void transmit(const canfd_frame& frame) override {
         sent.push_back(frame);
         if (automatic && frame.len == 2 && frame.data[0] == 0xE0) {
@@ -24,6 +25,11 @@ public:
             }
             feed(reply);
         }
+    }
+    bool try_transmit(const canfd_frame& frame) override {
+        if (!accept_checked_tx) return false;
+        transmit(frame);
+        return true;
     }
     void feed(const canfd_frame& frame) {
         // Deliver deliberately misrouted frames too, to exercise driver guard.

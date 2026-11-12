@@ -12,11 +12,12 @@ export const GROUPS = [
   {id:"temperature", label:"温度", keys:["temperature_c"], unit:"°C"},
   {id:"voltage", label:"母线电压", keys:["bus_voltage_v"], unit:"V"},
   {id:"current", label:"母线电流", keys:["bus_current_a"], unit:"A"},
+  {id:"iq", label:"Iq 电流", keys:["iq_current_a"], unit:"A"},
   {id:"fault", label:"故障码", keys:["error_id"], unit:"code"},
   {id:"age", label:"反馈延迟", keys:["feedback_age_s"], unit:"s"},
 ] as const;
 export type GroupId = typeof GROUPS[number]["id"];
-const METRIC_NAMES:Record<string,string> = {position_rad:"实际位置", command_position_rad:"目标位置", speed_rad_s:"速度", torque_nm:"力矩", temperature_c:"温度", bus_voltage_v:"母线电压", bus_current_a:"母线电流", error_id:"故障码", feedback_age_s:"反馈延迟"};
+const METRIC_NAMES:Record<string,string> = {position_rad:"实际位置", command_position_rad:"目标位置", speed_rad_s:"速度", torque_nm:"力矩", temperature_c:"温度", bus_voltage_v:"母线电压", bus_current_a:"母线电流", iq_current_a:"Iq 电流", error_id:"故障码", feedback_age_s:"反馈延迟"};
 const JOINT_NAMES:Record<string,string> = {shoulder_pitch:"肩俯仰", shoulder_roll:"肩侧摆", shoulder_yaw:"肩旋转", elbow:"肘关节", wrist_roll:"腕旋转", wrist_yaw:"腕偏航", wrist_pitch:"腕俯仰"};
 export const COLORS = ["#2563eb", "#e17c28", "#0c9278", "#9a54cb", "#df4764", "#008da8", "#8b751b"];
 export function parts(id:string) {const at=id.lastIndexOf("/"); return {joint:id.slice(0,at), metric:id.slice(at+1)};}

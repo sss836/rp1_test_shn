@@ -9,6 +9,7 @@ METRICS = {
  "speed_rad_s": ("rad/s", "measured"), "torque_nm": ("N·m", "adapter_reported_torque"),
  "temperature_c": ("°C", "measured"), "bus_voltage_v": ("V", "optional_bus_measurement"),
  "bus_current_a": ("A", "optional_bus_measurement"), "error_id": ("code", "drive_event"),
+ "iq_current_a": ("A", "drive_reported_iq_current"),
  "feedback_age_s": ("s", "host_derived"),
 }
 class TelemetryHub:

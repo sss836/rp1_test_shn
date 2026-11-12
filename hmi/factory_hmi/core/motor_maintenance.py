@@ -12,7 +12,43 @@ import threading
 import time
 import uuid
 
-from .motor_versions import MODEL_NAMES
+from .motor_versions import MODEL_NAMES, firmware_generation
+from ..motor_ota_policy import V2
+
+
+MODULE_109 = "module_108_to_109"
+SELECTED_109 = "selected_108_to_109"
+
+
+def _node_identity(row):
+    return tuple(row.get(key) for key in ("index", "interface", "motor_id", "model"))
+
+
+def _version_identity(row):
+    return tuple(row.get(key) for key in ("raw_firmware", "software", "hardware", "protocol"))
+
+
+def generation_for_target(target, observation, *, require_protocol=True):
+    """The label is insufficient on its own: require a fresh complete identity."""
+    if observation.get("status") != "known" or _node_identity(target) != _node_identity(observation):
+        return None
+    identity = _version_identity(observation)
+    if not all(identity if require_protocol else identity[:3]):
+        return None
+    try:
+        seen = datetime.fromisoformat(observation["observed_at"])
+        age = (datetime.now(timezone.utc) - seen).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not 0 <= age <= 180:
+        return None
+    return firmware_generation(observation["raw_firmware"])
+
+
+def _require_109_transition(package):
+    if (firmware_generation(package["manifest"]["version"]) != 109
+            or package["policy"].get("schema") != V2):
+        raise ValueError("108→109 需要精确签名的源版本、目标版本、协议和固件哈希映射")
 
 
 def now():
@@ -102,18 +138,42 @@ class ModuleFirmwareMaintenance:
             value["active"] = self.active
             return value
 
-    def preview(self, selections):
+    def preview(self, selections, *, mode=None, configuration_sha256=None):
         with self._lock:
             if self.active:
                 raise RuntimeError("已有模块固件维护任务")
+            self._preview = None
             actor = self.authorize()
             targets = self.targets()
+            configuration = digest(targets)
+            if configuration_sha256 is not None and configuration_sha256 != configuration:
+                raise ValueError("当前有效配置已变化，请刷新电机列表")
             indices = [s["index"] for s in selections]
-            if (not indices or len(indices) != len(set(indices)) or
-                    any(type(i) is not int for i in indices)):
+            if mode not in (None, MODULE_109, SELECTED_109):
+                raise ValueError("未知的固件升级范围")
+            if any(type(i) is not int for i in indices) or len(indices) != len(set(indices)):
                 raise ValueError("请选择非空且不重复的目标")
             by_index = {r["index"]: r for r in targets}
             observed = {r["index"]: r for r in self.observations()}
+            skipped = []
+            if mode == MODULE_109:
+                pending = set()
+                for target in targets:
+                    index = target["index"]
+                    observation = observed.get(index, {})
+                    generation = generation_for_target(target, observation)
+                    if generation == 108:
+                        pending.add(index)
+                    elif generation == 109:
+                        skipped.append({**target, "before": observation, "status": "already_109"})
+                    else:
+                        raise ValueError(f'{target["joint_name"]} 的实际版本未确认；无法确定整个模块的升级范围')
+                if not pending:
+                    raise ValueError("整个模块已确认是 109，无需刷写")
+                if set(indices) != pending:
+                    raise ValueError("整模块升级必须覆盖所有且仅覆盖当前的 108 电机")
+            if not indices:
+                raise ValueError("请选择非空且不重复的目标")
             rows = []
             for selection in selections:
                 index = selection["index"]
@@ -121,15 +181,20 @@ class ModuleFirmwareMaintenance:
                     raise ValueError("所选目标不属于当前模块")
                 target = by_index[index]
                 observation = observed.get(index, {})
-                if (observation.get("interface"), observation.get("motor_id"), observation.get("model")) != (
-                        target["interface"], target["motor_id"], target["model"]):
+                if _node_identity(observation) != _node_identity(target):
                     raise ValueError("实际版本与最终有效配置不一致")
+                if mode is not None and generation_for_target(target, observation) != 108:
+                    raise ValueError(f'{target["joint_name"]} 未确认是 108，不能加入此批次')
                 package = self.artifact(selection["release_id"], observation)
+                if mode is not None:
+                    _require_109_transition(package)
                 rows.append({**target, "release_id": selection["release_id"], "before": observation,
                              "manifest": package["manifest"], "policy": package["policy"]})
             preview = {"preview_id": uuid.uuid4().hex, "actor": actor, "created_at": now(),
-                       "configuration_sha256": digest(targets), "targets": rows,
+                       "configuration_sha256": configuration, "targets": rows,
                        "selections": deepcopy(selections), "expires_monotonic": time.monotonic() + 120}
+            if mode is not None:
+                preview.update(mode=mode, skipped_targets=skipped)
             self._preview = preview
             return deepcopy({k: v for k, v in preview.items() if k != "expires_monotonic"})
 
@@ -153,6 +218,8 @@ class ModuleFirmwareMaintenance:
                          "targets": [{**deepcopy(r), "status": "pending", "bytes_written": 0,
                                       "power_cycle_required": False, "human_acknowledged_at": None,
                                       "readback": None, "actual_version_verified": False} for r in p["targets"]]}
+            if p.get("mode"):
+                self._job.update(mode=p["mode"], skipped_targets=deepcopy(p["skipped_targets"]))
             self._preview = None
             self._stop.clear(); self._read.clear()
             try:
@@ -182,6 +249,14 @@ class ModuleFirmwareMaintenance:
         if self.authorize() != self._job["actor"]:
             raise RuntimeError("登录或维护权限已变化")
 
+    def _read_planned_identity(self, row, generation):
+        self._check()
+        actual = self.reader(row, self._stop)
+        if (generation_for_target(row, actual) != generation
+                or _version_identity(actual) != _version_identity(row["before"])):
+            raise VersionUnknownError(f'{row["joint_name"]} 的实际版本与预览不符；请重新检查')
+        return actual
+
     def _run(self):
         current = None
         terminal_status, terminal_error = "verified", None
@@ -192,11 +267,21 @@ class ModuleFirmwareMaintenance:
             # Retain a retryable reservation even if __enter__ fails part-way.
             self._reservation = self.reserve()
             self._reservation.__enter__()
+            mode = self._job.get("mode")
+            if mode:
+                # Confirm the entire plan before the first irreversible write.
+                for row in self._job["targets"]:
+                    self._read_planned_identity(row, 108)
+                for row in self._job["skipped_targets"]:
+                    actual = self._read_planned_identity(row, 109)
+                    with self._lock:
+                        row["skip_readback"] = actual
+                        self._save()
             for row in self._job["targets"]:
                 current = row
                 self._check()
                 # Re-read actual identity/version at the last boundary before erase.
-                before = self.reader(row, self._stop)
+                before = self._read_planned_identity(row, 108) if mode else self.reader(row, self._stop)
                 if before.get("status") != "known":
                     raise VersionUnknownError("写前实际版本未知，停止后续目标")
                 package = self.artifact(row["release_id"], before)
@@ -238,8 +323,11 @@ class ModuleFirmwareMaintenance:
                 if after.get("status") != "known":
                     raise VersionUnknownError("版本未知，停止后续目标")
                 m = row["manifest"]
-                if (after.get("raw_firmware"), after.get("software"), after.get("hardware"), after.get("protocol")) != (
-                        m["version"], m["software_version"], row["before"]["hardware"], row["before"]["protocol"]):
+                dest = row["policy"].get("entry", {}).get("target") if row["policy"].get("schema") == V2 else None
+                expected = (m["version"], m["software_version"],
+                            dest["hardware"] if dest else row["before"]["hardware"],
+                            dest["protocol"] if dest else row["before"]["protocol"])
+                if _version_identity(after) != expected or (mode and generation_for_target(row, after) != 109):
                     raise RuntimeError("回读版本不符，停止后续目标")
                 with self._lock:
                     row.update(status="verified", actual_version_verified=True)

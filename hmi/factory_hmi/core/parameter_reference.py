@@ -8,11 +8,27 @@ import hashlib
 import json
 from pathlib import Path
 
-from factory_hmi.motor_parameter_contract import PN_NUMBERS
+from factory_hmi.motor_parameter_contract import PN_NUMBERS, SOURCE_SHA256, validate
 
 CATALOG_SHA256 = 'c9995c1535f101b86c5ecac548ff6a6b69955a5627234110ad0282dbdd273f62'
 DOCUMENTATION_ZIP_SHA256 = 'de0c3701c67528b0fa2da945b9108535c8fc41c280993e46bf2f3a22db96ad68'
 CATALOG_PATH = Path(__file__).resolve().parents[1]/'resources/motor-parameters/pn-robopartydiver-0.6.0.reference.json'
+SCRIPT_REFERENCE_PATH = CATALOG_PATH.with_name('script-compatible-reference-v2.json')
+SCRIPT_REFERENCE_SHA256 = 'a1379a5a97d4dc115f6e6f2b863297df33c15c68d848c9ea35dc413a243d53d2'
+
+
+def script_reference(model):
+    """Pinned reference values for read-only diagnosis; not a write template."""
+    raw = SCRIPT_REFERENCE_PATH.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != SCRIPT_REFERENCE_SHA256:
+        raise ValueError('脚本参考表哈希不符')
+    content = json.loads(raw)
+    if content['source_sha256'] != SOURCE_SHA256:
+        raise ValueError('脚本参考表来源不符')
+    matches = [validate(value) for value in content['templates'] if value['model'] == model]
+    if len(matches) != 1:
+        raise ValueError('当前型号缺少唯一的脚本参考值')
+    return matches[0]
 
 
 def _validated_catalog(raw):

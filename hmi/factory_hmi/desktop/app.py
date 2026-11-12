@@ -173,6 +173,9 @@ class FactoryMainWindow(QMainWindow):
         "error_id",
         "软件诊断",
         "反馈延迟(s)",
+        "Iq 电流(A)",
+        "驱动状态",
+        "反馈头",
     )
     ZERO_COLUMNS = (
         "关节",
@@ -1858,7 +1861,7 @@ class FactoryMainWindow(QMainWindow):
         self.motor_table.horizontalHeader().setMinimumSectionSize(42)
         self.motor_table.horizontalHeader().setDefaultSectionSize(68)
         for column, width in enumerate(
-            (130, 48, 58, 70, 70, 70, 78, 82, 72, 88, 88, 72, 200, 90)
+            (130, 48, 58, 70, 70, 70, 78, 82, 72, 88, 88, 72, 200, 90, 88, 82, 70)
         ):
             if column:
                 self.motor_table.setColumnWidth(column, width)
@@ -2510,9 +2513,11 @@ class FactoryMainWindow(QMainWindow):
             match = re.search(r"\bid=(\d+)", detail)
             if match:
                 motor_id = match.group(1)
+            error_name = ("其他报警（OTHER_ERROR）" if "protocol_profile=v1.03" in detail
+                          else "驱动器故障（DRV_ERROR）" if "protocol_profile=legacy" in detail
+                          else "电机报警")
             message = (
-                f"{action}失败：电机 ID {motor_id} 报告驱动器故障"
-                "（DRV_ERROR，error_id=7）。"
+                f"{action}失败：电机 ID {motor_id} 报告{error_name}，error_id=7。"
                 "系统已撤销全部电机使能。请检查该电机驱动器、电源和线束，"
                 "必要时断电复位；排除故障后重新扫描，禁止强制忽略。"
             )
@@ -2868,8 +2873,18 @@ class FactoryMainWindow(QMainWindow):
                 diagnostic += "；状态数据已过期"
             if diagnostic.startswith("通信反馈超时") and not stale:
                 diagnostic += "；当前反馈已恢复"
-            if str(self._pick(motor, "error_id", default=0)) == "7" and not stale:
-                warning = "驱动器故障 DRV_ERROR；温度为上报值，故障时可能冻结"
+            profile = motor.get("lro_protocol_profile", "legacy")
+            if profile is None and motor.get("feedback_header") is not None and not stale:
+                pending = "LRO 协议待核实；显示原始反馈头"
+                diagnostic = pending if diagnostic in {"", "正常", "—"} else f"{diagnostic}；{pending}"
+            error_id = str(self._pick(motor, "error_id", default=0))
+            alarm_name = ({"5": "缺相或电流采样偏置", "6": "过压", "7": "其他报警 OTHER_ERROR"}.get(error_id)
+                          if profile == "v1.03" else None)
+            if error_id == "7" and alarm_name is None:
+                alarm_name = ("驱动器故障 DRV_ERROR" if profile == "legacy" or motor.get("feedback_header") is None
+                              else "电机报警 0x07")
+            if alarm_name and not stale:
+                warning = f"{alarm_name}；温度为上报值，故障时可能冻结"
                 diagnostic = warning if diagnostic in {"", "正常", "—"} else f"{diagnostic}；{warning}"
             explicit_error = self._pick(motor, "error", "position_error", default=None)
             if (
@@ -2888,6 +2903,8 @@ class FactoryMainWindow(QMainWindow):
                 actual = "—"
                 explicit_error = "—"
                 speed = "—"
+            drive_enabled = motor.get("drive_enabled")
+            feedback_header = motor.get("feedback_header")
             values = (
                 self._pick(motor, "joint", "joint_name", "name"),
                 self._pick(motor, "motor_id", "id"),
@@ -2932,6 +2949,9 @@ class FactoryMainWindow(QMainWindow):
                 ),
                 diagnostic,
                 feedback_age,
+                "—" if stale else self._pick(motor, "iq_current_a"),
+                ("已使能" if drive_enabled else "已失能") if not stale and type(drive_enabled) is bool else "—",
+                f"0x{feedback_header:02X}" if not stale and type(feedback_header) is int else "—",
             )
             formatted_values = tuple(self._format_value(value) for value in values)
             motor_rows.append(formatted_values)
@@ -6064,6 +6084,8 @@ class FactoryMainWindow(QMainWindow):
                 "所选电机已解除控制。请将该电机移动到机械零位，"
                 "读取并核对当前位置后再确认标零。"
             )
+        elif state in {"prepared", "completed"} and zeroing.get("pending_reboot_indices"):
+            self.zero_status_label.setText("标零指令已提交。等待该电机重新上电后，在机械零位核验反馈。")
         elif state == "prepared":
             self.zero_status_label.setText(
                 "当前电机标零已完成。可关闭窗口，然后在电机监控表选择任意电机。"
@@ -6269,11 +6291,10 @@ class FactoryMainWindow(QMainWindow):
             if isinstance(snapshot, Mapping):
                 self._render_snapshot(dict(snapshot))
         if action.startswith("confirm"):
-            QMessageBox.information(
-                self,
-                "标零完成",
-                f"已完成所选电机标零：\n{self._zero_selected_label}",
-            )
+            if zeroing and zeroing.get("pending_reboot_indices"):
+                QMessageBox.information(self, "标零指令已提交", "等待该电机重新上电后，在机械零位核验反馈。")
+            else:
+                QMessageBox.information(self, "标零完成", f"已完成所选电机标零：\n{self._zero_selected_label}")
             self.zero_dialog.accept()
         elif action == "abort":
             self.zero_dialog.reject()

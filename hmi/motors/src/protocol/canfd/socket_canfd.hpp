@@ -85,6 +85,7 @@ class MotorsSocketCANFD : public MotorsCANFD {
     static std::shared_ptr<MotorsSocketCANFD> get(const std::string& interface);
 
     void transmit(const canfd_frame& frame) override;
+    bool try_transmit(const canfd_frame& frame) override;
     void add_canfd_callback(const CanFdCbkFunc& callback, CanFdCbkId id) override;
     void remove_canfd_callback(CanFdCbkId id) override;
     void clear_canfd_callbacks() override;
