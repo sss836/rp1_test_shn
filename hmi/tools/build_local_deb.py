@@ -121,7 +121,9 @@ def main() -> None:
     (target_source / "docs").mkdir()
     for name in ("NPZ_UPLOAD_LIMITS.md", "QUICK_VERIFICATION.md", "SAMPLE_SELECTION.md",
                  "WAISTHIP_SUPPORT.md", "UBUNTU22_DEPLOYMENT.md", "LONG_RUN_SAFETY.md",
-                 "MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md", "MODULE_FIRMWARE_MAINTENANCE.md", "MODULE_PARAMETERS.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
+                 "MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md",
+                 "MODULE_FIRMWARE_MAINTENANCE.md", "MODULE_PARAMETERS.md", "PLC_HMI_LRO_108_109.md",
+                 "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, target_source / "docs" / name)
     (target_source / "config/examples").mkdir(parents=True)
     shutil.copy2(SOURCE / "config/examples/motion_completion.unverified.yaml",
