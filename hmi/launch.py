@@ -15,6 +15,7 @@ from pathlib import Path
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -255,6 +256,76 @@ def request_update_stop(_signum=None, _frame=None):
     request_stop()
 
 
+def site_stop_address(root: Path, pid: int) -> Path:
+    return root / f"run/site-stop-{pid}.sock"
+
+
+def site_stop_message(pid: int, start: str) -> bytes:
+    return f"stop-site-isolated {pid} {start}".encode("ascii")
+
+
+def socket_peer(connection: socket.socket) -> tuple[int, int]:
+    credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("iII"))
+    pid, uid, _gid = struct.unpack("iII", credentials)
+    return pid, uid
+
+
+class SiteIsolationControl:
+    """Receive a same-user, one-attempt confirmation on the launcher thread."""
+
+    def __init__(self, root: Path, pid: int, start: str):
+        self.address = site_stop_address(root, pid)
+        self.message = site_stop_message(pid, start)
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        bound = False
+        try:
+            self.listener.bind(str(self.address))
+            bound = True
+            self.address.chmod(0o600)
+            self.listener.listen(1)
+            self.listener.setblocking(False)
+        except OSError:
+            self.listener.close()
+            if bound:
+                self.address.unlink(missing_ok=True)
+            raise
+
+    def receive(self) -> bool:
+        try:
+            connection, _address = self.listener.accept()
+            with connection:
+                connection.settimeout(.1)
+                _pid, uid = socket_peer(connection)
+                if uid != os.geteuid() or connection.recv(128) != self.message:
+                    return False
+                connection.sendall(b"accepted")
+                return True
+        except OSError:
+            return False
+
+    def close(self) -> None:
+        self.listener.close()
+        self.address.unlink(missing_ok=True)
+
+
+def request_site_isolated_stop(root: Path, data: dict) -> None:
+    if data.get("site_isolated_stop") is not True:
+        raise RuntimeError("当前运行的启动器没有现场隔离退出端点，未发送退出请求。")
+    pid, start = int(data["pid"]), data["start"]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+            client.settimeout(2.0)
+            client.connect(str(site_stop_address(root, pid)))
+            peer_pid, peer_uid = socket_peer(client)
+            if (peer_pid != pid or peer_uid != os.geteuid() or process_start(peer_pid) != start):
+                raise RuntimeError("无法验证现场隔离退出端点的启动器身份，未发送退出请求。")
+            client.sendall(site_stop_message(pid, start))
+            if client.recv(128) != b"accepted":
+                raise RuntimeError("运行实例未确认现场隔离退出请求，请检查 status 和日志。")
+    except OSError as exc:
+        raise RuntimeError(f"现场隔离退出端点通信失败，请检查 status 和日志。{exc}") from exc
+
+
 def raise_existing(root: Path, data: dict) -> bool:
     """Only send a window request to this verified launcher's private sockets."""
     pid = data.get("pid")
@@ -482,12 +553,15 @@ def write_state(state: Path, data: dict) -> None:
     temporary.replace(state)
 
 
-def prepare_gateway(process: subprocess.Popen, url: str, token: str) -> dict:
+def prepare_gateway(process: subprocess.Popen, url: str, token: str, site_isolated: bool = False) -> dict:
     """Do not send a process signal until the live gateway acknowledges close."""
     method = "POST"
     while process.poll() is None:
+        headers = {"X-RP1-Shutdown-Token": token}
+        if site_isolated and method == "POST":
+            headers["X-RP1-Site-Isolated"] = "1"
         request = Request(url + "/api/v1/lifecycle/shutdown", method=method,
-                          headers={"X-RP1-Shutdown-Token": token})
+                          headers=headers)
         try:
             with open_gateway(request, timeout=2) as response:
                 result = json.load(response)
@@ -496,6 +570,9 @@ def prepare_gateway(process: subprocess.Popen, url: str, token: str) -> dict:
                     "detail": f"Shutdown handshake unavailable: {exc}"}
         if not isinstance(result, dict):
             return {"state": "blocked", "ready": False, "detail": "Invalid shutdown handshake response"}
+        if site_isolated and result.get("site_isolated") is not True:
+            return {"state": "blocked", "ready": False,
+                    "detail": "Gateway did not acknowledge the site-isolated shutdown attempt"}
         if result.get("state") in {"ready", "blocked"}:
             return result
         method = "GET"
@@ -524,21 +601,26 @@ def record_shutdown(state: Path, result: dict) -> None:
         print(f"Cannot persist shutdown status: {exc}", file=sys.stderr, flush=True)
 
 
-def supervised_shutdown(gateway, desktop, url: str, token: str, state: Path, *, extra_desktops=()) -> None:
+def supervised_shutdown(gateway, desktop, url: str, token: str, state: Path, *, extra_desktops=(),
+                        isolation_control: SiteIsolationControl | None = None,
+                        site_isolated: bool = False) -> None:
     while gateway is not None and gateway.poll() is None:
         generation = stop_generation
         record_shutdown(state, {"state": "preparing", "ready": False})
-        result = prepare_gateway(gateway, url, token)
+        result = prepare_gateway(gateway, url, token, site_isolated)
+        site_isolated = False
         record_shutdown(state, result)
         if result.get("ready") is True and result.get("state") == "ready":
             break
         if gateway.poll() is not None:
             break
         print("退出未完成，保留网关与单实例锁：" + str(result.get("detail", "unknown"))
-              + "。排除原因后再次执行 stop 重试；不会自动强杀。", file=sys.stderr, flush=True)
-        # Do not blindly repeat stop/close writes. A new user signal explicitly
-        # retries the same preparation, without bypassing its safety checks.
+              + "。排除原因后重新发起退出请求。", file=sys.stderr, flush=True)
+        # A retry requires a new signal or a fresh site-isolation confirmation.
         while gateway.poll() is None and stop_generation == generation:
+            if isolation_control is not None and isolation_control.receive():
+                site_isolated = True
+                break
             time.sleep(.2)
     desktops = (desktop, *extra_desktops) if desktop is not None else extra_desktops
     for process in desktops:
@@ -574,7 +656,13 @@ def main() -> int:
     parser.add_argument("--duration", type=float, default=0)
     parser.add_argument("--offline-check", action="store_true", help="Dedicated mock PLC; no hardware or platform connection")
     parser.add_argument("--offline-access", choices=("control", "monitor"), default="control")
+    parser.add_argument("--site-isolated", action="store_true",
+                        help="仅用于 stop。确认共享柜和全部受影响工位已现场隔离，"
+                             "测试已停止、电机已失能、机械负载已安全支撑，"
+                             "柜内、外部及独立供电均已切断，再退出 HMI。")
     args = parser.parse_args()
+    if args.site_isolated and args.action != "stop":
+        parser.error("--site-isolated 仅用于 stop")
     if not math.isfinite(args.lease_timeout) or not 0 < args.lease_timeout <= 300:
         parser.error("--lease-timeout must be finite and in (0, 300] seconds")
     if not 1024 <= args.port <= 65535:
@@ -595,12 +683,17 @@ def main() -> int:
         return 0
     if args.action == "stop":
         if data:
-            os.kill(int(data["pid"]), signal.SIGTERM)
+            if args.site_isolated:
+                request_site_isolated_stop(root, data)
+            else:
+                os.kill(int(data["pid"]), signal.SIGTERM)
             for _ in range(75):
                 if not running(state):
                     print("HMI and its own gateway stopped.")
                     return 0
                 time.sleep(0.2)
+            if args.site_isolated:
+                raise RuntimeError("现场隔离退出尚未完成。请检查 status 和日志，解决阻塞后重新发起退出请求。")
             raise RuntimeError("Stop is incomplete; gateway and launcher remain alive. Check status/logs, resolve the blocker, then run stop again.")
         print("HMI is already stopped.")
         return 0
@@ -647,18 +740,31 @@ def main() -> int:
         signal.signal(signal.SIGUSR1, request_update_stop)
         gateway = None
         shutdown_token = secrets.token_urlsafe(32)
-        env["RP1_FACTORY_SHUTDOWN_TOKEN"] = shutdown_token
         url = f"http://127.0.0.1:{args.port}"
         glog = BoundedProcessLog(root / "logs/gateway.log")
         desktops = None if args.gateway_only else DesktopChildren(root, url, env)
+        pid = os.getpid()
+        start = process_start(pid)
+        isolation_control = None
+        site_isolated = False
         try:
             try:
-                gateway = subprocess.Popen([sys.executable, "-m", "factory_hmi.gateway", "--host", "127.0.0.1", "--port", str(args.port), "--data-root", "data", "--lease-timeout", str(args.lease_timeout)], cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                isolation_control = SiteIsolationControl(root, pid, start)
+            except OSError as exc:
+                print(f"无法打开现场隔离退出端点：{exc}", file=sys.stderr, flush=True)
+            try:
+                gateway = subprocess.Popen(
+                    [sys.executable, "-m", "factory_hmi.gateway", "--host", "127.0.0.1", "--port", str(args.port),
+                     "--data-root", "data", "--lease-timeout", str(args.lease_timeout)],
+                    cwd=root, env=dict(env, RP1_FACTORY_SHUTDOWN_TOKEN=shutdown_token),
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                )
                 glog.attach(gateway.stdout)
-                launch_state = {"pid": os.getpid(), "start": process_start(os.getpid()),
+                launch_state = {"pid": pid, "start": start,
                                 "gateway_pid": gateway.pid, "gateway": url, "driver": driver,
                                 "access_mode": mode, "read_only": mode == "monitor",
-                                "update_safe_exit": True, "shutdown_handshake": True}
+                                "update_safe_exit": True, "shutdown_handshake": True,
+                                "site_isolated_stop": isolation_control is not None}
                 write_state(state, launch_state)
                 wait_health(gateway, url, driver, mode)
                 if desktops is not None:
@@ -667,6 +773,9 @@ def main() -> int:
                 print(f"HMI ready: PLC {driver}, {mode}, {url}", flush=True)
                 deadline = time.monotonic() + args.duration if args.duration > 0 else None
                 while not stopping:
+                    if isolation_control is not None and isolation_control.receive():
+                        site_isolated = True
+                        break
                     if gateway.poll() is not None:
                         raise RuntimeError("Gateway exited unexpectedly; see logs.")
                     if desktops is not None:
@@ -688,11 +797,17 @@ def main() -> int:
                 if desktops is not None:
                     desktops.stop_requests()
                 supervised_shutdown(gateway, None, url, shutdown_token, state,
-                                    extra_desktops=tuple(desktops.processes.values()) if desktops else ())
+                                    extra_desktops=tuple(desktops.processes.values()) if desktops else (),
+                                    isolation_control=isolation_control, site_isolated=site_isolated)
                 if desktops is not None:
                     desktops.reap()
                 state.unlink(missing_ok=True)
         finally:
+            if isolation_control is not None:
+                try:
+                    isolation_control.close()
+                except OSError as exc:
+                    print(f"无法清理现场隔离退出端点：{exc}", file=sys.stderr, flush=True)
             glog.close()
             if desktops is not None:
                 desktops.close_logs()

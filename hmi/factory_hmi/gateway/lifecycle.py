@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 logger = logging.getLogger(__name__)
 
 LIFECYCLE_PATH = "/api/v1/lifecycle/shutdown"
+SITE_ISOLATED_HEADER = "X-RP1-Site-Isolated"
 # Shutdown must not remove the existing operator safety controls. These
 # exact routes cannot start/reconfigure a test; endpoint auth, lease, PLC
 # revision and mechanical-support checks still apply after admission.
@@ -29,20 +30,23 @@ HEARTBEAT_PATH = "/api/v1/lease/heartbeat"
 
 
 class ShutdownCoordinator:
-    def __init__(self, close: Callable[[], None], *, drain_timeout_s: float = 10.0):
+    def __init__(self, close: Callable[[], None], *,
+                 close_isolated: Callable[[], None] | None = None, drain_timeout_s: float = 10.0):
         self._close = close
+        self._close_isolated = close_isolated
         self._condition = threading.Condition(threading.RLock())
         self._state = "running"
         self._detail = "Shutdown not requested"
         self._active = 0
         self._attempt = 0
+        self._site_isolated = False
         self._drain_timeout_s = drain_timeout_s
 
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
             return {"state": self._state, "ready": self._state == "ready",
                     "detail": self._detail, "attempt": self._attempt,
-                    "active_requests": self._active}
+                    "active_requests": self._active, "site_isolated": self._site_isolated}
 
     def enter(self, path: str) -> bool:
         with self._condition:
@@ -59,17 +63,25 @@ class ShutdownCoordinator:
             self._active -= 1
             self._condition.notify_all()
 
-    def request(self) -> dict[str, Any]:
+    def request(self, *, site_isolated: bool = False) -> dict[str, Any]:
         with self._condition:
-            if self._state in {"preparing", "ready"}:
+            if self._state == "ready":
                 return self.snapshot()
+            if self._state == "preparing":
+                if site_isolated and not self._site_isolated:
+                    raise ValueError("已有另一种退出方式正在处理，请等待该次结果")
+                return self.snapshot()
+            close = self._close_isolated if site_isolated else self._close
+            if close is None:
+                raise ValueError("当前网关不支持隔离后退出")
             self._state = "preparing"
+            self._site_isolated = site_isolated
             self._detail = "Draining accepted requests before closing resources"
             self._attempt += 1
-            threading.Thread(target=self._prepare, name="gateway-prepare-shutdown", daemon=True).start()
+            threading.Thread(target=self._prepare, args=(close,), name="gateway-prepare-shutdown", daemon=True).start()
             return self.snapshot()
 
-    def _prepare(self) -> None:
+    def _prepare(self, close: Callable[[], None]) -> None:
         try:
             deadline = time.monotonic() + self._drain_timeout_s
             with self._condition:
@@ -78,7 +90,7 @@ class ShutdownCoordinator:
                     if remaining <= 0:
                         raise RuntimeError("Accepted control request is still pending; no resources were closed")
                     self._condition.wait(remaining)
-            self._close()
+            close()
             # Safety requests can arrive during close. Keep their existing
             # service/lease serialization, then drain before acknowledging
             # readiness. The final zero check and ready transition share the

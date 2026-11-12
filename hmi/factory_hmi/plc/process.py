@@ -235,13 +235,15 @@ class PlcCabinetProcess(PlcCabinetClient):
                 self._process = None
             raise
 
-    def close(self) -> None:
+    def close(self, *, site_isolated: bool = False) -> None:
+        if type(site_isolated) is not bool:
+            raise ValueError("site_isolated must be a boolean")
         if self._process is None or self._closed:
             return
         if not self._confirmed_close:
             try:
-                self._shutdown_result = self._request("close", {}, timeout=self._close_timeout,
-                                                      owner=True)
+                params = {"site_isolated": True} if site_isolated else {}
+                self._shutdown_result = self._request("close", params, timeout=self._close_timeout, owner=True)
             except (OSError, ValueError, PlcRequestConflict) as exc:
                 self._shutdown_result = {"state": "unconfirmed", "detail": str(exc)}
                 raise RuntimeError(f"PLC 柜停机未确认：{exc}") from exc
@@ -306,7 +308,9 @@ class _CabinetServer(UnixStreamServer):
         self.closed = False
         self.closing = False
         self._preparing = False
+        self._site_isolating = False
         self._active_normal = 0
+        self._active_safety = 0
         self._gate = threading.Condition()
         self._close_lock = threading.Lock()
         self._slots = {name: threading.BoundedSemaphore(size) for name, size in (
@@ -325,10 +329,13 @@ class _CabinetServer(UnixStreamServer):
             expected = self._lifecycle_token if method == "close" else self._token
             if not isinstance(token, str) or not token.isascii() or not hmac.compare_digest(token, expected):
                 raise PlcRequestConflict("cabinet_forbidden", "PLC 柜进程权限校验失败")
-            if method == "close" and self.closed:
-                with connection:
-                    _send(connection, {"ok": True, "result": self._shutdown_status()}, _REPLY_BYTES)
-                return
+            if method == "close":
+                if params.keys() - {"site_isolated"} or type(params.get("site_isolated", False)) is not bool:
+                    raise ValueError("Invalid cabinet close request")
+                if self.closed:
+                    with connection:
+                        _send(connection, {"ok": True, "result": self._shutdown_status()}, _REPLY_BYTES)
+                    return
             slot_name = params.get("operation") if method == "execute" else method
             if method == "execute" and slot_name not in _SAFETY_COMMANDS:
                 slot_name = "execute"
@@ -370,7 +377,7 @@ class _CabinetServer(UnixStreamServer):
         if method == "shutdown-status":
             return self._shutdown_status()
         if method == "close":
-            return self.close_cabinet()
+            return self.close_cabinet(site_isolated=params.get("site_isolated", False))
         operation = params.get("operation")
         if operation not in _COMMANDS:
             raise ValueError("Invalid PLC operation")
@@ -380,41 +387,54 @@ class _CabinetServer(UnixStreamServer):
                 recover = (operation == "reset-fault" and not self.orphaned.is_set()
                            and not self._preparing
                            and self.service.shutdown_status["state"] == "unconfirmed")
-                if self.closed or ((self.closing or self.orphaned.is_set()) and not (safety or recover)):
+                if (self.closed or self._site_isolating
+                        or ((self.closing or self.orphaned.is_set()) and not (safety or recover))):
                     raise PlcRequestConflict("cabinet_closing", "PLC 柜正在停机，已禁止新的控制操作")
                 if safety:
                     safety_context.enter_context(self.service.shutdown_safety_request())
+                    self._active_safety += 1
                 else:
                     self._active_normal += 1
             try:
                 return self.service.coordination.execute(**params)
             finally:
-                if not safety:
-                    with self._gate:
+                safety_context.close()
+                with self._gate:
+                    if safety:
+                        self._active_safety -= 1
+                    else:
                         self._active_normal -= 1
-                        self._gate.notify_all()
+                    self._gate.notify_all()
 
     def _shutdown_status(self) -> dict[str, Any]:
         return {**self.service.shutdown_status, "ready": self.closed}
 
-    def close_cabinet(self) -> dict[str, Any]:
+    def close_cabinet(self, *, site_isolated: bool = False) -> dict[str, Any]:
         with self._close_lock:
             if self.closed:
                 return self._shutdown_status()
             with self._gate:
                 self.closing = True
                 self._preparing = True
+                self._site_isolating = site_isolated
             try:
                 with self._gate:
-                    if not self._gate.wait_for(lambda: not self._active_normal, timeout=10.0):
+                    if not self._gate.wait_for(
+                        lambda: not self._active_normal and (not site_isolated or not self._active_safety),
+                        timeout=10.0,
+                    ):
                         self.service.shutdown_status = {"state": "unconfirmed", "detail": "PLC command still active"}
                         raise RuntimeError("PLC command still active")
-                self.service.close()
+                if site_isolated:
+                    self.service.close(site_isolated=True)
+                else:
+                    self.service.close()
                 with self._gate:
                     self.closed = True
                 return self._shutdown_status()
             finally:
                 with self._gate:
+                    self._site_isolating = False
                     self._preparing = False
 
     def owner_lost(self) -> None:

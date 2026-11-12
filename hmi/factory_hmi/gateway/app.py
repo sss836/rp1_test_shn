@@ -34,7 +34,7 @@ from factory_hmi.version import process_identity
 from factory_hmi.execution_history import history_csv
 from factory_hmi.core.can_manager import CanConnectOutcomeUnknown
 
-from .lifecycle import LIFECYCLE_PATH, SAFETY_PATHS, ShutdownCoordinator, ShutdownGate
+from .lifecycle import LIFECYCLE_PATH, SAFETY_PATHS, SITE_ISOLATED_HEADER, ShutdownCoordinator, ShutdownGate
 from .lease import ControlLease, LeaseConflict, DEFAULT_LEASE_TIMEOUT_S, validate_lease_timeout
 from .display import DisplayPublisher
 from .can_connect import CanConnectCommands
@@ -908,7 +908,7 @@ class GatewayHub:
         self._retired_sessions: dict[str, None] = {}
         self._close_lock = threading.Lock()
         self._closed = False
-        self.shutdown = ShutdownCoordinator(self.close)
+        self.shutdown = ShutdownCoordinator(self.close, close_isolated=lambda: self.close(site_isolated=True))
 
     def apply_live_execution_code(self, session_key: str, execution_code: str) -> None:
         with self._lock:
@@ -985,7 +985,7 @@ class GatewayHub:
                 if runtime._lease_thread is None or not runtime._lease_thread.is_alive():
                     runtime.start()
 
-    def close(self) -> None:
+    def close(self, *, site_isolated: bool = False) -> None:
         # Keep successful and failed sessions inspectable, but never close a
         # successful one twice or release a failed owner's interfaces early.
         with self._close_lock:
@@ -1007,7 +1007,10 @@ class GatewayHub:
                 # A motor/record worker still needs recovery. Do not remove
                 # PLC polling or platform workers beneath that failed close.
                 raise RuntimeError("gateway shutdown incomplete: " + "; ".join(errors))
-            self.plc.close()
+            if site_isolated:
+                self.plc.close(site_isolated=True)
+            else:
+                self.plc.close()
             self._platform.close()
             with self._lock:
                 self._interface_owners.clear()
@@ -1388,9 +1391,15 @@ def create_app(
         return shutdown_status()
 
     @app.post(LIFECYCLE_PATH)
-    def prepare_shutdown(request: Request, x_rp1_shutdown_token: str | None = Header(default=None)):
+    def prepare_shutdown(request: Request, x_rp1_shutdown_token: str | None = Header(default=None),
+                         site_isolated: str | None = Header(default=None, alias=SITE_ISOLATED_HEADER)):
         require_shutdown_access(request, x_rp1_shutdown_token)
-        hub.shutdown.request()
+        if site_isolated not in (None, "1"):
+            raise HTTPException(status_code=422, detail="隔离后退出必须由本机启动器明确确认")
+        try:
+            hub.shutdown.request(site_isolated=site_isolated == "1")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return JSONResponse(status_code=200 if hub.shutdown.snapshot()["ready"] else 202,
                             content=shutdown_status())
 

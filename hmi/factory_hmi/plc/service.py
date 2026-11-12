@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +53,7 @@ class PlcCabinetService:
         self._shutdown_safety_pending = 0
         self._shutdown_interrupt = threading.Event()
         self._shutdown_closing = threading.Event()
+        self._site_isolating = False
         self._shutdown_error_kind = None
         self._thread: threading.Thread | None = None
         self._last_heartbeat = 0.0
@@ -114,6 +118,8 @@ class PlcCabinetService:
     def shutdown_safety_request(self):
         """Register an authenticated safety request before acquiring control locks."""
         with self._shutdown_guard:
+            if self._site_isolating or self.shutdown_status["state"] == "site_isolated":
+                raise PlcRequestConflict("cabinet_closing", "PLC 柜正在执行现场隔离后退出")
             self._shutdown_safety_pending += 1
             if self._shutdown_closing.is_set():
                 self._shutdown_interrupt.set()
@@ -133,19 +139,30 @@ class PlcCabinetService:
         if self._shutdown_interrupt.is_set():
             raise RuntimeError("PLC shutdown interrupted by safety command; exit remains pending")
 
-    def close(self) -> None:
+    def close(self, *, site_isolated: bool = False) -> None:
+        if type(site_isolated) is not bool:
+            raise ValueError("site_isolated must be a boolean")
         with self._shutdown_guard:
+            if self.shutdown_status["state"] == "site_isolated":
+                return
+            if self._site_isolating or (site_isolated and self._shutdown_closing.is_set()):
+                raise RuntimeError("PLC shutdown is already in progress")
             if self._shutdown_safety_pending:
                 raise RuntimeError("PLC safety request pending; exit remains pending")
             self._shutdown_interrupt.clear()
             self._shutdown_closing.set()
+            self._site_isolating = site_isolated
         try:
-            self._close_impl()
+            if site_isolated:
+                self._close_impl(site_isolated=True)
+            else:
+                self._close_impl()
         finally:
             with self._shutdown_guard:
+                self._site_isolating = False
                 self._shutdown_closing.clear()
 
-    def _close_impl(self) -> None:
+    def _close_impl(self, *, site_isolated: bool = False) -> None:
         self._stop.set()
         self._communication_gate.set()
         thread = self._thread
@@ -160,9 +177,14 @@ class PlcCabinetService:
         with self._lock:
             try:
                 self._check_shutdown_interrupt()
-                if not self.client.connected and (self._power_off_unverified or self.shutdown_status["state"] == "unconfirmed" and self._shutdown_error_kind == "electrical"):
+                isolation = None
+                if site_isolated:
+                    if self.controller._pending is not None:
+                        raise RuntimeError("PLC command still awaiting acknowledgement")
+                    isolation = self._record_site_isolation()
+                elif not self.client.connected and (self._power_off_unverified or self.shutdown_status["state"] == "unconfirmed" and self._shutdown_error_kind == "electrical"):
                     raise RuntimeError("PLC shutdown remains unconfirmed; reconnect and verify actual OFF")
-                if not self.client.connected or self.read_only:
+                elif not self.client.connected or self.read_only:
                     # An unused/offline PLC must not block external-power tests.
                     # Neither this nor monitor disconnect proves electrical OFF.
                     if self.shutdown_status["state"] != "confirmed":
@@ -192,6 +214,10 @@ class PlcCabinetService:
                         self._shutdown_interrupt.wait(t.poll_ms / 1000)
                 self.controller.disconnect()
                 self.coordination.advance()
+                if isolation is not None:
+                    self.communication_enabled = False
+                    self._communication_gate.clear()
+                    self.shutdown_status = isolation
                 self._shutdown_error_kind = None
             except Exception as exc:
                 self.shutdown_status = {"state": "unconfirmed", "detail": str(exc)}
@@ -207,6 +233,25 @@ class PlcCabinetService:
             finally:
                 self._persist_logs()
         self._log_writer.close()
+
+    def _record_site_isolation(self) -> dict[str, Any]:
+        assertion = {
+            "operator_asserted": True,
+            "plc_feedback_verified": False,
+            "asserted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        audit_path = self._log_path.with_name("shutdown.jsonl")
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with audit_path.open("a", encoding="utf-8") as audit:
+            record = {"event": "site_isolation_asserted", "operator_uid": os.getuid(), **assertion}
+            audit.write(json.dumps(record, ensure_ascii=False) + "\n")
+            audit.flush()
+            os.fsync(audit.fileno())
+        return {
+            "state": "site_isolated",
+            "detail": "操作员确认现场已隔离，PLC 软件连接已关闭；PLC 实际断电反馈未验证",
+            **assertion,
+        }
 
     def _try_connect(self, user: str) -> None:
         self.coordination.revision += 1

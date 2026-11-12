@@ -140,6 +140,58 @@ def test_api_rejects_non_loopback_prepare(tmp_path, monkeypatch):
         assert reply.status_code == 403
 
 
+def test_isolated_retry_closes_software_without_confirming_plc_feedback(tmp_path, monkeypatch):
+    monkeypatch.setenv("RP1_FACTORY_SHUTDOWN_TOKEN", "isolated-test-token")
+    controller = Controller()
+    app = create_app(controller, data_root=tmp_path)
+    hub = app.state.runtime
+    original = hub.plc.close
+    modes = []
+
+    def close(*, site_isolated=False):
+        modes.append(site_isolated)
+        if not site_isolated:
+            raise RuntimeError("PS1 shutdown feedback timeout")
+        original(site_isolated=True)
+
+    monkeypatch.setattr(hub.plc, "close", close)
+    headers = {"X-RP1-Shutdown-Token": "isolated-test-token"}
+    isolated = {**headers, "X-RP1-Site-Isolated": "1"}
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        assert client.post(LIFECYCLE_PATH, headers={"X-RP1-Site-Isolated": "1"}).status_code == 403
+        assert client.post(LIFECYCLE_PATH, headers={**headers, "X-RP1-Site-Isolated": "true"}).status_code == 422
+        assert client.post(LIFECYCLE_PATH, headers=headers).status_code == 202
+        eventually(lambda: hub.shutdown.snapshot()["state"] == "blocked")
+        assert modes == [False] and controller.closes == 1
+        assert client.post(LIFECYCLE_PATH, headers=isolated).status_code in {200, 202}
+        eventually(lambda: hub.shutdown.snapshot()["ready"])
+        status = client.get(LIFECYCLE_PATH, headers=headers).json()
+        assert modes == [False, True] and controller.closes == 1
+        assert status["site_isolated"] and status["attempt"] == 2
+        assert status["plc"]["state"] == "site_isolated"
+        assert status["plc"]["plc_feedback_verified"] is False
+        assert client.post("/api/v1/plc/start", json={}).status_code == 409
+
+
+def test_isolated_shutdown_preserves_failed_station_and_plc(tmp_path, monkeypatch):
+    controller = Controller()
+    hub = create_app(controller, data_root=tmp_path).state.runtime
+    hub.start()
+    controller.fail_close = True
+    close = Mock(wraps=hub.plc.close)
+    monkeypatch.setattr(hub.plc, "close", close)
+    try:
+        hub.shutdown.request(site_isolated=True)
+        eventually(lambda: hub.shutdown.snapshot()["state"] == "blocked")
+        close.assert_not_called()
+        assert "record worker" in hub.shutdown.snapshot()["detail"]
+        assert hub.session("shared", create=False).controller is controller
+    finally:
+        controller.fail_close = False
+        hub.close()
+    close.assert_called_once_with()
+
+
 def test_finish_never_escalates_to_kill_even_old_allow_kill_callers():
     module = launcher()
     process = Mock()
@@ -258,16 +310,34 @@ def test_prepared_gateway_cannot_create_a_new_station(tmp_path, monkeypatch):
         assert set(app.state.runtime._sessions) == {"first"}
 
 
-def test_actual_offline_launcher_completes_private_handshake(tmp_path):
+@pytest.mark.parametrize("site_isolated", [False, True])
+def test_actual_offline_launcher_completes_private_handshake(tmp_path, site_isolated):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     env = dict(os.environ, http_proxy="http://127.0.0.1:1", no_proxy="", NO_PROXY="")
-    process = subprocess.Popen([
-        sys.executable, str(HMI / "launch.py"), "--offline-check", "--gateway-only",
-        "--duration", ".3", "--port", str(port), "--state-dir", str(tmp_path),
-    ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, env=env)
+    launch = [sys.executable, str(HMI / "launch.py")]
+    state_args = ["--offline-check", "--state-dir", str(tmp_path)]
+    duration = [] if site_isolated else ["--duration", ".3"]
+    process = subprocess.Popen(
+        [*launch, "start", *state_args, "--gateway-only", "--port", str(port), *duration],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, env=env,
+    )
     try:
+        if site_isolated:
+            def ready():
+                try:
+                    with urlopen(f"http://127.0.0.1:{port}/api/v1/health", timeout=.4) as response:
+                        return json.load(response).get("ok")
+                except OSError:
+                    return False
+            eventually(ready, timeout=10)
+            stop = subprocess.run([*launch, "stop", *state_args, "--site-isolated"],
+                                  capture_output=True, text=True, timeout=20, env=env)
+            assert stop.returncode == 0, (stop.stdout, stop.stderr)
+            audit = tmp_path / "offline-check/data/plc/shutdown.jsonl"
+            records = [json.loads(line) for line in audit.read_text().splitlines()]
+            assert len(records) == 1 and records[0]["plc_feedback_verified"] is False
         output, error = process.communicate(timeout=30)
         assert process.returncode == 0, (output, error)
         assert "HMI ready: PLC mock" in output
