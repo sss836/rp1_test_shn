@@ -453,6 +453,16 @@ def seed_configs(root: Path, *, offline: bool, offline_access: str) -> None:
         if not destination.exists() and source.is_file():
             shutil.copy2(source, destination)
     (root / "config/can-disabled").chmod(0o700)
+    # Motor public resources originate in the installed, source-pinned bundle.
+    # This provisions files only; it never opens CAN, enables motors or flashes.
+    import runpy
+    try:
+        helper = runpy.run_path(str(SOURCE_ROOT / "factory_hmi/bundled_motor_assets.py"))
+        result = helper["seed_motor_assets"](root, SOURCE_ROOT / "factory_hmi/resources/motor-maintenance")
+        if result["status"] != "ready":
+            print("电机离线资源：保留已有专用信任配置，未覆盖。", file=sys.stderr, flush=True)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print("电机离线资源初始化未完成：" + str(exc), file=sys.stderr, flush=True)
     if offline:
         # Always replace the private test profile from this checkout. Never use
         # a persisted real-PLC profile, even if someone edited the test state.

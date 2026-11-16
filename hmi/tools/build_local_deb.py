@@ -72,6 +72,9 @@ def main() -> None:
     args = parser.parse_args()
     validate_preview_assets = runpy.run_path(str(SOURCE / "factory_hmi/preview_assets.py"))["validate_preview_assets"]
     preview_files = validate_preview_assets(SOURCE / "factory_hmi/resources/local-preview")
+    # Fail the build if clean workstations would lack the offline upgrade bundle.
+    verify_motor_bundle = runpy.run_path(str(SOURCE / "factory_hmi/bundled_motor_assets.py"))["verify_bundle"]
+    motor_assets = verify_motor_bundle(SOURCE / "factory_hmi/resources/motor-maintenance")
     runtime = args.runtime_dir.expanduser().resolve(strict=True)
     for module in ("PySide6", "pymodbus", "pyroute2", "yaml", "numpy"):
         if not (runtime / module).is_dir():
@@ -114,6 +117,7 @@ def main() -> None:
     for directory in ("factory_hmi", "scripts"):
         shutil.copytree(SOURCE / directory, target_source / directory, ignore=ignored)
     validate_preview_assets(target_source / "factory_hmi/resources/local-preview")
+    verify_motor_bundle(target_source / "factory_hmi/resources/motor-maintenance")
     # Production protocol scripts shipped with the HMI for offline maintenance.
     (target_source / "motors/scripts").mkdir(parents=True)
     shutil.copy2(SOURCE / "motors/scripts/motor_ota.py", target_source / "motors/scripts/motor_ota.py")
@@ -124,7 +128,7 @@ def main() -> None:
                  "WAISTHIP_SUPPORT.md", "UBUNTU22_DEPLOYMENT.md", "LONG_RUN_SAFETY.md",
                  "MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md",
                  "MODULE_FIRMWARE_MAINTENANCE.md", "MODULE_PARAMETERS.md", "MOTOR_MAINTENANCE_OFFLINE_20261112.md", "PLC_HMI_LRO_108_109.md",
-                 "TORQUE_ESTIMATION_3.0.31.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
+                 "TORQUE_ESTIMATION_3.0.31.md", "OFFLINE_MOTOR_BUNDLE_3.0.32.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, target_source / "docs" / name)
     (target_source / "config/examples").mkdir(parents=True)
     shutil.copy2(SOURCE / "config/examples/motion_completion.unverified.yaml",
@@ -191,7 +195,7 @@ def main() -> None:
     shutil.copy2(SOURCE / "docs/LOCAL_CONTROL_BUILD.md", doc / "README.zh_CN.md")
     shutil.copy2(SOURCE / "docs/UBUNTU22_DEPLOYMENT.md", doc)
     shutil.copy2(SOURCE / "docs/LONG_RUN_SAFETY.md", doc)
-    for name in ("MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md", "TORQUE_ESTIMATION_3.0.31.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
+    for name in ("MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md", "TORQUE_ESTIMATION_3.0.31.md", "OFFLINE_MOTOR_BUNDLE_3.0.32.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, doc / name)
     examples = doc / "examples"
     examples.mkdir()
@@ -259,7 +263,10 @@ Description: RP1 Modbus TCP PLC and physical SocketCAN HMI
               "depends_profile": args.depends_profile, "bundled_python": bool(args.python_binary),
               "bundled_stdlib": bool(args.python_stdlib), "runtime_file_count": len(runtime_manifest),
               "compression_level": args.compression_level, "preview_assets": preview_files,
-              "native_sdk_load_check": native_sdk, "platform_url": platform_url}
+              "native_sdk_load_check": native_sdk, "platform_url": platform_url,
+              "motor_assets": {"models": sorted(r["model"] for r in motor_assets["releases"]),
+                               "bundle_sha256": hashlib.sha256((SOURCE / "factory_hmi/resources/motor-maintenance/bundle.json").read_bytes()).hexdigest(),
+                               "device_writes": False}}
     if not args.stage_only:
         output = out / f"rp1-test-hmi_{version}_amd64.deb"
         if output.exists():

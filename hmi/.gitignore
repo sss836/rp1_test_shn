@@ -30,3 +30,6 @@ secrets/
 *.sqlite3-*
 *.db
 *.deb
+
+# Approved binary offline resources are shipped as a versioned Release asset.
+/factory_hmi/resources/motor-maintenance/

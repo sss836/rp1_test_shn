@@ -39,6 +39,8 @@ factory_hmi = [
   "resources/local-preview/*",
   "resources/local-preview/assets/*",
   "contracts/*.json",
+  "resources/motor-maintenance/*",
+  "resources/motor-maintenance/releases/*/*",
   "resources/quick/*.json",
   "resources/quick/*.npz",
   "desktop/assets/*.png",
