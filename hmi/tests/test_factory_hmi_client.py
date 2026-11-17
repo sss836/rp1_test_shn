@@ -128,6 +128,25 @@ class GatewayClientTest(unittest.TestCase):
         self.assertFalse(remote_maintenance.has_header(header))
 
     @mock.patch("factory_hmi.client.GatewayClient._open")
+    def test_module_limit_requests_authenticate_only_from_loopback(self, urlopen: mock.Mock) -> None:
+        urlopen.return_value = FakeResponse(b'{"ok":true}')
+        with mock.patch.dict("os.environ", {"RP1_HMI_LOCAL_MAINTENANCE_TOKEN": "test-local-token"}):
+            local = GatewayClient("http://127.0.0.1:8766")
+            remote = GatewayClient("https://gateway.example.test")
+        header = "X-rp1-local-maintenance"
+        for path, payload in (
+            ("/api/v1/limit-module/preview", {"serial": "MOCK"}),
+            ("/api/v1/limit-module/start", {"serial": "MOCK", "digest": "0" * 64, "confirmed": True}),
+        ):
+            with self.subTest(path=path):
+                local.post(path, payload)
+                sent = urlopen.call_args.args[0]
+                self.assertEqual(sent.unredirected_hdrs.get(header), "test-local-token")
+                self.assertNotIn(header, sent.headers)
+                remote.post(path, payload)
+                self.assertFalse(urlopen.call_args.args[0].has_header(header))
+
+    @mock.patch("factory_hmi.client.GatewayClient._open")
     def test_motor_version_refresh_is_separate_from_status(self, urlopen: mock.Mock) -> None:
         urlopen.return_value = FakeResponse(b'{"ok":true}')
         client = GatewayClient("http://127.0.0.1:8766", operator_token="operator-token")

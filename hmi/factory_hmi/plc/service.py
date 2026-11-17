@@ -110,7 +110,8 @@ class PlcCabinetService:
                     and self.controller.communication_state == "LIVE"
                     and not self.controller.stale and status is not None
                     and not any(status.channel_permit) and not status.main_ready
-                    and status.main_contactor_fb is False
+                    and (status.main_contactor_fb is False or self.controller.normal_stop_confirmed())
+                    and not status.ps1_request and not status.ps1_actual_output
                     and not command.main_enable and not command.ps1_output_enable
                     and not any(command.channel_enable) and self.controller._pending is None)
 

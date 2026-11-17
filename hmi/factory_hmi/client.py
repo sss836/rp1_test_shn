@@ -191,7 +191,11 @@ class GatewayClient:
             headers["Content-Type"] = "application/json"
 
         req = request.Request(url, data=data, headers=headers, method=method)
-        if self._local_maintenance_token and path.startswith(("/api/v1/motor-maintenance", "/api/v1/motor-parameters", "/api/v1/motor-firmware/", "/api/v1/limit-probe")):
+        if self._local_maintenance_token and (
+            path.startswith(("/api/v1/motor-maintenance", "/api/v1/motor-parameters",
+                             "/api/v1/motor-firmware/", "/api/v1/limit-probe"))
+            or path in {"/api/v1/limit-module/preview", "/api/v1/limit-module/start"}
+        ):
             req.add_unredirected_header("X-RP1-Local-Maintenance", self._local_maintenance_token)
         if path == "/api/v1/lease/heartbeat" and self.lease_generation is not None:
             req.add_header("X-RP1-Lease-Generation", str(self.lease_generation))

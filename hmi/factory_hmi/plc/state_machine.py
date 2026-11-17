@@ -73,6 +73,10 @@ class PlcCabinetController:
         self._ever_connected = False
         self._ps1_feedback = Ps1FeedbackTracker()
         self._startup_deadline = 0.0
+        # A completed normal stop has already observed fresh PS1 output OFF
+        # before dropping the main circuit. PS1 feedback may then disappear.
+        # Keep this proof only in this connection and command generation.
+        self._normal_stop_receipt: tuple[int, int] | None = None
         self.feedback: dict[str, CommandFeedback] = {
             name: CommandFeedback(FeedbackState.CONFIRMED, detail="not requested")
             for name in (
@@ -105,6 +109,7 @@ class PlcCabinetController:
         )
 
     def connect(self, *, user: str = "system") -> None:
+        self._normal_stop_receipt = None
         try:
             self.client.connect()
             # Persist uncertainty across the exception cleanup below. A live
@@ -186,6 +191,7 @@ class PlcCabinetController:
                 )
 
     def disconnect(self) -> None:
+        self._normal_stop_receipt = None
         self._cancel_sequence_feedback("PLC disconnected")
         self.client.disconnect()
         self.communication_state = "DISCONNECTED"
@@ -322,6 +328,8 @@ class PlcCabinetController:
             or self.stale
         ):
             return self._reject("Stop", user, "PLC communication is not live")
+        if self.normal_stop_confirmed():
+            return True  # Do not query an already depowered PS1 a second time.
         if self._pending is not None:
             return self._reject(
                 "Stop",
@@ -697,6 +705,7 @@ class PlcCabinetController:
             current - self.status.received_monotonic
             > self.timings.stale_timeout_ms / 1000.0
         ):
+            self._normal_stop_receipt = None
             if self._pending is not None:
                 self._finish_pending(FeedbackState.TIMEOUT, "PLC status exceeded stale timeout")
             self._cancel_sequence_feedback("PLC status exceeded stale timeout")
@@ -986,6 +995,7 @@ class PlcCabinetController:
                     self.command.command_sequence,
                     "channels, PS1 and main contactor are OFF",
                 )
+                self._normal_stop_receipt = (self.command.command_sequence, self.status.ps1_power_cycle)
             elif current >= self._phase_deadline:
                 self._enter_fault("KM0 release feedback timeout", "system")
 
@@ -995,6 +1005,10 @@ class PlcCabinetController:
         if now - self.status.received_monotonic > self.timings.stale_timeout_ms / 1000.0:
             return  # No acknowledgement or ON transition from a stale TCP frame.
         boundary = self._ps1_feedback.observe(self.status, now)
+        if boundary:
+            self._normal_stop_receipt = None
+        if self._normal_stop_receipt is not None and not self.normal_stop_confirmed():
+            self._normal_stop_receipt = None
         reset_pending = self._pending is not None and self._pending.controls == ("ResetFaultPulse",)
         if not reset_pending:
             if self.status.has_fault:
@@ -1139,6 +1153,7 @@ class PlcCabinetController:
         ]
         sequence = old.command_sequence + 1
         candidate = replace(old, **changes, command_sequence=sequence)
+        self._normal_stop_receipt = None
         if not self._write_checked(candidate):
             return
         self.command = candidate
@@ -1369,6 +1384,33 @@ class PlcCabinetController:
                 self.command.command_sequence,
                 "already OFF",
             )
+            self._normal_stop_receipt = (self.command.command_sequence, self.status.ps1_power_cycle)
+
+    def normal_stop_confirmed(self) -> bool:
+        """Check retained sequence evidence, never reinterpret missing feedback.
+
+        V1.2 can omit MainContactorFB and invalidate PS1 feedback after main
+        power removal. A receipt is issued only by the normal stop sequence,
+        after fresh PS1 OFF and final main-off acknowledgement. Fresh PLC
+        status and the same command/power epoch must still agree with it.
+        """
+        status, command, receipt = self.status, self.command, self._normal_stop_receipt
+        stop = self.feedback["Stop"]
+        if status is None or receipt is None:
+            return False
+        sequence, cycle = receipt
+        return bool(self.client.connected and self.communication_state == "LIVE" and not self.stale
+                    and self.phase == CabinetPhase.OFF and self._pending is None
+                    and status.control_protocol_supported and status.plc_ready and status.host_connected
+                    and not status.has_fault and status.main_contactor_fb is not True
+                    and not status.main_ready and not any(status.channel_permit)
+                    and not status.ps1_request and not status.ps1_actual_output
+                    and not command.main_enable and not command.ps1_output_enable
+                    and not any(command.channel_enable)
+                    and stop.state == FeedbackState.CONFIRMED and stop.sequence == sequence
+                    and command.command_sequence == sequence
+                    and (status.acknowledged_sequence & 0xFFFF) == (sequence & 0xFFFF)
+                    and status.ps1_power_cycle == cycle)
 
     def _finish_pending(self, state: FeedbackState, detail: str) -> None:
         pending = self._pending
@@ -1528,6 +1570,7 @@ class PlcCabinetController:
             )
 
     def _communication_lost(self, detail: str) -> None:
+        self._normal_stop_receipt = None
         self._ps1_feedback.reset()
         self._cancel_sequence_feedback(detail)
         if self._pending is not None:
@@ -1542,6 +1585,7 @@ class PlcCabinetController:
 
     def notify_cpu_restart(self) -> None:
         """Invalidate explicitly known restarts; 16-bit counters are not boot IDs."""
+        self._normal_stop_receipt = None
         self._ps1_feedback.reset()
         self._enter_fault("已知PLC CPU重启：本地反馈确认已撤销，需人工重新启动", "system")
 
@@ -1552,6 +1596,7 @@ class PlcCabinetController:
             "phase": self.phase.value,
             "communication_state": self.communication_state,
             "stale": stale,
+            "normal_stop_confirmed": self.normal_stop_confirmed(),
             "last_error": self.last_error,
             "output_admission": {"allowed": not bool(self._output_admission_reason()), "reason": self._output_admission_reason()},
             "ps1_progress_age_ms": self._ps1_feedback.age_ms(self.clock()),
