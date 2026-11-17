@@ -7,6 +7,7 @@ from .torque_estimation import estimate as estimate_torque
 
 import math
 import logging
+import copy
 import threading
 import time
 from dataclasses import replace
@@ -206,11 +207,16 @@ class MotorBackend(ABC):
             try:
                 self._enable_motors_impl()
             except Exception:
+                self._command_inhibit.set()
+                cleanup_confirmed = False
                 try:
                     self._disable_impl(None)
-                except Exception:
-                    pass
-                self._enabled = False
+                    cleanup_confirmed = True
+                except Exception as cleanup_error:
+                    self.control_stop_error = str(cleanup_error)
+                # A failed enable can leave a subset active. Do not turn a
+                # failed rollback into a global disabled claim.
+                self._enabled = not cleanup_confirmed
                 raise
             self._enabled = True
             with self._control_generation_lock:self._control_generation += 1
@@ -244,6 +250,10 @@ class MotorBackend(ABC):
     def disconnect(self) -> None:
         self.close_transport()
 
+    def disconnect_site_isolated(self) -> None:
+        """Trusted shutdown entry only; ordinary callers use disconnect()."""
+        self.close_transport()
+
     def close_transport(self) -> None:
         self._revoke_damping()
         if getattr(self, "_maintenance_active", False):
@@ -257,9 +267,7 @@ class MotorBackend(ABC):
                 self._release_resources()
                 self._maintenance_owner = None
                 return
-            if self._enabled:
-                self._disable_impl(None)
-                self._enabled = False
+            self._prepare_transport_release()
             self._close_transport_impl()
             self._connected = False
             self._maintenance_quarantined = False
@@ -270,10 +278,18 @@ class MotorBackend(ABC):
         """A retryable claim held through the caller's terminal persistence."""
         return _MaintenanceTransport(self)
 
+    def _prepare_transport_release(self, *, maintenance: bool = False) -> None:
+        """Stop before closing handles or transferring them to maintenance."""
+        if self._enabled:
+            self._disable_impl(None)
+            self._enabled = False
+
     def _begin_maintenance_transport(self, owner):
         with self._lock:
             if self._enabled or getattr(self, "_maintenance_active", False) or getattr(self, "_maintenance_quarantined", False):
                 raise MotorSafetyError("maintenance requires disabled motors and an idle backend")
+            if self._connected:
+                self._prepare_transport_release(maintenance=True)
             resources = tuple(sorted(set(self._exclusive_resources())))
             with _RESOURCE_LOCK:
                 if any(_RESOURCE_OWNERS.get(r) not in (None, id(self)) for r in resources):
@@ -461,6 +477,9 @@ class MotorBackend(ABC):
         """No transport acknowledgement is available; command flags are not feedback."""
         return "unknown"
 
+    def disable_status(self) -> dict:
+        return {"state": self.disable_feedback(), "motors": []}
+
     def disable(self, index: int | None = None) -> None:
         self._revoke_damping()
         if index is None:
@@ -538,6 +557,9 @@ class MotorsPyBackend(MotorBackend):
 
     _READ_ONLY_REFRESH_TYPES = frozenset({"DM", "LRO", "XYN"})
     _FEEDBACK_QUERY_TIMEOUT_S = 0.03
+    _DISABLE_CONFIRM_TIMEOUT_S = .45
+    _DISABLE_RETRY_INTERVAL_S = .06
+    _DISABLE_MAX_ATTEMPTS = 3
 
     def __init__(self, entries: Iterable[MotorEntry], *, station_config=None,
                  local_evidence: LocalLegacyEvidence | None = None) -> None:
@@ -567,6 +589,118 @@ class MotorsPyBackend(MotorBackend):
             entry.lro_protocol.protocol for entry in self.entries if entry.lro_protocol_profile == "v1.03"
         }
         self._pending_motor_zero: set[int] = set()
+        self._disable_status_data = {"state": "unknown", "motors": []}
+        self._disable_confirmation_key = None
+        self._enable_open_epoch = 0
+        self._disable_confirmation_epoch = None
+        self._host_enable_attempt_epoch = None
+
+    def disable_motors(self) -> None:
+        # The software flag may already be false after an old unconfirmed stop.
+        # A repeated request must still reach the actual driver handles.
+        self._revoke_damping()
+        self._command_inhibit.set()
+        if self._command_watchdog is not None:
+            self._command_watchdog.disarm()
+        with self._lock:
+            self._require_connected()
+            self._damping_owner = None
+            self._disable_impl(None)
+            self._enabled = False
+
+    def disable_feedback(self) -> str:
+        with self._lock:
+            return self._disable_status_data["state"]
+
+    def disable_status(self) -> dict:
+        with self._lock:
+            return copy.deepcopy(self._disable_status_data)
+
+    def _prepare_transport_release(self, *, maintenance: bool = False) -> None:
+        # Closing a software-disabled station must not hand still-enabled
+        # native drives to maintenance or lose their handles. A previous
+        # confirmed stop can be reused after power-off.
+        if not maintenance and self._can_release_read_only_transport():
+            self._disable_status_data = {"state": "unknown", "motors": [], "scope": "all",
+                "read_only_release": True, "reused_confirmation": False,
+                "enable_open_epoch": self._enable_open_epoch,
+                "host_enable_attempt_epoch": self._host_enable_attempt_epoch,
+                "release_reason": "read_only_transport", "release_requested_at_monotonic_s": time.monotonic()}
+            return
+        self.disable_motors()
+
+    def _can_release_read_only_transport(self) -> bool:
+        # This is explicit host-command provenance, not an inference from the
+        # software enabled flag. No prior stop attempt or native enabled bit
+        # may be hidden by the read-only close path. Maintenance never uses it.
+        if (self._host_enable_attempt_epoch is not None or self._enabled
+                or self._disable_status_data.get("motors")
+                or self._disable_status_data.get("state") != "unknown"):
+            return False
+        for motor in self._motors:
+            getter = getattr(motor, "get_motor_drive_enabled", None)
+            if callable(getter):
+                try:
+                    if getter() is True:
+                        return False
+                except Exception:
+                    pass  # Never-enabled read-only ownership is still unknown.
+        return True
+
+    def disconnect_site_isolated(self) -> None:
+        """Release after trusted physical-isolation shutdown, retaining evidence.
+
+        This does not assert that motors acknowledged disable. The trusted
+        shutdown caller owns the site-isolation confirmation; normal close and
+        maintenance cannot invoke this path implicitly.
+        """
+        self._revoke_damping()
+        if getattr(self, "_maintenance_active", False):
+            raise BackendInUseError("cancel and join maintenance before isolated shutdown")
+        self._command_inhibit.set()
+        if self._command_watchdog is not None:
+            self._command_watchdog.disarm()
+        with self._lock:
+            self._damping_owner = None
+            if not self._connected:
+                self._release_resources()
+                return
+            disable_error = None
+            try:
+                self._disable_impl(None)
+            except Exception as exc:
+                disable_error = str(exc)
+                self._disable_status_data["state"] = "unconfirmed"
+                self.control_stop_error = disable_error
+            self._disable_status_data.update(site_isolated_release=False, site_isolated_release_requested=True,
+                release_reason="site_isolated", release_disable_error=disable_error,
+                transport_release_error=None)
+            try:
+                self._close_transport_impl()
+            except Exception as exc:
+                self._disable_status_data["transport_release_error"] = str(exc)
+                # A live versions thread still owns native handles. Physical
+                # isolation waives missing drive replies, not a live I/O owner.
+                if self._motors:
+                    raise
+            self._connected = False
+            self._enabled = False  # No host control handles remain; see disable evidence.
+            self._maintenance_quarantined = False
+            self._release_resources()
+            self._maintenance_owner = None
+            self._disable_confirmation_key = None
+            self._disable_confirmation_epoch = None
+            self._disable_status_data["site_isolated_release"] = True
+            self._disable_status_data["released_at_monotonic_s"] = time.monotonic()
+
+    def _invalidate_disable_confirmation(self) -> None:
+        # Permission revocations (stop/cancel/watchdog) deliberately do not
+        # change this epoch: only a new open or enable attempt can erase a
+        # confirmed stop of the same driver handles.
+        self._enable_open_epoch += 1
+        self._disable_status_data = {"state": "unknown", "motors": []}
+        self._disable_confirmation_key = None
+        self._disable_confirmation_epoch = None
 
     @property
     def motors(self) -> list[Any]:
@@ -579,6 +713,8 @@ class MotorsPyBackend(MotorBackend):
         )
 
     def _open_transport_impl(self) -> None:
+        self._invalidate_disable_confirmation()
+        self._host_enable_attempt_epoch = None
         try:
             import motors_py
         except ImportError:
@@ -830,6 +966,8 @@ class MotorsPyBackend(MotorBackend):
             self._check_protocol_conflicts()
 
     def _enable_motors_impl(self) -> None:
+        self._invalidate_disable_confirmation()
+        self._host_enable_attempt_epoch = self._enable_open_epoch
         errors: list[int] = []
         initialized: list[Any] = []
         generation = self.control_generation
@@ -928,6 +1066,8 @@ class MotorsPyBackend(MotorBackend):
         self._motors = []
         if first_error is not None:
             raise MotorBackendError(f"failed to disable one or more motors: {first_error}")
+        if self._disable_status_data.get("read_only_release"):
+            self._disable_status_data["released_at_monotonic_s"] = time.monotonic()
 
     def _command_mit_impl(
         self,
@@ -1194,13 +1334,165 @@ class MotorsPyBackend(MotorBackend):
         for motor in motors:
             motor.clear_motor_error()
 
+    def _reuse_confirmed_disable(self) -> bool:
+        """Reuse a prior stop fact after power-off, never invent a fresh reply."""
+        generation = self.control_generation
+        key = (tuple(id(m) for m in self._motors), tuple(self._selected_protocols))
+        if (self._enabled or not self._command_inhibit.is_set()
+                or self._disable_confirmation_key != key
+                or self._disable_confirmation_epoch != self._enable_open_epoch):
+            return False
+        rows = self._disable_status_data.get("motors", [])
+        if not rows or self._disable_status_data.get("scope") != "all":
+            return False
+        for row in rows:
+            if row["request_error"] or (row["requires_confirmation"] and row["state"] != "confirmed"):
+                return False
+            if row["requires_confirmation"]:
+                try:
+                    if self._motors[row["index"]].get_motor_drive_enabled() is True:
+                        return False
+                except Exception:
+                    # A missing reply after already confirmed power-off does
+                    # not erase that stop fact. Its original time is retained.
+                    pass
+        self._disable_status_data.update(reused_confirmation=True,
+            reused_at_monotonic_s=time.monotonic(), control_generation=generation)
+        return True
+
     def _disable_impl(self, index: int | None) -> None:
-        motors = self._motors if index is None else [self._motors[index]]
-        for motor in motors:
+        if index is None and self._reuse_confirmed_disable():
+            return
+        indices = list(range(len(self._motors))) if index is None else [index]
+        started = time.monotonic()
+        deadline = started + self._DISABLE_CONFIRM_TIMEOUT_S
+        rows = {}
+        for i in indices:
+            entry, motor = self.entries[i], self._motors[i]
+            profile = self._selected_protocols[i]
+            getter = getattr(motor, "get_lro_protocol_profile", None)
+            if entry.motor_type.upper() == "LRO" and profile is None and callable(getter):
+                try:
+                    profile = getter()
+                except Exception:
+                    pass
+            rows[i] = {"index": i, "bus": entry.interface, "motor_id": entry.motor_id,
+                "joint_name": entry.joint_name, "protocol_profile": profile,
+                "requires_confirmation": entry.motor_type.upper() == "LRO" and profile == "v1.03",
+                "state": "pending", "attempts": 0, "drive_enabled": None,
+                "feedback_count": None, "request_feedback_count": None,
+                "request_error": None, "feedback_error": None}
+        self._disable_status_data = {"state": "pending", "scope": "all" if index is None else "selected",
+            "requested_indices": indices, "started_at_monotonic_s": started,
+            "budget_s": self._DISABLE_CONFIRM_TIMEOUT_S, "motors": list(rows.values()),
+            "reused_confirmation": False, "control_generation": self.control_generation,
+            "enable_open_epoch": self._enable_open_epoch,
+            "host_enable_attempt_epoch": self._host_enable_attempt_epoch}
+
+        def send(i):
+            row, motor = rows[i], self._motors[i]
+            row["attempts"] += 1
             try:
-                motor.unlock_motor()
-            except Exception:
-                motor.deinit_motor()
+                # Native deinit includes its ordinary inter-command spacing;
+                # direct unlock previously queued all 7 setup frames at once.
+                deinit = getattr(motor, "deinit_motor", None)
+                if callable(deinit):
+                    deinit()
+                else:
+                    motor.unlock_motor()
+                row["request_error"] = None
+            except Exception as exc:
+                try:
+                    motor.unlock_motor()
+                    row["request_error"] = None
+                except Exception as fallback:
+                    row["request_error"] = f"{exc}; {fallback}"
+            row["request_feedback_count"] = self._feedback_count(self.entries[i], motor)
+            row["requested_at_monotonic_s"] = time.monotonic()
+            row["observed_feedback_count"] = None
+            row["observed_at_monotonic_s"] = None
+            row["query_feedback_count"] = None
+            row["query_started_at_monotonic_s"] = None
+
+        for i in indices:
+            send(i)
+        pending = {i for i in indices if rows[i]["requires_confirmation"]}
+        next_retry = time.monotonic() + self._DISABLE_RETRY_INTERVAL_S
+        while pending and time.monotonic() < deadline:
+            for i in tuple(pending):
+                row, motor = rows[i], self._motors[i]
+                try:
+                    # LRO refresh is a zero-gain/zero-torque status request,
+                    # never an enable. Do not call other vendors' refresh here.
+                    now = time.monotonic()
+                    query_at = row["query_started_at_monotonic_s"]
+                    if query_at is None or now-query_at > .1:
+                        row["query_feedback_count"] = self._feedback_count(self.entries[i], motor)
+                        row["query_started_at_monotonic_s"] = now
+                        motor.refresh_motor_status()
+                    count = self._feedback_count(self.entries[i], motor)
+                    enabled = motor.get_motor_drive_enabled()
+                    after = self._feedback_count(self.entries[i], motor)
+                    row["drive_enabled"], row["feedback_count"] = enabled, after
+                    row["feedback_error"] = None
+                    baseline = row["request_feedback_count"]
+                    observed = row["observed_feedback_count"]
+                    query_baseline = row["query_feedback_count"]
+                    now = time.monotonic()
+                    age = now-row["query_started_at_monotonic_s"]
+                    fresh = (baseline is not None and count is not None and count == after and count > baseline
+                             and query_baseline is not None and count > query_baseline
+                             and count != observed and 0 <= age <= .1 and now <= deadline)
+                    if fresh:
+                        self._last_feedback_counts[i] = count
+                        self._last_feedback_at[i] = now
+                        # Upper bound from this zero-torque query, not a
+                        # cached status relabelled as a new frame.
+                        row["feedback_age_s"] = age
+                        row["observed_at_monotonic_s"] = now
+                        row["observed_feedback_count"] = count
+                        row["query_started_at_monotonic_s"] = None
+                    elif row["observed_at_monotonic_s"] is not None:
+                        row["feedback_age_s"] = time.monotonic()-row["observed_at_monotonic_s"]
+                    if fresh and enabled is False and not row["request_error"]:
+                        row["state"] = "confirmed"
+                        pending.remove(i)
+                except Exception as exc:
+                    row["feedback_error"] = str(exc)
+            if not pending:
+                break
+            now = time.monotonic()
+            if now >= next_retry:
+                for i in tuple(pending):
+                    if rows[i]["attempts"] < self._DISABLE_MAX_ATTEMPTS:
+                        send(i)
+                next_retry = time.monotonic() + self._DISABLE_RETRY_INTERVAL_S
+            time.sleep(.005)
+        for i, row in rows.items():
+            if row["state"] != "confirmed":
+                row["state"] = "unconfirmed" if row["requires_confirmation"] else (
+                    "request_failed" if row["request_error"] else "unknown")
+        failed = [r for r in rows.values() if r["state"] in {"unconfirmed", "request_failed"}]
+        state = "unconfirmed" if failed else "confirmed" if rows and all(
+            r["state"] == "confirmed" for r in rows.values()) else "unknown"
+        self._disable_status_data.update(state=state, finished_at_monotonic_s=time.monotonic(),
+                                        elapsed_s=time.monotonic()-started)
+        if failed:
+            self._disable_confirmation_key = None
+            self._disable_confirmation_epoch = None
+            self._command_inhibit.set()
+            # This is conservative any-motor-active/unconfirmed state, never
+            # permission to command: the inhibit latch above remains set.
+            self._enabled = True
+            detail = "; ".join(f"{r['bus']}#{r['motor_id']} enabled={r['drive_enabled']} "
+                f"feedback={r['request_feedback_count']}->{r['feedback_count']} attempts={r['attempts']} "
+                f"{r['request_error'] or r['feedback_error'] or ''}" for r in failed)
+            raise MotorSafetyError("电机失能反馈未确认：" + detail)
+        if index is None:
+            self._disable_confirmation_key = (tuple(id(m) for m in self._motors), tuple(self._selected_protocols))
+            self._disable_confirmation_epoch = self._enable_open_epoch
+            self._disable_status_data["confirmation_generation"] = self.control_generation
+            self._disable_status_data["confirmation_enable_open_epoch"] = self._enable_open_epoch
 
 
 # Descriptive alias used by callers selecting a platform backend.

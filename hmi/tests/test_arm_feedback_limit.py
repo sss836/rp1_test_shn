@@ -57,7 +57,12 @@ def test_builtin_default_completes_from_nonzero_feedback(limb, count):
     assert profile.source == "builtin_reference" and profile.approved_by is None
     assert context["execution_mode"] == "feedback_limit_search"
     assert context["order_source"] == "builtin_order_only"
-    assert all(w.point.full_range_search and w.point.search_pose_deg == profile.home_deg for w in profile.windows)
+    for w in profile.windows:
+        assert w.point.full_range_search
+        if w.point.joint == "left_shoulder_yaw_joint":
+            assert w.point.search_pose_deg[3] == pytest.approx(-80.803, abs=.01)
+        else:
+            assert w.point.search_pose_deg == profile.home_deg
     assert len(profile.windows) == count
     # Candidates deliberately offset from reference: copying references/NPZ
     # instead of measuring the simulated physical stops would fail this test.
@@ -73,7 +78,8 @@ def test_builtin_default_completes_from_nonzero_feedback(limb, count):
         assert row["fresh_samples"] >= 3
         assert row["baseline_nm"] == pytest.approx(.7)
         assert row["torque_floor_nm"] == 2.
-    np.testing.assert_allclose(cycle.actual, np.zeros(count//2), atol=1.e-8)
+    from factory_hmi.core.mujoco_completion import preset_info
+    np.testing.assert_allclose(cycle.actual, np.deg2rad(preset_info(coords.station)["target_joint_deg"]), atol=1e-8)
     assert duration < 1500  # Deterministic virtual time, not a wall-clock sleep.
 
 
@@ -81,13 +87,14 @@ def test_builtin_default_completes_from_nonzero_feedback(limb, count):
 def test_missing_or_wrong_stop_is_not_fabricated_as_reference(offset, missing, outcome):
     coords, profile, _ = plan("left_short_arm")
     cycle, failure, searches, _ = simulate(coords, profile, offset=offset, missing=missing)
-    assert failure and "结果异常" in failure
-    assert len(searches) == len(cycle.results) == 1
-    assert cycle.results[0]["outcome"] == outcome
-    if missing:
-        assert cycle.results[0].get("actual_deg") is None
-    else:
-        assert abs(cycle.results[0]["deviation_deg"]) == pytest.approx(8.)
+    assert failure is None and cycle.phase == "finished"
+    assert len(searches) == len(cycle.results) == 10
+    for result in cycle.results:
+        assert result["outcome"] == outcome and result["retreat_completed"]
+        if missing:
+            assert result.get("actual_deg") is None
+        else:
+            assert abs(result["deviation_deg"]) == pytest.approx(8.)
 
 
 def test_peak_override_and_bus_sign_mapping_are_bound_to_plan():
@@ -113,8 +120,11 @@ def test_bad_external_profile_is_not_silently_replaced(monkeypatch):
 
 
 def test_other_modules_do_not_get_arm_defaults():
-    with pytest.raises(ValueError, match="尚未安装"):
-        plan("left_short_leg")
+    coords, profile, context = plan("left_short_leg")
+    assert profile.limb == "left_short_leg"
+    assert len(profile.windows) == 10
+    assert all("shoulder" not in name and "wrist" not in name for name in coords.names)
+    assert context["runtime_policy"] == "all-module-feedback-v1"
 
 
 def test_zero_search_still_uses_fresh_feedback_and_station_load_caps():
@@ -167,7 +177,7 @@ def test_default_service_start_uses_current_pose_and_saves_on_cancel(tmp_path, m
         assert report["context"]["entry_target_deg"] == [0.] * len(initial)
         assert report["phase"] == "aborted"
         assert report["last_transfer"]["phase"] == "homing"
-        assert report["last_transfer"]["arrival_tolerance_deg"] == 3.
+        assert report["last_transfer"]["arrival_tolerance_deg"] is None
         assert report["transfer_history"] and report["last_drive_feedback"]
         assert report["transfer_history_truncated"] is False
         assert fake.zeroed_indices == []  # Moving to zero never writes encoder zero.
@@ -178,13 +188,13 @@ def test_default_service_start_uses_current_pose_and_saves_on_cancel(tmp_path, m
 def test_candidate_and_iq_survive_retreat_failure_in_report(tmp_path, monkeypatch):
     from unittest.mock import Mock
     from factory_hmi.models import MotorSample
-    from factory_hmi.core.live_limit_probe import ProbeCycle
+    from factory_hmi.core.feedback_limit_search import FeedbackLimitSearch
     from factory_hmi.core.module_limit_check import ModuleWorker
 
     coords, profile, context = plan("left_short_arm")
     def failed_retreat(*_):
         raise FeedbackError("模拟退让故障")
-    monkeypatch.setattr(ProbeCycle, "_plan_retreat", failed_retreat)
+    monkeypatch.setattr(FeedbackLimitSearch, "_begin_retreat", failed_retreat)
     cycle, failure, _, _ = simulate(coords, profile, offset=-.8)
     assert failure == "模拟退让故障"
     assert cycle.probe.candidate and not cycle.results
@@ -212,9 +222,9 @@ def test_candidate_and_iq_survive_retreat_failure_in_report(tmp_path, monkeypatc
 def test_homing_with_loaded_arm_offset_proceeds_to_search(limb):
     coords, profile, _ = plan(limb)
     n = len(coords.names)
-    # Field report: target zero, final shoulder +2.81°, elbow -2.83°.
+    # Field regression: final shoulder +3.36°, elbow -2.83° at target zero.
     initial = np.deg2rad([.51, 3.29, 164.46, -84.36, 148.20, 6.46, -5.96][:n])
-    bias = np.deg2rad([2.81, .43, .01, -2.83, .19, .49, -.56][:n])
+    bias = np.deg2rad([3.36, .43, .01, -2.83, .19, .49, -.56][:n])
     cycle = ModuleCycle(coords, profile, initial, 1.)
     reached_home = False
     peak_speed = 0.
@@ -243,22 +253,20 @@ def test_homing_with_loaded_arm_offset_proceeds_to_search(limb):
     pytest.fail(f"did not enter search: {cycle.phase}")
 
 
-def test_homing_offset_outside_arrival_range_reports_measured_axis():
+def test_loaded_homing_records_large_offset_and_continues_after_actual_settle():
     coords, profile, _ = plan()
     initial = np.zeros(7); initial[3] = math.radians(-40)
     cycle = ModuleCycle(coords, profile, initial, 1.)
     for i in range(1, 600):
         q = cycle.target.copy()
         if cycle.phase == "homing":
-            q[3] -= math.radians(3.4 * cycle.move.progress / cycle.move.duration)
-        try:
-            cycle.step(1+i*.025, q, np.ones(7), np.ones(7))
-        except FeedbackError as exc:
-            assert "left_elbow_joint" in str(exc) and "3.40°" in str(exc) and "±3°" in str(exc)
-            assert cycle.last_transfer["actual_deg"][3] == pytest.approx(-3.4)
-            assert cycle.probe is None
+            q[3] -= math.radians(5.5 * cycle.move.progress / cycle.move.duration)
+        cycle.step(1+i*.025, q, np.ones(7), np.ones(7))
+        if not cycle.homing:
+            assert abs(cycle.last_transfer["actual_deg"][3]-cycle.last_transfer["target_deg"][3]) > 5.
+            assert cycle.last_transfer["arrival_tolerance_deg"] is None
             return
-    pytest.fail("out-of-range arrival accepted")
+    pytest.fail("loaded homing did not continue after actual settling")
 
 
 def test_arm_arrival_requires_stable_feedback_and_legacy_remains_tight():

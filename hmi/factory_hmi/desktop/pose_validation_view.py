@@ -92,6 +92,9 @@ def build_pose_layout(panel):
     heading.addWidget(label("本机检查 · 实测反馈", "poseBadge"))
     layout.addLayout(heading)
     layout.addWidget(label("自动回零  ·  按顺序搜索  ·  实测记录限位", "poseMuted"))
+    panel.motion_rates = label("", "poseMuted")
+    panel.motion_rates.hide()
+    layout.addWidget(panel.motion_rates)
 
     identity, row = card()
     panel.module_value, panel.serial_value, panel.link_value = (label("—", "poseValue") for _ in range(3))
@@ -100,7 +103,7 @@ def build_pose_layout(panel):
         column = QVBoxLayout(); column.setSpacing(5)
         column.addWidget(label(title, "poseMuted")); column.addWidget(value)
         row.addLayout(column, stretch)
-    tip = label("先连接、扫描并使能，再开始验证。\n自动移动到逻辑零点，不修改电机零偏。", "poseMuted")
+    tip = label("先连接、扫描并使能，再开始验证。\n自动发送零位目标并等待实测停稳，不修改电机零偏。", "poseMuted")
     tip.setWordWrap(True); row.addWidget(tip, 3)
     layout.addWidget(identity)
 
@@ -133,6 +136,9 @@ def build_pose_layout(panel):
     panel.current_value = label("等待开始", "poseValue")
     panel.measurement = label("实测角度 —    ·    力矩 —", "poseMuted")
     col.addWidget(panel.current_value); col.addWidget(panel.measurement)
+    panel.contact_detail = label("", "poseMuted")
+    panel.contact_detail.setWordWrap(True)
+    col.addWidget(panel.contact_detail)
     col.addWidget(label("角度持续停滞且力矩上升，记录实测止挡角。", "poseMuted"))
     summaries.addWidget(current, 3)
     summary, col = card(QVBoxLayout)
@@ -171,6 +177,18 @@ def number(value, *, signed=True):
     return format(value, "+.2f" if signed else ".2f")
 
 
+def search_attempt_tooltip(attempts):
+    reasons = {"actual_travel": "实测到达行程边界", "command_travel": "指令到达行程边界",
+               "contact": "检出止挡"}
+    return "\n".join(
+        f"第 {row['attempt']} 次 · {reasons.get(row.get('end_reason'), '搜索结束')}\n"
+        f"搜索终点 {number(row.get('search_end_actual_deg'))}°  ·  "
+        f"目标 {number(row.get('search_end_target_deg'))}°\n"
+        f"终点力矩 {number(row.get('search_end_torque_nm'), signed=False)} N·m  ·  "
+        f"判定门槛 {number(row.get('threshold_nm'), signed=False)} N·m"
+        for row in attempts)
+
+
 def render_pose_status(panel, s, *, online, pending, serial):
     active = bool(s.get("active")); phase = s.get("phase", "idle")
     rows = s.get("checks") or reference_rows(s.get("limb"))
@@ -178,11 +196,26 @@ def render_pose_status(panel, s, *, online, pending, serial):
     total = len(rows); done = len(results)
     current = s.get("current_check") or {}
     candidate = s.get("current_candidate")
+    attempt, attempt_limit = current.get("search_attempt"), current.get("search_attempt_limit")
+    retrying = attempt is not None and attempt > 1
+    extending = bool(current.get("search_extension_active"))
     panel.module_value.setText(dict(MODULES).get(s.get("limb"), "未应用模块"))
     panel.module_value.setToolTip(panel.digest.text())
     panel.serial_value.setText(serial or "未填写")
+    rates = s.get("motion_rates") or {}
+    if rates:
+        panel.motion_rates.setText(
+            f"目标速度：搜索 {rates['search_deg_s']:g}°/s  ·  近限位 {rates['near_limit_deg_s']:g}°/s"
+            f"  ·  回程 {rates['return_deg_s']:g}°/s")
+    panel.motion_rates.setVisible(bool(rates))
     link = ("状态连接待确认" if not online else "未连接电机" if not s.get("discovered") else
             "已连接 · 已使能" if s.get("motors_enabled") else "已连接 · 未使能")
+    disabled = s.get("motor_disable") or (s.get("disable") or {}).get("details") or {}
+    unconfirmed = [row for row in disabled.get("motors", [])
+                   if row.get("requires_confirmation") and row.get("state") != "confirmed"
+                   or row.get("state") == "request_failed"]
+    if unconfirmed:
+        link = "失能未确认 · " + "、".join(f"{row['bus']}#{row['motor_id']}" for row in unconfirmed)
     panel.link_value.setText(link)
     fault = s.get("fault") if phase == "aborted" else None
     panel.fault_banner.setText("检查中止：" + fault if fault else "")
@@ -190,8 +223,12 @@ def render_pose_status(panel, s, *, online, pending, serial):
     panel.progress_text.setText("正在启动…" if pending else f"检查中 · {min(done+1,total)} / {total} 项" if active
                                else "已中止" if phase == "aborted" else "检查完成" if phase == "finished" else "等待开始")
     transfer = s.get("last_transfer") or {}
+    completion = s.get("completion") or {}
+    if active and done == total > 0:
+        panel.progress_text.setText("检查项已记录 · 回零收尾中")
     if active and phase == "homing":
-        panel.progress_text.setText(f"自动回零 · {round(100*transfer.get('command_progress', 0))}%")
+        panel.progress_text.setText("自动回零 · 等待反馈停稳" if transfer.get("waiting_for_settle") else
+                                   f"自动回零 · {round(100*transfer.get('command_progress', 0))}%")
     panel.progress.setValue(round(done * 100 / total) if total else 0)
     stage = (3 if phase == "finished" else 2 if phase == "returning" or done == total > 0 else
              0 if phase in {"idle", "waiting_feedback", "gain_transition", "homing"} and not done else 1)
@@ -201,18 +238,57 @@ def render_pose_status(panel, s, *, online, pending, serial):
                            "background: transparent; color: #61748d;")
     if current:
         panel.current_value.setText(f"{joint_label(current['joint'])} · {'上限' if current['sign'] > 0 else '下限'}")
+        if active and attempt is not None:
+            title = "复搜" if retrying else "首轮搜索"
+            panel.current_value.setText(f"{panel.current_value.text()} · {title} {attempt}/{attempt_limit}")
+        elif active and extending and phase == "search":
+            panel.current_value.setText(f"{panel.current_value.text()} · 延伸搜索")
         kind = "估算力矩" if current.get("torque_is_estimated") else "力矩"
         panel.measurement.setText(f"实测角度 {number(current.get('actual_deg'))}°    ·    {kind} {number(current.get('torque_nm'), signed=False)} N·m")
+        state = ("正在按实测位移退让" if phase == "retreat" else
+                 "推进已停止，正在完成接触判定" if current.get("search_hold") else
+                 "基线已冻结，观察角度和力矩" if current.get("baseline_frozen") else "随实际运动更新负载基线")
+        panel.contact_detail.setText(
+            f"负载基线 {number(current.get('baseline_nm'), signed=False)} N·m  ·  "
+            f"接触门槛 {number(current.get('contact_threshold_nm'), signed=False)} N·m\n{state}"
+            if "baseline_nm" in current else "正在采集搜索负载基线")
+        if active and retrying and phase == "baseline":
+            panel.contact_detail.setText("退让已确认，正在重新采集复搜负载基线")
+        elif active and attempt == 1 and attempt_limit == 2 and phase == "retreat" and not candidate:
+            panel.contact_detail.setText("首轮未检出，确认退让后低速复搜")
     else:
+        panel.contact_detail.clear()
         panel.current_value.setText("从当前姿态平滑回零" if phase == "homing" else
-                                    "返回零点" if phase == "returning" else "回零或转场中止" if phase == "aborted" and transfer else
+                                    "返回零点" if phase == "returning" else
+                                    "回零收尾中止" if phase == "aborted" and transfer and done == total > 0 else
+                                    "回零或转场中止" if phase == "aborted" and transfer else
                                     "等待开始" if not done else "检查已结束" if not active else "转场中")
         panel.measurement.setText("实测角度 —    ·    力矩 —")
         if transfer and (active or phase == "aborted"):
             actual, goal = transfer.get("actual_deg", []), transfer.get("goal_deg", [])
             if actual and len(actual) == len(goal):
                 error = max(abs(a-b) for a,b in zip(actual, goal))
-                panel.measurement.setText(f"最大到位偏差 {error:.2f}°    ·    到位范围 ±{transfer['arrival_tolerance_deg']:g}°")
+                tolerance = transfer['arrival_tolerance_deg']
+                condition = ("角差仅记录，等待实测停稳" if tolerance is None
+                             else f"到位范围 ±{tolerance:g}°")
+                panel.measurement.setText(f"最大目标角差 {error:.2f}°    ·    {condition}")
+    if phase in {"arm_hanging", "arm_settling", "arm_holding"}:
+        panel.progress_text.setText("肘部缓慢下垂收尾" if phase == "arm_hanging" else
+                                   "下垂姿态 · 等待实测停稳" if phase == "arm_settling" else "下垂收尾需处理 · 保持目标")
+        panel.current_value.setText(panel.progress_text.text())
+        actual, target = completion.get("actual_joint_deg", []), completion.get("target_joint_deg", [])
+        if len(actual) > 3 and len(target) > 3:
+            panel.measurement.setText(f"肘部实测 {actual[3]:+.2f}°  ·  目标 {target[3]:+.2f}°"
+                                      f"  ·  已停稳 {completion.get('stable_seconds', 0):.1f} s")
+        panel.contact_detail.setText("下垂轨迹完成并连续停稳后，再逐台确认失能。")
+        if completion.get("alarm"):
+            panel.fault_banner.setText(completion["alarm"])
+            panel.fault_banner.show()
+    if unconfirmed and (disabled.get("state") in {"unconfirmed", "request_failed"}
+                        or (s.get("disable") or {}).get("request") == "failed"):
+        panel.progress_text.setText("检查已记录 · 电机失能未全部确认")
+        if completion.get("normal_completed"):
+            panel.current_value.setText("肘部缓降完成 · 失能待确认")
     errors = sum(row.get("outcome") != "within_reference" for row in results)
     panel.counts.setText(f"{done} 已记录    {errors} 异常    {max(0,total-done-(1 if active and current else 0))} 待检查")
     if s.get("record_error"):
@@ -221,7 +297,7 @@ def render_pose_status(panel, s, *, online, pending, serial):
         panel.record_path.setText("本机报告：" + s["report_file"])
     else:
         panel.record_path.setText("结果自动保存在本机。尚未检查的项目不显示实测值。")
-    stamp = json.dumps((rows, results, candidate, (current.get("joint"), current.get("sign")), phase, active))
+    stamp = json.dumps((rows, results, candidate, (current.get("joint"), current.get("sign"), attempt, extending), phase, active))
     if panel._table_stamp == stamp:
         return
     # Snapshot primitives only; polling must not overwrite the comparison stamp in place.
@@ -235,17 +311,22 @@ def render_pose_status(panel, s, *, online, pending, serial):
         if not result and candidate and key == (candidate["joint"], candidate["sign"]):
             result = candidate
         outcome = outcomes.get(result.get("outcome"), "候选已记录 · 待退让") if result else (
+            "延伸搜索中" if is_current and active and extending and phase == "search" else
+            "复搜中" if is_current and active and retrying else
             "搜索中" if is_current and active and phase == "search" else "处理中" if is_current and active else
             "未检查" if phase == "aborted" else "待检查")
+        if result and result.get("search_extension") and result.get("outcome") == "not_detected":
+            outcome = "行程到界 · 止挡待确认"
         tone = "#157452" if result and result.get("outcome") == "within_reference" else (
             "#b45309" if result else "#2367c4" if is_current and active else "#7a8799")
         result = result or {}
-        load = number(result.get("torque_floor_nm"), signed=False)
+        load = number(result.get("torque_median_nm", result.get("torque_floor_nm")), signed=False)
         if load != "—" and result.get("torque_is_estimated"):
             load += "（估算）"
         values = [f"{joint_label(ref['joint'])} / {'上限' if ref['sign'] > 0 else '下限'}",
                   number(ref["reference_deg"]), number(result.get("actual_deg")),
                   number(result.get("deviation_deg")), load, outcome]
+        result_tip = search_attempt_tooltip(result.get("search_attempts") or [])
         for column, value in enumerate(values):
             item = panel.results.item(index, column)
             if item is None:
@@ -256,4 +337,5 @@ def render_pose_status(panel, s, *, online, pending, serial):
             item.setBackground(QColor("#eaf7f0" if result.get("outcome") == "within_reference" else
                                       "#fff3df" if result else "#e9f2ff" if is_current and active else "#f7f9fd")
                                if column == 5 else QColor("#ffffff" if index % 2 == 0 else "#f7f9fd"))
-            item.setToolTip(ref["joint"] if column == 0 else "Iq × 实测 Kt 换算的估算力矩" if column == 4 and result.get("torque_is_estimated") else "")
+            item.setToolTip(ref["joint"] if column == 0 else result_tip if column == 5 else
+                            "Iq × 实测 Kt 换算的估算力矩" if column == 4 and result.get("torque_is_estimated") else "")

@@ -190,7 +190,7 @@ def test_repeated_motor_feedback_cannot_keep_worker_moving():
         worker.start()
         worker.thread.join(2.)
         snapshot = worker.snapshot()
-        assert snapshot["phase"] == "aborted" and "新鲜" in snapshot["fault"]
+        assert snapshot["phase"] == "aborted" and any(text in snapshot["fault"] for text in ("新鲜", "超时"))
         assert len(fake.command_history) == 1
         assert not fake.motors_enabled and snapshot["disable"]["feedback"] == "confirmed_mock"
     finally:

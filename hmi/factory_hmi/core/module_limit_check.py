@@ -65,10 +65,6 @@ class ModuleProfile(BaseModel):
     def require_site_author(self):
         if self.source == "site" and self.approved_by is None:
             raise ValueError("外置工位方案须保留核定人")
-        if (self.transfer_speed_deg_s or 0) > 10 and not (
-                self.source == "builtin_reference" and self.limb in {"left_arm", "left_short_arm"}
-                and all(w.point.full_range_search for w in self.windows)):
-            raise ValueError("transfer_speed_deg_s：非内置左臂回零仍使用原有 10°/s 上限")
         return self
 
     @property
@@ -84,10 +80,10 @@ def load_module_plan(config, serial, config_revision):
     try:
         payload = read_site_profile(PROFILE_ROOT / (config.limb + ".sequence.json"))
     except ValueError as exc:
-        if config.limb not in {"left_arm", "left_short_arm"} or not isinstance(exc.__cause__, FileNotFoundError):
+        if not isinstance(exc.__cause__, FileNotFoundError):
             raise
-        from .arm_limit_defaults import builtin_arm_profile
-        profile = builtin_arm_profile(config)
+        from .module_limit_defaults import builtin_module_profile
+        profile = builtin_module_profile(config)
     else:
         profile = ModuleProfile.model_validate_json(payload)
     return validate_module_plan(config, profile, serial, config_revision)
@@ -147,6 +143,15 @@ def validate_module_plan(config, profile, serial, config_revision):
         raise ValueError("检查顺序与轨迹转场不能同时启用")
     if profile.use_builtin_trajectory or profile.use_builtin_order:
         profile = apply_builtin_trajectory(coords, profile)
+    # Every whole-module inspection uses the same feedback-driven executor.
+    # Keep fixture geometry, order, gains and torque budgets; do not copy an
+    # arm pose onto legs or waist. The historic field name stays wire-compatible.
+    profile = profile.model_copy(update={
+        "transfer_speed_deg_s": 20.,
+        "windows": tuple(window.model_copy(update={
+            "point": ProbePoint.model_validate({**window.point.model_dump(),
+                "full_range_search": True, "search_speed_deg_s": 10.,
+                "positioning_speed_deg_s": 20.})}) for window in profile.windows)})
     descriptions = [point_description(config, profile, w.point, coords=coords) for w in profile.windows]
     hips = profile.waist_hip_hold_bounds_deg
     if hips is not None and (coords.station.limb != "waist_hip" or len(profile.home_deg) != 4 or not all(
@@ -168,6 +173,8 @@ def validate_module_plan(config, profile, serial, config_revision):
                "limb": config.limb, "station_sha256": profile.station_sha256, "config_revision": config_revision,
                "windows": descriptions, "joint_names": list(coords.names),
                "transfer_speed_deg_s": profile.transfer_speed,
+               "runtime_policy": "all-module-feedback-extension-v1" if any(w.point.search_extension for w in profile.windows)
+               else "all-module-feedback-v1",
                "execution_mode": "feedback_limit_search",
                "order_source": "builtin_order_only" if profile.use_builtin_order else "profile_or_legacy_route",
                "startup_action": "move_to_joint_zero" if all(v == 0 for v in profile.home_deg)
@@ -183,7 +190,13 @@ def path_segments(profile, names):
         route = (previous, *window.via_deg, point.staging_pose_deg, point.search_pose_deg)
         yield from zip(route, route[1:])
         search_end = list(point.search_pose_deg)
-        search_end[names.index(point.joint)] += point.direction * point.permitted_travel_deg
+        axis = names.index(point.joint)
+        if point.search_extension is None:
+            search_end[axis] += point.direction * point.permitted_travel_deg
+        else:
+            extension = point.search_extension
+            search_end[axis] = max((extension.actual_limit_deg, extension.command_limit_deg),
+                                   key=lambda angle: point.direction * angle)
         yield point.search_pose_deg, search_end
         previous = point.search_pose_deg
     route = (previous, *profile.return_via_deg, profile.home_deg)
@@ -209,8 +222,8 @@ def entry_poses(coords, profile, q):
 
 
 class ModuleCycle:
-    """Transfer only between acknowledged poses. Any unexpected stop ends the run."""
-    def __init__(self, coords, profile, q, now):
+    """Record each measured stop; only motion failures abort a full-range run."""
+    def __init__(self, coords, profile, q, now, *, prepared_completion=None):
         self.coords, self.profile = coords, profile
         self.index = 0
         self.phase = "positioning"
@@ -221,6 +234,7 @@ class ModuleCycle:
         self.results = []
         self.result = None
         self.probe = None
+        self.arm_completion = None
         self.last_packet = []
         self.samples = []
         self.last_transfer = None
@@ -230,6 +244,13 @@ class ModuleCycle:
         self.direction_evidence = []
         self.point = profile.windows[0].point
         self.fixed_hips = q[2:].copy() if coords.station.limb == "waist_hip" else None
+        from .mujoco_completion import ARM_LIMBS
+        self._prepared_arm_completion = prepared_completion
+        if coords.station.limb in ARM_LIMBS and prepared_completion is None:
+            from .limit_arm_completion import prepare_arm_completion
+            # Direct state-machine users prepare before their first step.
+            # The live ModuleWorker supplies this before acquiring motion.
+            self._prepared_arm_completion = prepare_arm_completion(coords, self._fixed(profile.home_deg))
         poses = entry_poses(coords, profile, q)
         # Use the most conservative commissioned limits across transfers.
         self.transfer_motor = np.min([w.point.motor_abort_nm for w in profile.windows], axis=0)
@@ -282,7 +303,13 @@ class ModuleCycle:
             self.homing = False
             self._prepare_window(q, now)
         elif self.index == len(self.profile.windows):
-            self.phase = "finished"
+            from .mujoco_completion import ARM_LIMBS
+            if self.coords.station.limb in ARM_LIMBS:
+                self.arm_completion = self._prepared_arm_completion.activate(self.coords, self.target, q, now)
+                self.goal = self.arm_completion.goal.copy()
+                self.phase = self.arm_completion.phase
+            else:
+                self.phase = "finished"
         else:
             self.probe = ProbeCycle(self.coords, self.point, q, now, target=self.target)
             self.phase = self.probe.phase
@@ -296,18 +323,22 @@ class ModuleCycle:
             return
         check_torque(self.coords, joint_tau, motor_tau, self.transfer_joint, self.transfer_motor,
                      "转场中超过核定中止力矩")
-        if np.max(abs(np.rad2deg(q - self.target))) > self.transfer_error:
+        if not self.point.full_range_search and np.max(abs(np.rad2deg(q - self.target))) > self.transfer_error:
             raise FeedbackError("转场跟踪偏差超过核定值")
 
     def step(self, now, q, joint_tau, motor_tau):
         # Save the current measurement even when a verification raises below.
         self.actual = q.copy()
         if self.probe is None:
+            completion = self.arm_completion
             self.last_transfer = {"phase": self.phase, "time_s": now,
                 "actual_deg": np.rad2deg(q).tolist(), "target_deg": np.rad2deg(self.target).tolist(),
                 "goal_deg": np.rad2deg(self.goal).tolist(), "joint_nm": joint_tau.tolist(),
                 "arrival_tolerance_deg": self.point.arrival_tolerance_deg,
-                "command_progress": self.move.progress / self.move.duration if self.move.duration else 1.}
+                "waiting_for_settle": (completion.commanded_complete if completion is not None
+                                       else self.move.commanded_at is not None),
+                "command_progress": ((completion.progress/completion.duration if completion.duration else 0.)
+                    if completion is not None else self.move.progress/self.move.duration if self.move.duration else 1.)}
             if now - self.last_transfer_recorded >= .1:
                 self.transfer_history.append(dict(self.last_transfer))
                 self.transfer_sample_count += 1
@@ -321,6 +352,9 @@ class ModuleCycle:
             self.phase, self.target, self.gains = probe.phase, probe.target.copy(), probe.gains
             if probe.result is not None:
                 self._complete_window(probe, q, joint_tau, motor_tau)
+        elif self.arm_completion is not None:
+            self.target, done = self.arm_completion.step(now, q, self.point)
+            self.phase = "finished" if done else self.arm_completion.phase
         else:
             self._position(q, now)
         if self.fixed_hips is not None:
@@ -335,10 +369,10 @@ class ModuleCycle:
         self.direction_evidence.append({"joint": self.point.joint, "sign": self.point.direction,
             "samples": list(probe.samples), "samples_truncated": probe.sample_count > len(probe.samples)})
         self.probe = None
-        if self.result["outcome"] != "within_reference":
+        if not self.point.full_range_search and self.result["outcome"] != "within_reference":
             raise FeedbackError(f"{probe.direction.label} {probe.direction.label_direction}结果异常，整模块检查已中止")
         # Confirm the next move leads away from the stop and preserves the held axes.
-        if self.point.direction * (probe.start[probe.axis] - q[probe.axis]) > math.radians(.02):
+        if not self.point.full_range_search and self.point.direction * (probe.start[probe.axis] - q[probe.axis]) > math.radians(.02):
             raise FeedbackError("缓退位置已超出核定退路，停止后续转场")
         self._move("clearance", probe.start)
 
@@ -372,13 +406,19 @@ class ModuleWorker(ProbeWorker):
         self.checks = [{"joint": w["point"]["joint"], "sign": w["point"]["direction"],
                        "label": w["label"], "reference_deg": w["reference_deg"]}
                       for w in context["windows"]]
+        from .mujoco_completion import ARM_LIMBS
+        self._prepared_arm_completion = None
+        if coords.station.limb in ARM_LIMBS:
+            from .limit_arm_completion import prepare_arm_completion
+            self._prepared_arm_completion = prepare_arm_completion(coords, np.deg2rad(profile.home_deg))
 
     def _new_cycle(self, q, now):
         # The station was holding during preflight. Reject a changed entrance,
         # independently of distance from the programmed home point.
         if np.max(abs(np.rad2deg(q - self.entry_position))) > min(p.point.following_error_deg for p in self.profile.windows):
             raise FeedbackError("预检后工位姿态已变化，自动回位未开始")
-        return ModuleCycle(self.coords, self.profile, q, now)
+        return ModuleCycle(self.coords, self.profile, q, now,
+                           prepared_completion=self._prepared_arm_completion)
 
     def begin(self):
         raise ValueError("整模块任务已自动执行")
@@ -416,12 +456,23 @@ class ModuleWorker(ProbeWorker):
                           direction_total=len(self.profile.windows), results=list(cycle.results) if cycle else [],
                           current_candidate=candidate,
                           checks=self.checks, report_file=self.report_file, record_error=self.record_error)
+            point = self.profile.windows[0].point
+            result["motion_rates"] = {
+                "search_deg_s": point.search_speed_deg_s,
+                "near_limit_deg_s": point.contact_speed_deg_s,
+                "return_deg_s": min(self.profile.transfer_speed, point.positioning_speed_deg_s),
+                "home_deg_s": self.profile.transfer_speed}
             if cycle:
                 result["last_transfer"] = cycle.last_transfer
+                result["completion"] = (cycle.arm_completion.snapshot() if cycle.arm_completion is not None
+                    else {"required": self.profile.limb in {"left_arm", "left_short_arm", "right_arm", "right_short_arm"},
+                          "phase": "pending", "active": False, "normal_completed": False})
             if cycle and probe:
                 axis = self.coords.names.index(probe.point.joint)
                 result["current_check"] = {"joint": probe.point.joint, "sign": probe.point.direction,
                     "actual_deg": float(np.rad2deg(cycle.actual[axis]))}
+                if probe.feedback_search:
+                    result["current_check"].update(probe.feedback_search.diagnostics())
                 if cycle.last_packet:
                     drive = cycle.last_packet[axis]
                     result["current_check"].update(torque_nm=(probe.samples[-1]["joint_nm"][axis]
@@ -439,11 +490,16 @@ class ModuleWorker(ProbeWorker):
                 result["unfinished_search"] = ({"joint": probe.point.joint, "sign": probe.point.direction,
                     "samples": list(probe.samples), "samples_truncated": probe.sample_count > len(probe.samples)}
                     if probe else None)
+                if probe and probe.feedback_search and probe.feedback_search.attempts:
+                    result["unfinished_search"]["search_attempts"] = list(probe.feedback_search.attempts)
         return result
 
     def _record_end(self):
         # The drive has already been disabled or a failed request recorded.
         try:
+            with self.lock:
+                if self.cycle is not None and self.cycle.arm_completion is not None and self.reason:
+                    self.cycle.arm_completion.interrupt(self.reason)
             report = self.snapshot(include_samples=True)
             report.update(active=False, moving=False)
             self.destination.parent.mkdir(parents=True, exist_ok=True)

@@ -414,9 +414,11 @@ class GatewayRuntime:
         if isinstance(protection, Mapping) and protection.get("active") is True:
             raise RuntimeError("保护阻尼仍在运行；先可靠支撑机构并显式失能，再退出网关")
 
-    def close(self, *, disconnect_can: bool = False) -> None:
+    def close(self, *, disconnect_can: bool = False, site_isolated: bool = False) -> None:
         # Process exit must not bypass the desktop's support-before-disable
         # boundary or silently withdraw an active protective damping session.
+        # Isolation is supplied only by the existing private launcher shutdown
+        # path. Operator disconnect and maintenance keep their normal policy.
         if self._process is not None:
             if self.display is not None and not self.display.stop(timeout=2):
                 raise RuntimeError("工位状态采集仍未退出")
@@ -424,7 +426,10 @@ class GatewayRuntime:
                 if self.quick is not None and self.quick.snapshot()["active"] and not self._process.close_pending:
                     self.quick.cancel()
                 with self._lease_guard:
-                    self._process.close()
+                    if site_isolated:
+                        self._process.close(site_isolated=True)
+                    else:
+                        self._process.close()
             except Exception:
                 if self.display is not None:
                     self.display.start()
@@ -448,10 +453,12 @@ class GatewayRuntime:
             close_service = getattr(self.controller, "close", None)
             if callable(close_service):
                 try:
+                    options = {}
                     if disconnect_can:
-                        close_service(disconnect_can=True)
-                    else:
-                        close_service()
+                        options["disconnect_can"] = True
+                    if site_isolated:
+                        options["site_isolated"] = True
+                    close_service(**options)
                 except Exception as exc:
                     self._cleanup_error = f"service shutdown failed: {exc}"
                     raise RuntimeError(self._cleanup_error) from exc
@@ -460,13 +467,16 @@ class GatewayRuntime:
             # Prefer their atomic shutdown entry point when available.
             shutdown_disconnect = getattr(self.controller, "disconnect_for_shutdown", None)
             if callable(shutdown_disconnect):
-                shutdown_disconnect()
+                if site_isolated:
+                    shutdown_disconnect(site_isolated=True)
+                else:
+                    shutdown_disconnect()
                 return
             state = str(self.snapshot().get("state", ""))
             if state not in {"disconnected", "completed"}:
                 self._safe_stop("gateway shutdown")
             self._require_shutdown_support()
-            self._invoke(("disconnect",))
+            self._invoke(("disconnect_site_isolated",) if site_isolated else ("disconnect",))
 
     def lease_snapshot(self) -> dict[str, Any]:
         """Read liveness without polling hardware, reports, or the platform."""
@@ -1015,7 +1025,12 @@ class GatewayHub:
                 if key in self._closed_sessions:
                     continue
                 try:
-                    runtime.close()
+                    # Forward the trusted context to motor/session teardown,
+                    # before applying it to the cabinet below.
+                    if site_isolated:
+                        runtime.close(site_isolated=True)
+                    else:
+                        runtime.close()
                 except Exception as exc:
                     errors.append(str(exc))
                 else:

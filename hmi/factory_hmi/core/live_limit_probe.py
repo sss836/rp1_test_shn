@@ -26,6 +26,12 @@ VEC = Annotated[tuple[Annotated[float, Field(allow_inf_nan=False)], ...], Field(
 POS_VEC = Annotated[tuple[POS, ...], Field(min_length=2, max_length=7)]
 
 
+class SearchExtension(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    actual_limit_deg: float
+    command_limit_deg: float
+
+
 class ProbePoint(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     joint: str
@@ -34,8 +40,9 @@ class ProbePoint(BaseModel):
     search_pose_deg: VEC
     full_range_search: bool = False
     permitted_travel_deg: Annotated[float, Field(gt=0, le=360)]
-    search_speed_deg_s: Annotated[float, Field(gt=0, le=5)]
-    positioning_speed_deg_s: Annotated[float, Field(gt=0, le=5)]
+    search_extension: SearchExtension | None = None
+    search_speed_deg_s: Annotated[float, Field(gt=0, le=10)]
+    positioning_speed_deg_s: Annotated[float, Field(gt=0, le=20)]
     reset_kp_scale: Annotated[float, Field(gt=0, le=1)]
     reset_kd_scale: Annotated[float, Field(ge=0, le=1)]
     search_kp_scale: Annotated[float, Field(gt=0, le=1)]
@@ -51,17 +58,24 @@ class ProbePoint(BaseModel):
 
     @property
     def arrival_tolerance_deg(self):
-        # A loaded arm at nominal zero is preparation, not encoder calibration
-        # or a measured stop. Retain the tighter legacy pilot requirement.
-        return min(3., self.following_error_deg) if self.full_range_search else .12
+        # Full-range MIT preparation confirms completion of the commanded path
+        # and actual settling. Static load error is measured, not an arrival
+        # fault. The legacy one-direction pilot keeps its commissioned gate.
+        return None if self.full_range_search else .12
+
+    @property
+    def contact_speed_deg_s(self):
+        return min(self.search_speed_deg_s, 2.) if self.full_range_search else self.search_speed_deg_s
 
     @model_validator(mode="after")
     def bounded(self):
+        if self.search_extension is not None and not self.full_range_search:
+            raise ValueError("延伸搜索仅用于整模块限位检查")
         if not self.full_range_search and (self.permitted_travel_deg > 12 or
                 self.search_speed_deg_s > 1 or self.following_error_deg > 2):
             raise ValueError("单方向试点仍使用原有行程、速度和跟踪范围")
-        contact_speed = min(self.search_speed_deg_s, 1.) if self.full_range_search else self.search_speed_deg_s
-        if self.following_error_deg <= contact_speed * SETTINGS.stall_s + .05:
+        contact_speed = self.contact_speed_deg_s
+        if not self.full_range_search and self.following_error_deg <= contact_speed * SETTINGS.stall_s + .05:
             raise ValueError("跟踪门限未留出一秒停滞窗口的最大指令推进量")
         return self
 
@@ -129,9 +143,6 @@ def point_description(config, profile, point, *, coords=None):
     count = len(coords.names)
     if any(len(v) != count for v in (staging, start, point.motor_abort_nm, point.joint_abort_nm)):
         raise ValueError("核定角度与力矩向量必须对应工位的具名关节顺序")
-    if point.full_range_search and (config.limb not in {"left_arm", "left_short_arm"}
-                                   or abs(start[index]) > 1.e-9):
-        raise ValueError("从零搜索仅支持左臂 5／7 轴，受检关节须从逻辑零点开始")
     if profile.joint_peak_nm is not None:
         if len(profile.joint_peak_nm) != count:
             raise ValueError("峰值力矩必须对应工位的具名关节顺序")
@@ -150,10 +161,20 @@ def point_description(config, profile, point, *, coords=None):
             raise ValueError("复位起点和搜索姿态须位于量产参考区间内")
     reference_travel = sign * (direction.reference_deg - start[index])
     beyond = point.permitted_travel_deg - reference_travel
-    contact_speed = min(point.search_speed_deg_s, 1.) if point.full_range_search else point.search_speed_deg_s
-    if reference_travel <= 0 or not contact_speed * SETTINGS.stall_s + .05 < beyond <= 3.0 + 1e-8:
+    contact_speed = point.contact_speed_deg_s
+    min_beyond = 0. if point.full_range_search else contact_speed * SETTINGS.stall_s + .05
+    if reference_travel <= 0 or not min_beyond < beyond <= 3.0 + 1e-8:
         raise ValueError("搜索起点须在参考位置内侧，参考外指令预算须可容纳判定窗口且不超过 3°")
-    if reference_travel + 1e-8 < point.retreat_deg:
+    if point.search_extension is not None:
+        if getattr(profile, "source", None) != "site" or not profile.approved_by:
+            raise ValueError("延伸搜索须使用核定的整模块工位方案")
+        extension = point.search_extension
+        actual_travel = sign * (extension.actual_limit_deg - start[index])
+        command_travel = sign * (extension.command_limit_deg - start[index])
+        if not (point.permitted_travel_deg + point.motor_step_deg < actual_travel <= 360.
+                and point.permitted_travel_deg < command_travel <= 360.):
+            raise ValueError("延伸搜索实测边界须留出单步余量，目标边界须沿本方向越过普通行程")
+    if not point.full_range_search and reference_travel + 1e-8 < point.retreat_deg:
         raise ValueError(f"{direction.label} {direction.label_direction} 的搜索起点距参考角 "
                          f"{reference_travel:.3g}°，不足以缓退 {point.retreat_deg:g}°")
     # The absolute baseline is nonnegative. Its actual value is measured on site.
@@ -176,10 +197,10 @@ class PositionSettling:
 
     @classmethod
     def for_point(cls, point):
-        return cls(point.arrival_tolerance_deg, .05 if point.full_range_search else 0.)
+        return cls(point.arrival_tolerance_deg, SETTINGS.stall_deg if point.full_range_search else 0.)
 
     def settled(self, now, q, target):
-        if np.max(abs(q - target)) > math.radians(self.tolerance_deg):
+        if self.tolerance_deg is not None and np.max(abs(q - target)) > math.radians(self.tolerance_deg):
             self.window.clear()
             return False
         self.window.append((now, q.copy()))
@@ -254,7 +275,10 @@ class PositionMove:
         if self.commanded_at is None:
             return target, ratio, False
         settled = self.settling.settled(now, q, self.goal)
-        if not settled and now - self.commanded_at > 3.:
+        # Full-range MIT preparation waits for actual settling, without a
+        # fixed angle-error or 3-second gate. The caller continues checking
+        # torque, feedback, drive faults and configured motion bounds.
+        if not settled and not point.full_range_search and now - self.commanded_at > 3.:
             error = abs(np.rad2deg(q-self.goal))
             axis = int(np.argmax(error))
             raise FeedbackError(f"{timeout_message}：{coords.names[axis]} 实测 {math.degrees(q[axis]):.2f}°，"
@@ -272,7 +296,7 @@ class ProbeCycle:
         self.start = np.deg2rad(point.search_pose_deg)
         staging = np.deg2rad(point.staging_pose_deg)
         arrival = point.arrival_tolerance_deg if point.full_range_search else .25
-        if min(np.max(abs(q - staging)), np.max(abs(q - self.start))) > math.radians(arrival):
+        if not point.full_range_search and min(np.max(abs(q - staging)), np.max(abs(q - self.start))) > math.radians(arrival):
             raise FeedbackError("实测姿态不在核定复位起点或搜索起点范围内")
         self.actual = q.copy()
         self.target = q.copy() if target is None else target.copy()
@@ -295,6 +319,10 @@ class ProbeCycle:
         self.samples = deque(maxlen=5000)
         self.sample_count = 0
         self.samples_started = now
+        self.feedback_search = None
+        if point.full_range_search:
+            from .feedback_limit_search import FeedbackLimitSearch
+            self.feedback_search = FeedbackLimitSearch(self)
 
     def _phase(self, name, now):
         self.phase, self.since = name, now
@@ -314,6 +342,8 @@ class ProbeCycle:
                 p.reset_kd_scale * (1-x) + p.search_kd_scale * x)
 
     def step(self, now, q, joint_tau, motor_tau):
+        if self.feedback_search is not None:
+            return self.feedback_search.step(now, q, joint_tau, motor_tau)
         p, a, s = self.point, self.axis, self.point.direction
         elapsed, dt = now - self.since, now - self.previous
         if not (0 < dt <= SETTINGS.max_feedback_age_s):
@@ -478,6 +508,13 @@ class ProbeWorker:
         self.reason = ""
         self.disable = {"request": "pending", "feedback": "unknown"}
         self.started = False
+        self.feedback_diagnostics = {"received_groups": 0, "accepted_groups": 0,
+            "repeated_groups": 0, "empty_reads": 0, "recovery_count": 0,
+            "last_group_skew_ms": None, "max_group_skew_ms": 0.,
+            "latest_status": "waiting_feedback", "last_error": None}
+        self.latest_feedback_group = None
+        self.last_rejected_feedback_group = None
+        self.feedback_events = deque(maxlen=64)
 
     def start(self):
         self.thread.start()
@@ -515,9 +552,14 @@ class ProbeWorker:
                     "fault": self.reason or None, "disable": dict(self.disable),
                     "result": dict(c.result) if c and c.result else None,
                     "positions_rad": c.actual.tolist() if c else None}
+            base["control_thread_running"] = self.thread.is_alive()
+            base["feedback_diagnostics"] = dict(self.feedback_diagnostics)
             if include_samples:
                 base.update(context=self.context, calibration_passed=None,
                             samples=list(c.samples) if c else [])
+                base.update(latest_feedback_group=self.latest_feedback_group,
+                            last_rejected_feedback_group=self.last_rejected_feedback_group,
+                            feedback_events=list(self.feedback_events))
                 if isinstance(c, ProbeCycle):
                     base.update(candidate=c.candidate, samples_truncated=c.sample_count > len(c.samples))
             return base
@@ -528,6 +570,15 @@ class ProbeWorker:
             self.disable = {"request": "sent", "feedback": self.backend.disable_feedback()}
         except Exception as exc:
             self.disable = {"request": "failed", "feedback": "unknown", "reason": str(exc)}
+            if not self.reason:
+                self.reason = "收尾失能尚未确认：" + str(exc)
+        status = getattr(self.backend, "disable_status", None)
+        if callable(status):
+            try:
+                self.disable["details"] = status()
+                self.disable["feedback"] = self.backend.disable_feedback()
+            except Exception as exc:
+                self.disable["status_error"] = str(exc)
 
     def _new_cycle(self, q, now):
         return ProbeCycle(self.coords, self.point, q, now)
@@ -539,27 +590,95 @@ class ProbeWorker:
     def _record_end(self):
         pass
 
+    def _observe_feedback(self, samples, now):
+        """Capture the received group before validation can reject its facts."""
+        stamps = [row.timestamp_s for row in samples]
+        skew = (1000.*(max(stamps)-min(stamps)) if stamps and
+                all(math.isfinite(value) for value in stamps) else None)
+        group = {"received_at_monotonic_s": now, "skew_ms": skew,
+                 "samples": [row.to_dict() for row in samples]}
+        with self.lock:
+            self.latest_feedback_group = group
+            diag = self.feedback_diagnostics
+            diag["received_groups" if samples else "empty_reads"] += 1
+            diag["last_group_skew_ms"] = skew
+            if skew is not None and skew > diag["max_group_skew_ms"]:
+                diag["max_group_skew_ms"] = skew
+                self.feedback_events.append({"event": "observed_skew", "time_s": now, "skew_ms": skew})
+
+    def _feedback_state(self, state, now):
+        with self.lock:
+            diag = self.feedback_diagnostics
+            previous = diag["latest_status"]
+            if state == "accepted":
+                diag["accepted_groups"] += 1
+                if previous.startswith("waiting_") and previous != "waiting_feedback":
+                    diag["recovery_count"] += 1
+                    self.feedback_events.append({"event": "recovered", "time_s": now,
+                                                 "previous_status": previous})
+            elif state == "waiting_repeated":
+                diag["repeated_groups"] += 1
+            if state != previous and state.startswith("waiting_"):
+                self.feedback_events.append({"event": state, "time_s": now})
+            diag["latest_status"] = state
+
+    def _feedback_failure(self, message, now, received):
+        with self.lock:
+            diag = self.feedback_diagnostics
+            diag.update(latest_status="failed", last_error=message)
+            group = self.latest_feedback_group if received else None
+            self.last_rejected_feedback_group = {"reason": message, "failed_at_monotonic_s": now,
+                "received": received, "skew_ms": group["skew_ms"] if group else None,
+                "samples": group["samples"] if group else []}
+            self.feedback_events.append({"event": "failed", "time_s": now, "reason": message,
+                                         "received": received, "skew_ms": group["skew_ms"] if group else None})
+
+    def _check_received_loads(self, tau, motor_tau):
+        """A repeated group must not hide new drive faults or an overload."""
+        cycle = self.cycle
+        point = cycle.point if cycle is not None else self.point
+        in_transfer = hasattr(cycle, "transfer_joint") and getattr(cycle, "probe", None) is None
+        joint = cycle.transfer_joint if in_transfer else point.joint_abort_nm
+        motor = cycle.transfer_motor if in_transfer else point.motor_abort_nm
+        check_torque(self.coords, tau, motor_tau, joint, motor, "实测力矩达到工位中止门限")
+
     def _run(self):
         stamp = ()
         last_cohort = time.monotonic()
         last_motor = None
         last_command = None
+        received = False
         try:
             while not self.stop_event.is_set():
+                received = False
                 samples = self.read()
                 now = time.monotonic()
-                if not samples or (stamp and not all(
-                        s.timestamp_s > old for s, old in zip(samples, stamp, strict=True))):
+                received = True
+                self._observe_feedback(samples, now)
+                if not samples:
+                    self._feedback_state("waiting_empty", now)
+                    if now - last_cohort >= SETTINGS.max_feedback_age_s:
+                        raise FeedbackError("没有收到完整的新鲜逐电机反馈")
+                    self.stop_event.wait(.008)
+                    continue
+                # Validate current identities, individual freshness and faults
+                # before the repeated-group wait; no stale/fault/overload is
+                # swallowed by that wait. Skew is recorded but never a gate.
+                q, tau, received_stamp = self.coords.decode(samples, now, ())
+                motor_tau = np.asarray([s.torque_nm for s in samples])
+                self._check_received_loads(tau, motor_tau)
+                if stamp and not all(a > old for a, old in zip(received_stamp, stamp, strict=True)):
+                    self._feedback_state("waiting_repeated", now)
                     if now - last_cohort >= SETTINGS.max_feedback_age_s:
                         raise FeedbackError("没有收到完整的新鲜逐电机反馈")
                     self.stop_event.wait(.008)
                     continue
                 if now - last_cohort >= SETTINGS.max_feedback_age_s:
                     raise FeedbackError("逐电机反馈超过允许间隔")
-                q, tau, stamp = self.coords.decode(samples, now, stamp)
+                stamp = received_stamp
+                self._feedback_state("accepted", now)
                 self.on_samples(samples)
                 last_cohort = now
-                motor_tau = np.asarray([s.torque_nm for s in samples])
                 with self.lock:
                     if self.cycle is None:
                         check_torque(self.coords, tau, motor_tau, self.point.joint_abort_nm,
@@ -589,6 +708,7 @@ class ProbeWorker:
             self.reason = "工位停止、租约撤销或操作员中止"
         except Exception as exc:
             self.reason = str(exc)
+            self._feedback_failure(self.reason, time.monotonic(), received)
         finally:
             self._disable()
             with self.lock:

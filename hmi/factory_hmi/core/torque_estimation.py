@@ -1,13 +1,14 @@
 """109 Iq × device-read Kt. No configured/target parameter fallback."""
 import math
 import time
+from .lro_query import valid_query_header
 
 SUPPORTED_MODELS = {0: "LRO_5550", 1: "LRO_6562", 2: "LRO_8462", 3: "LRO_10062"}
 
 
 def decode_kt(payload):
     # Same unsigned big-endian /100 encoding as deploy_motorlro_params.py.
-    if len(payload) < 4 or payload[:2] != bytes((0xA0, 0x16)):
+    if len(payload) < 4 or not valid_query_header(payload[0]) or payload[1] != 0x16:
         raise ValueError("Kt响应头或长度无效")
     value = int.from_bytes(payload[2:4], "big") / 100.0
     if value <= 0:

@@ -134,13 +134,13 @@ def test_late_protection_after_shutdown_commit_cannot_reenable():
     controller = FactoryController(config, backend, enable_recording=False)
     controller.connect()
     committed, release = threading.Event(), threading.Event()
-    original = backend.disable
-    def disable(*args, **kwargs):
+    original = backend._prepare_transport_release
+    def prepare_release(*args, **kwargs):
         assert controller._shutdown_committed
         committed.set()
         assert release.wait(2)
         return original(*args, **kwargs)
-    backend.disable = disable
+    backend._prepare_transport_release = prepare_release
     errors, late_result = [], []
     def close():
         try:
@@ -160,5 +160,5 @@ def test_late_protection_after_shutdown_commit_cannot_reenable():
         assert not backend.connected and not backend.motors_enabled
     finally:
         release.set()
-        backend.disable = original
+        backend._prepare_transport_release = original
         controller.disconnect()

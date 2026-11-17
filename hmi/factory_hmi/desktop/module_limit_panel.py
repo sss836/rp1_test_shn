@@ -12,7 +12,9 @@ from .pose_validation_view import build_pose_layout, render_pose_status
 PHASE = {"idle": "等待工位就绪", "waiting_feedback": "等待逐电机反馈", "gain_transition": "平滑切换增益",
          "homing": "从实测姿态平滑复位", "positioning": "按检查顺序转场", "reset": "回到搜索起点", "baseline": "采集力矩基线",
          "search": "低速搜索", "unload": "停止推进", "retreat": "沿实测路径缓退", "clearance": "返回安全转场起点",
-         "returning": "返回检查起点", "finished": "检查完成", "aborted": "已中止"}
+         "returning": "返回检查起点", "arm_hanging": "肘部缓慢下垂收尾",
+         "arm_settling": "下垂姿态等待停稳", "arm_holding": "下垂收尾需处理，保持目标",
+         "finished": "检查完成", "aborted": "已中止"}
 VERDICT = {"within_reference": "参考范围内", "early": "提前阻挡", "late": "超出参考", "not_detected": "未检出"}
 
 
@@ -125,7 +127,8 @@ class ModuleLimitPanel(QWidget):
         ready = self.online and s.get("backend") == "motors_py" and s.get("discovered") and s.get("motors_enabled")
         self.start.setEnabled(bool(ready and not active and not self.pending))
         self.abort.setEnabled(bool(active or s.get("motors_enabled")))
-        self.export.setEnabled(current and not active and s.get("phase") in {"finished", "aborted"})
+        self.export.setEnabled(current and not s.get("control_thread_running", active)
+                               and s.get("phase") in {"finished", "aborted"})
         limb = dict(MODULES).get(s.get("limb"), "未应用支持的真机模块")
         state = PHASE.get(s.get("phase"), "等待工位状态") if current else "等待启动"
         if not self.online:
@@ -143,6 +146,11 @@ class ModuleLimitPanel(QWidget):
             state += " · 失能指令" + ("已发出" if disable["request"] == "sent" else "发送失败")
             if disable.get("feedback") == "unknown":
                 state += " · 实际反馈待核对"
+            elif disable.get("feedback") == "confirmed":
+                state += (" · 复用本次控制的逐台失能确认" if disable.get("details", {}).get("reused_confirmation")
+                          else " · 已逐台确认失能")
+            elif disable.get("feedback") == "unconfirmed":
+                state += " · 尚有电机未确认失能"
         self.state.setText(f"{limb} · {state}")
         self.digest.setText(f"工位配置摘要 {s['station_sha256']}" if s.get("station_sha256") else "")
         render_pose_status(self, s, online=self.online, pending=self.pending,

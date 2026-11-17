@@ -254,6 +254,7 @@ class FactoryMainWindow(QMainWindow):
         self._can_command_timer.timeout.connect(self._poll_can_command)
         self._motors_discovered = False
         self._motors_enabled = False
+        self._motor_disable_pending = False
         self._connected = False
         self._lease_enabled = False
         self._ws_connected = False
@@ -3370,13 +3371,18 @@ class FactoryMainWindow(QMainWindow):
         station_data = station if isinstance(station, Mapping) else {}
         state = str(station_data.get("state", snapshot.get("state", ""))).lower()
         enabled = station_data.get("motors_enabled") is True
+        disable = self._motor_disable_view(snapshot)
         if self._manual_stop_requested:
             self._manual_mode_active = False
         elif not self._manual_starting or server_manual_active:
             self._manual_mode_active = server_manual_active
         manual_active = self._manual_mode_active
         moving = manual_data.get("moving") is True
-        if manual_data.get("fault"):
+        if disable["pending"]:
+            status = "失能待确认 · 控制下发已阻止；可再次点击软件失能。"
+            self.manual_command_timer.stop()
+            self._manual_command_queued = False
+        elif manual_data.get("fault"):
             status = f"关节控制故障：{manual_data.get('fault')}"
         elif manual_active and moving:
             status = "正在平滑移动；控制线程持续发送目标位置"
@@ -3387,7 +3393,7 @@ class FactoryMainWindow(QMainWindow):
         else:
             status = "等待样机配置、连接并使能"
         self.manual_status_label.setText(status)
-        ready = bool(enabled and state == "connected" and entries)
+        ready = bool(enabled and state == "connected" and entries and not disable["pending"])
         self.manual_current_button.setEnabled(bool(joint_positions))
         self.manual_move_button.setText(
             "关节控制已开启"
@@ -3400,8 +3406,8 @@ class FactoryMainWindow(QMainWindow):
             ready and not manual_active and not self._manual_starting
         )
         self.manual_stop_button.setEnabled(manual_active)
-        self.manual_disable_button.setEnabled(enabled)
-        self._set_manual_input_enabled(manual_active)
+        self.manual_disable_button.setEnabled(enabled or disable["pending"])
+        self._set_manual_input_enabled(manual_active and not disable["pending"])
 
     def _motor_background(
         self,
@@ -3495,6 +3501,60 @@ class FactoryMainWindow(QMainWindow):
             self.global_fault.style().unpolish(self.global_fault)
             self.global_fault.style().polish(self.global_fault)
 
+    @staticmethod
+    def _motor_disable_view(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        report = snapshot.get("motor_disable")
+        report = report if isinstance(report, Mapping) else {}
+        motors = report.get("motors")
+        rows = [row for row in motors if isinstance(row, Mapping)] if isinstance(motors, list) else []
+        pending = [row for row in rows if row.get("request_error")
+            or row.get("state") in {"unconfirmed", "request_failed", "pending"}
+            or row.get("requires_confirmation") is True and row.get("state") != "confirmed"]
+        legacy = [row for row in rows if row.get("requires_confirmation") is False
+                  and row.get("state") == "unknown" and not row.get("request_error")]
+        def label(row):
+            return f"{row.get('bus') or row.get('can') or row.get('interface') or 'CAN?'}#{row.get('motor_id', '?')}"
+        fresh_enabled = []
+        station = snapshot.get("station")
+        observed = snapshot.get("motors")
+        observed = observed.values() if isinstance(observed, Mapping) else observed if isinstance(observed, list) else ()
+        if (isinstance(station, Mapping) and station.get("motors_enabled") is False
+                and not snapshot.get("feedback_read_error")):
+            for motor in observed:
+                if not isinstance(motor, Mapping):
+                    continue
+                stamp = finite_number(motor.get("timestamp_s"))
+                age = finite_number(motor.get("feedback_age_s"))
+                # The saved stop result cannot override a newer physical
+                # enabled bit. Missing/expired values are never such evidence.
+                if (motor.get("drive_enabled") is True and motor.get("lro_protocol_profile") == "v1.03"
+                        and stamp is not None and stamp > 0 and age is not None and age >= 0
+                        and feedback_age_s(motor, snapshot.get("timestamp_s"), 0.) <= .1+1.e-9):
+                    fresh_enabled.append(label(motor))
+        messages = []
+        for row in pending:
+            if label(row) in fresh_enabled:
+                continue
+            reason = row.get("request_error") or row.get("feedback_error")
+            messages.append(label(row) + ("：发送失败" if row.get("request_error") or row.get("state") == "request_failed"
+                                         else "：失能反馈待确认") + (f"（{reason}）" if reason else ""))
+        for row in legacy:
+            messages.append(label(row) + "：失能指令已发出；旧协议无使能位，仅记录指令发送结果")
+        messages.extend(name + "：仍使能（新鲜实测反馈），失能待确认" for name in fresh_enabled)
+        is_pending = bool(pending or fresh_enabled) or report.get("state") in {"pending", "unconfirmed", "request_failed"}
+        confirmed = bool(rows) and all(row.get("state") == "confirmed" for row in rows) and not is_pending
+        if confirmed:
+            messages = ["已逐台确认失能：" + "、".join(label(row) for row in rows)]
+        return {"pending": is_pending, "confirmed": confirmed,
+                "legacy": bool(legacy), "fresh_enabled": fresh_enabled, "tooltip": "\n".join(messages)
+                or ("工位失能反馈待确认；控制下发已阻止。" if is_pending else "")}
+
+    def _new_motion_blocked_by_disable(self) -> bool:
+        if not self._motor_disable_pending:
+            return False
+        self.statusBar().showMessage("失能待确认，控制下发已阻止；请再次点击软件失能。", 8000)
+        return True
+
     def _sync_state(self, snapshot: Mapping[str, Any]) -> None:
         configured_value = snapshot.get("configured")
         if isinstance(configured_value, bool):
@@ -3565,9 +3625,12 @@ class FactoryMainWindow(QMainWindow):
             self._motors_enabled = True
         elif not self._motors_discovered:
             self._motors_enabled = False
+        disable = self._motor_disable_view(snapshot)
+        self._motor_disable_pending = disable["pending"]
         self._preflight_ok = bool(
             state == "armed" and self._trajectory_imported and self._motors_enabled
             and not self._preflight_pending and not self._default_return_pending
+            and not self._motor_disable_pending
         )
 
         self._render_can_controls(snapshot)
@@ -3580,9 +3643,12 @@ class FactoryMainWindow(QMainWindow):
                 else "未发现"
             )
         )
-        self.motor_enable_label.setText(
-            f"使能\n{'是' if self._motors_enabled else '否'}"
-        )
+        self.motor_enable_label.setText("使能\n" + (
+            "失能待确认" if disable["pending"] else
+            "已失能 · 已逐台确认" if disable["confirmed"] else
+            "失能指令已发出" if disable["legacy"] else
+            "是" if self._motors_enabled else "否"))
+        self.motor_enable_label.setToolTip(disable["tooltip"])
         protection = station.get("protective_damping") if isinstance(station, Mapping) else None
         self.position_hold_label.setText(
             "保护阻尼\nKd=1 · 承重未确认" if isinstance(protection, Mapping) and protection.get("active") is True
@@ -3591,6 +3657,9 @@ class FactoryMainWindow(QMainWindow):
         self.feedback_read_label.setText(
             "状态读取\n"
             + (
+                "失能待确认 · 控制下发已阻止" if disable["pending"] else
+                "失能已逐台确认" if disable["confirmed"] else
+                "旧协议无使能位 · 失能指令已发出" if disable["legacy"] else
                 "正在确认反馈，保持未使能" if self._motor_discovery_pending else
                 "正在读取固件与协议，保持未使能" if self._motor_protocols_pending(snapshot) else
                 "只读、未施加力矩"
@@ -3598,13 +3667,15 @@ class FactoryMainWindow(QMainWindow):
                 else ("实时控制反馈" if self._motors_enabled else "等待连接")
             )
         )
+        self.feedback_read_label.setToolTip(disable["tooltip"])
         set_tone(
             self.motor_discovery_label,
             "success" if self._motors_discovered else "warning",
         )
         set_tone(
             self.motor_enable_label,
-            "success" if self._motors_enabled else "warning",
+            "warning" if disable["pending"] or disable["legacy"] else
+            "success" if self._motors_enabled or disable["confirmed"] else "warning",
         )
         set_tone(
             self.position_hold_label,
@@ -3612,32 +3683,42 @@ class FactoryMainWindow(QMainWindow):
         )
         set_tone(
             self.feedback_read_label,
+            "warning" if disable["pending"] or disable["legacy"] else
             "success" if self._motors_discovered and not self._motor_protocols_pending(snapshot) else "warning",
         )
         self._refresh_configuration_buttons()
         self._sync_preflight_controls(state)
         self.pause_button.setEnabled(state == "running")
-        self.resume_button.setEnabled(state == "paused")
+        self.resume_button.setEnabled(state == "paused" and not self._motor_disable_pending)
         self.stop_button.setEnabled(state in {"running", "paused"})
         completion = (snapshot.get("playback") or {}).get("completion") or {}
         if completion.get("active") is True:
             phase = completion.get("phase")
             self.pause_button.setEnabled(phase in {"running", "finishing_cycle"} and state == "running")
-            self.resume_button.setEnabled(phase in {"running", "finishing_cycle"} and state == "paused")
+            self.resume_button.setEnabled(phase in {"running", "finishing_cycle"} and state == "paused"
+                                          and not self._motor_disable_pending)
             self.stop_button.setEnabled(phase in {"running", "finishing_cycle", "approaching", "approach_settling"})
         self.reset_button.setEnabled(
             self._motors_discovered
             and self._motors_enabled
             and state in {"connected", "armed", "completed"}
             and not self._default_return_pending and not self._preflight_pending
+            and not self._motor_disable_pending
         )
         self.motor_fault_reset_button.setEnabled(
             self._configured and self._can_connected and not self._motors_enabled
             and self._can_command_id is None
             and not self._motor_fault_reset_pending
             and state in {"disconnected", "connected", "fault", "armed", "completed"}
+            and not self._motor_disable_pending
         )
-        self.disable_button.setEnabled(self._motors_enabled)
+        self.disable_button.setEnabled(self._motors_enabled or self._motor_disable_pending)
+        if self._motor_disable_pending:
+            self.manual_move_button.setEnabled(False)
+            self.manual_disable_button.setEnabled(True)
+            self._set_manual_input_enabled(False)
+            self.manual_command_timer.stop()
+            self._manual_command_queued = False
 
     def _render_can_controls(self, snapshot: Mapping[str, Any]) -> None:
         can = snapshot.get("can")
@@ -3720,6 +3801,7 @@ class FactoryMainWindow(QMainWindow):
             self._can_command_id is None and self._motors_discovered and not self._motors_enabled
             and not reading and not self._motor_enable_pending
             and not self._motor_fault_reset_pending and not self._motor_discovery_pending
+            and not self._motor_disable_pending
         )
 
     @staticmethod
@@ -3733,7 +3815,9 @@ class FactoryMainWindow(QMainWindow):
 
     def _sync_preflight_controls(self, state: str) -> None:
         reason = ""
-        if self._default_return_pending:
+        if self._motor_disable_pending:
+            reason = "失能待确认，控制下发已阻止；请再次点击软件失能。"
+        elif self._default_return_pending:
             reason = "正在回默认位，请等待回位完成。"
         elif self._preflight_pending:
             reason = "正在执行安全预检，请等待网关确认。"
@@ -3758,6 +3842,7 @@ class FactoryMainWindow(QMainWindow):
         self.start_button.setEnabled(
             self._motors_enabled and self._preflight_ok and state == "armed"
             and not self._preflight_pending and not self._default_return_pending
+            and not self._motor_disable_pending
         )
         if reason:
             self.preflight_result.setText(reason)
@@ -4345,6 +4430,8 @@ class FactoryMainWindow(QMainWindow):
         return str(item)
 
     def _confirm_preflight(self) -> None:
+        if self._new_motion_blocked_by_disable():
+            return
         if self._preflight_pending or self._default_return_pending:
             return
         current_state = self._current_station_state(self._last_snapshot)
@@ -4616,11 +4703,11 @@ class FactoryMainWindow(QMainWindow):
             self._render_snapshot(dict(payload))
         self.enable_motors_button.setEnabled(False)
         self.disconnect_button.setEnabled(True)
-        self.preflight_button.setEnabled(self._trajectory_imported)
+        self.preflight_button.setEnabled(self._trajectory_imported and not self._motor_disable_pending)
         self.pause_button.setEnabled(False)
         self.resume_button.setEnabled(False)
         self.stop_button.setEnabled(False)
-        self.reset_button.setEnabled(True)
+        self.reset_button.setEnabled(not self._motor_disable_pending)
         self.disable_button.setEnabled(True)
         self._poll_snapshot()
 
@@ -4688,6 +4775,7 @@ class FactoryMainWindow(QMainWindow):
         self._schedule_manual_command()
 
     def _set_manual_input_enabled(self, enabled: bool) -> None:
+        enabled = enabled and not self._motor_disable_pending
         self.manual_speed_slider.setEnabled(enabled)
         self.manual_speed_spin.setEnabled(enabled)
         for row in range(self.manual_joint_table.rowCount()):
@@ -4703,6 +4791,7 @@ class FactoryMainWindow(QMainWindow):
             not self._manual_mode_active
             or self._manual_starting
             or self._manual_stop_requested
+            or self._motor_disable_pending
         ):
             return
         self.manual_command_timer.start()
@@ -4719,6 +4808,9 @@ class FactoryMainWindow(QMainWindow):
         return targets
 
     def _dispatch_manual_command(self) -> None:
+        if self._new_motion_blocked_by_disable():
+            self._manual_command_queued = False
+            return
         if not self._manual_mode_active or self._manual_stop_requested:
             return
         if self._manual_command_pending:
@@ -4762,6 +4854,8 @@ class FactoryMainWindow(QMainWindow):
         self._schedule_manual_command()
 
     def _manual_move(self) -> None:
+        if self._new_motion_blocked_by_disable():
+            return
         try:
             targets = self._manual_targets()
         except ValueError as exc:
@@ -4777,6 +4871,8 @@ class FactoryMainWindow(QMainWindow):
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self._new_motion_blocked_by_disable():
             return
         self._manual_starting = True
         self.manual_move_button.setEnabled(False)
@@ -4806,7 +4902,7 @@ class FactoryMainWindow(QMainWindow):
         self._manual_starting = False
         if not self._manual_mode_active:
             self.manual_move_button.setText("进入关节控制并保持")
-            self.manual_move_button.setEnabled(self._motors_enabled)
+            self.manual_move_button.setEnabled(self._motors_enabled and not self._motor_disable_pending)
 
     def _manual_stop(self) -> None:
         self.manual_command_timer.stop()
@@ -4833,7 +4929,7 @@ class FactoryMainWindow(QMainWindow):
             if isinstance(snapshot, Mapping):
                 self._render_snapshot(dict(snapshot))
         self.manual_move_button.setText("进入关节控制并保持")
-        self.manual_move_button.setEnabled(self._motors_enabled)
+        self.manual_move_button.setEnabled(self._motors_enabled and not self._motor_disable_pending)
 
     def _save_current_csv(self) -> None:
         playback = self._last_snapshot.get("playback")
@@ -5900,6 +5996,8 @@ class FactoryMainWindow(QMainWindow):
         self.statusBar().showMessage("已准备下一组，请导入新轨迹并执行预检。", 8000)
 
     def _start_playback(self) -> None:
+        if self._new_motion_blocked_by_disable():
+            return
         if not self._sample_selection_allowed():
             return
         robot_id = self.robot_id.text().strip()
@@ -6015,6 +6113,8 @@ class FactoryMainWindow(QMainWindow):
                 completion_mode=completion_mode,
                 parking_pose_confirmed=parking_confirmed,
         )
+        if self._new_motion_blocked_by_disable():
+            return
         self._run_rest("开始请求", lambda: self.client.playback_start(**start_payload), self._playback_started)
 
 
@@ -6046,6 +6146,8 @@ class FactoryMainWindow(QMainWindow):
         self._run_rest(label, operation)
 
     def _return_default(self) -> None:
+        if self._new_motion_blocked_by_disable():
+            return
         answer = QMessageBox.question(
             self,
             "确认回默认位",
@@ -6058,6 +6160,8 @@ class FactoryMainWindow(QMainWindow):
             self._start_default_return(recheck=False)
 
     def _reset_motor_fault(self) -> None:
+        if self._new_motion_blocked_by_disable():
+            return
         if self._motor_fault_reset_pending:
             return
         answer = QMessageBox.question(
@@ -6093,6 +6197,8 @@ class FactoryMainWindow(QMainWindow):
         self.preflight_result.setStyleSheet("color: #116329; font-weight: 700;")
 
     def _start_default_return(self, *, recheck: bool) -> None:
+        if self._new_motion_blocked_by_disable():
+            return
         if self._default_return_pending or self._preflight_pending:
             return
         self._default_return_pending = True

@@ -31,6 +31,16 @@ def commissioned(limb):
     return validate_module_plan(station, profile, "TEST-ONLY", "revision1")
 
 
+@pytest.mark.parametrize("limb", sorted(PRESET_KEYS))
+def test_missing_external_file_uses_each_modules_actual_builtin_entry(limb, monkeypatch, tmp_path):
+    from factory_hmi.core import module_limit_check
+    monkeypatch.setattr(module_limit_check, "PROFILE_ROOT", tmp_path/"no-site-directory")
+    coords, profile, context = module_limit_check.load_module_plan(nominal_station(limb), "MISSING-SITE", "1")
+    assert profile.source == "builtin_reference" and profile.limb == limb
+    assert context["runtime_policy"] == "all-module-feedback-v1"
+    assert len(profile.windows) == (4 if limb == "waist_hip" else 2*len(coords.names))
+
+
 def run(cycle, early=False, stop_after=60000):
     for i in range(1, stop_after):
         now = 1 + i*.05
@@ -146,6 +156,10 @@ def test_one_start_checks_all_directions_and_returns(limb):
         final[2:] = q[2:]
     cycle = ModuleCycle(coords, profile, q, 1.)
     run(cycle)
+    from factory_hmi.core.mujoco_completion import ARM_LIMBS, preset_info
+    if limb in ARM_LIMBS:
+        final = np.deg2rad(preset_info(coords.station)["target_joint_deg"])
+        assert cycle.arm_completion.finished
     assert len(cycle.results) == len(coords.directions)
     for result, row in zip(cycle.results, coords.directions, strict=True):
         assert result["joint"] == row.joint and result["sign"] == row.sign
@@ -184,12 +198,11 @@ def test_builtin_sequence_keeps_site_search_settings_and_runs_all_directions(lim
     ]
 
 
-def test_abnormal_candidate_stops_before_advancing():
+def test_abnormal_candidate_is_recorded_and_remaining_directions_continue():
     coords, profile, _ = commissioned("left_short_arm")
     cycle = ModuleCycle(coords, profile, np.deg2rad(profile.home_deg), 1.)
-    with pytest.raises(FeedbackError, match="结果异常"):
-        run(cycle, early=True)
-    assert cycle.index == 0
+    run(cycle, early=True)
+    assert cycle.phase == "finished" and len(cycle.results) == len(profile.windows)
     assert cycle.results[0]["outcome"] == "early"
 
 
@@ -203,6 +216,31 @@ def test_ready_pose_and_transfers_reject_bad_feedback():
         cycle.step(1.05, q, np.zeros(5), np.ones(5)*20.)
     with pytest.raises(FeedbackError, match="反馈不连续"):
         cycle.step(1.2, q, np.zeros(5), np.zeros(5))
+
+
+@pytest.mark.parametrize("limb", sorted(PRESET_KEYS))
+def test_all_module_policy_uses_same_executor_and_preserves_fixture_and_limits(limb):
+    coords, profile, _ = commissioned(limb)
+    original = profile.model_copy(update={"transfer_speed_deg_s": 5., "windows": tuple(
+        window.model_copy(update={"point": ProbePoint.model_validate({**window.point.model_dump(),
+            "full_range_search": False, "search_speed_deg_s": 1., "positioning_speed_deg_s": 5.})})
+        for window in profile.windows)})
+    _, effective, context = validate_module_plan(coords.station, original, "ALL-MODULE", "1")
+    assert context["runtime_policy"] == "all-module-feedback-v1"
+    assert effective.transfer_speed == 20. and original.transfer_speed == 5.
+    assert effective.home_deg == original.home_deg
+    assert effective.entry_via_deg == original.entry_via_deg
+    assert effective.return_via_deg == original.return_via_deg
+    for before, after in zip(original.windows, effective.windows, strict=True):
+        assert after.point.full_range_search
+        assert after.point.search_speed_deg_s == 10.
+        assert after.point.contact_speed_deg_s == 2.
+        assert after.point.positioning_speed_deg_s == 20.
+        assert before.via_deg == after.via_deg
+        for field in ("joint", "direction", "staging_pose_deg", "search_pose_deg", "motor_abort_nm",
+                      "joint_abort_nm", "permitted_travel_deg", "reset_kp_scale", "reset_kd_scale",
+                      "search_kp_scale", "search_kd_scale"):
+            assert getattr(before.point, field) == getattr(after.point, field)
 
 
 def test_homing_adjusts_to_motor_step_and_accepts_small_feedback_noise():
@@ -231,14 +269,15 @@ def test_homing_adjusts_to_motor_step_and_accepts_small_feedback_noise():
     pytest.fail("homing did not complete")
 
 
-def test_commissioned_transfer_speed_reduces_homing_time():
+def test_all_module_speed_policy_overrides_slow_rates_with_bounded_frames():
     coords, profile, _ = commissioned("left_short_leg")
     q = np.deg2rad(profile.home_deg)
     q[0] += math.radians(30.)
     torque = np.zeros(len(q))
 
-    def homing_time(profile):
-        _, profile, context = validate_module_plan(coords.station, profile, "SPEED-MOCK", "1")
+    def homing_time(profile, normalize):
+        if normalize:
+            _, profile, _ = validate_module_plan(coords.station, profile, "SPEED-MOCK", "1")
         cycle = ModuleCycle(coords, profile, q, 1.)
         began = None
         for i in range(1, 600):
@@ -246,7 +285,7 @@ def test_commissioned_transfer_speed_reduces_homing_time():
             previous = cycle.target.copy()
             cycle.step(now, previous, torque, torque)
             speed = np.max(abs(np.rad2deg(cycle.target - previous))) / .025
-            assert speed <= context["transfer_speed_deg_s"] + 1.e-8
+            assert speed <= profile.transfer_speed + 1.e-8
             motor_step = coords.motor_target(cycle.target) - coords.motor_target(previous)
             assert np.max(abs(np.rad2deg(motor_step))) <= cycle.point.motor_step_deg + 1.e-8
             if cycle.phase == "homing" and began is None:
@@ -256,12 +295,14 @@ def test_commissioned_transfer_speed_reduces_homing_time():
                 return now - began
         pytest.fail("homing did not complete")
 
-    fast = ModuleProfile.model_validate({**profile.model_dump(), "transfer_speed_deg_s": 10.})
-    assert homing_time(profile) == pytest.approx(11.475, abs=.075)
-    assert homing_time(fast) == pytest.approx(5.85, abs=.075)
-    assert fast.windows[0].point.search_speed_deg_s == 1.
-    with pytest.raises(ValueError, match="transfer_speed_deg_s"):
-        ModuleProfile.model_validate({**profile.model_dump(), "transfer_speed_deg_s": 10.1})
+    slow = ModuleProfile.model_validate({**profile.model_dump(), "transfer_speed_deg_s": 5.})
+    assert homing_time(slow, False) > 11.
+    assert homing_time(slow, True) < 5.
+    _, effective, _ = validate_module_plan(coords.station, slow, "SPEED-MOCK", "1")
+    assert effective.transfer_speed == 20.
+    assert effective.windows[0].point.search_speed_deg_s == 10.
+    assert effective.windows[0].point.contact_speed_deg_s == 2.
+    assert slow.transfer_speed == 5.  # Preserve the original declared profile.
 
 
 def test_waist_rejects_a_path_that_moves_hips_and_missing_windows():
@@ -356,3 +397,47 @@ def test_worker_owns_motor_commands_and_saves_aborted_report(tmp_path, monkeypat
             np.testing.assert_array_equal(command["target"][2:], start[2:])
     finally:
         service.close()
+
+
+def test_worker_records_disable_failure_after_normal_cycle_without_claiming_finished(tmp_path, monkeypatch):
+    from factory_hmi.core.backend import FakeMotorBackend, MotorSafetyError
+    from factory_hmi.core.module_limit_check import ModuleWorker
+    import json
+
+    class PartialDisable(FakeMotorBackend):
+        def disable_motors(self):
+            raise MotorSafetyError("can0#5 仍报告已使能")
+
+        def disable_feedback(self):
+            return "unconfirmed"
+
+        def disable_status(self):
+            return dict(state="unconfirmed", motors=[dict(bus="can0", motor_id=5,
+                state="unconfirmed", requires_confirmation=True, drive_enabled=True)])
+
+    coords, profile, context = commissioned("waist_hip")
+    fake = PartialDisable(coords.entries, initial_positions=coords.motor_target(np.deg2rad(profile.home_deg)))
+    fake.open_transport()
+    fake.enable_motors()
+    worker = ModuleWorker(fake, coords, profile, context, fake.read_samples,
+                          lambda *_: None, lambda *_: None, tmp_path / "result.json",
+                          np.deg2rad(profile.home_deg))
+    new_cycle = worker._new_cycle
+
+    def finished_cycle(q, now):
+        cycle = new_cycle(q, now)
+        cycle.phase = "finished"  # Isolate terminal handoff from motion already covered separately.
+        return cycle
+
+    monkeypatch.setattr(worker, "_new_cycle", finished_cycle)
+    worker.start()
+    worker.thread.join(2.)
+    assert not worker.thread.is_alive()
+    saved = json.loads((tmp_path / "result.json").read_text())
+    assert saved["phase"] == "aborted" and "收尾失能尚未确认" in saved["fault"]
+    assert saved["disable"]["feedback"] == "unconfirmed"
+    assert saved["disable"]["details"]["motors"][0]["drive_enabled"] is True
+    assert worker.active and worker.snapshot()["control_thread_running"] is False
+    # Avoid calling the intentionally failing public fixture override during cleanup.
+    FakeMotorBackend.disable_motors(fake)
+    fake.close_transport()

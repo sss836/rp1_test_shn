@@ -30,6 +30,15 @@ def test_exact_raw_numeric_and_no_108_guess():
             decode_version(raw)
 
 
+def test_field_b0_version_responses_preserve_raw_identity():
+    assert decode_version(bytes.fromhex("b03156352e302e302e3130390000000000000000"))["raw_firmware"] == "V5.0.0.109"
+    assert decode_version(bytes.fromhex("b01e00010900010000000111")) == dict(
+        software="0.1.9", hardware="0.1.0", protocol="0.0.1.17")
+    for head in (0xA1, 0xA7, 0xB1, 0xB7, 0x20, 0x30):
+        with pytest.raises(ValueError):
+            decode_version(bytes((head, 0x1E)) + bytes.fromhex("00010900010000000111"))
+
+
 def test_background_version_observation_no_enable_and_stale():
     class Motor:
         def __init__(self): self.requests = []

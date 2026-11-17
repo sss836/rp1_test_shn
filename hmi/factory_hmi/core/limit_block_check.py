@@ -59,7 +59,6 @@ class Settings:
     abort_nm: float = 12.0
     reference_tolerance_deg: float = 3.0
     max_feedback_age_s: float = 0.15
-    max_feedback_skew_s: float = 0.035
     approach_margin_deg: float = 6.0
     retreat_deg: float = 1.0
     reset_seconds: float = 4.0
@@ -167,8 +166,8 @@ class Coordinates:
                     or getattr(sample, "drive_enabled", None) is False
                     or not math.isfinite(sample.pos_rad) or not math.isfinite(sample.torque_nm)):
                 raise FeedbackError(f"电机 {sample.bus}#{sample.motor_id} 反馈无效、超时或驱动故障")
-        if max(stamps) - min(stamps) > SETTINGS.max_feedback_skew_s:
-            raise FeedbackError("逐电机反馈未在允许时间差内到齐")
+        # Each motor must be fresh and advance independently. CAN responses
+        # need not share a 35 ms group deadline; group skew is diagnostic only.
         if last_stamps and not all(a > b for a, b in zip(stamps, last_stamps)):
             raise FeedbackError("需要一组全部更新的逐电机反馈")
         motor = np.array([s.pos_rad for s in samples])

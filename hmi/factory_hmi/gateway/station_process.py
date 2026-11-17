@@ -185,12 +185,14 @@ def _run_station(channels, ready, data_root, report_root, outbox_path, lease_tim
             return True
         return runtime._safe_release(reason=reason, disconnect_can=owns_current_can())
 
-    def close_station():
+    def close_station(*, site_isolated=False):
+        if type(site_isolated) is not bool:
+            raise ValueError("现场隔离退出标记须为布尔值")
         service.request_motion_stop()
         with close_lock, runtime._lease_guard:
             if transport is not None:
                 raise RuntimeError("工位维护传输尚未安全释放")
-            runtime.close(disconnect_can=owns_current_can())
+            runtime.close(disconnect_can=owns_current_can(), site_isolated=site_isolated)
             clear_permit()
             release_can()
 
@@ -240,7 +242,7 @@ def _run_station(channels, ready, data_root, report_root, outbox_path, lease_tim
             if name in _SAFETY:
                 return getattr(service, name)(*args, **kwargs)
             if name == "close":
-                close_station()
+                close_station(*args, **kwargs)
                 return None
             if name == "recover":
                 with runtime._lease_guard:
@@ -642,7 +644,9 @@ class StationProcess:
         channel = self._channels.get("safety")
         return self._close_confirmed or (channel is not None and channel.pending == "close")
 
-    def close(self):
+    def close(self, *, site_isolated=False):
+        if type(site_isolated) is not bool:
+            raise ValueError("现场隔离退出标记须为布尔值")
         with self._lifecycle_lock:
             for task in self.maintenance_tasks():
                 if task.active:
@@ -655,7 +659,8 @@ class StationProcess:
             if not self._close_confirmed:
                 if not self._process.is_alive() and not self.close_pending:
                     raise StationUnavailable("工位进程已退出，设备状态未确认")
-                self._channels["safety"].call("close", (), {}, timeout=8)
+                options = {"site_isolated": True} if site_isolated else {}
+                self._channels["safety"].call("close", (), options, timeout=8)
                 self._close_confirmed = True
             self._process.join(2)
             if self._process.is_alive():

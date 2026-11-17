@@ -194,12 +194,15 @@ class FactoryService:
                 raise TimeoutError("detached reports still running; source evidence retained")
             time.sleep(min(.05, remaining))
 
-    def close(self, timeout: float = 5.0, *, disconnect_can: bool = False) -> dict[str, Any]:
+    def close(self, timeout: float = 5.0, *, disconnect_can: bool = False,
+              site_isolated: bool = False) -> dict[str, Any]:
         """Normally disconnect, then finish local CSV handoff before return.
 
         Timeout bounds the report drain, not an unresponsive native disconnect.
         A failed close remains closing and can be retried; it never authorizes
         deleting state or forcibly terminating a device/worker.
+        The private shutdown path may carry a confirmed site-isolation context;
+        report draining and active-protection boundaries still apply.
         """
         with self._lifecycle_lock:
             if self._closed:
@@ -216,7 +219,10 @@ class FactoryService:
             if controller is not None:
                 try:
                     shutdown_disconnect = getattr(controller, "disconnect_for_shutdown", controller.disconnect)
-                    shutdown_disconnect()
+                    if site_isolated:
+                        shutdown_disconnect(site_isolated=True)
+                    else:
+                        shutdown_disconnect()
                 except Exception as exc:
                     disconnect_error = exc
                     with self._lock:
@@ -738,7 +744,7 @@ class FactoryService:
         controller = self._controller
         probe = self._limit_probe
         if probe and probe.backend is getattr(controller, "backend", None):
-            if report and probe.active:
+            if report and probe.thread.is_alive():
                 raise ValueError("请在复位和搜索结束后导出报告")
             result = probe.snapshot(include_samples=report)
         else:
@@ -747,6 +753,9 @@ class FactoryService:
             result.update(limb=controller.config.limb, station_sha256=station_sha(controller.config),
                           motors_enabled=bool(controller.backend.motors_enabled),
                           discovered=bool(controller.backend.connected), model="RP1.3.4", backend=self._backend_name)
+            status = getattr(controller.backend, "disable_status", None)
+            if callable(status):
+                result["motor_disable"] = status()
         return result
 
     def _limit_probe_spec(self, limb, joint, direction, serial):
@@ -1913,6 +1922,9 @@ class FactoryService:
             snapshot["motor_maintenance"] = maintenance_snapshot
             snapshot["motor_parameters"] = parameters_snapshot
             snapshot["motor_versions"] = self._controller.backend.motor_versions()
+            disable_status = getattr(self._controller.backend, "disable_status", None)
+            if callable(disable_status):
+                snapshot["motor_disable"] = disable_status()
             playback = snapshot.get("playback")
             identity = dict(self._record_identity)
             if isinstance(playback, dict) and playback.get("test_id") == identity.get("test_id"):

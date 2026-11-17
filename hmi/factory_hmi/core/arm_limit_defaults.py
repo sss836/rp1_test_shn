@@ -1,5 +1,7 @@
 """Executable left-arm defaults: production references and feedback, not NPZ playback."""
 import math
+import json
+from importlib import resources
 
 from .limit_block_check import Coordinates
 from .live_limit_probe import ProbePoint, station_sha
@@ -40,19 +42,30 @@ def builtin_arm_profile(config):
             raise ValueError(f"{entry.joint_name} 的中止门限不能容纳接触判定")
         limits.append(limit)
     windows = []
+    # Reuse the existing named hanging pose; the old folded simulation uses
+    # the opposite elbow direction and is not the requested downward posture.
+    data = json.loads(resources.files("factory_hmi").joinpath(
+        "resources/completion/mujoco_hanging.json").read_text())
+    preset = data["presets"][config.limb]
+    if tuple(preset["joint_names"]) != coords.names:
+        raise ValueError("肩 yaw 避让姿态与当前模块关节映射不一致")
+    elbow = coords.names.index("left_elbow_joint")
+    hanging = list(zero)
+    hanging[elbow] = math.degrees(preset["joint_positions"][-1][elbow])
     for d in coords.directions:
+        pose = tuple(hanging) if d.joint == "left_shoulder_yaw_joint" else zero
         point = ProbePoint(
             joint=d.joint, direction=d.sign, full_range_search=True,
-            staging_pose_deg=zero, search_pose_deg=zero,
+            staging_pose_deg=pose, search_pose_deg=pose,
             permitted_travel_deg=abs(d.reference_deg) + 2.9,
-            search_speed_deg_s=5., positioning_speed_deg_s=5.,
+            search_speed_deg_s=10., positioning_speed_deg_s=20.,
             reset_kp_scale=1., reset_kd_scale=1., search_kp_scale=1., search_kd_scale=1.,
             motor_abort_nm=limits, joint_abort_nm=limits,
             contact_floor_nm=.5, contact_rise_nm=.5, following_error_deg=5.,
             motor_step_deg=.5, retreat_deg=1., comparison_tolerance_deg=3.)
         windows.append(ScheduledPoint(point=point))
     return ModuleProfile(schema_version=1, limb=config.limb, model="RP1.3.4", power_source="existing_station",
-        fixture="当前模块台架", revision="arm-zero-feedback-v2", source="builtin_reference",
+        fixture="当前模块台架", revision="arm-zero-feedback-v5", source="builtin_reference",
         torque_limit_source="station_cap_and_production_range" + ("_and_joint_peak" if peaks else ""),
         station_sha256=station_sha(config), home_deg=zero, joint_peak_nm=peaks,
         windows=windows, transfer_speed_deg_s=20., use_builtin_order=True)

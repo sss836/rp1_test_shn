@@ -34,6 +34,12 @@ def test_reject_missing_bad_response_or_zero(payload):
     with pytest.raises(ValueError): decode_kt(bytes.fromhex(payload))
 
 
+def test_query_drive_state_bit_does_not_erase_actual_kt():
+    assert decode_kt(bytes.fromhex("b01600ae")) == 1.74
+    for value in ("b11600ae", "b71600ae", "b0160000", "301600ae"):
+        with pytest.raises(ValueError): decode_kt(bytes.fromhex(value))
+
+
 @pytest.mark.parametrize('model,kt', [(0,1.59),(1,2.18),(2,3.08),(3,4.32)])
 def test_four_models_use_each_actual_kt_not_template(model,kt):
     e=entry(model)
@@ -61,6 +67,33 @@ def wait_kt(backend):
         if all(r.get('torque_kt_nm_a') is not None or r.get('raw_firmware')=='108' for r in backend.motor_versions()): return
         time.sleep(.01)
     pytest.fail('Kt worker did not finish')
+
+
+def test_109_background_b0_refresh_keeps_limit_probe_torque(open_backend):
+    class StateBitMotor(ActualKtMotor):
+        state_bit = False
+        def version_payload(self, code):
+            data = super().version_payload(code)
+            return bytes((data[0] | (0x10 if self.state_bit else 0),)) + bytes(data[1:])
+    motor = StateBitMotor(174)
+    backend = open_backend((motor, None))
+    wait_kt(backend)
+    backend.prepare_motor_protocols()
+    backend.enable_motors()
+    motor.state_bit = True
+    # Trigger the same worker pass as its periodic refresh while the synthetic
+    # drive is enabled; the public manual-refresh API intentionally rejects it.
+    backend._versions.request_refresh()
+    end = time.monotonic()+2
+    while backend.motor_version_refresh_status()["state"] != "complete" and time.monotonic() < end:
+        time.sleep(.01)
+    assert backend.motor_version_refresh_status()["state"] == "complete"
+    row = backend.motor_versions()[0]
+    assert row["status"] == "known" and row["raw_responses"]["0x31"].startswith("b031")
+    assert row["kt_raw_response"].startswith("b016")
+    sample = backend.limit_probe_samples()[0]
+    assert sample.torque_nm == pytest.approx(17.4)
+    assert sample.torque_source == "device_kt_times_iq" and sample.lro_protocol_profile == "v1.03"
 
 
 def test_mixed_backend_real_samples_records_curves_peaks(open_backend,tmp_path):

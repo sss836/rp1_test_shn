@@ -13,10 +13,11 @@ import time
 from uuid import uuid4
 
 from ..motor_ota_policy import MODEL_NAMES, firmware_generation
+from .lro_query import valid_query_header
 
 
 def decode_version(payload: bytes) -> dict:
-    if len(payload) < 2 or payload[0] != 0xA0:
+    if len(payload) < 2 or not valid_query_header(payload[0]):
         raise ValueError("版本响应头无效或设备返回错误")
     if payload[1] == 0x31:
         if len(payload) < 20:

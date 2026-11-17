@@ -895,12 +895,12 @@ class FactoryController:
                     or session is not None and session.snapshot().get("active") is True):
                 raise FactoryControllerError("保护阻尼正在建立或运行；先可靠支撑机构并显式失能，再关闭服务")
 
-    def disconnect_for_shutdown(self) -> None:
+    def disconnect_for_shutdown(self, *, site_isolated: bool = False) -> None:
         """Order ordinary exit against active and pending protection, atomically."""
         with self._damping_guard:
             self._require_no_shutdown_protection()
             try:
-                self._disconnect(shutdown=True)
+                self._disconnect(shutdown=True, site_isolated=site_isolated)
             finally:
                 with self._shutdown_intent_guard:
                     self._shutdown_committed = False
@@ -909,7 +909,7 @@ class FactoryController:
         # Existing explicit operator disconnect retains its semantics.
         self._disconnect()
 
-    def _disconnect(self, *, shutdown: bool = False) -> None:
+    def _disconnect(self, *, shutdown: bool = False, site_isolated: bool = False) -> None:
         self._stop_protective_damping(request_only=True)
         self.request_motion_stop()
         self._stop_manual_session()
@@ -942,11 +942,14 @@ class FactoryController:
         disconnect_error: Exception | None = None
         try:
             if self.backend.connected:
-                try:
-                    self.backend.disable()
-                except Exception:
-                    pass
-                self.backend.disconnect()
+                # The backend owns stop confirmation and handle release as
+                # one transaction. A separate disable here would destroy a
+                # never-enabled read-only close's provenance on missing replies
+                # before that transaction can choose its release policy.
+                if site_isolated:
+                    self.backend.disconnect_site_isolated()
+                else:
+                    self.backend.disconnect()
         except Exception as exc:
             disconnect_error = exc
 

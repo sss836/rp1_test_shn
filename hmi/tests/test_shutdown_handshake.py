@@ -51,7 +51,7 @@ class Controller:
     def disconnect(self):
         pass
 
-    def close(self):
+    def close(self, *, site_isolated=False):
         self.closes += 1
         if self.fail_close:
             raise RuntimeError("synthetic record worker still pending")

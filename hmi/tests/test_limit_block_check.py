@@ -102,8 +102,13 @@ def test_ankle_torque_virtual_work_and_motor_pair_provenance():
     with pytest.raises(FeedbackError, match="全部更新"):
         c.decode(samples, 1.02, stamps)
     skewed = [*samples[:-1], replace(samples[-1], timestamp_s=.95)]
-    with pytest.raises(FeedbackError, match="时间差"):
-        c.decode(skewed, 1.02, ())
+    # Fresh motor frames may arrive at different times; 50ms is diagnostic,
+    # not a separate stop condition. Per-motor expiry still applies.
+    q_skewed, _, _ = c.decode(skewed, 1.02, ())
+    np.testing.assert_allclose(q_skewed, q, atol=1e-6)
+    expired = [*samples[:-1], replace(samples[-1], timestamp_s=.80)]
+    with pytest.raises(FeedbackError, match="无效、超时"):
+        c.decode(expired, 1.02, ())
     with pytest.raises(FeedbackError, match="不一致"):
         c.decode(samples[::-1], 1.02, ())
 

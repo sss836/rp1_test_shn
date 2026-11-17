@@ -250,6 +250,7 @@ def test_109_enable_needs_new_disabled_feedback(open_backend):
     with pytest.raises(MotorSafetyError, match="新鲜的驱动失能反馈"):
         backend.enable_motors()
     assert motor.enables == 0
+    motor.read_only_status_responds = True  # Restore injected failure for fixture cleanup.
 
 
 def test_109_zero_submission_keeps_verification_pending(open_backend):
