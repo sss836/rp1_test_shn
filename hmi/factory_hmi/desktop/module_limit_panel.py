@@ -1,18 +1,18 @@
-"""Run the selected module's commissioned real limit check."""
+"""Validate the current module's pose and physical stops from motor feedback."""
 from __future__ import annotations
 
 import json
 
-from PySide6.QtCore import QIODevice, QSaveFile, QTimer, Qt
-from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QMessageBox, QTextEdit, QVBoxLayout, QWidget
+from PySide6.QtCore import QIODevice, QSaveFile, QTimer
+from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
 
-from factory_hmi.core.limit_block_check import MODULES, NAMES
-from .limit_block_page import add_button
+from factory_hmi.core.limit_block_check import MODULES
+from .pose_validation_view import build_pose_layout, render_pose_status
 
 PHASE = {"idle": "等待工位就绪", "waiting_feedback": "等待逐电机反馈", "gain_transition": "平滑切换增益",
-         "homing": "自动回到轨迹起点", "positioning": "按核定路径转场", "reset": "接近搜索起点", "baseline": "采集力矩基线",
+         "homing": "从实测姿态平滑复位", "positioning": "按检查顺序转场", "reset": "回到搜索起点", "baseline": "采集力矩基线",
          "search": "低速搜索", "unload": "停止推进", "retreat": "沿实测路径缓退", "clearance": "返回安全转场起点",
-         "returning": "回核定收尾位", "finished": "检查完成", "aborted": "已中止"}
+         "returning": "返回检查起点", "finished": "检查完成", "aborted": "已中止"}
 VERDICT = {"within_reference": "参考范围内", "early": "提前阻挡", "late": "超出参考", "not_detected": "未检出"}
 
 
@@ -23,31 +23,7 @@ class ModuleLimitPanel(QWidget):
         self.pending = self.polling = False
         self.online = False
         self.status = {}
-        layout = QVBoxLayout(self)
-        title = QLabel("真机整模块限位检查")
-        title.setObjectName("pageHeading")
-        layout.addWidget(title)
-        detail = QLabel("工位就绪后，点击「检查限位装置」会启动当前模块的整轮真机动作。"
-                        "内置轨迹随工位方案自动选用，上位机从当前姿态回到检查起点。")
-        detail.setWordWrap(True)
-        layout.addWidget(detail)
-        buttons = QHBoxLayout()
-        self.start = add_button(buttons, "检查限位装置", self._start, primary=True)
-        self.abort = add_button(buttons, "中止并失能", self._abort)
-        self.export = add_button(buttons, "导出实测报告", self._export)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
-        self.state = QLabel()
-        self.state.setWordWrap(True)
-        layout.addWidget(self.state)
-        self.digest = QLabel()
-        self.digest.setWordWrap(True)
-        self.digest.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.digest)
-        self.results = QTextEdit()
-        self.results.setReadOnly(True)
-        self.results.setMinimumHeight(220)
-        layout.addWidget(self.results, 1)
+        build_pose_layout(self)
         self.timer = QTimer(self)
         self.timer.setInterval(500)
         self.timer.timeout.connect(self._poll)
@@ -99,7 +75,7 @@ class ModuleLimitPanel(QWidget):
                     or self.status.get("limb") != limb or plan.get("limb") != limb):
                 self._start_done()
                 return
-            if not plan["profile"].get("use_builtin_trajectory"):
+            if not (plan["profile"].get("use_builtin_trajectory") or plan["profile"].get("use_builtin_order")):
                 fixture = plan["profile"]["fixture"]
                 count = len(plan["windows"])
                 module = dict(MODULES)[limb]
@@ -154,6 +130,8 @@ class ModuleLimitPanel(QWidget):
         state = PHASE.get(s.get("phase"), "等待工位状态") if current else "等待启动"
         if not self.online:
             state += " · 状态连接待确认"
+        elif not ready and not active:
+            state += " · 请先在样机配置页连接、扫描并使能当前模块"
         if s.get("direction_total"):
             state += f" · 第 {s['direction_index']}/{s['direction_total']} 项"
         if self.pending:
@@ -167,19 +145,5 @@ class ModuleLimitPanel(QWidget):
                 state += " · 实际反馈待核对"
         self.state.setText(f"{limb} · {state}")
         self.digest.setText(f"工位配置摘要 {s['station_sha256']}" if s.get("station_sha256") else "")
-        lines = []
-        if current:
-            for e in s.get("results", []):
-                joint = e['joint'].removesuffix('_joint').removeprefix('left_').removeprefix('right_')
-                direction = "上限" if e["sign"] > 0 else "下限"
-                angle = f"实测 {e['actual_deg']:+.2f}°" if e.get("actual_deg") is not None else "未取得候选角"
-                load = f" · 阻挡力矩 {e['torque_floor_nm']:.2f} N·m" if e.get("torque_floor_nm") is not None else ""
-                lines.append(f"{NAMES.get(joint, joint)} {direction} · {angle} · 参考 {e['reference_deg']:+.2f}°"
-                             f" · {VERDICT[e['outcome']]}{load}")
-            if s.get("report_file"):
-                lines.append(f"\n本机报告 {s['report_file']}")
-            if s.get("record_error"):
-                lines.append(f"\n自动保存失败 {s['record_error']}")
-        text = "\n".join(lines) or "实测角度和阻挡力矩将在各方向结束后显示。"
-        if self.results.toPlainText() != text:
-            self.results.setPlainText(text)
+        render_pose_status(self, s, online=self.online, pending=self.pending,
+                           serial=self.window.robot_id.text().strip())

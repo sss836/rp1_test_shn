@@ -51,6 +51,90 @@ def run(cycle, early=False, stop_after=60000):
     pytest.fail("mock sequence did not reach the end")
 
 
+@pytest.mark.parametrize("limb,count", [("left_short_arm", 5), ("left_arm", 7)])
+@pytest.mark.parametrize("missing_home", [True, False])
+def test_left_arm_defaults_to_logical_zero_without_measured_start(limb, count, missing_home):
+    coords, site, _ = commissioned(limb)
+    document = site.model_dump()
+    if missing_home:
+        del document["home_deg"]
+    else:
+        document["home_deg"] = None
+    document["use_builtin_trajectory"] = True
+    profile = ModuleProfile.model_validate(document)
+    assert profile.home_deg == (0.,) * count
+    coords, profile, context = validate_module_plan(coords.station, profile, "MOCK-ZERO", "1")
+    assert context["startup_action"] == "move_to_joint_zero"
+
+    # This is far outside the old one-point pilot's 0.25 degree starting
+    # tolerance. The whole-module executor must home from measured feedback.
+    actual = np.deg2rad([25., 15., -20., -50., 10., *([10., -10.] if count == 7 else [])])
+    original_entries = coords.station.entries
+    cycle = ModuleCycle(coords, profile, actual, 1.)
+    np.testing.assert_array_equal(cycle.target, actual)  # Never jump to zero.
+    reached_zero = False
+    entered_search = False
+    for i in range(1, 3000):
+        before = cycle.target.copy()
+        if cycle.phase == "homing" and np.max(abs(before)) < 1.e-10:
+            reached_zero = True
+        cycle.step(1 + i*.05, before, np.zeros(count), np.zeros(count))
+        if cycle.probe is not None:
+            assert reached_zero
+            entered_search = True
+            break
+    assert entered_search
+    assert coords.station.entries == original_entries  # No zero-offset rewrite.
+    assert {d.reference_deg for d in coords.directions if "shoulder_pitch" in d.joint} == {-165.553, 165.553}
+
+
+def test_explicit_fixture_home_is_preserved_and_other_modules_require_home():
+    coords, site, _ = commissioned("left_arm")
+    document = site.model_dump()
+    document["home_deg"] = [1., 0., 0., 0., 0., 0., 0.]
+    profile = ModuleProfile.model_validate(document)
+    assert profile.home_deg == tuple(document["home_deg"])
+    assert validate_module_plan(coords.station, profile, "MOCK", "1")[2]["startup_action"] == "move_to_profile_home"
+    _, leg, _ = commissioned("left_short_leg")
+    document = leg.model_dump()
+    del document["home_deg"]
+    with pytest.raises(ValueError, match="home_deg"):
+        ModuleProfile.model_validate(document)
+
+
+@pytest.mark.parametrize("limb", ["left_short_arm", "left_arm"])
+def test_builtin_order_does_not_import_simulated_angles_or_waypoints(limb, monkeypatch):
+    import json
+    from factory_hmi.core import module_limit_check as module
+    coords, site, _ = commissioned(limb)
+    expected = tuple(reversed(site.windows))
+    route = {"limb": limb, "joint_names": list(coords.names), "windows": [
+        {"joint": row.point.joint, "direction": row.point.direction,
+         "held_pose_deg": [9999.] * len(coords.names), "via_deg": [[9999.] * len(coords.names)],
+         "simulated_stop_deg": -9999., "time_s": -9999.}
+        for row in expected]}
+    monkeypatch.setattr(module, "read_manifest", lambda _: {limb: {"route": "order"}})
+    monkeypatch.setattr(module, "verified_asset", lambda *_: (None, json.dumps(route).encode()))
+    source = site.model_copy(update={"use_builtin_order": True})
+    _, profile, context = validate_module_plan(coords.station, source, "MOCK-ORDER", "1")
+    assert profile.windows == expected
+    assert context["execution_mode"] == "feedback_limit_search"
+    assert context["order_source"] == "builtin_order_only"
+    cycle = ModuleCycle(coords, profile, np.deg2rad(profile.home_deg), 1.)
+    run(cycle)
+    assert [(r["joint"], r["sign"]) for r in cycle.results] == [
+        (w.point.joint, w.point.direction) for w in expected]
+    for result in cycle.results:
+        assert result["actual_deg"] != -9999.
+
+
+def test_cannot_mix_order_only_and_fixed_route():
+    coords, site, _ = commissioned("left_arm")
+    with pytest.raises(ValueError, match="不能同时"):
+        validate_module_plan(coords.station, site.model_copy(update={
+            "use_builtin_order": True, "use_builtin_trajectory": True}), "MOCK", "1")
+
+
 @pytest.mark.parametrize("limb", sorted(PRESET_KEYS))
 def test_one_start_checks_all_directions_and_returns(limb):
     coords, profile, _ = commissioned(limb)

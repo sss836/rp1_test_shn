@@ -32,7 +32,7 @@ class FactoryHmiUiContractTests(unittest.TestCase):
             "继续",
             "停止",
             "软件失能",
-            "保存 CSV…",
+            "保存原始采样 CSV…",
             "导出执行包…",
             "提交审批",
             "重试归档",

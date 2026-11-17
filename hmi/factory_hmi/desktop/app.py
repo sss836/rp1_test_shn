@@ -86,9 +86,6 @@ from factory_hmi.desktop.feedback_freshness import (
     DISPLAY_STALE_S, STATUS_SILENCE_S, feedback_age_s, finite_number, snapshot_key,
 )
 from factory_hmi.desktop.diagnostics_page import DiagnosticsPage
-from factory_hmi.desktop.limit_block_page import LimitBlockPage
-from factory_hmi.desktop.continuous_limit_page import ContinuousLimitPage
-from factory_hmi.desktop.live_limit_panel import LiveLimitPanel
 from factory_hmi.desktop.module_limit_panel import ModuleLimitPanel
 from PySide6.QtWidgets import QTabWidget
 from factory_hmi.desktop.case_filter import (
@@ -449,16 +446,8 @@ class FactoryMainWindow(QMainWindow):
         self.tabs.addTab(self._wrap_workspace_page(self.quick_page, "quickPageScroll"), "工厂快速验证")
         self.diagnostics_page = DiagnosticsPage(self.client, self)
         self.tabs.addTab(self.diagnostics_page, "诊断助手")
-        self.limit_block_page = LimitBlockPage(self)
-        self.live_limit_panel = LiveLimitPanel(self)
-        self.continuous_limit_page = ContinuousLimitPage(self)
         self.module_limit_panel = ModuleLimitPanel(self)
-        limit_tabs = QTabWidget()
-        limit_tabs.addTab(self._wrap_workspace_page(self.module_limit_panel, "moduleLimitScroll"), "真机检查")
-        limit_tabs.addTab(self._wrap_workspace_page(self.continuous_limit_page, "continuousLimitScroll"), "连续轨迹")
-        limit_tabs.addTab(self._wrap_workspace_page(self.live_limit_panel, "limitLiveScroll"), "真机试点")
-        limit_tabs.addTab(self._wrap_workspace_page(self.limit_block_page, "limitBlockScroll"), "模拟验收")
-        self.tabs.addTab(limit_tabs, "限位块检查")
+        self.tabs.addTab(self._wrap_workspace_page(self.module_limit_panel, "moduleLimitScroll"), "姿态验证")
         body_layout.addWidget(self.tabs, 1)
 
         shell = QWidget()
@@ -536,7 +525,7 @@ class FactoryMainWindow(QMainWindow):
         self._nav_group.addButton(self.quick_nav_button, 7)
         self.quick_nav_button.clicked.connect(lambda: self._select_main_page(4))
         layout.addWidget(self.quick_nav_button)
-        self.limit_block_nav_button = QPushButton("限位块检查")
+        self.limit_block_nav_button = QPushButton("姿态验证")
         self.limit_block_nav_button.setObjectName("navButton")
         self.limit_block_nav_button.setCheckable(True)
         self._nav_group.addButton(self.limit_block_nav_button, 9)
@@ -6513,9 +6502,6 @@ class FactoryMainWindow(QMainWindow):
 
     def _finish_window_close(self, event: Any) -> None:
         self._closing = True
-        self.limit_block_page.shutdown()
-        self.live_limit_panel.shutdown()
-        self.continuous_limit_page.shutdown()
         self.module_limit_panel.shutdown()
         self._can_command_timer.stop()
         self.diagnostics_page.stop()

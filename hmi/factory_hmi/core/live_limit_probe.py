@@ -32,8 +32,9 @@ class ProbePoint(BaseModel):
     direction: Literal[-1, 1]
     staging_pose_deg: VEC
     search_pose_deg: VEC
-    permitted_travel_deg: Annotated[float, Field(gt=0, le=12)]
-    search_speed_deg_s: Annotated[float, Field(gt=0, le=1)]
+    full_range_search: bool = False
+    permitted_travel_deg: Annotated[float, Field(gt=0, le=360)]
+    search_speed_deg_s: Annotated[float, Field(gt=0, le=5)]
     positioning_speed_deg_s: Annotated[float, Field(gt=0, le=5)]
     reset_kp_scale: Annotated[float, Field(gt=0, le=1)]
     reset_kd_scale: Annotated[float, Field(ge=0, le=1)]
@@ -43,14 +44,18 @@ class ProbePoint(BaseModel):
     joint_abort_nm: POS_VEC
     contact_floor_nm: POS
     contact_rise_nm: POS
-    following_error_deg: Annotated[float, Field(gt=.2, le=2)]
+    following_error_deg: Annotated[float, Field(gt=.2, le=8)]
     motor_step_deg: Annotated[float, Field(gt=0, le=.5)]
     retreat_deg: Annotated[float, Field(ge=.5, le=2)]
     comparison_tolerance_deg: Annotated[float, Field(gt=0, le=3)]
 
     @model_validator(mode="after")
     def bounded(self):
-        if self.following_error_deg <= self.search_speed_deg_s * SETTINGS.stall_s + .05:
+        if not self.full_range_search and (self.permitted_travel_deg > 12 or
+                self.search_speed_deg_s > 1 or self.following_error_deg > 2):
+            raise ValueError("单方向试点仍使用原有行程、速度和跟踪范围")
+        contact_speed = min(self.search_speed_deg_s, 1.) if self.full_range_search else self.search_speed_deg_s
+        if self.following_error_deg <= contact_speed * SETTINGS.stall_s + .05:
             raise ValueError("跟踪门限未留出一秒停滞窗口的最大指令推进量")
         return self
 
@@ -118,6 +123,9 @@ def point_description(config, profile, point, *, coords=None):
     count = len(coords.names)
     if any(len(v) != count for v in (staging, start, point.motor_abort_nm, point.joint_abort_nm)):
         raise ValueError("核定角度与力矩向量必须对应工位的具名关节顺序")
+    if point.full_range_search and (config.limb not in {"left_arm", "left_short_arm"}
+                                   or abs(start[index]) > 1.e-9):
+        raise ValueError("从零搜索仅支持左臂 5／7 轴，受检关节须从逻辑零点开始")
     if profile.joint_peak_nm is not None:
         if len(profile.joint_peak_nm) != count:
             raise ValueError("峰值力矩必须对应工位的具名关节顺序")
@@ -136,7 +144,8 @@ def point_description(config, profile, point, *, coords=None):
             raise ValueError("复位起点和搜索姿态须位于量产参考区间内")
     reference_travel = sign * (direction.reference_deg - start[index])
     beyond = point.permitted_travel_deg - reference_travel
-    if reference_travel <= 0 or not point.search_speed_deg_s * SETTINGS.stall_s + .05 < beyond <= 3.0 + 1e-8:
+    contact_speed = min(point.search_speed_deg_s, 1.) if point.full_range_search else point.search_speed_deg_s
+    if reference_travel <= 0 or not contact_speed * SETTINGS.stall_s + .05 < beyond <= 3.0 + 1e-8:
         raise ValueError("搜索起点须在参考位置内侧，参考外指令预算须可容纳判定窗口且不超过 3°")
     if reference_travel + 1e-8 < point.retreat_deg:
         raise ValueError(f"{direction.label} {direction.label_direction} 的搜索起点距参考角 "
@@ -260,6 +269,7 @@ class ProbeCycle:
         self.progress = 0.
         self.commanded_at = None
         self.recent_load = []
+        self.moving_load = deque(maxlen=25)
         self.trace = []
         self.retreat = None
         self.candidate = None
@@ -331,6 +341,14 @@ class ProbeCycle:
                 raise FeedbackError("搜索增益切换后未取得稳定基线")
         elif self.phase == "search":
             self.trace.append((now, q.copy()))
+            if p.full_range_search:
+                # Refresh gravity/load baseline only while actually following
+                # forward motion. Freeze it as soon as lag/stall begins.
+                moving = s * math.degrees(q[a] - self.actual[a]) > .002
+                if moving and abs(math.degrees(q[a] - self.target[a])) < .3:
+                    self.moving_load.append(abs(joint_tau[a]))
+                    self.window.baseline = statistics.median(self.moving_load)
+                    self.window.threshold_nm = max(p.contact_floor_nm, self.window.baseline + p.contact_rise_nm)
             self.candidate = self.window.observe(now, math.degrees(q[a]), joint_tau[a], math.degrees(self.target[a]))
             cap = math.radians(p.permitted_travel_deg)
             displacement = s * (q[a] - self.start[a])
@@ -346,7 +364,11 @@ class ProbeCycle:
                     pose = self.start.copy()
                     pose[a] += s * travel
                     return pose
-                proposed = min(cap, self.progress + math.radians(dt * p.search_speed_deg_s))
+                speed = p.search_speed_deg_s
+                if p.full_range_search and (s * (self.direction.reference_deg - math.degrees(q[a])) <= 6.
+                        or abs(math.degrees(q[a] - self.target[a])) > .35):
+                    speed = min(speed, 1.)
+                proposed = min(cap, self.progress + math.radians(dt * speed))
                 self.progress = advance_motion(self.coords, p, dt, search_pose, self.progress, proposed)
                 self.target = search_pose(self.progress)
         elif self.phase == "unload":

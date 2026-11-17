@@ -9,7 +9,7 @@ import tempfile
 from typing import Annotated, Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from factory_hmi.limit_replay_assets import PRESET_KEYS, RESOURCE_ROOT, read_manifest, verified_asset
 from .limit_block_check import Coordinates, FeedbackError, SETTINGS
@@ -28,10 +28,12 @@ class ModuleProfile(BaseModel):
     schema_version: Literal[1]
     limb: str
     model: Literal["RP1.3.4"]
-    power_source: Literal["external"]
+    power_source: Literal["external", "existing_station"]
     fixture: Annotated[str, Field(min_length=1, max_length=120)]
     revision: Annotated[str, Field(min_length=1, max_length=80)]
-    approved_by: Annotated[str, Field(min_length=1, max_length=120)]
+    approved_by: Annotated[str, Field(min_length=1, max_length=120)] | None = None
+    source: Literal["site", "builtin_reference"] = "site"
+    torque_limit_source: str = "site_profile"
     station_sha256: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
     home_deg: VEC
     entry_via_deg: Annotated[tuple[VEC, ...], Field(max_length=12)] = ()
@@ -41,6 +43,28 @@ class ModuleProfile(BaseModel):
     joint_peak_nm: POS_VEC | None = None
     transfer_speed_deg_s: Annotated[float, Field(gt=0, le=10)] | None = None
     use_builtin_trajectory: bool = False
+    use_builtin_order: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_left_arm_zero_pose(cls, value):
+        """An arm reset means moving to logical zero, never setting encoder zero.
+
+        Missing home coordinates do not require an operator to position the
+        arm or supply measured starting angles. Existing explicit fixture
+        homes remain supported; entry always starts from fresh feedback.
+        """
+        if isinstance(value, dict) and value.get("home_deg") is None:
+            count = {"left_short_arm": 5, "left_arm": 7}.get(value.get("limb"))
+            if count is not None:
+                value = {**value, "home_deg": [0.0] * count}
+        return value
+
+    @model_validator(mode="after")
+    def require_site_author(self):
+        if self.source == "site" and self.approved_by is None:
+            raise ValueError("外置工位方案须保留核定人")
+        return self
 
     @property
     def transfer_speed(self) -> float:
@@ -52,7 +76,15 @@ class ModuleProfile(BaseModel):
 def load_module_plan(config, serial, config_revision):
     if config.limb not in PRESET_KEYS:
         raise ValueError("当前模块不支持整模块真机限位检查")
-    profile = ModuleProfile.model_validate_json(read_site_profile(PROFILE_ROOT / (config.limb + ".sequence.json")))
+    try:
+        payload = read_site_profile(PROFILE_ROOT / (config.limb + ".sequence.json"))
+    except ValueError as exc:
+        if config.limb not in {"left_arm", "left_short_arm"} or not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+        from .arm_limit_defaults import builtin_arm_profile
+        profile = builtin_arm_profile(config)
+    else:
+        profile = ModuleProfile.model_validate_json(payload)
     return validate_module_plan(config, profile, serial, config_revision)
 
 
@@ -68,6 +100,11 @@ def apply_builtin_trajectory(coords, profile):
     route_keys = [(row["joint"], row["direction"]) for row in route["windows"]]
     if set(route_keys) != set(site) or len(route_keys) != len(site):
         raise ValueError("内置转场须覆盖该模块的全部上下限")
+    if profile.use_builtin_order:
+        # The old visualization is an order reference, not motion input.
+        # Do not import any held angles, waypoints, timestamps or simulated
+        # contact angles from it. ProbeCycle terminates on real feedback.
+        return profile.model_copy(update={"windows": tuple(site[key] for key in route_keys)})
     windows = []
     for key, row in zip(route_keys, route["windows"], strict=True):
         window = site[key]
@@ -101,7 +138,9 @@ def validate_module_plan(config, profile, serial, config_revision):
     submitted = {(row.point.joint, row.point.direction) for row in profile.windows}
     if submitted != expected or len(profile.windows) != len(expected):
         raise ValueError("整模块方案须覆盖该模块的全部上下限，每个方向一次")
-    if profile.use_builtin_trajectory:
+    if profile.use_builtin_trajectory and profile.use_builtin_order:
+        raise ValueError("检查顺序与轨迹转场不能同时启用")
+    if profile.use_builtin_trajectory or profile.use_builtin_order:
         profile = apply_builtin_trajectory(coords, profile)
     descriptions = [point_description(config, profile, w.point, coords=coords) for w in profile.windows]
     hips = profile.waist_hip_hold_bounds_deg
@@ -123,7 +162,11 @@ def validate_module_plan(config, profile, serial, config_revision):
     context = {"source_kind": "physical", "mode": "module", "serial": serial, "profile": profile.model_dump(),
                "limb": config.limb, "station_sha256": profile.station_sha256, "config_revision": config_revision,
                "windows": descriptions, "joint_names": list(coords.names),
-               "transfer_speed_deg_s": profile.transfer_speed}
+               "transfer_speed_deg_s": profile.transfer_speed,
+               "execution_mode": "feedback_limit_search",
+               "order_source": "builtin_order_only" if profile.use_builtin_order else "profile_or_legacy_route",
+               "startup_action": "move_to_joint_zero" if all(v == 0 for v in profile.home_deg)
+               else "move_to_profile_home"}
     context["digest"] = _sha(context)
     return coords, profile, context
 
@@ -175,6 +218,7 @@ class ModuleCycle:
         self.probe = None
         self.last_packet = []
         self.samples = []
+        self.direction_evidence = []
         self.point = profile.windows[0].point
         self.fixed_hips = q[2:].copy() if coords.station.limb == "waist_hip" else None
         poses = entry_poses(coords, profile, q)
@@ -264,8 +308,10 @@ class ModuleCycle:
     def _complete_window(self, probe, q, joint_tau, motor_tau):
         self.result = {**probe.result, "joint": self.point.joint, "sign": self.point.direction,
                        "reference_deg": probe.direction.reference_deg, "joint_nm_after_retreat": joint_tau.tolist(),
-                       "motor_nm_after_retreat": motor_tau.tolist()}
+                       "motor_nm_after_retreat": motor_tau.tolist(), "retreat_completed": True}
         self.results.append(self.result)
+        self.direction_evidence.append({"joint": self.point.joint, "sign": self.point.direction,
+            "samples": list(probe.samples), "samples_truncated": probe.sample_count > len(probe.samples)})
         self.probe = None
         if self.result["outcome"] != "within_reference":
             raise FeedbackError(f"{probe.direction.label} {probe.direction.label_direction}结果异常，整模块检查已中止")
@@ -301,6 +347,9 @@ class ModuleWorker(ProbeWorker):
         self.entry_position = entry_position.copy()
         self.report_file = None
         self.record_error = None
+        self.checks = [{"joint": w["point"]["joint"], "sign": w["point"]["direction"],
+                       "label": w["label"], "reference_deg": w["reference_deg"]}
+                      for w in context["windows"]]
 
     def _new_cycle(self, q, now):
         # The station was holding during preflight. Reject a changed entrance,
@@ -314,17 +363,55 @@ class ModuleWorker(ProbeWorker):
 
     def _record_feedback(self, samples):
         cycle = self.cycle
-        if len(cycle.samples) < len(cycle.results):
-            cycle.samples.append([row.to_dict() for row in samples])
+        cycle.last_packet = [row.to_dict() for row in samples]
+        # Preserve the raw Iq and torque provenance alongside the logical
+        # angle/load trace, without sending the whole trace on every UI poll.
+        new_result = len(cycle.samples) < len(cycle.results)
+        trace = cycle.probe.samples if cycle.probe else (
+            cycle.direction_evidence[-1]["samples"] if new_result else ())
+        if trace:
+            trace[-1]["drive_load"] = [
+                {key: row.get(key) for key in ("motor_id", "bus", "joint_name", "iq_current_a",
+                  "torque_nm", "torque_kt_nm_a", "torque_source", "torque_is_estimated")}
+                for row in cycle.last_packet]
+        if new_result:
+            cycle.samples.append(cycle.last_packet)
+            row = cycle.results[-1]
+            drive = samples[self.coords.names.index(row["joint"])]
+            row.update(torque_is_estimated=drive.torque_is_estimated, torque_source=drive.torque_source,
+                       drive_feedback=cycle.last_packet)
 
     def snapshot(self, *, include_samples=False):
         result = super().snapshot(include_samples=include_samples)
         with self.lock:
             cycle = self.cycle
+            probe = cycle.probe if cycle else None
+            candidate = ({**probe.candidate, "joint": probe.point.joint, "sign": probe.point.direction,
+                          "reference_deg": probe.direction.reference_deg,
+                          "deviation_deg": probe.candidate["actual_deg"] - probe.direction.reference_deg,
+                          "retreat_completed": False} if probe and probe.candidate else None)
             result.update(mode="module", direction_index=min(cycle.index+1, len(self.profile.windows)) if cycle else 1,
                           direction_total=len(self.profile.windows), results=list(cycle.results) if cycle else [],
-                          current_candidate=cycle.probe.candidate if cycle and cycle.probe else None,
-                          report_file=self.report_file, record_error=self.record_error)
+                          current_candidate=candidate,
+                          checks=self.checks, report_file=self.report_file, record_error=self.record_error)
+            if cycle and probe:
+                axis = self.coords.names.index(probe.point.joint)
+                result["current_check"] = {"joint": probe.point.joint, "sign": probe.point.direction,
+                    "actual_deg": float(np.rad2deg(cycle.actual[axis]))}
+                if cycle.last_packet:
+                    drive = cycle.last_packet[axis]
+                    result["current_check"].update(torque_nm=(probe.samples[-1]["joint_nm"][axis]
+                        if probe.samples else None),
+                        torque_is_estimated=drive["torque_is_estimated"])
+            if candidate and cycle.last_packet:
+                drive = cycle.last_packet[self.coords.names.index(candidate["joint"])]
+                candidate.update(torque_is_estimated=drive["torque_is_estimated"],
+                                 drive_feedback=cycle.last_packet)
+            if include_samples and cycle:
+                result["direction_evidence"] = list(cycle.direction_evidence)
+                result["unfinished_search"] = ({"joint": probe.point.joint, "sign": probe.point.direction,
+                    "samples": list(probe.samples), "samples_truncated": probe.sample_count > len(probe.samples)}
+                    if probe else None)
         return result
 
     def _record_end(self):
