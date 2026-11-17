@@ -71,6 +71,7 @@ def build_pose_layout(panel):
         #poseValidation QLabel#poseValue { color: #15324e; font-size: 17px; font-weight: 600; }
         #poseValidation QLabel#poseSection { font-size: 16px; font-weight: 600; }
         #poseValidation QLabel#poseBadge { background: #edf4ff; color: #245eb2; border-radius: 7px; padding: 8px 12px; }
+        #poseValidation QLabel#poseFault { background: #fff1ef; color: #ac302a; border: 1px solid #f1c9c5; border-radius: 7px; padding: 10px 12px; }
         #poseValidation QLabel#poseStep { border-radius: 8px; padding: 10px 8px; font-size: 13px; }
         #poseValidation QPushButton { min-height: 36px; padding: 0 16px; border: 1px solid #bdcde1; border-radius: 7px; background: white; color: #1d4268; font-weight: 600; }
         #poseValidation QPushButton#poseStart { background: #2169db; color: white; border-color: #2169db; }
@@ -112,6 +113,10 @@ def build_pose_layout(panel):
     row.addStretch()
     panel.progress_text = label("等待开始", "poseValue"); row.addWidget(panel.progress_text)
     layout.addWidget(actions)
+    panel.fault_banner = label("", "poseFault")
+    panel.fault_banner.setWordWrap(True)
+    panel.fault_banner.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    panel.fault_banner.hide(); layout.addWidget(panel.fault_banner)
     steps = QHBoxLayout()
     panel.steps = []
     for text in ("1   自动回零", "2   限位搜索", "3   回零收尾", "4   保存报告"):
@@ -179,8 +184,14 @@ def render_pose_status(panel, s, *, online, pending, serial):
     link = ("状态连接待确认" if not online else "未连接电机" if not s.get("discovered") else
             "已连接 · 已使能" if s.get("motors_enabled") else "已连接 · 未使能")
     panel.link_value.setText(link)
+    fault = s.get("fault") if phase == "aborted" else None
+    panel.fault_banner.setText("检查中止：" + fault if fault else "")
+    panel.fault_banner.setVisible(bool(fault))
     panel.progress_text.setText("正在启动…" if pending else f"检查中 · {min(done+1,total)} / {total} 项" if active
                                else "已中止" if phase == "aborted" else "检查完成" if phase == "finished" else "等待开始")
+    transfer = s.get("last_transfer") or {}
+    if active and phase == "homing":
+        panel.progress_text.setText(f"自动回零 · {round(100*transfer.get('command_progress', 0))}%")
     panel.progress.setValue(round(done * 100 / total) if total else 0)
     stage = (3 if phase == "finished" else 2 if phase == "returning" or done == total > 0 else
              0 if phase in {"idle", "waiting_feedback", "gain_transition", "homing"} and not done else 1)
@@ -194,8 +205,14 @@ def render_pose_status(panel, s, *, online, pending, serial):
         panel.measurement.setText(f"实测角度 {number(current.get('actual_deg'))}°    ·    {kind} {number(current.get('torque_nm'), signed=False)} N·m")
     else:
         panel.current_value.setText("从当前姿态平滑回零" if phase == "homing" else
-                                    "返回零点" if phase == "returning" else "等待开始" if not done else "检查已结束" if not active else "转场中")
+                                    "返回零点" if phase == "returning" else "回零或转场中止" if phase == "aborted" and transfer else
+                                    "等待开始" if not done else "检查已结束" if not active else "转场中")
         panel.measurement.setText("实测角度 —    ·    力矩 —")
+        if transfer and (active or phase == "aborted"):
+            actual, goal = transfer.get("actual_deg", []), transfer.get("goal_deg", [])
+            if actual and len(actual) == len(goal):
+                error = max(abs(a-b) for a,b in zip(actual, goal))
+                panel.measurement.setText(f"最大到位偏差 {error:.2f}°    ·    到位范围 ±{transfer['arrival_tolerance_deg']:g}°")
     errors = sum(row.get("outcome") != "within_reference" for row in results)
     panel.counts.setText(f"{done} 已记录    {errors} 异常    {max(0,total-done-(1 if active and current else 0))} 待检查")
     if s.get("record_error"):

@@ -166,6 +166,10 @@ def test_default_service_start_uses_current_pose_and_saves_on_cancel(tmp_path, m
         assert report["context"]["entry_pose_deg"][0] == pytest.approx(12.)
         assert report["context"]["entry_target_deg"] == [0.] * len(initial)
         assert report["phase"] == "aborted"
+        assert report["last_transfer"]["phase"] == "homing"
+        assert report["last_transfer"]["arrival_tolerance_deg"] == 3.
+        assert report["transfer_history"] and report["last_drive_feedback"]
+        assert report["transfer_history_truncated"] is False
         assert fake.zeroed_indices == []  # Moving to zero never writes encoder zero.
     finally:
         service.close()
@@ -202,3 +206,70 @@ def test_candidate_and_iq_survive_retreat_failure_in_report(tmp_path, monkeypatc
     assert report["unfinished_search"]["samples"][-1]["drive_load"][0]["iq_current_a"] == 1.
     assert report["results"] == []
     worker.backend.disable_motors.assert_not_called()  # Test persists evidence only.
+
+
+@pytest.mark.parametrize("limb", ["left_arm", "left_short_arm"])
+def test_homing_with_loaded_arm_offset_proceeds_to_search(limb):
+    coords, profile, _ = plan(limb)
+    n = len(coords.names)
+    # Field report: target zero, final shoulder +2.81°, elbow -2.83°.
+    initial = np.deg2rad([.51, 3.29, 164.46, -84.36, 148.20, 6.46, -5.96][:n])
+    bias = np.deg2rad([2.81, .43, .01, -2.83, .19, .49, -.56][:n])
+    cycle = ModuleCycle(coords, profile, initial, 1.)
+    reached_home = False
+    peak_speed = 0.
+    for i in range(1, 1600):
+        previous = cycle.target.copy()
+        if cycle.phase == "homing":
+            scale = cycle.move.progress / cycle.move.duration
+        else:
+            scale = 1. if reached_home else 0.
+        q = previous + bias * scale
+        q += math.radians(.006 * (-1)**i)  # small quantisation/jitter
+        was_homing = cycle.phase == "homing"
+        cycle.step(1 + i*.025, q, np.ones(n), np.ones(n))
+        peak_speed = max(peak_speed, float(np.max(abs(np.rad2deg(cycle.target - previous))) / .025))
+        assert np.max(abs(np.rad2deg(coords.motor_target(cycle.target)-coords.motor_target(previous)))) <= .5+1.e-8
+        if was_homing and cycle.phase != "homing":
+            reached_home = True
+        if cycle.phase == "search":
+            assert reached_home
+            assert i*.025 < 19.  # Old path took ~34 s then failed before search.
+            assert 15 < peak_speed <= 20.+1.e-8
+            assert not cycle.results  # Near-zero acceptance cannot invent stop results.
+            assert cycle.probe.window.baseline == 1.
+            assert cycle.last_transfer is not None and cycle.transfer_history
+            return
+    pytest.fail(f"did not enter search: {cycle.phase}")
+
+
+def test_homing_offset_outside_arrival_range_reports_measured_axis():
+    coords, profile, _ = plan()
+    initial = np.zeros(7); initial[3] = math.radians(-40)
+    cycle = ModuleCycle(coords, profile, initial, 1.)
+    for i in range(1, 600):
+        q = cycle.target.copy()
+        if cycle.phase == "homing":
+            q[3] -= math.radians(3.4 * cycle.move.progress / cycle.move.duration)
+        try:
+            cycle.step(1+i*.025, q, np.ones(7), np.ones(7))
+        except FeedbackError as exc:
+            assert "left_elbow_joint" in str(exc) and "3.40°" in str(exc) and "±3°" in str(exc)
+            assert cycle.last_transfer["actual_deg"][3] == pytest.approx(-3.4)
+            assert cycle.probe is None
+            return
+    pytest.fail("out-of-range arrival accepted")
+
+
+def test_arm_arrival_requires_stable_feedback_and_legacy_remains_tight():
+    from factory_hmi.core.live_limit_probe import PositionSettling
+    _, profile, _ = plan()
+    arm = PositionSettling.for_point(profile.windows[0].point)
+    legacy = PositionSettling()
+    for i in range(30):
+        now = 1+i*.025
+        assert not arm.settled(now, np.deg2rad([.8 if i%2 else 0.]), np.zeros(1))
+        assert not legacy.settled(now, np.deg2rad([2.8]), np.zeros(1))
+    for i in range(30,50):
+        ok = arm.settled(1+i*.025, np.deg2rad([2.8 + .006*(-1)**i]), np.zeros(1))
+    assert ok

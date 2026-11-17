@@ -52,7 +52,7 @@ def builtin_arm_profile(config):
             motor_step_deg=.5, retreat_deg=1., comparison_tolerance_deg=3.)
         windows.append(ScheduledPoint(point=point))
     return ModuleProfile(schema_version=1, limb=config.limb, model="RP1.3.4", power_source="existing_station",
-        fixture="当前模块台架", revision="arm-zero-feedback-v1", source="builtin_reference",
+        fixture="当前模块台架", revision="arm-zero-feedback-v2", source="builtin_reference",
         torque_limit_source="station_cap_and_production_range" + ("_and_joint_peak" if peaks else ""),
         station_sha256=station_sha(config), home_deg=zero, joint_peak_nm=peaks,
-        windows=windows, transfer_speed_deg_s=10., use_builtin_order=True)
+        windows=windows, transfer_speed_deg_s=20., use_builtin_order=True)

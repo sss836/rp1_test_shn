@@ -4,7 +4,7 @@
   "model": "RP1.3.4",
   "power_source": "existing_station",
   "fixture": "当前模块台架",
-  "revision": "arm-zero-feedback-v1",
+  "revision": "arm-zero-feedback-v2",
   "approved_by": null,
   "source": "builtin_reference",
   "torque_limit_source": "station_cap_and_production_range",
@@ -822,7 +822,7 @@
     }
   ],
   "joint_peak_nm": null,
-  "transfer_speed_deg_s": 10.0,
+  "transfer_speed_deg_s": 20.0,
   "use_builtin_trajectory": false,
   "use_builtin_order": true
 }

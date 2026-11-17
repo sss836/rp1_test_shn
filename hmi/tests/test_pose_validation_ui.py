@@ -60,3 +60,19 @@ def test_unready_has_explanation_and_estimated_result_is_labelled(window):
     text = " ".join(panel.results.item(r, c).text() for r in range(panel.results.rowCount()) for c in range(panel.results.columnCount()))
     assert "+164.90" in text and "-0.65" in text and "（估算）" in text
     assert panel.export.isEnabled()
+
+
+def test_homing_abort_shows_reason_above_results_and_preserves_actual_error(window):
+    panel = window.module_limit_panel
+    transfer = dict(phase="homing", actual_deg=[2.81,0,0,-2.83,0,0,0], goal_deg=[0]*7,
+                    arrival_tolerance_deg=3., command_progress=.5)
+    state = dict(limb="left_arm", mode="module", active=True, phase="homing", last_transfer=transfer)
+    panel._take_result({"result": state})
+    assert panel.progress_text.text() == "自动回零 · 50%"
+    assert "2.83°" in panel.measurement.text() and "±3°" in panel.measurement.text()
+    assert panel.fault_banner.isHidden()
+    reason = "转场命令已发完，未确认到位：left_elbow_joint 偏差 3.40°"
+    panel._take_result({"result": dict(state, active=False, phase="aborted", fault=reason)})
+    assert not panel.fault_banner.isHidden() and reason in panel.fault_banner.text()
+    assert "中止" in panel.current_value.text()
+    assert panel.export.isEnabled()

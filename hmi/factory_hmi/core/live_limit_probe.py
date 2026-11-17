@@ -49,6 +49,12 @@ class ProbePoint(BaseModel):
     retreat_deg: Annotated[float, Field(ge=.5, le=2)]
     comparison_tolerance_deg: Annotated[float, Field(gt=0, le=3)]
 
+    @property
+    def arrival_tolerance_deg(self):
+        # A loaded arm at nominal zero is preparation, not encoder calibration
+        # or a measured stop. Retain the tighter legacy pilot requirement.
+        return min(3., self.following_error_deg) if self.full_range_search else .12
+
     @model_validator(mode="after")
     def bounded(self):
         if not self.full_range_search and (self.permitted_travel_deg > 12 or
@@ -164,11 +170,16 @@ def point_description(config, profile, point, *, coords=None):
 
 
 class PositionSettling:
-    def __init__(self):
+    def __init__(self, tolerance_deg=.12, jitter_deg=0.):
         self.window = deque()
+        self.tolerance_deg, self.jitter_deg = tolerance_deg, jitter_deg
+
+    @classmethod
+    def for_point(cls, point):
+        return cls(point.arrival_tolerance_deg, .05 if point.full_range_search else 0.)
 
     def settled(self, now, q, target):
-        if np.max(abs(q - target)) > math.radians(.12):
+        if np.max(abs(q - target)) > math.radians(self.tolerance_deg):
             self.window.clear()
             return False
         self.window.append((now, q.copy()))
@@ -178,7 +189,7 @@ class PositionSettling:
         if duration < .20:
             return False
         span = np.ptp([row[1] for row in self.window], axis=0)
-        return bool(np.max(span) <= math.radians(.15) * duration)
+        return bool(np.max(span) <= math.radians(max(self.jitter_deg, .15 * duration)))
 
 
 def motor_step_cap(coords, point, dt):
@@ -219,13 +230,13 @@ def advance_motion(coords, point, dt, pose, progress, proposed):
 
 
 class PositionMove:
-    def __init__(self, origin, goal, speed, *, gain_transition=False):
+    def __init__(self, origin, goal, speed, *, gain_transition=False, settling=None):
         self.origin, self.goal = origin.copy(), goal.copy()
         self.duration = max(.5 if gain_transition else 0.,
                             1.875 * np.max(abs(np.rad2deg(goal - origin))) / speed)
         self.progress = 0.
         self.commanded_at = None
-        self.settling = PositionSettling()
+        self.settling = settling or PositionSettling()
 
     def pose(self, elapsed):
         x = elapsed / self.duration if self.duration else 1.
@@ -244,7 +255,11 @@ class PositionMove:
             return target, ratio, False
         settled = self.settling.settled(now, q, self.goal)
         if not settled and now - self.commanded_at > 3.:
-            raise FeedbackError(timeout_message)
+            error = abs(np.rad2deg(q-self.goal))
+            axis = int(np.argmax(error))
+            raise FeedbackError(f"{timeout_message}：{coords.names[axis]} 实测 {math.degrees(q[axis]):.2f}°，"
+                                f"目标 {math.degrees(self.goal[axis]):.2f}°，偏差 {error[axis]:.2f}°，"
+                                f"到位范围 ±{self.settling.tolerance_deg:g}°；须同时停稳")
         return target, ratio, settled
 
 
@@ -256,16 +271,19 @@ class ProbeCycle:
         self.direction = next(d for d in coords.directions if d.joint == point.joint and d.sign == point.direction)
         self.start = np.deg2rad(point.search_pose_deg)
         staging = np.deg2rad(point.staging_pose_deg)
-        if min(np.max(abs(q - staging)), np.max(abs(q - self.start))) > math.radians(.25):
+        arrival = point.arrival_tolerance_deg if point.full_range_search else .25
+        if min(np.max(abs(q - staging)), np.max(abs(q - self.start))) > math.radians(arrival):
             raise FeedbackError("实测姿态不在核定复位起点或搜索起点范围内")
         self.actual = q.copy()
         self.target = q.copy() if target is None else target.copy()
-        self.reset = PositionMove(self.target, self.start, point.positioning_speed_deg_s)
+        self.reset = PositionMove(self.target, self.start, point.positioning_speed_deg_s,
+                                  settling=PositionSettling.for_point(point))
+        self.held_actual = q.copy()
         self.phase = "reset"
         self.since = now
         self.previous = now
         self.gain_blend = 0.
-        self.settling = PositionSettling()
+        self.settling = PositionSettling.for_point(point)
         self.progress = 0.
         self.commanded_at = None
         self.recent_load = []
@@ -304,7 +322,9 @@ class ProbeCycle:
                      "实测力矩达到工位中止门限")
         if np.max(abs(np.rad2deg(q - self.target))) > p.following_error_deg:
             raise FeedbackError("实际姿态与最近指令偏差超过核定值")
-        if np.max(abs(np.rad2deg(np.delete(q - self.start, a)))) > .35:
+        held = self.held_actual if p.full_range_search else self.start
+        held_tolerance = p.arrival_tolerance_deg if p.full_range_search else .35
+        if np.max(abs(np.rad2deg(np.delete(q - held, a)))) > held_tolerance:
             raise FeedbackError("非搜索轴离开核定保持位")
         self.samples.append({"time_s": now - self.samples_started, "phase": self.phase,
             "actual_deg": np.rad2deg(q).tolist(), "target_deg": np.rad2deg(self.target).tolist(),

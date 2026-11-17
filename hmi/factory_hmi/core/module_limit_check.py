@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+from collections import deque
 from typing import Annotated, Literal
 
 import numpy as np
@@ -13,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from factory_hmi.limit_replay_assets import PRESET_KEYS, RESOURCE_ROOT, read_manifest, verified_asset
 from .limit_block_check import Coordinates, FeedbackError, SETTINGS
-from .live_limit_probe import (POS_VEC, PROFILE_ROOT, VEC, PositionMove, ProbeCycle, ProbePoint, ProbeWorker,
+from .live_limit_probe import (POS_VEC, PROFILE_ROOT, VEC, PositionMove, PositionSettling, ProbeCycle, ProbePoint, ProbeWorker,
                                _sha, check_torque, point_description, read_site_profile, station_sha)
 
 
@@ -41,7 +42,7 @@ class ModuleProfile(BaseModel):
     waist_hip_hold_bounds_deg: tuple[tuple[float, float], tuple[float, float]] | None = None
     windows: Annotated[tuple[ScheduledPoint, ...], Field(min_length=4, max_length=14)]
     joint_peak_nm: POS_VEC | None = None
-    transfer_speed_deg_s: Annotated[float, Field(gt=0, le=10)] | None = None
+    transfer_speed_deg_s: Annotated[float, Field(gt=0, le=20)] | None = None
     use_builtin_trajectory: bool = False
     use_builtin_order: bool = False
 
@@ -64,6 +65,10 @@ class ModuleProfile(BaseModel):
     def require_site_author(self):
         if self.source == "site" and self.approved_by is None:
             raise ValueError("外置工位方案须保留核定人")
+        if (self.transfer_speed_deg_s or 0) > 10 and not (
+                self.source == "builtin_reference" and self.limb in {"left_arm", "left_short_arm"}
+                and all(w.point.full_range_search for w in self.windows)):
+            raise ValueError("transfer_speed_deg_s：非内置左臂回零仍使用原有 10°/s 上限")
         return self
 
     @property
@@ -218,6 +223,10 @@ class ModuleCycle:
         self.probe = None
         self.last_packet = []
         self.samples = []
+        self.last_transfer = None
+        self.transfer_history = deque(maxlen=5000)
+        self.transfer_sample_count = 0
+        self.last_transfer_recorded = -math.inf
         self.direction_evidence = []
         self.point = profile.windows[0].point
         self.fixed_hips = q[2:].copy() if coords.station.limb == "waist_hip" else None
@@ -257,7 +266,8 @@ class ModuleCycle:
         self.gains_to = self.gains if scales is None else scales
         speed = min(self.transfer_speed, self.point.positioning_speed_deg_s) if phase == "clearance" else self.transfer_speed
         self.move = PositionMove(self.target, goal, speed,
-                                 gain_transition=self.gains_from != self.gains_to)
+                                 gain_transition=self.gains_from != self.gains_to,
+                                 settling=PositionSettling.for_point(self.point))
 
     def _next_waypoint(self, q, now):
         for waypoint in self.via:
@@ -290,6 +300,18 @@ class ModuleCycle:
             raise FeedbackError("转场跟踪偏差超过核定值")
 
     def step(self, now, q, joint_tau, motor_tau):
+        # Save the current measurement even when a verification raises below.
+        self.actual = q.copy()
+        if self.probe is None:
+            self.last_transfer = {"phase": self.phase, "time_s": now,
+                "actual_deg": np.rad2deg(q).tolist(), "target_deg": np.rad2deg(self.target).tolist(),
+                "goal_deg": np.rad2deg(self.goal).tolist(), "joint_nm": joint_tau.tolist(),
+                "arrival_tolerance_deg": self.point.arrival_tolerance_deg,
+                "command_progress": self.move.progress / self.move.duration if self.move.duration else 1.}
+            if now - self.last_transfer_recorded >= .1:
+                self.transfer_history.append(dict(self.last_transfer))
+                self.transfer_sample_count += 1
+                self.last_transfer_recorded = now
         self._verify_load(q, joint_tau, motor_tau, now)
         if self.probe is not None:
             probe = self.probe
@@ -394,6 +416,8 @@ class ModuleWorker(ProbeWorker):
                           direction_total=len(self.profile.windows), results=list(cycle.results) if cycle else [],
                           current_candidate=candidate,
                           checks=self.checks, report_file=self.report_file, record_error=self.record_error)
+            if cycle:
+                result["last_transfer"] = cycle.last_transfer
             if cycle and probe:
                 axis = self.coords.names.index(probe.point.joint)
                 result["current_check"] = {"joint": probe.point.joint, "sign": probe.point.direction,
@@ -408,6 +432,9 @@ class ModuleWorker(ProbeWorker):
                 candidate.update(torque_is_estimated=drive["torque_is_estimated"],
                                  drive_feedback=cycle.last_packet)
             if include_samples and cycle:
+                result["transfer_history"] = list(cycle.transfer_history)
+                result["transfer_history_truncated"] = cycle.transfer_sample_count > len(cycle.transfer_history)
+                result["last_drive_feedback"] = list(cycle.last_packet)
                 result["direction_evidence"] = list(cycle.direction_evidence)
                 result["unfinished_search"] = ({"joint": probe.point.joint, "sign": probe.point.direction,
                     "samples": list(probe.samples), "samples_truncated": probe.sample_count > len(probe.samples)}
