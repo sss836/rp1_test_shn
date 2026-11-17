@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "limb": "waist_hip",
+  "model": "RP1.3.4",
+  "power_source": "external",
+  "fixture": null,
+  "revision": null,
+  "approved_by": null,
+  "station_sha256": null,
+  "home_deg": [
+    null,
+    null,
+    null,
+    null
+  ],
+  "return_via_deg": [],
+  "windows": [
+    {
+      "point": {
+        "joint": "waist_roll_joint",
+        "direction": -1,
+        "staging_pose_deg": [
+          null,
+          0.0,
+          5.729577951308233,
+          -5.729577951308233
+        ],
+        "search_pose_deg": [
+          null,
+          0.0,
+          5.729577951308233,
+          -5.729577951308233
+        ],
+        "permitted_travel_deg": null,
+        "search_speed_deg_s": null,
+        "positioning_speed_deg_s": null,
+        "reset_kp_scale": null,
+        "reset_kd_scale": null,
+        "search_kp_scale": null,
+        "search_kd_scale": null,
+        "motor_abort_nm": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "joint_abort_nm": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "contact_floor_nm": null,
+        "contact_rise_nm": null,
+        "following_error_deg": null,
+        "motor_step_deg": null,
+        "retreat_deg": null,
+        "comparison_tolerance_deg": null
+      },
+      "via_deg": []
+    },
+    {
+      "point": {
+        "joint": "waist_yaw_joint",
+        "direction": 1,
+        "staging_pose_deg": [
+          0.0,
+          null,
+          5.729577951308233,
+          -5.729577951308233
+        ],
+        "search_pose_deg": [
+          0.0,
+          null,
+          5.729577951308233,
+          -5.729577951308233
+        ],
+        "permitted_travel_deg": null,
+        "search_speed_deg_s": null,
+        "positioning_speed_deg_s": null,
+        "reset_kp_scale": null,
+        "reset_kd_scale": null,
+        "search_kp_scale": null,
+        "search_kd_scale": null,
+        "motor_abort_nm": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "joint_abort_nm": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "contact_floor_nm": null,
+        "contact_rise_nm": null,
+        "following_error_deg": null,
+        "motor_step_deg": null,
+        "retreat_deg": null,
+        "comparison_tolerance_deg": null
+      },
+      "via_deg": []
+    },
+    {
+      "point": {
+        "joint": "waist_roll_joint",
+        "direction": 1,
+        "staging_pose_deg": [
+          null,
+          0.0,
+          5.729577951308233,
+          -5.729577951308233
+        ],
+        "search_pose_deg": [
+          null,
+          0.0,
+          5.729577951308233,
+          -5.729577951308233
+        ],
+        "permitted_travel_deg": null,
+        "search_speed_deg_s": null,
+        "positioning_speed_deg_s": null,
+        "reset_kp_scale": null,
+        "reset_kd_scale": null,
+        "search_kp_scale": null,
+        "search_kd_scale": null,
+        "motor_abort_nm": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "joint_abort_nm": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "contact_floor_nm": null,
+        "contact_rise_nm": null,
+        "following_error_deg": null,
+        "motor_step_deg": null,
+        "retreat_deg": null,
+        "comparison_tolerance_deg": null
+      },
+      "via_deg": []
+    },
+    {
+      "point": {
+        "joint": "waist_yaw_joint",
+        "direction": -1,
+        "staging_pose_deg": [
+          0.0,
+          null,
+          5.729577951308233,
+          -5.729577951308233
+        ],
+        "search_pose_deg": [
+          0.0,
+          null,
+          5.729577951308233,
+          -5.729577951308233
+        ],
+        "permitted_travel_deg": null,
+        "search_speed_deg_s": null,
+        "positioning_speed_deg_s": null,
+        "reset_kp_scale": null,
+        "reset_kd_scale": null,
+        "search_kp_scale": null,
+        "search_kd_scale": null,
+        "motor_abort_nm": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "joint_abort_nm": [
+          null,
+          null,
+          null,
+          null
+        ],
+        "contact_floor_nm": null,
+        "contact_rise_nm": null,
+        "following_error_deg": null,
+        "motor_step_deg": null,
+        "retreat_deg": null,
+        "comparison_tolerance_deg": null
+      },
+      "via_deg": []
+    }
+  ],
+  "entry_via_deg": [],
+  "waist_hip_hold_bounds_deg": null,
+  "use_builtin_trajectory": true
+}

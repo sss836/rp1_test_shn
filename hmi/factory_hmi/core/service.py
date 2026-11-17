@@ -89,6 +89,8 @@ class FactoryService:
         self._maintenance = None
         self._parameters = None
         self._controller: FactoryController | None = None
+        self._limit_probe = None
+        self._module_limit_digest: str | None = None
         self._zeroing: MotorZeroingSession | None = None
         self._backend_name: str | None = None
         self._config_path: Path | None = None
@@ -729,6 +731,191 @@ class FactoryService:
                     pass
             raise
         return self.snapshot()
+
+    def limit_probe_status(self, *, report=False):
+        from .live_limit_probe import station_sha
+        from factory_hmi.limit_replay_assets import PRESET_KEYS
+        controller = self._controller
+        probe = self._limit_probe
+        if probe and probe.backend is getattr(controller, "backend", None):
+            if report and probe.active:
+                raise ValueError("请在复位和搜索结束后导出报告")
+            result = probe.snapshot(include_samples=report)
+        else:
+            result = {"active": False, "phase": "idle"}
+        if controller is not None and controller.config.limb in PRESET_KEYS:
+            result.update(limb=controller.config.limb, station_sha256=station_sha(controller.config),
+                          motors_enabled=bool(controller.backend.motors_enabled),
+                          discovered=bool(controller.backend.connected), model="RP1.3.4", backend=self._backend_name)
+        return result
+
+    def _limit_probe_spec(self, limb, joint, direction, serial):
+        from .live_limit_probe import _sha, load_site_profile, point_description
+        controller = self.controller
+        serial = str(serial).strip()
+        if not serial or len(serial) > 120:
+            raise ValueError("请填写实际样机编号")
+        if controller.config.limb != limb or self._backend_name != "motors_py":
+            raise ValueError("须先在当前工位应用对应 5 自由度腿的真机电机配置")
+        profile = load_site_profile(controller.config)
+        point = next((p for p in profile.points if (p.joint, p.direction) == (joint, direction)), None)
+        if point is None:
+            raise ValueError("当前关节方向没有核定的试点方案")
+        context = {**point_description(controller.config, profile, point), "serial": serial,
+                   "source_kind": "physical", "limb": limb, "power_source": profile.power_source,
+                   "station_sha256": profile.station_sha256, "config_revision": self._config_revision}
+        context["digest"] = _sha(context)
+        return controller, point, context
+
+    @_open_service_operation
+    def limit_probe_preview(self, limb, joint, direction, serial):
+        return self._limit_probe_spec(limb, joint, direction, serial)[2]
+
+    @_open_service_operation
+    def limit_probe_reset(self, limb, joint, direction, serial, digest, confirmed):
+        from .limit_block_check import Coordinates
+        from .live_limit_probe import ProbeWorker
+        controller, point, context = self._limit_probe_spec(limb, joint, direction, serial)
+        if not confirmed or context["digest"] != digest:
+            raise ValueError("请重新确认外部供电工装支撑、急停和当前方案摘要")
+        self._require_probe_ready(controller)
+        coords = Coordinates(controller.config)
+        read, bounds, publish = self._probe_io(controller)
+        search_end = np.array(point.search_pose_deg)
+        search_end[coords.names.index(point.joint)] += point.direction * point.permitted_travel_deg
+        self._check_probe_path(coords, bounds, ((point.staging_pose_deg, point.search_pose_deg),
+                                               (point.search_pose_deg, search_end)))
+        if not read():
+            raise ValueError("当前逐电机反馈刷新中，请重新核对")
+        worker = ProbeWorker(controller.backend, coords, point, context, read, bounds, publish)
+        return self._attach_probe_worker(controller, worker)
+
+    def _require_probe_ready(self, controller):
+        controller.state_machine.require(StationState.CONNECTED)
+        self._require_protective_damping_released()
+        self._require_recording_closed()
+        if (controller.manual_control_active or not controller.backend.motors_enabled
+                or not controller.backend.connected or not self.can_status()["all_up"]
+                or self._zeroing is not None and self._zeroing.state.value in {"prepared", "reading"}):
+            raise RuntimeError("须独立连接、扫描并使能，且本工位无其他运动、标零或维护")
+
+    @staticmethod
+    def _probe_io(controller):
+        from .limit_block_check import FeedbackError
+        backend = controller.backend
+        safety = controller.config.safety_limits
+        temperature_limit = controller._diagnosis.thresholds.overtemperature_c
+
+        def bounds(q, motor):
+            for value, lower, upper in ((q, safety.joint_min_rad, safety.joint_max_rad),
+                                        (motor, safety.motor_min_rad, safety.motor_max_rad)):
+                if (not np.all(np.isfinite(value)) or lower is not None and np.any(value < lower)
+                        or upper is not None and np.any(value > upper)):
+                    raise FeedbackError("目标超出工位配置的位置边界")
+
+        def read():
+            samples = backend.limit_probe_samples()
+            if any(not math.isfinite(row.temp_c) or row.temp_c >= temperature_limit
+                   or not math.isfinite(row.spd_rad_s) for row in samples):
+                raise FeedbackError("电机的温度或速度反馈异常")
+            return samples
+
+        def publish(samples):
+            controller.telemetry_hub.publish(samples)
+            controller._last_samples = samples
+
+        return read, bounds, publish
+
+    @staticmethod
+    def _check_probe_path(coords, bounds, segments):
+        from .limit_block_check import FeedbackError
+        for begin, end in segments:
+            for degrees in np.linspace(begin, end, 121):
+                q = np.deg2rad(degrees)
+                motor = coords.motor_target(q)
+                bounds(q, motor)
+                coords.jacobian(q)
+                if np.max(abs(coords.joint_position(motor) - q)) > 1e-5:
+                    raise FeedbackError("核定轨迹的踝闭链支路不可逆")
+
+    def _attach_probe_worker(self, controller, worker):
+        with controller._lock:
+            controller._manual = worker
+        try:
+            controller._stop_position_hold()
+            controller.backend.refresh_feedback()
+            self._limit_probe = worker
+            worker.start()
+        except Exception:
+            worker._disable()
+            if worker.disable["request"] == "failed":
+                worker.started = True
+            else:
+                with controller._lock:
+                    if controller._manual is worker:
+                        controller._manual = None
+            raise
+        return worker.snapshot()
+
+    def _module_probe_spec(self, serial):
+        from .module_limit_check import load_module_plan
+        controller = self.controller
+        if self._backend_name != "motors_py":
+            raise ValueError("请应用当前模块的真机配置")
+        coords, profile, context = load_module_plan(controller.config, serial, self._config_revision)
+        return controller, coords, profile, context
+
+    @_open_service_operation
+    def limit_module_preview(self, serial):
+        from .module_limit_check import path_segments
+        self._module_limit_digest = None
+        controller, coords, profile, context = self._module_probe_spec(serial)
+        _, bounds, _ = self._probe_io(controller)
+        self._check_probe_path(coords, bounds, path_segments(profile, coords.names))
+        self._module_limit_digest = context["digest"]
+        return context
+
+    @_open_service_operation
+    def limit_module_start(self, serial, digest, confirmed):
+        from .module_limit_check import ModuleWorker, entry_poses, path_segments
+        controller, coords, profile, context = self._module_probe_spec(serial)
+        if not confirmed or digest != context["digest"] or digest != self._module_limit_digest:
+            raise ValueError("模块、工装或方案已变化，请重新启动并核对")
+        self._require_probe_ready(controller)
+        read, bounds, publish = self._probe_io(controller)
+        samples = read()
+        if not samples:
+            raise ValueError("当前逐电机反馈刷新中，请重试")
+        now = time.monotonic()
+        q, _, _ = coords.decode(samples, now, ())
+        poses = entry_poses(coords, profile, q)
+        segments = list(zip(poses, poses[1:]))
+        if controller.config.limb == "waist_hip":
+            # Preflight the actual held hip angles, including the following transfers.
+            for enter, leave in path_segments(profile, coords.names):
+                segments.append(((*enter[:2], *poses[0][2:]), (*leave[:2], *poses[0][2:])))
+        self._check_probe_path(coords, bounds, segments)
+        task = uuid.uuid4().hex
+        context.update(check_id=task, started_at=datetime.now(timezone.utc).isoformat(),
+                       entry_pose_deg=poses[0].tolist(), entry_target_deg=poses[-1].tolist())
+        worker = ModuleWorker(controller.backend, coords, profile, context, read, bounds, publish,
+                              self.data_root / "limit-checks" / f"{task}.json", q)
+        self._module_limit_digest = None  # A timed-out request or retry cannot start a second job.
+        return self._attach_probe_worker(controller, worker)
+
+    @_open_service_operation
+    def limit_probe_start(self, digest):
+        probe = self._limit_probe
+        if not probe or probe.backend is not self.controller.backend or digest != probe.context["digest"]:
+            raise ValueError("复位实例或方案摘要已变化")
+        if probe.context.get("mode") == "module":
+            raise ValueError("整模块任务已自动执行")
+        current = self._limit_probe_spec(probe.context["limb"], probe.point.joint, probe.point.direction,
+                                         probe.context["serial"])[2]
+        if current["digest"] != digest:
+            raise ValueError("现场方案已变化，须先中止并复核")
+        probe.begin()
+        return probe.snapshot()
 
     def protective_damping_snapshot(self):
         controller = self._controller

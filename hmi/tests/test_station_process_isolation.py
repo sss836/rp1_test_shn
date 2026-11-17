@@ -504,3 +504,35 @@ def test_gateway_channel_loss_preserves_active_protection(isolated_app):
                 if protection and protection.get("active"):
                     worker.disable_protection()
                 worker.close()
+
+
+def test_pilot_routes_inspect_but_do_not_advance_fake_or_unauthorized_station(isolated_app):
+    owner = "limit-probe-worker"
+    local = {"X-RP1-Client-ID": owner, "X-RP1-Local-Maintenance": "fixture-local-maintenance"}
+    body = {"limb": "left_short_leg", "joint": "left_knee_joint", "direction": 1, "serial": "MOCK"}
+    with TestClient(isolated_app, client=("127.0.0.1", 50000),
+                    raise_server_exceptions=False) as client:
+        forbidden = client.post("/api/v1/limit-probe/preview", headers={"X-RP1-Client-ID": owner}, json=body)
+        assert forbidden.status_code == 403, forbidden.text
+        module_body = {"serial": "MOCK", "digest": "0"*64, "confirmed": True}
+        forbidden = client.post("/api/v1/limit-module/start", headers={"X-RP1-Client-ID": owner}, json=module_body)
+        assert forbidden.status_code == 403, forbidden.text
+        configured = client.post("/api/v1/configure", headers=local, json={
+            "config_path": "left_short_leg_motors.yaml", "limb": "left_short_leg", "backend": "fake",
+        })
+        assert configured.status_code == 200, configured.text
+        read = client.get("/api/v1/limit-probe", headers=local)
+        assert read.status_code == 200 and read.json()["result"]["backend"] == "fake", read.text
+        wrong = client.post("/api/v1/limit-probe/preview", headers=local,
+                            json={**body, "limb": "waist_hip"})
+        assert wrong.status_code == 422, wrong.text
+        rejected = client.post("/api/v1/limit-probe/preview", headers=local, json=body)
+        assert rejected.status_code == 409 and "真机" in rejected.text, rejected.text
+        start = client.post("/api/v1/limit-probe-start", headers=local, json={"digest": "0"*64})
+        assert start.status_code == 409, start.text
+        preview_module = client.post("/api/v1/limit-module/preview", headers=local, json={"serial": "MOCK"})
+        assert preview_module.status_code == 409 and "真机" in preview_module.text, preview_module.text
+        start_module = client.post("/api/v1/limit-module/start", headers=local, json=module_body)
+        assert start_module.status_code == 409, start_module.text
+        status = client.get("/api/v1/limit-probe", headers=local).json()["result"]
+        assert status["phase"] == "idle" and not status["motors_enabled"]

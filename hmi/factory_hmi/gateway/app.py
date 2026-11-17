@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import asyncio
 import logging
 import os
@@ -54,6 +56,9 @@ from .schemas import (
     HistoryImportRequest,
     LocalCorrectionRequest,
     ManualMoveRequest,
+    LimitModuleRequest,
+    LimitProbeRequest,
+    LimitProbeStartRequest,
     PlatformLoginRequest,
     PlaybackStartRequest,
     PlcChannelRequest,
@@ -2417,6 +2422,53 @@ def create_app(
             lambda runtime: runtime._invoke(("start",), **body.model_dump()),
             motion_command=True,
         )
+
+    def require_limit_runtime(request, client_id, token):
+        require_token(token)
+        require_local_maintenance(request, client_id)
+        runtime = hub.session(owner_id(request, client_id), create=False)
+        if runtime._process is None:
+            raise HTTPException(status_code=409, detail="真机限位试点要求独立工位进程")
+        return runtime
+
+    @app.get("/api/v1/limit-probe")
+    def limit_probe_status(request: Request, report: bool = False,
+                           x_rp1_client_id: str | None = Header(default=None),
+                           x_rp1_operator_token: str | None = Header(default=None)):
+        runtime = require_limit_runtime(request, x_rp1_client_id, x_rp1_operator_token)
+        try:
+            return {"ok": True, "result": runtime._invoke(("limit_probe_status",), report=report)}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/limit-probe/{action}")
+    def limit_probe_action(action: Literal["preview", "reset"], body: LimitProbeRequest, request: Request,
+                           x_rp1_client_id: str | None = Header(default=None),
+                           x_rp1_operator_token: str | None = Header(default=None)):
+        require_limit_runtime(request, x_rp1_client_id, x_rp1_operator_token)
+        payload = body.model_dump(exclude={"digest", "confirmed"} if action == "preview" else set())
+        return mutate(request, x_rp1_client_id, x_rp1_operator_token,
+                      lambda runtime: runtime._invoke(("limit_probe_" + action,), **payload),
+                      motion_command=action == "reset", require_active_lease=True)
+
+    @app.post("/api/v1/limit-probe-start")
+    def limit_probe_start(body: LimitProbeStartRequest, request: Request,
+                          x_rp1_client_id: str | None = Header(default=None),
+                          x_rp1_operator_token: str | None = Header(default=None)):
+        require_limit_runtime(request, x_rp1_client_id, x_rp1_operator_token)
+        return mutate(request, x_rp1_client_id, x_rp1_operator_token,
+                      lambda runtime: runtime._invoke(("limit_probe_start",), body.digest),
+                      motion_command=True, require_active_lease=True)
+
+    @app.post("/api/v1/limit-module/{action}")
+    def limit_module_action(action: Literal["preview", "start"], body: LimitModuleRequest, request: Request,
+                            x_rp1_client_id: str | None = Header(default=None),
+                            x_rp1_operator_token: str | None = Header(default=None)):
+        require_limit_runtime(request, x_rp1_client_id, x_rp1_operator_token)
+        payload = body.model_dump(exclude={"digest", "confirmed"} if action == "preview" else set())
+        return mutate(request, x_rp1_client_id, x_rp1_operator_token,
+                      lambda runtime: runtime._invoke(("limit_module_" + action,), **payload),
+                      motion_command=action == "start", require_active_lease=True)
 
     @app.post("/api/v1/manual/move")
     def manual_move(

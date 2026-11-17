@@ -305,3 +305,25 @@ class QuickStartRequest(BaseModel):
         if self.completion_mode == "mujoco_hanging" and not self.parking_pose_confirmed:
             raise ValueError("请先确认 MuJoCo 停放姿态适用于当前设备且可安全撤力")
         return self
+
+
+class LimitProbeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    limb: Literal["left_short_leg", "right_short_leg"]
+    joint: str = Field(min_length=1, max_length=100)
+    direction: Literal[-1, 1]
+    serial: str = Field(min_length=1, max_length=120)
+    digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    confirmed: StrictBool = False
+
+
+class LimitProbeStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class LimitModuleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    serial: str = Field(min_length=1, max_length=120)
+    digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    confirmed: StrictBool = False

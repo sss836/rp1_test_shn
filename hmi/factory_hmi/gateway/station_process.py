@@ -31,6 +31,8 @@ _CONTROL = frozenset({
     "connect", "discover_motors", "enable_motors", "disable_motors", "disconnect",
     "request_motor_version_refresh",
     "import_trajectory", "arm", "start", "pause", "resume", "finish", "stop", "disable",
+    "limit_probe_preview", "limit_probe_reset", "limit_probe_start",
+    "limit_module_preview", "limit_module_start",
     "prepare_next_run", "manual_move", "manual_stop", "reset", "reset_motor_fault",
     "zero_motor", "zero_all_motors", "zero_prepare", "zero_read", "zero_confirm", "zero_skip", "zero_abort",
 })
@@ -42,7 +44,7 @@ _RECORDS = frozenset({
     "adopt_platform_execution_code", "preview_record_identity",
 })
 _READS = frozenset({"snapshot", "display_snapshot", "collect_display_snapshot", "can_status", "can_interfaces",
-                   "maintenance_targets", "maintenance_ready", "motor_version_refresh_status"})
+                   "maintenance_targets", "maintenance_ready", "motor_version_refresh_status", "limit_probe_status"})
 _SAFETY = frozenset({"request_motion_stop", "protective_damping_snapshot"})
 _LEASE = frozenset({"claim", "refresh", "release", "snapshot", "expired"})
 _MAX_MESSAGE = 32 * 1024 * 1024
@@ -268,6 +270,12 @@ def _run_station(channels, ready, data_root, report_root, outbox_path, lease_tim
                         raise LeaseConflict("工位控制租约已失效")
                     if runtime._cleanup_error is not None or transport is not None:
                         raise LeaseConflict("工位正在清理或维护")
+                    probe = service._limit_probe
+                    if probe is not None and probe.active and name not in {
+                            "limit_probe_start", "disable", "disable_motors", "disconnect"}:
+                        raise LeaseConflict("限位试点独占工位，先中止并复核状态")
+                    if name in {"limit_probe_reset", "limit_probe_start", "limit_module_start"} and not owns_current_can():
+                        raise LeaseConflict("限位试点缺少当前工位的 CAN 独占")
                     if name == "configure":
                         previous = set(can_claims)
                         if previous and any(row["up"] for row in service.can_status()["interfaces"]):

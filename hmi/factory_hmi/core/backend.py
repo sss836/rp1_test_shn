@@ -1008,6 +1008,26 @@ class MotorsPyBackend(MotorBackend):
             if pending:
                 time.sleep(0.001)
 
+    def limit_probe_samples(self) -> list[MotorSample]:
+        """No response-counter fallback for hard-stop inspection."""
+        with self._lock:
+            self._require_enabled()
+            before = [self._feedback_count(entry, motor)
+                      for entry, motor in zip(self.entries, self._motors, strict=True)]
+            if any(value is None for value in before):
+                raise MotorSafetyError("限位试点需要每台电机可验证的原生收帧序号")
+            rows = self._read_samples_impl()
+            after = [self._feedback_count(entry, motor)
+                     for entry, motor in zip(self.entries, self._motors, strict=True)]
+            if before != after:
+                return []  # RX raced the sample read. The caller retries without commanding.
+            for row in rows:
+                if (row.lro_protocol_profile not in {"legacy", "v1.03"}
+                        or row.torque_source not in {"drive_reported", "device_kt_times_iq"}
+                        or not math.isfinite(row.torque_nm)):
+                    raise MotorSafetyError("限位检查未取得确认的协议和实际力矩来源")
+            return rows
+
     def _read_samples_impl(self) -> list[MotorSample]:
         now = time.monotonic()
         result: list[MotorSample] = []

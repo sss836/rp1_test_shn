@@ -789,6 +789,10 @@ class FactoryController:
         This only cancels an existing operation. It never enables, clears errors,
         or starts motion; the caller still executes its normal disable command.
         """
+        from .live_limit_probe import ProbeWorker
+        if isinstance(self._manual, ProbeWorker):
+            self._manual.request_stop()
+            return True
         playback = self._playback
         if playback is not None and playback.running:
             playback._stop_event.set()
@@ -853,6 +857,10 @@ class FactoryController:
                         if not playback.wait(2):raise TimeoutError('playback did not stop for protective damping')
                 self._stop_manual_session()
                 self._stop_position_hold()
+                # A supported limit fixture requests disable on cancellation.
+                # Do not re-enter damping after that owner has disabled the drive.
+                if not self.backend.motors_enabled:
+                    return None
                 def observe(samples):
                     with self._lock:self._last_samples = samples
                     self.telemetry_hub.publish(samples)
@@ -1348,9 +1356,11 @@ class FactoryController:
     def _stop_manual_session(self) -> ManualControlSession | None:
         with self._lock:
             manual = self._manual
-            self._manual = None
         if manual is not None:
             manual.stop()
+            with self._lock:
+                if self._manual is manual:
+                    self._manual = None
         return manual
 
     def _on_manual_fault(

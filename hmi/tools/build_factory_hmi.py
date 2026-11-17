@@ -82,6 +82,9 @@ def build(target: str, *, one_dir: bool, motors_py: Path | None) -> None:
     if target == "gateway":
         validate_preview_assets = runpy.run_path(str(ROOT / "factory_hmi/preview_assets.py"))["validate_preview_assets"]
         validate_preview_assets(ROOT / "factory_hmi/resources/local-preview")
+    if target == "desktop":
+        verify_limit_bundle = runpy.run_path(str(ROOT / "factory_hmi/limit_replay_assets.py"))["verify_bundle"]
+        verify_limit_bundle(ROOT / "factory_hmi/resources/limit-replay")
     if importlib.util.find_spec("PyInstaller") is None:
         raise SystemExit('PyInstaller is missing; run: python -m pip install -e ".[build]"')
     if target == "desktop" and importlib.util.find_spec("PySide6") is None:
@@ -156,6 +159,8 @@ def build(target: str, *, one_dir: bool, motors_py: Path | None) -> None:
     if target == "desktop":
         command.extend(
             [
+                "--add-data",
+                f"{ROOT / 'factory_hmi/resources/limit-replay'}{os.pathsep}factory_hmi/resources/limit-replay",
                 "--add-data",
                 (
                     f"{ROOT / 'factory_hmi' / 'desktop' / 'assets'}"

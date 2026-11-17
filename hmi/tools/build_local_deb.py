@@ -24,6 +24,9 @@ def ignored(_directory: str, names: list[str]) -> set[str]:
     if quick_resources:
         manifest = json.loads((Path(_directory) / "manifest.json").read_text())
         approved_npz = {item["file"] for item in manifest["trajectories"]}
+    elif Path(_directory).resolve() == (SOURCE / "factory_hmi/resources/limit-replay").resolve():
+        manifest = json.loads((Path(_directory) / "manifest.json").read_text())
+        approved_npz = {item["npz"]["file"] for item in manifest.values()}
     return {name for name in names if name in {"__pycache__", ".venv", "secrets", "factory_data", "build", "dist"}
             or name.startswith(".env") or name.endswith((".pyc", ".csv", ".npy", ".sqlite", ".db", ".key"))
             or (name.endswith(".npz") and name not in approved_npz)}
@@ -95,6 +98,8 @@ def main() -> None:
         path = (quick_root / item["file"]).resolve(strict=True)
         if path.parent != quick_root.resolve() or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
             raise RuntimeError(f"Built-in trajectory does not match its manifest: {item['file']}")
+    verify_limit_bundle = runpy.run_path(str(SOURCE / "factory_hmi/limit_replay_assets.py"))["verify_bundle"]
+    limit_replays = verify_limit_bundle(SOURCE / "factory_hmi/resources/limit-replay")
     # Reject incompatible SDK/library bundles before assembling an installable package.
     verify_command = [sys.executable, str(SOURCE / "tools/verify_native_sdk.py"), "--runtime-dir", str(runtime)]
     if args.native_provenance:
@@ -116,6 +121,7 @@ def main() -> None:
     target_source = app / "hmi"
     for directory in ("factory_hmi", "scripts"):
         shutil.copytree(SOURCE / directory, target_source / directory, ignore=ignored)
+    verify_limit_bundle(target_source / "factory_hmi/resources/limit-replay")
     validate_preview_assets(target_source / "factory_hmi/resources/local-preview")
     verify_motor_bundle(target_source / "factory_hmi/resources/motor-maintenance")
     # Production protocol scripts shipped with the HMI for offline maintenance.
@@ -128,8 +134,10 @@ def main() -> None:
                  "WAISTHIP_SUPPORT.md", "UBUNTU22_DEPLOYMENT.md", "LONG_RUN_SAFETY.md",
                  "MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md",
                  "MODULE_FIRMWARE_MAINTENANCE.md", "MODULE_PARAMETERS.md", "MOTOR_MAINTENANCE_OFFLINE_20261112.md", "PLC_HMI_LRO_108_109.md",
-                 "TORQUE_ESTIMATION_3.0.31.md", "OFFLINE_MOTOR_BUNDLE_3.0.32.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
+                 "TORQUE_ESTIMATION_3.0.31.md", "OFFLINE_MOTOR_BUNDLE_3.0.32.md", "LIVE_LIMIT_PROBE_PILOT.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, target_source / "docs" / name)
+    shutil.copy2(SOURCE / "docs/CONTINUOUS_LIMIT_REPLAY.md", target_source / "docs/CONTINUOUS_LIMIT_REPLAY.md")
+    shutil.copy2(SOURCE / "docs/MODULE_LIMIT_CONTROL.md", target_source / "docs/MODULE_LIMIT_CONTROL.md")
     (target_source / "config/examples").mkdir(parents=True)
     shutil.copy2(SOURCE / "config/examples/motion_completion.unverified.yaml",
                  target_source / "config/examples/motion_completion.unverified.yaml")
@@ -195,10 +203,13 @@ def main() -> None:
     shutil.copy2(SOURCE / "docs/LOCAL_CONTROL_BUILD.md", doc / "README.zh_CN.md")
     shutil.copy2(SOURCE / "docs/UBUNTU22_DEPLOYMENT.md", doc)
     shutil.copy2(SOURCE / "docs/LONG_RUN_SAFETY.md", doc)
-    for name in ("MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md", "TORQUE_ESTIMATION_3.0.31.md", "OFFLINE_MOTOR_BUNDLE_3.0.32.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
+    for name in ("MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md", "TORQUE_ESTIMATION_3.0.31.md", "OFFLINE_MOTOR_BUNDLE_3.0.32.md", "LIVE_LIMIT_PROBE_PILOT.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, doc / name)
     examples = doc / "examples"
     examples.mkdir()
+    shutil.copytree(SOURCE / "config/examples/limit-profiles", examples / "limit-profiles")
+    for name in ("MODULE_LIMIT_CONTROL.md", "CONTINUOUS_LIMIT_REPLAY.md"):
+        shutil.copy2(SOURCE / "docs" / name, doc / name)
     for name in ("10-rp1-test-hmi-local-admin.pkla", "49-rp1-test-hmi-local-admin.rules"):
         shutil.copy2(SOURCE / "packaging" / name, examples / name)
     for path in app.rglob("*"):
@@ -263,7 +274,7 @@ Description: RP1 Modbus TCP PLC and physical SocketCAN HMI
               "depends_profile": args.depends_profile, "bundled_python": bool(args.python_binary),
               "bundled_stdlib": bool(args.python_stdlib), "runtime_file_count": len(runtime_manifest),
               "compression_level": args.compression_level, "preview_assets": preview_files,
-              "native_sdk_load_check": native_sdk, "platform_url": platform_url,
+              "native_sdk_load_check": native_sdk, "platform_url": platform_url, "limit_replays": limit_replays,
               "motor_assets": {"models": sorted(r["model"] for r in motor_assets["releases"]),
                                "bundle_sha256": hashlib.sha256((SOURCE / "factory_hmi/resources/motor-maintenance/bundle.json").read_bytes()).hexdigest(),
                                "device_writes": False}}
