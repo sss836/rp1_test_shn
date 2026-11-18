@@ -179,6 +179,7 @@ def number(value, *, signed=True):
 
 def search_attempt_tooltip(attempts):
     reasons = {"actual_travel": "实测到达行程边界", "command_travel": "指令到达行程边界",
+               "feedback_stall": "关节停滞，增载证据不足",
                "contact": "检出止挡"}
     return "\n".join(
         f"第 {row['attempt']} 次 · {reasons.get(row.get('end_reason'), '搜索结束')}\n"
@@ -316,7 +317,8 @@ def render_pose_status(panel, s, *, online, pending, serial):
             "搜索中" if is_current and active and phase == "search" else "处理中" if is_current and active else
             "未检查" if phase == "aborted" else "待检查")
         if result and result.get("search_extension") and result.get("outcome") == "not_detected":
-            outcome = "行程到界 · 止挡待确认"
+            outcome = ("推进停滞 · 止挡待确认" if result.get("search_end_reason") == "feedback_stall"
+                       else "行程到界 · 止挡待确认")
         tone = "#157452" if result and result.get("outcome") == "within_reference" else (
             "#b45309" if result else "#2367c4" if is_current and active else "#7a8799")
         result = result or {}

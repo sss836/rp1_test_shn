@@ -14,8 +14,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from factory_hmi.limit_replay_assets import PRESET_KEYS, RESOURCE_ROOT, read_manifest, verified_asset
 from .limit_block_check import Coordinates, FeedbackError, SETTINGS
-from .live_limit_probe import (POS_VEC, PROFILE_ROOT, VEC, PositionMove, PositionSettling, ProbeCycle, ProbePoint, ProbeWorker,
-                               _sha, check_torque, point_description, read_site_profile, station_sha)
+from .live_limit_probe import (MEASURED_SEARCH_MARGIN_DEG, POS_VEC, PROFILE_ROOT, VEC, PositionMove,
+                               PositionSettling, ProbeCycle, ProbePoint, ProbeWorker, _sha, check_torque,
+                               point_description, read_site_profile, station_sha)
 
 
 class ScheduledPoint(BaseModel):
@@ -135,9 +136,9 @@ def validate_module_plan(config, profile, serial, config_revision):
     if config.limb not in PRESET_KEYS or profile.limb != config.limb or profile.station_sha256 != station_sha(config):
         raise ValueError("模块或电机映射与核定的工位方案不一致")
     coords = Coordinates(config, include_waist_holds=True)
-    expected = {(d.joint, d.sign) for d in coords.directions}
+    directions = {(d.joint, d.sign): d for d in coords.directions}
     submitted = {(row.point.joint, row.point.direction) for row in profile.windows}
-    if submitted != expected or len(profile.windows) != len(expected):
+    if submitted != directions.keys() or len(profile.windows) != len(directions):
         raise ValueError("整模块方案须覆盖该模块的全部上下限，每个方向一次")
     if profile.use_builtin_trajectory and profile.use_builtin_order:
         raise ValueError("检查顺序与轨迹转场不能同时启用")
@@ -146,12 +147,18 @@ def validate_module_plan(config, profile, serial, config_revision):
     # Every whole-module inspection uses the same feedback-driven executor.
     # Keep fixture geometry, order, gains and torque budgets; do not copy an
     # arm pose onto legs or waist. The historic field name stays wire-compatible.
-    profile = profile.model_copy(update={
-        "transfer_speed_deg_s": 20.,
-        "windows": tuple(window.model_copy(update={
-            "point": ProbePoint.model_validate({**window.point.model_dump(),
-                "full_range_search": True, "search_speed_deg_s": 10.,
-                "positioning_speed_deg_s": 20.})}) for window in profile.windows)})
+    windows = []
+    for window in profile.windows:
+        point = window.point
+        direction = directions[(point.joint, point.direction)]
+        data = point.model_dump()
+        if point.search_extension is None:
+            data["search_extension"] = {
+                "actual_limit_deg": direction.reference_deg + direction.sign * MEASURED_SEARCH_MARGIN_DEG,
+            }
+        data.update(full_range_search=True, search_speed_deg_s=10., positioning_speed_deg_s=20.)
+        windows.append(window.model_copy(update={"point": ProbePoint.model_validate(data)}))
+    profile = profile.model_copy(update={"transfer_speed_deg_s": 20., "windows": tuple(windows)})
     descriptions = [point_description(config, profile, w.point, coords=coords) for w in profile.windows]
     hips = profile.waist_hip_hold_bounds_deg
     if hips is not None and (coords.station.limb != "waist_hip" or len(profile.home_deg) != 4 or not all(
@@ -173,8 +180,7 @@ def validate_module_plan(config, profile, serial, config_revision):
                "limb": config.limb, "station_sha256": profile.station_sha256, "config_revision": config_revision,
                "windows": descriptions, "joint_names": list(coords.names),
                "transfer_speed_deg_s": profile.transfer_speed,
-               "runtime_policy": "all-module-feedback-extension-v1" if any(w.point.search_extension for w in profile.windows)
-               else "all-module-feedback-v1",
+               "runtime_policy": "all-module-feedback-extension-v1",
                "execution_mode": "feedback_limit_search",
                "order_source": "builtin_order_only" if profile.use_builtin_order else "profile_or_legacy_route",
                "startup_action": "move_to_joint_zero" if all(v == 0 for v in profile.home_deg)
@@ -195,8 +201,10 @@ def path_segments(profile, names):
             search_end[axis] += point.direction * point.permitted_travel_deg
         else:
             extension = point.search_extension
-            search_end[axis] = max((extension.actual_limit_deg, extension.command_limit_deg),
-                                   key=lambda angle: point.direction * angle)
+            search_end[axis] = extension.actual_limit_deg
+            if extension.command_limit_deg is not None:
+                search_end[axis] = max((search_end[axis], extension.command_limit_deg),
+                                       key=lambda angle: point.direction * angle)
         yield point.search_pose_deg, search_end
         previous = point.search_pose_deg
     route = (previous, *profile.return_via_deg, profile.home_deg)

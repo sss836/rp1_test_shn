@@ -37,7 +37,7 @@ def test_missing_external_file_uses_each_modules_actual_builtin_entry(limb, monk
     monkeypatch.setattr(module_limit_check, "PROFILE_ROOT", tmp_path/"no-site-directory")
     coords, profile, context = module_limit_check.load_module_plan(nominal_station(limb), "MISSING-SITE", "1")
     assert profile.source == "builtin_reference" and profile.limb == limb
-    assert context["runtime_policy"] == "all-module-feedback-v1"
+    assert context["runtime_policy"] == "all-module-feedback-extension-v1"
     assert len(profile.windows) == (4 if limb == "waist_hip" else 2*len(coords.names))
 
 
@@ -223,10 +223,11 @@ def test_all_module_policy_uses_same_executor_and_preserves_fixture_and_limits(l
     coords, profile, _ = commissioned(limb)
     original = profile.model_copy(update={"transfer_speed_deg_s": 5., "windows": tuple(
         window.model_copy(update={"point": ProbePoint.model_validate({**window.point.model_dump(),
-            "full_range_search": False, "search_speed_deg_s": 1., "positioning_speed_deg_s": 5.})})
+            "full_range_search": False, "search_extension": None, "search_speed_deg_s": 1.,
+            "positioning_speed_deg_s": 5.})})
         for window in profile.windows)})
     _, effective, context = validate_module_plan(coords.station, original, "ALL-MODULE", "1")
-    assert context["runtime_policy"] == "all-module-feedback-v1"
+    assert context["runtime_policy"] == "all-module-feedback-extension-v1"
     assert effective.transfer_speed == 20. and original.transfer_speed == 5.
     assert effective.home_deg == original.home_deg
     assert effective.entry_via_deg == original.entry_via_deg

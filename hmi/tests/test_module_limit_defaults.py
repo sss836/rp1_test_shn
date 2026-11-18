@@ -12,7 +12,8 @@ import pytest
 from factory_hmi.core import module_limit_defaults as defaults
 from factory_hmi.core.limit_block_check import Coordinates, nominal_station
 from factory_hmi.core.live_limit_probe import station_sha
-from factory_hmi.core.module_limit_check import ModuleCycle, validate_module_plan
+from factory_hmi.core.module_limit_check import ModuleCycle, path_segments, validate_module_plan
+from factory_hmi.core.service import FactoryService
 from factory_hmi.core.production_parameters import load_script
 from factory_hmi.limit_replay_assets import PRESET_KEYS
 
@@ -41,12 +42,15 @@ def test_every_module_has_complete_named_feedback_defaults(limb):
         assert p.positioning_speed_deg_s == 20.
         assert p.staging_pose_deg == p.search_pose_deg and p.search_pose_deg[a] == 0.
         assert p.permitted_travel_deg == pytest.approx(p.direction*d.reference_deg+2.9)
+        assert p.search_extension.actual_limit_deg == pytest.approx(d.reference_deg + 10.*d.sign)
+        assert p.search_extension.command_limit_deg is None
         assert p.contact_floor_nm == p.contact_rise_nm == .5
         assert (p.reset_kp_scale, p.reset_kd_scale, p.search_kp_scale, p.search_kd_scale) == (1.,)*4
         assert tuple(p.motor_abort_nm) == tuple(min(35., script.MODEL_PARAMS[e.motor_model]['tau_max'])
                                                for e in coords.entries)
         assert tuple(p.joint_abort_nm) == tuple(p.motor_abort_nm)
         assert "station_cap_and_production_range" in profile.torque_limit_source
+    FactoryService._check_probe_path(coords, lambda *_: None, path_segments(profile, coords.names))
     if limb not in {"left_arm", "left_short_arm"}:
         assert profile.revision == "all-module-feedback-v1"
         np.testing.assert_allclose(profile.home_deg, np.rad2deg(coords.home))

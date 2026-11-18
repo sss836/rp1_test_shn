@@ -85,6 +85,7 @@ class FeedbackLimitSearch:
         self.c = cycle
         self.attempt = 1
         self.extension = cycle.point.search_extension
+        self.command_limit = None
         self.extending = False
         self.attempt_limit = (2 if self.extension is None and cycle.coords.station.limb == "left_arm" and
                               (cycle.point.joint, cycle.point.direction) in WRIST_RECHECK_DIRECTIONS else 1)
@@ -92,7 +93,8 @@ class FeedbackLimitSearch:
             origin = math.degrees(cycle.start[cycle.axis])
             sign = cycle.point.direction
             self.actual_limit = sign * (self.extension.actual_limit_deg - origin)
-            self.command_limit = sign * (self.extension.command_limit_deg - origin)
+            if self.extension.command_limit_deg is not None:
+                self.command_limit = sign * (self.extension.command_limit_deg - origin)
         self.attempts = []
         self.initial_loads = deque()
         self.hold_since = None
@@ -152,13 +154,22 @@ class FeedbackLimitSearch:
                 # Independently stop advancing at the actual travel envelope.
                 command_cap = cap + c.window.load_offset_deg
                 progress = s*math.degrees(c.target[a]-c.start[a])
+                hold_reason = "command_travel"
                 if self.extension is not None:
                     if travel >= cap or progress >= command_cap-1e-9:
                         self.extending = True
                     if self.extending:
-                        cap = self.actual_limit-p.motor_step_deg
-                        command_cap = self.command_limit
-                    else:
+                        if self.command_limit is None:
+                            cap = self.actual_limit
+                            # Follow the measured motion. If it stalls, finish
+                            # one contact window with bounded additional lead.
+                            contact_lead = p.contact_speed_deg_s * (SETTINGS.stall_s + .2)
+                            command_cap = min(cap, travel + contact_lead) + max(0., c.window.load_offset_deg)
+                            hold_reason = "feedback_stall"
+                        else:
+                            cap = self.actual_limit-p.motor_step_deg
+                            command_cap = self.command_limit
+                    elif self.command_limit is not None:
                         command_cap = min(command_cap, self.command_limit)
                 remaining = s*(c.direction.reference_deg-angle)
                 speed = p.contact_speed_deg_s if remaining <= 6. or (
@@ -168,10 +179,11 @@ class FeedbackLimitSearch:
                 proposed = max(progress, min(command_cap, progress+dt*speed))
                 # Re-evaluate on every fresh measurement. A changing measured
                 # load offset must not latch an irreversible end-of-search state.
-                bounded = travel >= cap or proposed <= progress+1e-9
+                at_boundary = travel >= cap-1e-9
+                bounded = at_boundary or proposed <= progress+1e-9
                 if bounded:
                     if self.hold_since is None:
-                        self.cap_reason = "actual_travel" if travel >= cap else "command_travel"
+                        self.cap_reason = "actual_travel" if at_boundary else hold_reason
                         self.hold_since = now
                     # A final stationary command still supplies pressure. Finish
                     # the same contact window before declaring no stop found.
@@ -223,7 +235,7 @@ class FeedbackLimitSearch:
 
     def _begin_retreat(self, now, q, torque):
         c, p = self.c, self.c.point
-        if self.attempt_limit > 1:
+        if self.attempt_limit > 1 or self.extension is not None:
             self.attempts.append({"attempt": self.attempt,
                                   "end_reason": "contact" if c.candidate else self.cap_reason,
                                   "search_end_actual_deg": math.degrees(q[c.axis]),

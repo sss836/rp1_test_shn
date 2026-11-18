@@ -37,11 +37,14 @@ def extension_fixture(direction, *, origin_deg=0., site=True):
     return station, document, index
 
 
-def extension_cycle(direction, *, origin_deg=0.):
+def extension_cycle(direction, *, origin_deg=0., automatic=False):
     station, document, index = extension_fixture(direction, origin_deg=origin_deg)
+    if automatic:
+        document["windows"][index]["point"].pop("search_extension")
     coords, profile, _ = validate_module_plan(station, ModuleProfile.model_validate(document), "MOCK", "offline")
     point = next(w.point for w in profile.windows if (w.point.joint, w.point.direction) == direction)
-    assert point == ProbePoint.model_validate(document["windows"][index]["point"])
+    if not automatic:
+        assert point == ProbePoint.model_validate(document["windows"][index]["point"])
     return ProbeCycle(coords, point, np.deg2rad(point.search_pose_deg), 1.)
 
 
@@ -49,7 +52,7 @@ def drive_cycle(cycle, *, stop=None, lag_deg=0., incident=None):
     axis, sign = cycle.axis, cycle.point.direction
     point = cycle.point
     soft = sign * point.search_pose_deg[axis] + point.permitted_travel_deg
-    command_cap = sign * point.search_extension.command_limit_deg
+    command_end = point.search_extension.command_limit_deg
     trace = []
     for step in range(1, 1500):
         phase = cycle.phase
@@ -63,6 +66,8 @@ def drive_cycle(cycle, *, stop=None, lag_deg=0., incident=None):
             if stop is not None and actual >= stop:
                 actual = stop
                 joint_torque[axis] = motor_torque[axis] = 2.
+            if phase == "search" and incident == "stalled":
+                actual = min(actual, soft + 2.)
             if phase == "retreat" and incident == "retreat_overrun":
                 actual = sign * point.search_extension.actual_limit_deg + .1
             if phase == "search" and directed_target_deg > soft + .3:
@@ -78,7 +83,8 @@ def drive_cycle(cycle, *, stop=None, lag_deg=0., incident=None):
         if cycle.phase == "ready":
             cycle.start_search(now)
         next_target_deg = sign * math.degrees(cycle.target[axis])
-        assert next_target_deg <= command_cap + 1e-7
+        if command_end is not None:
+            assert next_target_deg <= sign * command_end + 1e-7
         np.testing.assert_array_equal(np.delete(cycle.target, axis), np.zeros(6))
         trace.append((phase, directed_target_deg, sign * math.degrees(q[axis]), next_target_deg))
         if cycle.result is not None:
@@ -137,6 +143,35 @@ def test_hard_actual_guard_remains_in_force_while_unloading():
         drive_cycle(cycle, stop=cycle.point.permitted_travel_deg + 3., incident="retreat_overrun")
     assert cycle.phase == "retreat"
     assert cycle.candidate is not None and cycle.result is None
+
+
+@pytest.mark.parametrize("direction,measured_limit", [(YAW_LOWER, -95.), (PITCH_UPPER, 80.)])
+def test_automatic_extension_uses_signed_reference_margin_and_no_fixed_command(direction, measured_limit):
+    cycle = extension_cycle(direction, automatic=True)
+    assert cycle.point.search_extension.actual_limit_deg == measured_limit
+    assert cycle.point.search_extension.command_limit_deg is None
+    stop = abs(measured_limit) - 2.
+    result, trace = drive_cycle(cycle, stop=stop, lag_deg=3.)
+    assert result["actual_deg"] == pytest.approx(direction[1] * stop)
+    assert result["search_end_reason"] == "contact"
+    assert len(result["search_attempts"]) == 1
+    assert max(row[1] for row in trace if row[0] == "search") > abs(measured_limit)
+
+
+def test_automatic_extension_stops_at_measured_boundary_without_a_stop_angle():
+    cycle = extension_cycle(YAW_LOWER, automatic=True)
+    result, _ = drive_cycle(cycle)
+    assert result["search_end_reason"] == "actual_travel"
+    assert "actual_deg" not in result
+    assert result["search_attempts"][0]["search_end_actual_deg"] == pytest.approx(-95.)
+
+
+def test_automatic_extension_does_not_push_indefinitely_on_stale_position():
+    cycle = extension_cycle(PITCH_UPPER, automatic=True)
+    result, trace = drive_cycle(cycle, incident="stalled")
+    assert result["search_end_reason"] == "feedback_stall"
+    assert "actual_deg" not in result
+    assert max(row[1] for row in trace if row[0] == "search") < 80.
 
 
 def test_extension_uses_only_site_profile_and_preflights_both_endpoints():

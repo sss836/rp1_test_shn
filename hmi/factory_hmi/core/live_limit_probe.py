@@ -24,12 +24,14 @@ PROFILE_ROOT = Path("/etc/rp1-factory-hmi/limit-probe.d")
 POS = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 VEC = Annotated[tuple[Annotated[float, Field(allow_inf_nan=False)], ...], Field(min_length=2, max_length=7)]
 POS_VEC = Annotated[tuple[POS, ...], Field(min_length=2, max_length=7)]
+MEASURED_SEARCH_MARGIN_DEG = 10.
 
 
 class SearchExtension(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
     actual_limit_deg: float
-    command_limit_deg: float
+    # Explicit endpoints remain readable for already commissioned v3.0.35 profiles.
+    command_limit_deg: float | None = None
 
 
 class ProbePoint(BaseModel):
@@ -166,14 +168,19 @@ def point_description(config, profile, point, *, coords=None):
     if reference_travel <= 0 or not min_beyond < beyond <= 3.0 + 1e-8:
         raise ValueError("搜索起点须在参考位置内侧，参考外指令预算须可容纳判定窗口且不超过 3°")
     if point.search_extension is not None:
-        if getattr(profile, "source", None) != "site" or not profile.approved_by:
-            raise ValueError("延伸搜索须使用核定的整模块工位方案")
         extension = point.search_extension
         actual_travel = sign * (extension.actual_limit_deg - start[index])
-        command_travel = sign * (extension.command_limit_deg - start[index])
-        if not (point.permitted_travel_deg + point.motor_step_deg < actual_travel <= 360.
-                and point.permitted_travel_deg < command_travel <= 360.):
-            raise ValueError("延伸搜索实测边界须留出单步余量，目标边界须沿本方向越过普通行程")
+        if not point.permitted_travel_deg + point.motor_step_deg < actual_travel <= 360.:
+            raise ValueError("延伸搜索实测边界须沿本方向越过普通行程")
+        if extension.command_limit_deg is None:
+            if not math.isclose(actual_travel-reference_travel, MEASURED_SEARCH_MARGIN_DEG, abs_tol=1e-8):
+                raise ValueError("自动延伸的实测边界须为参考角沿搜索方向外移 10°")
+        else:
+            if getattr(profile, "source", None) != "site" or not profile.approved_by:
+                raise ValueError("固定延伸目标只适用于已核定的整模块工位方案")
+            command_travel = sign * (extension.command_limit_deg - start[index])
+            if not point.permitted_travel_deg < command_travel <= 360.:
+                raise ValueError("延伸搜索目标边界须沿本方向越过普通行程")
     if not point.full_range_search and reference_travel + 1e-8 < point.retreat_deg:
         raise ValueError(f"{direction.label} {direction.label_direction} 的搜索起点距参考角 "
                          f"{reference_travel:.3g}°，不足以缓退 {point.retreat_deg:g}°")
