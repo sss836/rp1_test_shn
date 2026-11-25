@@ -11,6 +11,7 @@ import threading
 import uuid
 import time
 import inspect
+import logging
 from functools import wraps
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ from .config import load_station_config, require_supported_limb
 from .controller import FactoryController
 from .command_receipts import StartReceipts
 from .motion_completion import automatic_completion_parameters
+from .module_preflight import ModulePreflight, Preparation, check_bounds, check_path, validate_entry
 from .identity import build_execution_code, build_local_execution_code
 from .report import ReportManager, ReportResult
 from .zeroing import MotorZeroingSession
@@ -91,6 +93,7 @@ class FactoryService:
         self._controller: FactoryController | None = None
         self._limit_probe = None
         self._module_limit_digest: str | None = None
+        self._module_preflight = ModulePreflight()
         self._zeroing: MotorZeroingSession | None = None
         self._backend_name: str | None = None
         self._config_path: Path | None = None
@@ -213,6 +216,7 @@ class FactoryService:
             with self._lock:
                 self._closing.set()
                 controller = self._controller
+            self._module_preflight.close()
             for task in self.maintenance_tasks():
                 task.cancel(timeout)
             disconnect_error = None
@@ -355,6 +359,12 @@ class FactoryService:
             self._can_interfaces = can_interfaces
             self._can_bindings = normalized_bindings
             self._fake_can_connected = False
+            self._module_preflight.clear()
+            if backend == "motors_py":
+                from factory_hmi.limit_replay_assets import PRESET_KEYS
+                if limb in PRESET_KEYS:
+                    # Optional warm-up while drives are still disconnected.
+                    self._module_preflight.warm(station_config, self._config_revision)
             return self.snapshot()
 
     @_open_service_operation
@@ -367,6 +377,7 @@ class FactoryService:
                 self._controller.disconnect()
             if self._can_interfaces:
                 self._disconnect_can_locked("清除工位配置")
+            self._module_preflight.clear()
             self._controller = None
             self._zeroing = None
             self._backend_name = None
@@ -816,11 +827,7 @@ class FactoryService:
         temperature_limit = controller._diagnosis.thresholds.overtemperature_c
 
         def bounds(q, motor):
-            for value, lower, upper in ((q, safety.joint_min_rad, safety.joint_max_rad),
-                                        (motor, safety.motor_min_rad, safety.motor_max_rad)):
-                if (not np.all(np.isfinite(value)) or lower is not None and np.any(value < lower)
-                        or upper is not None and np.any(value > upper)):
-                    raise FeedbackError("目标超出工位配置的位置边界")
+            check_bounds(safety, q, motor)
 
         def read():
             samples = backend.limit_probe_samples()
@@ -835,24 +842,20 @@ class FactoryService:
 
         return read, bounds, publish
 
-    @staticmethod
-    def _check_probe_path(coords, bounds, segments):
-        from .limit_block_check import FeedbackError
-        for begin, end in segments:
-            for degrees in np.linspace(begin, end, 121):
-                q = np.deg2rad(degrees)
-                motor = coords.motor_target(q)
-                bounds(q, motor)
-                coords.jacobian(q)
-                if np.max(abs(coords.joint_position(motor) - q)) > 1e-5:
-                    raise FeedbackError("核定轨迹的踝闭链支路不可逆")
+    _check_probe_path = staticmethod(check_path)
 
-    def _attach_probe_worker(self, controller, worker):
-        with controller._lock:
+    def _attach_probe_worker(self, controller, worker, preparation=None):
+        with controller._lock, self._module_preflight.guard:
+            if preparation is not None:
+                self._module_preflight.consume(preparation)
+            hold = controller._position_hold_thread
+            hold_stop = controller._position_hold_stop if hold and hold.is_alive() else None
+            generation = controller.backend.control_generation if preparation is None else preparation.generation
+            worker.take_over_hold(controller._position_dispatch_lock, hold_stop, generation)
             controller._manual = worker
         try:
-            controller._stop_position_hold()
-            controller.backend.refresh_feedback()
+            if hold_stop is None:
+                controller.backend.refresh_feedback()
             self._limit_probe = worker
             worker.start()
         except Exception:
@@ -875,8 +878,51 @@ class FactoryService:
         return controller, coords, profile, context
 
     @_open_service_operation
+    def limit_module_prepare(self, serial, preparation_id, lease_generation=None):
+        from .limit_block_check import Coordinates
+        controller = self.controller
+        if self._backend_name != "motors_py":
+            raise ValueError("请应用当前模块的真机配置")
+        planner = self._module_preflight
+        epoch = planner.epoch
+        self._require_probe_ready(controller)
+        generation = controller.backend.control_generation
+        job = planner.job
+        if job and job.id == preparation_id:
+            if (job.serial, job.revision, job.generation, job.lease_generation) != (
+                    serial, self._config_revision, generation, lease_generation):
+                raise ValueError("工位或样机已变化，请重新核对")
+            return self.limit_module_preparation(preparation_id)
+        coords = Coordinates(controller.config, include_waist_holds=True)
+        read, _, _ = self._probe_io(controller)
+        samples = read()
+        if not samples:
+            raise ValueError("当前逐电机反馈刷新中，请重试")
+        entry, _, _ = coords.decode(samples, time.monotonic(), ())
+        if job:
+            job.future.cancel()
+        self._module_limit_digest = None
+        future = planner.submit(controller.config, self._config_revision, serial, entry)
+        planner.register(Preparation(preparation_id, serial, self._config_revision, generation,
+                                     lease_generation, entry, future), epoch)
+        return self.limit_module_preparation(preparation_id)
+
+    def limit_module_preparation(self, preparation_id):
+        job = self._module_preflight.job
+        if job is None or job.id != preparation_id:
+            raise ValueError("本次预检已取消或已被替代")
+        if not job.future.done():
+            return {"preparing": True, "preparation_id": preparation_id}
+        try:
+            result, _ = job.future.result()
+        except Exception as exc:
+            raise ValueError(f"工位路径预检失败：{exc}") from exc
+        return {**result, "preparation_id": preparation_id}
+
+    @_open_service_operation
     def limit_module_preview(self, serial):
         from .module_limit_check import path_segments
+        self._module_preflight.clear()
         self._module_limit_digest = None
         controller, coords, profile, context = self._module_probe_spec(serial)
         _, bounds, _ = self._probe_io(controller)
@@ -885,10 +931,19 @@ class FactoryService:
         return context
 
     @_open_service_operation
-    def limit_module_start(self, serial, digest, confirmed):
-        from .module_limit_check import ModuleWorker, entry_poses, path_segments
+    def limit_module_start(self, serial, digest, confirmed, preparation_id=None, lease_generation=None):
+        from .module_limit_check import ModuleWorker, entry_poses
         controller, coords, profile, context = self._module_probe_spec(serial)
-        if not confirmed or digest != context["digest"] or digest != self._module_limit_digest:
+        epoch = self._module_preflight.epoch
+        job = self._module_preflight.job if preparation_id is not None else None
+        if preparation_id is not None:
+            plan = self.limit_module_preparation(preparation_id)
+            valid = (job is not None and not plan.get("preparing") and digest == plan["digest"]
+                     and job.generation == controller.backend.control_generation
+                     and job.lease_generation == lease_generation and job.revision == self._config_revision)
+        else:
+            valid = digest == self._module_limit_digest
+        if not confirmed or digest != context["digest"] or not valid:
             raise ValueError("模块、工装或方案已变化，请重新启动并核对")
         self._require_probe_ready(controller)
         read, bounds, publish = self._probe_io(controller)
@@ -897,20 +952,29 @@ class FactoryService:
             raise ValueError("当前逐电机反馈刷新中，请重试")
         now = time.monotonic()
         q, _, _ = coords.decode(samples, now, ())
-        poses = entry_poses(coords, profile, q)
-        segments = list(zip(poses, poses[1:]))
-        if controller.config.limb == "waist_hip":
-            # Preflight the actual held hip angles, including the following transfers.
-            for enter, leave in path_segments(profile, coords.names):
-                segments.append(((*enter[:2], *poses[0][2:]), (*leave[:2], *poses[0][2:])))
-        self._check_probe_path(coords, bounds, segments)
+        completion = None
+        if preparation_id is None:
+            poses = validate_entry(coords, profile, q, bounds)
+        else:
+            tolerance = min(w.point.following_error_deg for w in profile.windows)
+            if np.max(abs(np.rad2deg(q - job.entry))) > tolerance:
+                future = self._module_preflight.submit(controller.config, self._config_revision, serial, q)
+                updated = Preparation(job.id, serial, job.revision, job.generation, lease_generation, q, future)
+                self._module_preflight.register(updated, epoch)
+                return {"preparing": True, "preparation_id": job.id}
+            poses = entry_poses(coords, profile, q)
+            logging.getLogger(__name__).info("Pose check %s limb=%s preflight_ms=%s static_path_cached=%s",
+                preparation_id, coords.station.limb, plan["preflight_ms"], plan["static_path_cached"])
+            # Apply the same validated entry to the worker's first fresh frame.
+            q = job.entry
+            completion = job.arm_completion(controller.config)
         task = uuid.uuid4().hex
         context.update(check_id=task, started_at=datetime.now(timezone.utc).isoformat(),
                        entry_pose_deg=poses[0].tolist(), entry_target_deg=poses[-1].tolist())
         worker = ModuleWorker(controller.backend, coords, profile, context, read, bounds, publish,
-                              self.data_root / "limit-checks" / f"{task}.json", q)
+                              self.data_root / "limit-checks" / f"{task}.json", q, prepared_completion=completion)
         self._module_limit_digest = None  # A timed-out request or retry cannot start a second job.
-        return self._attach_probe_worker(controller, worker)
+        return self._attach_probe_worker(controller, worker, preparation=job)
 
     @_open_service_operation
     def limit_probe_start(self, digest):
@@ -942,6 +1006,7 @@ class FactoryService:
         return controller.enter_protective_damping(reason, kd=1.0)
 
     def disable_motors(self) -> dict[str, Any]:
+        self._module_preflight.clear()
         if any(t.active for t in self.maintenance_tasks()):
             for task in self.maintenance_tasks():
                 task.cancel()
@@ -951,6 +1016,7 @@ class FactoryService:
         return self.snapshot()
 
     def disconnect(self) -> dict[str, Any]:
+        self._module_preflight.clear()
         for task in self.maintenance_tasks():
             task.cancel()
         controller = self.controller
@@ -1736,6 +1802,7 @@ class FactoryService:
         return self.snapshot()
 
     def request_motion_stop(self) -> bool:
+        self._module_preflight.clear()
         # Do not take the controller's command lock: reset holds it while
         # returning. Signalling is cancellation-only and does not touch CAN.
         controller = self._controller

@@ -117,6 +117,7 @@ class FactoryController:
         self._shutdown_intent_guard = threading.RLock()
         self._protective_requests = 0
         self._shutdown_committed = False
+        self._position_dispatch_lock = threading.Lock()
         self._position_hold_stop = threading.Event()
         self._position_hold_thread: threading.Thread | None = None
         self._position_hold_target: np.ndarray | None = None
@@ -225,19 +226,21 @@ class FactoryController:
                 before = self._confirm_motor_feedback("before motor enable")
                 self._check_motor_positions(before)
                 self._check_motor_operation_cancelled()
-                self.backend.enable_motors()
+                handshake = self.backend.enable_motors()
+                first_deadline = self.backend.first_command_deadline
                 self._last_samples = self._confirm_motor_feedback(
-                    "after motor enable", baseline=before, updates=1, require_drive_enabled=True
+                    "after motor enable", baseline=before, updates=1, require_drive_enabled=True,
+                    initial_samples=handshake, deadline_s=first_deadline,
                 )
                 self._check_motor_positions(self._last_samples)
                 self._check_motor_operation_cancelled()
                 positions = np.asarray(
                     [sample.pos_rad for sample in self._last_samples], dtype=np.float64
                 )
-                self._fault = None
-                self._start_position_hold(positions)
+                self._start_position_hold(positions, self._last_samples, first_deadline)
             except Exception as exc:
-                self._set_fault(exc, samples=self._last_samples)
+                if self.state is not StationState.FAULT or not self._fault or self._fault.kind != "ControlTimeout":
+                    self._set_fault(exc, samples=self._last_samples)
                 raise
             finally:
                 self._motor_recovery_active.clear()
@@ -280,6 +283,8 @@ class FactoryController:
         timeout_s: float | None = None,
         poll_interval_s: float = 0.005,
         require_drive_enabled: bool = False,
+        initial_samples: list[MotorSample] | None = None,
+        deadline_s: float | None = None,
     ) -> list[MotorSample]:
         """Require new replies from every motor; cached zero errors cannot pass.
 
@@ -298,18 +303,30 @@ class FactoryController:
                   if timeout_s is None else timeout_s)
         started = time.monotonic()
         deadline = started + budget
+        if deadline_s is not None:
+            # Reserve one control period for submitting the measured-pose hold.
+            deadline = min(deadline, deadline_s - 1.0 / self.config.control_rate_hz)
         stale_seconds = self._diagnosis.thresholds.stale_seconds
         logger.info("Motor feedback confirmation started: phase=%s timeout_s=%.3f motors=%d",
-                    phase, budget, len(previous))
+                    phase, deadline - started, len(previous))
         while True:
             self._check_motor_operation_cancelled()
-            self.backend.refresh_feedback()
-            samples = self.backend.read_samples()
+            if initial_samples is None:
+                self.backend.refresh_feedback()
+                samples = self.backend.read_samples()
+            else:
+                now = time.monotonic()
+                samples = [row.with_feedback_age(now) for row in initial_samples]
+                initial_samples = None
             if len(samples) != len(previous):
                 raise FactoryControllerError(f"{phase}: feedback motor count changed during confirmation")
             self._last_samples = samples
             self.telemetry_hub.publish(samples)
             for index, sample in enumerate(samples):
+                entry = self.config.entries[index]
+                if require_drive_enabled and (sample.bus, sample.motor_id, sample.joint_name) != (
+                        entry.interface, entry.motor_id, entry.joint_name):
+                    raise FactoryControllerError(f"{phase}: unexpected feedback identity for {entry.interface}#{entry.motor_id}")
                 fresh = (
                     np.isfinite(sample.timestamp_s)
                     and sample.timestamp_s > 0
@@ -334,6 +351,10 @@ class FactoryController:
                         progress[index] = 0
                     stamps[index] = sample.timestamp_s
                     progress[index] = min(updates, progress[index] + 1)
+            if require_drive_enabled:
+                self.backend.pending_enable_motor_ids = tuple(
+                    sample.motor_id for sample, count in zip(samples, progress) if count < updates
+                )
             self._check_motor_operation_cancelled()
             now = time.monotonic()
             if now >= deadline:
@@ -1238,7 +1259,10 @@ class FactoryController:
                 raise FactoryControllerError("playback has not been started")
             return self._playback
 
-    def _start_position_hold(self, target: np.ndarray | list[float]) -> None:
+    def _start_position_hold(
+        self, target: np.ndarray | list[float],
+        confirmed: list[MotorSample] | None = None, first_deadline: float | None = None,
+    ) -> None:
         target_array = np.asarray(target, dtype=np.float64).reshape(-1)
         if target_array.shape != (len(self.config.entries),):
             raise ValueError(
@@ -1255,7 +1279,7 @@ class FactoryController:
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._position_hold_loop,
-            args=(target_array.copy(), stop_event),
+            args=(target_array.copy(), stop_event, confirmed, first_deadline, self.backend.control_generation),
             name=f"factory-position-hold-{self.config.limb}",
             daemon=True,
         )
@@ -1290,6 +1314,9 @@ class FactoryController:
         self,
         target: np.ndarray,
         stop_event: threading.Event,
+        confirmed: list[MotorSample] | None = None,
+        first_deadline: float | None = None,
+        generation: int | None = None,
     ) -> None:
         period = 1.0 / float(self.config.control_rate_hz)
         next_tick = time.monotonic()
@@ -1298,17 +1325,36 @@ class FactoryController:
         try:
             while not stop_event.is_set():
                 now = time.monotonic()
-                if now - last_sample_at >= 0.05:
+                if confirmed is not None:
+                    # The measured target is from this enable operation. Avoid
+                    # waiting for another CAN reply or the enabling RPC's lock.
+                    samples = [row.with_feedback_age(now) for row in confirmed]
+                    confirmed = None
+                    self._check_motor_feedback(samples, "initial position hold")
+                    feedback_deadline = min(row.timestamp_s for row in samples) + self._diagnosis.thresholds.stale_seconds
+                    first_deadline = min(first_deadline, feedback_deadline) if first_deadline is not None else feedback_deadline
+                elif now - last_sample_at >= 0.05:
                     samples = self.backend.read_samples()
                     self._check_motor_feedback(samples, "position hold")
-                    with self._lock:
-                        if self._position_hold_stop is stop_event:
-                            self._last_samples = samples
-                            self.telemetry_hub.publish(samples)
+                    # Slow snapshot readers may skip a display update. The
+                    # control loop still checks actual drive feedback above.
+                    if self._lock.acquire(blocking=False):
+                        try:
+                            if self._position_hold_stop is stop_event:
+                                self._last_samples = samples
+                                self.telemetry_hub.publish(samples)
+                        finally:
+                            self._lock.release()
                     last_sample_at = now
-                if stop_event.is_set():
-                    break
-                self.backend.command_mit(target)
+                with self._position_dispatch_lock:
+                    if stop_event.is_set():
+                        break
+                    if first_deadline is None:
+                        self.backend.command_mit(target)
+                    else:
+                        self.backend.command_mit(target, expected_generation=generation,
+                                                 dispatch_before=first_deadline, cancelled=stop_event)
+                        first_deadline = None
                 next_tick += period
                 delay = next_tick - time.monotonic()
                 if delay > 0.0:

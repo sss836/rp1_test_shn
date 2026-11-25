@@ -532,6 +532,12 @@ def test_pilot_routes_inspect_but_do_not_advance_fake_or_unauthorized_station(is
         assert start.status_code == 409, start.text
         preview_module = client.post("/api/v1/limit-module/preview", headers=local, json={"serial": "MOCK"})
         assert preview_module.status_code == 409 and "真机" in preview_module.text, preview_module.text
+        preparation_id = "1" * 32
+        prep = client.post("/api/v1/limit-module/preview", headers=local,
+                           json={"serial": "MOCK", "preparation_id": preparation_id})
+        assert prep.status_code == 409 and "真机" in prep.text, prep.text
+        poll = client.get("/api/v1/limit-probe", params={"preparation_id": preparation_id}, headers=local)
+        assert poll.status_code == 409 and "已取消" in poll.text, poll.text
         start_module = client.post("/api/v1/limit-module/start", headers=local, json=module_body)
         assert start_module.status_code == 409, start_module.text
         status = client.get("/api/v1/limit-probe", headers=local).json()["result"]

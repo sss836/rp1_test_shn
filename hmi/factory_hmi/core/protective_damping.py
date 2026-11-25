@@ -31,14 +31,26 @@ class ProtectiveDamping:
     def start(self):
         with self._lifecycle:self._start()
 
+    def _check_drives(self, samples):
+        faults = []
+        for sample in samples:
+            overtemp = math.isfinite(sample.temp_c) and sample.temp_c >= self.overtemperature_c
+            if sample.error_id or overtemp:
+                motor = f"{sample.bus}#{sample.motor_id} {sample.joint_name}"
+                if sample.error_id:
+                    faults.append(f"{motor} 驱动故障 error_id={sample.error_id}")
+                if overtemp:
+                    faults.append(f"{motor} 温度 {sample.temp_c:g} °C 达到阈值 {self.overtemperature_c:g} °C")
+        if faults:
+            raise RuntimeError("，".join(faults))
+
     def _start(self):
         if self.stop_event.is_set():return
         if self.thread and self.thread.is_alive():return
         try:samples=self.backend.read_samples()
         except Exception as exc:
             self._update(feedback="unknown",feedback_error=str(exc));samples=[]
-        if any(s.error_id or (math.isfinite(s.temp_c) and s.temp_c>=self.overtemperature_c) for s in samples):
-            raise RuntimeError('drive fault or overtemperature prohibits protective damping')
+        self._check_drives(samples)
         self.owner=self.backend.begin_protective_damping(self.generation)
         try:
             self.backend.command_protective_damping(self.owner,self.kd)
@@ -64,8 +76,7 @@ class ProtectiveDamping:
                     except Exception as exc:
                         self._update(feedback='unknown',feedback_error=str(exc));samples=[]
                     if samples:
-                        if any(s.error_id or (math.isfinite(s.temp_c) and s.temp_c>=self.overtemperature_c) for s in samples):
-                            raise RuntimeError('drive fault or overtemperature during protective damping')
+                        self._check_drives(samples)
                         fresh=all(math.isfinite(s.feedback_age_s) and s.feedback_age_s<.5 for s in samples)
                         self._update(feedback='fresh' if fresh else 'stale',feedback_error=None)
                         if self.on_samples:self.on_samples(samples)

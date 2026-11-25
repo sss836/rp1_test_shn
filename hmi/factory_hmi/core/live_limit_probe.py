@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import asdict, replace
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -510,6 +511,9 @@ class ProbeWorker:
         self.context, self.read, self.limits, self.on_samples = report_context, read, limits, on_samples
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
+        self._handoff_lock = None
+        self._hold_stop = None
+        self._handoff_generation = None
         self.thread = threading.Thread(target=self._run, daemon=True, name="limit-probe")
         self.cycle = None
         self.reason = ""
@@ -523,6 +527,36 @@ class ProbeWorker:
         self.last_rejected_feedback_group = None
         self.feedback_events = deque(maxlen=64)
 
+    def take_over_hold(self, dispatch_lock, hold_stop, generation):
+        self._handoff_lock = dispatch_lock
+        self._hold_stop = hold_stop
+        self._handoff_generation = generation
+
+    def _send_first_target(self, target, kp_scale, kd_scale, stamps):
+        # The old owner checks its stop event under the same lock before each
+        # write. Its thread can finish later without sending another hold.
+        with self._handoff_lock:
+            if (self.stop_event.is_set() or self.backend.control_generation != self._handoff_generation
+                    or (self._hold_stop is not None and self._hold_stop.is_set())):
+                raise FeedbackError("控制交接已取消")
+            if time.monotonic() - min(stamps) >= SETTINGS.max_feedback_age_s:
+                raise FeedbackError("控制交接时逐电机反馈已过期")
+            if self._hold_stop is not None:
+                self._hold_stop.set()
+            previous = self.backend.last_mit_success_s
+            self.backend.command_mit(target, kp_scale=kp_scale, kd_scale=kd_scale,
+                                     expected_generation=self._handoff_generation,
+                                     dispatch_before=min(stamps) + SETTINGS.max_feedback_age_s,
+                                     cancelled=self.stop_event)
+            first = self.backend.last_mit_success_s
+        self._handoff_lock = None
+        gap_ms = round((first - previous) * 1000, 2) if first is not None and previous is not None else None
+        with self.lock:
+            self.feedback_diagnostics["first_dispatch_monotonic_s"] = first
+            self.feedback_diagnostics["handoff_gap_ms"] = gap_ms
+        logging.getLogger(__name__).info("Pose check %s first dispatch: limb=%s handoff_gap_ms=%s",
+                                         self.context.get("check_id"), self.coords.station.limb, gap_ms)
+
     def start(self):
         self.thread.start()
         self.started = True
@@ -533,6 +567,8 @@ class ProbeWorker:
 
     def request_stop(self):
         self.stop_event.set()
+        if self._hold_stop is not None:
+            self._hold_stop.set()
 
     def stop(self, timeout=2.0):
         self.request_stop()
@@ -572,6 +608,8 @@ class ProbeWorker:
             return base
 
     def _disable(self):
+        if self._hold_stop is not None:
+            self._hold_stop.set()
         try:
             self.backend.disable_motors()
             self.disable = {"request": "sent", "feedback": self.backend.disable_feedback()}
@@ -659,6 +697,8 @@ class ProbeWorker:
             while not self.stop_event.is_set():
                 received = False
                 samples = self.read()
+                if self.stop_event.is_set():
+                    break
                 now = time.monotonic()
                 received = True
                 self._observe_feedback(samples, now)
@@ -680,7 +720,10 @@ class ProbeWorker:
                         raise FeedbackError("没有收到完整的新鲜逐电机反馈")
                     self.stop_event.wait(.008)
                     continue
-                if now - last_cohort >= SETTINGS.max_feedback_age_s:
+                # Before takeover the hold owner is servicing the drives. A
+                # delayed first read may still return a fully fresh group.
+                holding_before_takeover = not stamp and self._hold_stop is not None and not self._hold_stop.is_set()
+                if not holding_before_takeover and now - last_cohort >= SETTINGS.max_feedback_age_s:
                     raise FeedbackError("逐电机反馈超过允许间隔")
                 stamp = received_stamp
                 self._feedback_state("accepted", now)
@@ -708,7 +751,10 @@ class ProbeWorker:
                     kp_scale, kd_scale = self.cycle.gains
                 if self.stop_event.is_set():
                     break
-                self.backend.command_mit(target, kp_scale=kp_scale, kd_scale=kd_scale)
+                if self._handoff_lock is None:
+                    self.backend.command_mit(target, kp_scale=kp_scale, kd_scale=kd_scale)
+                else:
+                    self._send_first_target(target, kp_scale, kd_scale, stamp)
                 last_motor = target
                 last_command = now
                 self.stop_event.wait(.025)

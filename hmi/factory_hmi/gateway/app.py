@@ -2447,11 +2447,13 @@ def create_app(
         return runtime
 
     @app.get("/api/v1/limit-probe")
-    def limit_probe_status(request: Request, report: bool = False,
+    def limit_probe_status(request: Request, report: bool = False, preparation_id: str | None = None,
                            x_rp1_client_id: str | None = Header(default=None),
                            x_rp1_operator_token: str | None = Header(default=None)):
         runtime = require_limit_runtime(request, x_rp1_client_id, x_rp1_operator_token)
         try:
+            if preparation_id is not None:
+                return {"ok": True, "result": runtime._invoke(("limit_module_preparation",), preparation_id)}
             return {"ok": True, "result": runtime._invoke(("limit_probe_status",), report=report)}
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -2480,9 +2482,13 @@ def create_app(
                             x_rp1_client_id: str | None = Header(default=None),
                             x_rp1_operator_token: str | None = Header(default=None)):
         require_limit_runtime(request, x_rp1_client_id, x_rp1_operator_token)
-        payload = body.model_dump(exclude={"digest", "confirmed"} if action == "preview" else set())
+        payload = body.model_dump(exclude={"digest", "confirmed"} if action == "preview" else set(), exclude_none=True)
+        if action == "start":
+            payload["digest"] = body.digest
+        operation = "prepare" if action == "preview" and body.preparation_id else action
         return mutate(request, x_rp1_client_id, x_rp1_operator_token,
-                      lambda runtime: runtime._invoke(("limit_module_" + action,), **payload),
+                      lambda runtime: runtime._invoke(("limit_module_" + operation,), **payload),
+                      action_receipt_only=body.preparation_id is not None,
                       motion_command=action == "start", require_active_lease=True)
 
     @app.post("/api/v1/manual/move")

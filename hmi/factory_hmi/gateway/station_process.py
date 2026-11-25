@@ -32,7 +32,7 @@ _CONTROL = frozenset({
     "request_motor_version_refresh",
     "import_trajectory", "arm", "start", "pause", "resume", "finish", "stop", "disable",
     "limit_probe_preview", "limit_probe_reset", "limit_probe_start",
-    "limit_module_preview", "limit_module_start",
+    "limit_module_preview", "limit_module_prepare", "limit_module_start",
     "prepare_next_run", "manual_move", "manual_stop", "reset", "reset_motor_fault",
     "zero_motor", "zero_all_motors", "zero_prepare", "zero_read", "zero_confirm", "zero_skip", "zero_abort",
 })
@@ -44,7 +44,7 @@ _RECORDS = frozenset({
     "adopt_platform_execution_code", "preview_record_identity",
 })
 _READS = frozenset({"snapshot", "display_snapshot", "collect_display_snapshot", "can_status", "can_interfaces",
-                   "maintenance_targets", "maintenance_ready", "motor_version_refresh_status", "limit_probe_status"})
+                   "maintenance_targets", "maintenance_ready", "motor_version_refresh_status", "limit_probe_status", "limit_module_preparation"})
 _SAFETY = frozenset({"request_motion_stop", "protective_damping_snapshot"})
 _LEASE = frozenset({"claim", "refresh", "release", "snapshot", "expired"})
 _MAX_MESSAGE = 32 * 1024 * 1024
@@ -298,6 +298,8 @@ def _run_station(channels, ready, data_root, report_root, outbox_path, lease_tim
                                 "can_disconnect", "clear_configuration",
                                 "request_motor_version_refresh"} and service._can_interfaces:
                         reserve_can(service._backend_name, service._can_interfaces)
+                    if name in {"limit_module_prepare", "limit_module_start"} and kwargs.get("preparation_id"):
+                        kwargs["lease_generation"] = generation
                     result = getattr(service, name)(*args, **kwargs)
                     if name in {"can_disconnect", "clear_configuration"}:
                         confirm_release()
@@ -409,7 +411,7 @@ class _Channel:
                 try:
                     status, result = _receive(self.connection, self.buffer, time.monotonic())
                 except BlockingIOError as exc:
-                    raise StationOutcomeUnknown("工位仍在处理此前请求，结果未确认") from exc
+                    raise StationOutcomeUnknown(f"工位仍在处理此前请求，结果未确认（{self.pending}）") from exc
                 previous, self.pending = self.pending, None
                 if name == previous == "close" and status == "ok":
                     return result
@@ -435,7 +437,8 @@ class _Channel:
                 )
             self.pending = None
         except TimeoutError as exc:
-            raise StationOutcomeUnknown("工位进程请求超时，结果未确认") from exc
+            logger.warning("Station request timed out: operation=%s pending=%s budget_s=%s", name, self.pending, timeout)
+            raise StationOutcomeUnknown(f"工位进程请求超时，结果未确认（{name}）") from exc
         except (EOFError, OSError) as exc:
             raise StationOutcomeUnknown("工位进程失联，设备状态未确认") from exc
         finally:

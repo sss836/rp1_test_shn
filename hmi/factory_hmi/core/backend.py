@@ -91,6 +91,11 @@ class MotorBackend(ABC):
         self._damping_owner = None
         self._damping_cancelled = threading.Event()
         self._command_watchdog: CommandWatchdog | None = None
+        self._mit_dispatch = ("尚无 MIT 下发", 0., 0.)
+        self._dispatch_owner = None
+        self._dispatch_group = None
+        self.last_mit_success_s = None
+        self.pending_enable_motor_ids = ()
         self.control_stop_error: str | None = None
         self._versions = None
 
@@ -127,6 +132,11 @@ class MotorBackend(ABC):
                 if not self._command_watchdog.is_current(generation):
                     return
                 self._command_inhibit.set()
+                stage, since, previous_duration = self._mit_dispatch
+                age = time.monotonic() - since if since else 0.
+                message += f"，MIT 最近阶段 {stage}，距今 {age:.3f} s，上次成功调用耗时 {previous_duration:.3f} s"
+                message += (f"; sender={self._dispatch_owner} sdk_group={self._dispatch_group}"
+                            f" pending_enable_ids={self.pending_enable_motor_ids}")
                 try:
                     on_fault(message)
                 except Exception as exc:
@@ -138,6 +148,8 @@ class MotorBackend(ABC):
                     self.disable()
             except Exception as exc:
                 self.control_stop_error = str(exc)
+            finally:
+                logging.getLogger(__name__).error("%s", message)
         self._command_watchdog = CommandWatchdog(timeout_s, trip)
 
     @property
@@ -196,7 +208,11 @@ class MotorBackend(ABC):
                 raise
             self._connected = True
 
-    def enable_motors(self) -> None:
+    @property
+    def first_command_deadline(self) -> float | None:
+        return self._command_watchdog.first_deadline if self._command_watchdog else None
+
+    def enable_motors(self) -> list[MotorSample] | None:
         with self._lock:
             if getattr(self, "_maintenance_quarantined", False):
                 raise MotorSafetyError("maintenance transport close failed; normal disconnect recovery required")
@@ -205,7 +221,7 @@ class MotorBackend(ABC):
                 raise BackendInUseError("motors are already enabled")
             self.prepare_motor_protocols()
             try:
-                self._enable_motors_impl()
+                handshake = self._enable_motors_impl()
             except Exception:
                 self._command_inhibit.set()
                 cleanup_confirmed = False
@@ -218,6 +234,10 @@ class MotorBackend(ABC):
                 # failed rollback into a global disabled claim.
                 self._enabled = not cleanup_confirmed
                 raise
+            self._mit_dispatch = ("等待首条 MIT 下发", time.monotonic(), 0.)
+            self._dispatch_owner = self._dispatch_group = None
+            self.last_mit_success_s = None
+            self.pending_enable_motor_ids = tuple(entry.motor_id for entry in self.entries)
             self._enabled = True
             with self._control_generation_lock:self._control_generation += 1
             self._damping_owner = None
@@ -226,6 +246,7 @@ class MotorBackend(ABC):
                 self.control_stop_error = None
                 if self._command_watchdog is not None:
                     self._command_watchdog.arm()
+            return handshake
 
     def prepare_motor_protocols(self, check_cancelled: Callable[[], None] | None = None) -> None:
         """Confirm any drive-specific control protocols before enabling motors."""
@@ -347,6 +368,9 @@ class MotorBackend(ABC):
         torque: np.ndarray | list[float] | None = None,
         kp_scale: float = 1.0,
         kd_scale: float = 1.0,
+        expected_generation: int | None = None,
+        dispatch_before: float | None = None,
+        cancelled: threading.Event | None = None,
     ) -> None:
         target_array = np.asarray(target, dtype=np.float64).reshape(-1)
         if target_array.shape != (len(self.entries),):
@@ -362,14 +386,29 @@ class MotorBackend(ABC):
                 raise ValueError("MIT torque count does not match motor count")
             if not np.all(np.isfinite(torque_array)):
                 raise ValueError("MIT torque contains NaN or inf")
+        previous_duration = self._mit_dispatch[2]
+        self._dispatch_owner = threading.current_thread().name
+        self._dispatch_group = None
+        self._mit_dispatch = ("等待设备锁", time.monotonic(), previous_duration)
         with self._lock:
             self._require_enabled()
+            began = time.monotonic()
+            if expected_generation is not None and self.control_generation != expected_generation:
+                raise MotorSafetyError("控制代次已变化，首条指令已取消")
+            if cancelled is not None and cancelled.is_set():
+                raise MotorSafetyError("控制操作已取消，首条指令未下发")
+            if dispatch_before is not None and began >= dispatch_before:
+                raise MotorSafetyError("控制首帧已过期，未下发")
+            self._mit_dispatch = ("调用电机后端", began, previous_duration)
             self._command_mit_impl(
                 target_array,
                 torque=torque_array,
                 kp_scale=float(kp_scale),
                 kd_scale=float(kd_scale),
             )
+            finished = time.monotonic()
+            self.last_mit_success_s = finished
+            self._mit_dispatch = ("下发已返回", finished, finished - began)
             if self._command_watchdog is not None:
                 self._command_watchdog.touch()
 
@@ -504,7 +543,7 @@ class MotorBackend(ABC):
         pass
 
     @abstractmethod
-    def _enable_motors_impl(self) -> None:
+    def _enable_motors_impl(self) -> list[MotorSample] | None:
         pass
 
     @abstractmethod
@@ -965,7 +1004,7 @@ class MotorsPyBackend(MotorBackend):
                     )
             self._check_protocol_conflicts()
 
-    def _enable_motors_impl(self) -> None:
+    def _enable_motors_impl(self) -> list[MotorSample] | None:
         self._invalidate_disable_confirmation()
         self._host_enable_attempt_epoch = self._enable_open_epoch
         errors: list[int] = []
@@ -990,7 +1029,7 @@ class MotorsPyBackend(MotorBackend):
                         f"failed to enable with error_id={error_id} protocol_profile={self._selected_protocols[index]}"
                     )
                 motor.set_motor_control_mode(self._motors_py.MotorControlMode.MIT)
-            self._confirm_enabled_v103(baseline, generation)
+            handshake = self._confirm_enabled_v103(baseline, generation)
         except Exception:
             for motor in reversed(initialized):
                 try:
@@ -1000,6 +1039,7 @@ class MotorsPyBackend(MotorBackend):
             self.init_error_ids = errors
             raise
         self.init_error_ids = errors
+        return handshake
 
     def _check_enable_generation(self, generation):
         if self.control_generation != generation:
@@ -1032,7 +1072,9 @@ class MotorsPyBackend(MotorBackend):
             if not pending:
                 logging.getLogger(__name__).info("109 enable feedback confirmed: motors=%d elapsed_s=%.3f",
                                                 len(baseline), time.monotonic()-started)
-                return
+                # Legacy nodes do not have the verified 109 enable handshake.
+                # Mixed modules go through the normal whole-module read.
+                return samples if len(baseline) == len(samples) else None
             if time.monotonic() >= deadline:
                 detail = "; ".join(
                     f"{sample.bus}#{sample.motor_id} enabled={sample.drive_enabled} "
@@ -1041,6 +1083,9 @@ class MotorsPyBackend(MotorBackend):
                 logging.getLogger(__name__).warning("109 enable feedback timed out: %s", detail)
                 raise MotorSafetyError("等待109使能反馈超时（300毫秒）；" + detail)
             time.sleep(.005)
+
+    def _mark_dispatch_group(self, group):
+        self._dispatch_group = group
 
     def _require_disabled_v103(self) -> None:
         if "v1.03" not in self._selected_protocols:
@@ -1085,6 +1130,7 @@ class MotorsPyBackend(MotorBackend):
             torque=torque,
             kp_scale=kp_scale,
             kd_scale=kd_scale,
+            on_group=self._mark_dispatch_group,
         )
         self._last_command[:] = target
         self._last_mit_command_at = time.monotonic()

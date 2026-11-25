@@ -16,6 +16,8 @@ class CommandWatchdog:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._last_dispatch = 0.0
+        self._dispatch_count = 0
+        self.first_deadline = 0.0
         self._thread: threading.Thread | None = None
         self.error: str | None = None
         self._generation = 0
@@ -24,11 +26,13 @@ class CommandWatchdog:
         self.disarm()
         with self._lock:
             self._last_dispatch = time.monotonic()
+            self.first_deadline = self._last_dispatch + self.timeout_s
+            self._dispatch_count = 0
             self.error = None
             stop = self._stop = threading.Event()
             self._generation += 1
             generation = self._generation
-            self._thread = threading.Thread(target=self._run, args=(stop, generation),
+            self._thread = threading.Thread(target=self._run, args=(stop, generation, self._last_dispatch),
                                             name="factory-control-watchdog", daemon=True)
             self._thread.start()
 
@@ -44,14 +48,21 @@ class CommandWatchdog:
     def touch(self) -> None:
         with self._lock:
             self._last_dispatch = time.monotonic()
+            self._dispatch_count += 1
 
-    def _run(self, stop: threading.Event, generation: int) -> None:
+    def _run(self, stop: threading.Event, generation: int, previous_check: float) -> None:
         while not stop.wait(min(.05, self.timeout_s / 4)):
             with self._lock:
-                age = time.monotonic() - self._last_dispatch
+                now = time.monotonic()
+                age = now - self._last_dispatch
+                check_gap = now - previous_check
+                previous_check = now
                 if stop.is_set() or self._stop is not stop or age <= self.timeout_s:
                     continue
                 stop.set()
-                self.error = f"controller_timeout: no successful dispatch for {age:.3f}s (limit {self.timeout_s:.3f}s)"
+                last_success = self._last_dispatch if self._dispatch_count else None
+                self.error = (f"controller_timeout: no successful dispatch for {age:.3f}s (limit {self.timeout_s:.3f}s)"
+                              f"; dispatch_count={self._dispatch_count} last_success_monotonic_s={last_success}"
+                              f" watchdog_check_gap_ms={check_gap * 1000:.1f}")
             self._on_timeout(self.error, generation)
             return

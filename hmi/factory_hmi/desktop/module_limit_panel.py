@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from PySide6.QtCore import QIODevice, QSaveFile, QTimer
 from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
@@ -24,6 +25,7 @@ class ModuleLimitPanel(QWidget):
         self.window = window
         self.pending = self.polling = False
         self.online = False
+        self.preparation_id = None
         self.status = {}
         build_pose_layout(self)
         self.timer = QTimer(self)
@@ -41,10 +43,12 @@ class ModuleLimitPanel(QWidget):
         super().hideEvent(event)
 
     def shutdown(self):
+        self.preparation_id = None
+        self.pending = False
         self.timer.stop()
 
     def _poll(self):
-        if not self.isVisible() or self.pending or self.polling:
+        if not self.isVisible() or self.polling:
             return
         self.polling = True
         self.window._run_rest("读取整模块检查状态", lambda: self.window.client.get("/api/v1/limit-probe"),
@@ -67,17 +71,45 @@ class ModuleLimitPanel(QWidget):
         if not serial:
             QMessageBox.warning(self, "缺少样机编号", "请在「样机配置与连接」填写实际样机编号。")
             return
+        if self.pending:
+            return
         self.pending = True
+        ticket = self.preparation_id = uuid.uuid4().hex
         limb = self.status.get("limb")
+        approved_digest = None
         self._refresh()
 
+        def done():
+            if self.preparation_id == ticket:
+                self._start_done()
+
+        def poll_preparation():
+            if self.preparation_id == ticket:
+                self.window._run_rest("核对工位限位方案",
+                    lambda: self.window.client.get("/api/v1/limit-probe?preparation_id=" + ticket),
+                    consent, on_failure=lambda _: done())
+
         def consent(response):
+            nonlocal approved_digest
+            if self.preparation_id != ticket:
+                return
             plan = response["result"]
             if (not self.isVisible() or self.window.robot_id.text().strip() != serial
-                    or self.status.get("limb") != limb or plan.get("limb") != limb):
+                    or self.status.get("limb") != limb):
                 self._start_done()
                 return
-            if not (plan["profile"].get("use_builtin_trajectory") or plan["profile"].get("use_builtin_order")):
+            if plan.get("preparation_id") != ticket:
+                done()
+                return
+            if plan.get("preparing"):
+                QTimer.singleShot(250, self, poll_preparation)
+                return
+            if plan.get("limb") != limb:
+                done()
+                return
+            if approved_digest != plan["digest"] and not (
+                plan["profile"].get("use_builtin_trajectory") or plan["profile"].get("use_builtin_order")
+            ):
                 fixture = plan["profile"]["fixture"]
                 count = len(plan["windows"])
                 module = dict(MODULES)[limb]
@@ -92,19 +124,35 @@ class ModuleLimitPanel(QWidget):
                 if choice != QMessageBox.StandardButton.Yes:
                     self._start_done()
                     return
+            approved_digest = plan["digest"]
             payload = {"serial": serial, "digest": plan["digest"], "confirmed": True}
+            if self.preparation_id != ticket:
+                return
+            payload["preparation_id"] = ticket
             self.window._run_rest("启动整模块限位检查", lambda: self.window.client.post("/api/v1/limit-module/start", payload),
-                                  self._take_result, on_finished=self._start_done)
+                                  started, on_failure=lambda _: done())
 
-        self.window._run_rest("核对工位限位方案", lambda: self.window.client.post("/api/v1/limit-module/preview", {"serial": serial}),
-                              consent, on_failure=lambda _: self._start_done())
+        def started(response):
+            if self.preparation_id != ticket:
+                return
+            if response["result"].get("preparing"):
+                consent(response)
+            else:
+                self._take_result(response)
+                done()
+
+        self.window._run_rest("核对工位限位方案", lambda: self.window.client.post("/api/v1/limit-module/preview", {"serial": serial, "preparation_id": ticket}),
+                              consent, on_failure=lambda _: done())
 
     def _start_done(self):
+        self.preparation_id = None
         self.pending = False
         self._refresh()
         self._poll()
 
     def _abort(self):
+        self.preparation_id = None
+        self.pending = False
         self.window._run_rest("中止并失能", self.window.client.disable_motors, lambda _: self._poll())
 
     def _export(self):

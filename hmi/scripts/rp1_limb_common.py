@@ -7,6 +7,7 @@ import glob
 import math
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -793,6 +794,7 @@ def command_mit(
     kp_scale: float = 1.0,
     kd_scale: float = 1.0,
     torque: np.ndarray | None = None,
+    on_group: Callable[[tuple[str, str, str]], None] | None = None,
 ) -> None:
     if len(motors) != len(entries):
         raise ValueError(f"motors and entries length mismatch: {len(motors)} != {len(entries)}")
@@ -851,7 +853,9 @@ def command_mit(
         group["kd"][slot] = float(entry.kd) * kd_scale
         group["t"][slot] = float(tau)
 
-    for group in groups.values():
+    for key, group in groups.items():
+        if on_group is not None:
+            on_group(key)
         group["motor"].motors_mit_cmd(group["p"], group["v"], group["kp"], group["kd"], group["t"])
 
 

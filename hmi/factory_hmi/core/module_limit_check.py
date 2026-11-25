@@ -404,7 +404,7 @@ class ModuleCycle:
 
 
 class ModuleWorker(ProbeWorker):
-    def __init__(self, backend, coords, profile, context, read, limits, publish, destination, entry_position):
+    def __init__(self, backend, coords, profile, context, read, limits, publish, destination, entry_position, *, prepared_completion=None):
         super().__init__(backend, coords, profile.windows[0].point, context, read, limits, publish)
         self.profile = profile
         self.destination = Path(destination)
@@ -415,8 +415,8 @@ class ModuleWorker(ProbeWorker):
                        "label": w["label"], "reference_deg": w["reference_deg"]}
                       for w in context["windows"]]
         from .mujoco_completion import ARM_LIMBS
-        self._prepared_arm_completion = None
-        if coords.station.limb in ARM_LIMBS:
+        self._prepared_arm_completion = prepared_completion
+        if coords.station.limb in ARM_LIMBS and prepared_completion is None:
             from .limit_arm_completion import prepare_arm_completion
             self._prepared_arm_completion = prepare_arm_completion(coords, np.deg2rad(profile.home_deg))
 

@@ -323,6 +323,7 @@ class LimitProbeStartRequest(BaseModel):
 
 
 class LimitModuleRequest(BaseModel):
+    preparation_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
     model_config = ConfigDict(extra="forbid")
     serial: str = Field(min_length=1, max_length=120)
     digest: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")

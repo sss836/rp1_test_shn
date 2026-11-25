@@ -129,7 +129,7 @@ def test_mixed_bus_uses_verified_109_and_legacy_108_telemetry(open_backend):
     backend = open_backend((old, None), (new, EXPECTED))
     backend.prepare_motor_protocols()
     assert (old.enables, new.enables) == (0, 0)
-    backend.enable_motors()
+    assert backend.enable_motors() is None  # The 108 node still needs the normal feedback check.
     samples = backend.read_samples()
     legacy, verified = samples
     assert legacy.torque_nm == 3 and math.isnan(legacy.iq_current_a)
@@ -291,7 +291,10 @@ class DelayedEnableLro(OfflineLro):
 def test_109_delayed_enable_feedback_waits_without_reissuing_enable(open_backend,count):
     motors=[DelayedEnableLro(.04+i*.01) for i in range(count)]
     backend=open_backend(*[(m,None) for m in motors]);backend.prepare_motor_protocols()
-    started=time.monotonic();backend.enable_motors()
+    started = time.monotonic()
+    samples = backend.enable_motors()
+    assert [row.motor_id for row in samples] == [entry.motor_id for entry in backend.entries]
+    assert all(row.drive_enabled and row.feedback_age_s <= .1 for row in samples)
     assert backend.motors_enabled and all(m.enabled and m.enables==1 for m in motors)
     assert .03 <= time.monotonic()-started < .7
 

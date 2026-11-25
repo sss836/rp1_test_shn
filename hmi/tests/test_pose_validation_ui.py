@@ -26,7 +26,7 @@ def test_single_pose_page_starts_preview_then_live_job_without_replay(window, mo
         calls.append((path, payload))
         if path.endswith("preview"):
             return {"result": dict(limb=limb, profile={"use_builtin_order": True},
-                                   windows=[{}]*count, digest="a"*64)}
+                                   windows=[{}]*count, digest="a"*64, preparation_id=payload["preparation_id"])}
         assert path == "/api/v1/limit-module/start"
         return {"result": dict(ready, active=True, mode="module", phase="homing",
                                direction_index=1, direction_total=count)}
@@ -41,7 +41,8 @@ def test_single_pose_page_starts_preview_then_live_job_without_replay(window, mo
     assert panel.start.isEnabled()
     panel.start.click()
     assert [path for path, _ in calls] == ["/api/v1/limit-module/preview", "/api/v1/limit-module/start"]
-    assert calls[1][1] == dict(serial="POSE-TEST", digest="a"*64, confirmed=True)
+    assert calls[1][1] == dict(serial="POSE-TEST", digest="a"*64, confirmed=True,
+                               preparation_id=calls[0][1]["preparation_id"])
     assert "平滑复位" in panel.state.text()
     assert not panel.start.isEnabled() and panel.abort.isEnabled()
     panel.shutdown()
@@ -210,3 +211,21 @@ def test_prior_disable_confirmation_is_labelled_as_reused(window):
         phase="finished",disable=dict(request="sent",feedback="confirmed",
                                       details=dict(reused_confirmation=True)))})
     assert "复用本次控制的逐台失能确认" in panel.state.text()
+
+
+def test_hide_during_preflight_cannot_start_late_job(window, monkeypatch):
+    panel = window.module_limit_panel
+    monkeypatch.setattr(panel, "isVisible", lambda: True)
+    window.robot_id.setEditText("OFFLINE")
+    panel._take_result({"result": dict(limb="left_short_leg", backend="motors_py",
+                                       discovered=True, motors_enabled=True)})
+    operations = []
+    monkeypatch.setattr(window, "_run_rest", lambda label, operation, success, **kw: operations.append(success))
+    panel.start.click()
+    callback = operations[0]
+    ticket = panel.preparation_id
+    panel.shutdown()
+    callback({"result": dict(limb="left_short_leg", preparation_id=ticket,
+                             digest="a"*64, profile={"use_builtin_order": True})})
+    assert len(operations) == 1
+    assert not panel.pending

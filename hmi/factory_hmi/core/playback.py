@@ -942,7 +942,17 @@ class PlaybackController:
                     or not math.isfinite(sample.feedback_age_s)
                     or sample.feedback_age_s >= stale_seconds
                     or not math.isfinite(sample.timestamp_s) or sample.timestamp_s <= 0):
-                raise PlaybackError(f"电机故障或反馈失效: id={sample.motor_id}")
+                reasons = []
+                if sample.error_id:
+                    reasons.append(f"error_id={sample.error_id}")
+                if not math.isfinite(sample.pos_rad) or not math.isfinite(sample.spd_rad_s):
+                    reasons.append(f"角度或速度无效（{sample.pos_rad:g} rad，{sample.spd_rad_s:g} rad/s）")
+                if not math.isfinite(sample.feedback_age_s) or sample.feedback_age_s >= stale_seconds:
+                    reasons.append(f"反馈延迟 {sample.feedback_age_s:.3f} s，阈值 {stale_seconds:.3f} s")
+                if not math.isfinite(sample.timestamp_s) or sample.timestamp_s <= 0:
+                    reasons.append(f"反馈时间戳无效（{sample.timestamp_s:g}）")
+                raise PlaybackError(f"电机故障或反馈失效: {sample.bus}#{sample.motor_id} "
+                                    f"{sample.joint_name}，" + "，".join(reasons))
         positions = np.array([s.pos_rad for s in samples])
         if self._parameters is not None:
             self._parameters.check_target(self.config, positions)
