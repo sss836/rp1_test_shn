@@ -224,7 +224,9 @@ class DeviceToolsPage(QWidget):
         self.feedback.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.feedback.verticalHeader().setDefaultSectionSize(27)
         self.feedback.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
-        self.feedback.setFixedHeight(6 * self.feedback.verticalHeader().defaultSectionSize() + 46)
+        header = self.feedback.horizontalHeader()
+        header.setFixedHeight(34)
+        self.feedback.setFixedHeight(header.height() + self.feedback.verticalHeader().length() + 2)
         for i, name in enumerate(AXES):
             for j in range(6):
                 item = QTableWidgetItem(name if j == 0 else "—")
