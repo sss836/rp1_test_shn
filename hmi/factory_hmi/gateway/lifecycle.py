@@ -16,7 +16,7 @@ SITE_ISOLATED_HEADER = "X-RP1-Site-Isolated"
 # exact routes cannot start/reconfigure a test; endpoint auth, lease, PLC
 # revision and mechanical-support checks still apply after admission.
 SAFETY_PATHS = frozenset({
-    "/api/v1/device-tools/dexhand/stop", "/api/v1/device-tools/dexhand/disconnect",
+    "/api/v1/device-tools/dexhand/finish-wave", "/api/v1/device-tools/dexhand/stop", "/api/v1/device-tools/dexhand/disconnect",
     "/api/v1/device-tools/imu/stop",
     "/api/v1/plc/stop", "/api/v1/plc/all-stop",
     "/api/v1/motors/disable", "/api/v1/playback/disable",

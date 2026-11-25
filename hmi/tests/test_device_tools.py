@@ -479,3 +479,61 @@ def test_initialized_imu_must_pass_installed_bus_policy(monkeypatch):
     with pytest.raises(RuntimeError, match="授权配置"):
         initialize_imu({"action": "check", "interface": "can8"}, threading.Event(), lambda _: None)
     assert calls == [("can8", {"bitrate": 1000000, "dbitrate": None, "fd": False})]
+
+
+def test_single_state_read_never_enables_or_stops_the_hand(tmp_path):
+    class Observer(MockHand):
+        def prepare_disconnect(self): pytest.fail("snapshot issued a stop")
+        def enable(self): pytest.fail("snapshot enabled the hand")
+        def home(self): pytest.fail("snapshot homed the hand")
+        def set_positions(self, targets): pytest.fail("snapshot moved the hand")
+    hand = Observer()
+    tools, released = make_tools(tmp_path, hand)
+    try:
+        settings = {"backend": "mock", "follow_arm": False, "interface": "can3", "node_id": 1}
+        tools.submit("dexhand", "a", "read-state", settings)
+        wait_for(lambda: tools.status("dexhand")["owner"] is None)
+        report = tools.status("dexhand")["last_report"]
+        assert report["passed"] and report["result"]["feedback"]["positions"] == [0] * 6
+        assert released == ["claim"] and not hand.is_connected()
+    finally:
+        tools.close()
+
+
+def test_continuous_wave_follows_demo_and_requires_measured_round_trip():
+    from factory_hmi.core.dexhand import run_wave, wave_target
+    assert wave_target(1) == [10000, 0, 0, 0, 0, 0]
+    assert wave_target(3) == [0, 10000, 0, 0, 0, 0]
+    assert wave_target(5) == [0, 0, 0, 3000, 6000, 3000]
+    assert wave_target(10) == [0] * 6
+    class Finish:
+        now = 0.
+        def is_set(self): return self.now >= 20.1
+        def wait(self, duration): self.now += max(.000001, duration)
+    hand = MockHand()
+    hand.connect("can3", 1)
+    hand.enable()
+    hand.home()
+    finish = Finish()
+    result = run_wave(hand, threading.Event(), finish, lambda: None, lambda s: None, clock=lambda: finish.now)
+    assert result["passed"] and result["rounds"] == 2
+    hand.set_positions = lambda target: True
+    finish = Finish()
+    with pytest.raises(RuntimeError, match="未观察到往返"):
+        run_wave(hand, threading.Event(), finish, lambda: None, lambda s: None, clock=lambda: finish.now)
+
+
+def test_wave_button_stops_disables_and_releases(tmp_path):
+    hand = MockHand()
+    tools, released = make_tools(tmp_path, hand)
+    settings = {"backend": "mock", "follow_arm": False, "interface": "can3", "node_id": 1}
+    try:
+        state = tools.submit("dexhand", "a", "wave", settings)
+        wait_for(lambda: tools.status("dexhand")["phase"] == "waving")
+        tools.submit("dexhand", "a", "finish-wave", {}, state["generation"])
+        wait_for(lambda: tools.status("dexhand")["owner"] is None)
+        result = tools.status("dexhand")["last_report"]["result"]
+        assert not result["passed"] and not any(result["feedback"]["enabled"])
+        assert released == ["claim"] and not hand.is_connected()
+    finally:
+        tools.close()

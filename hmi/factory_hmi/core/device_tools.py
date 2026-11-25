@@ -52,7 +52,7 @@ class DeviceTools:
         with self.lock:
             slot = self.slots[kind]
             result = deepcopy({k: v for k, v in slot.items() if k not in
-                               {"thread", "safety_thread", "cancel", "resource", "last_heartbeat", "feedback_at"}})
+                               {"thread", "safety_thread", "cancel", "resource", "last_heartbeat", "feedback_at", "finish_wave"}})
             age = None if not slot["feedback_at"] else time.monotonic() - slot["feedback_at"]
             result["feedback_age_s"] = age
             if result["feedback"] is not None and (age is None or age > 0.3):
@@ -75,7 +75,7 @@ class DeviceTools:
 
     def submit(self, kind, owner, action, config, generation=None):
         with self.lock:
-            if self.closed and action not in {"stop", "disconnect", "recover"}:
+            if self.closed and action not in {"stop", "disconnect", "recover", "finish-wave"}:
                 raise RuntimeError("设备工具正在关闭")
             slot = self.slots[kind]
             if kind == "imu" and action == "recover":
@@ -95,16 +95,27 @@ class DeviceTools:
                 self._release_locked(slot)
                 slot.update(phase="disconnected", detail="已核对主机接口恢复；原失败记录保留")
                 return self.status(kind)
+            if kind == "dexhand" and action == "finish-wave":
+                self._owner(slot, owner, generation)
+                if slot["phase"] == "waving":
+                    slot["finish_wave"].set()
+                    slot["detail"] = "正在停止并核对失能反馈"
+                    return self.status(kind)
+                if slot["config"].get("operation") != "wave":
+                    raise RuntimeError("当前没有手指运动")
+                action = "disconnect"
             if action in {"stop", "disconnect"}:
                 self._owner(slot, owner, generation)
                 self._stop_locked(kind, disconnect=action == "disconnect", reason="操作员请求停止")
                 return self.status(kind)
             if slot["busy"] or slot["phase"] == "cleanup_failed":
                 raise RuntimeError("设备仍在操作或安全收尾失败；请先停止并确认")
-            if kind == "imu" or action == "connect":
+            if kind == "imu" or action in {"connect", "read-state", "wave"}:
                 if slot["owner"] is not None:
                     raise RuntimeError("设备仍被占用，请先断开")
-                resolved, resource = self.acquire(kind, owner, dict(config))
+                resolved, resource = self.acquire(kind, owner, {**config, "operation": action})
+                if action == "wave":
+                    slot["finish_wave"] = threading.Event()
                 slot.update(owner=owner, generation=str(uuid.uuid4()), config=resolved, resource=resource,
                             expired=False, last_heartbeat=time.monotonic(), feedback=None, feedback_at=0,
                             disconnect_requested=False, fault_latched=False, parameters=None)
@@ -159,12 +170,14 @@ class DeviceTools:
                 stream.close()
         try:
             evidence = folder / "samples.csv"
+            with evidence.open("rb") as sample_file:
+                evidence_sha = hashlib.file_digest(sample_file, "sha256").hexdigest()
             report = {"schema": "rp1-device-tools-v1", "id": report_id, "kind": kind, "action": action,
                       "created_at": datetime.now(timezone.utc).isoformat(), "duration_s": time.monotonic()-started,
                       "config": slot["config"], "settings": settings, "owner": slot["owner"],
                       "applied_parameters": slot.get("parameters"),
                       "source_kind": "simulation" if slot["config"].get("backend") == "mock" else "hardware",
-                      "result": result, "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}
+                      "result": result, "evidence_sha256": evidence_sha}
             (folder / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
             with self.lock:
                 slot["last_report"] = {"id": report_id, "path": str(folder / "report.json"),
@@ -177,8 +190,11 @@ class DeviceTools:
             if slot["phase"] not in {"stopping", "cleanup_failed"}:
                 slot.update(busy=False, phase="fault" if error else "connected" if kind == "dexhand" else "completed",
                             detail=error or result.get("note", "操作完成"))
-                if kind == "dexhand" and error and self.hand is not None:
-                    self._stop_locked(kind, disconnect=False, reason=error)
+                if kind == "dexhand" and action in {"read-state", "wave"} and self.hand is None:
+                    slot["phase"] = "fault" if error else "completed"
+                    self._release_locked(slot)
+                elif kind == "dexhand" and error and self.hand is not None:
+                    self._stop_locked(kind, disconnect=action in {"read-state", "wave"}, reason=error)
             if kind == "imu":
                 if result.get("restore_failed"):
                     slot.update(phase="cleanup_failed", busy=False, detail=result.get("error"))
@@ -190,7 +206,7 @@ class DeviceTools:
     def _hand_action(self, action, settings, cancel, record):
         slot = self.slots["dexhand"]
         cfg = slot["config"]
-        if action == "connect":
+        if action in {"connect", "read-state", "wave"}:
             hand = self.hand_factory(cfg["backend"])
             with self.lock: self.hand = hand
             dexhand.checked(hand, "connect", cfg["interface"], cfg["node_id"])
@@ -198,6 +214,18 @@ class DeviceTools:
             with self.lock: slot["connected"] = True
             current = dexhand.snapshot(hand)
             record(current)
+            if action == "read-state":
+                valid = current["feedback_valid"]
+                fault = any(current["fault_codes"])
+                result = {"feedback": current, "passed": valid and not fault,
+                          "note": "设备反馈无效" if not valid else "已读取六轴状态，设备报告故障" if fault else "已读取六轴状态"}
+                hand.disconnect()
+                with self.lock:
+                    self.hand = None
+                    slot["connected"] = False
+                return result
+            if action == "wave":
+                return self._wave_session(hand, slot, cancel, record)
             return {"passed": current["feedback_valid"], "note": "连接完成；未自动使能或回零"}
         hand = self.hand
         guard = lambda: self.arm_guard(slot["owner"], cfg)
@@ -244,16 +272,45 @@ class DeviceTools:
         record(state)
         return {"passed": True, "note": "反馈检查完成；速度和电流限幅为发送及本地缓存确认，力矩停止模式只读回首轴，未证明六轴参数均已设备端读回。"}
 
+    def _wave_session(self, hand, slot, cancel, record):
+        cfg = slot["config"]
+        def guard():
+            if cancel.is_set():
+                raise RuntimeError("手指运动已中断")
+            self.arm_guard(slot["owner"], cfg)
+        guard()
+        dexhand.require_healthy(dexhand.snapshot(hand))
+        self._publish("dexhand", "正在准备并回零")
+        for method, args in (("disable", ()), ("set_speed", (16000,)), ("set_current_limit", (400,)),
+                             ("set_torque_reached_mode", (False,)), ("enable", ()), ("home", ())):
+            guard()
+            dexhand.checked(hand, method, *args)
+        with self.lock:
+            if cancel.is_set():
+                raise RuntimeError("手指运动已中断")
+            slot.update(phase="waving", detail="手指正在循环往返")
+        result = dexhand.run_wave(hand, cancel, slot["finish_wave"], guard, record)
+        dexhand.checked(hand, "prepare_disconnect")
+        result["feedback"] = self._confirm_disabled(hand)
+        with self.lock:
+            slot["connected"] = False
+        hand.disconnect()
+        with self.lock:
+            self.hand = None
+            slot["connected"] = False
+        return result
+
     @staticmethod
     def _confirm_disabled(hand):
         state = dexhand.snapshot(hand)
         if not state["feedback_valid"] or any(state["enabled"]) or not all(state["stopped"]):
             raise RuntimeError("未获得灵巧手已停止且六轴失能的有效反馈")
+        return state
 
     def _stop_locked(self, kind, *, disconnect, reason):
         slot = self.slots[kind]
         slot["cancel"].set()
-        slot["disconnect_requested"] = slot.get("disconnect_requested", False) or disconnect
+        slot["disconnect_requested"] = slot.get("disconnect_requested", False) or disconnect or slot["config"].get("operation") in {"wave", "read-state"}
         if slot["phase"] == "stopping" and slot["safety_thread"] is not None and slot["safety_thread"].is_alive():
             return
         slot.update(phase="stopping", busy=True, detail=reason)
@@ -266,7 +323,7 @@ class DeviceTools:
         try:
             hand = self.hand if kind == "dexhand" else None
             # Native priority cancellation must happen before joining a home.
-            if hand is not None and hand.is_connected():
+            if hand is not None and hand.is_connected() and slot["config"].get("operation") != "read-state":
                 hand.prepare_disconnect()
             worker = slot["thread"]
             if worker is not None and worker is not threading.current_thread():
@@ -278,7 +335,7 @@ class DeviceTools:
                 raise RuntimeError("灵巧手连接已丢失，无法确认停止与失能，保留 CAN 占用")
             if kind == "imu" and (slot.get("last_report") or {}).get("result", {}).get("restore_failed"):
                 raise RuntimeError("IMU 主机 CAN 恢复失败，请先在工位恢复接口并重启网关核对")
-            if hand is not None and hand.is_connected():
+            if hand is not None and hand.is_connected() and slot["config"].get("operation") != "read-state":
                 dexhand.checked(hand, "prepare_disconnect")
                 self._confirm_disabled(hand)
             with self.lock:
@@ -310,11 +367,13 @@ class DeviceTools:
             with self.lock:
                 hand = self.hand
                 slot = self.slots["dexhand"]
-                connected = slot["connected"]
+                connected = slot["connected"] and slot["config"].get("operation") != "read-state"
             if hand is not None and connected:
                 try:
                     feedback = dexhand.snapshot(hand)
                     with self.lock:
+                        if hand is not self.hand or not slot["connected"]:
+                            continue
                         slot.update(feedback=feedback, feedback_at=time.monotonic())
                         if (not feedback["feedback_valid"] or any(feedback["fault_codes"]) or any(feedback["emergency_stopped"])) and not slot.get("fault_latched") and slot["phase"] not in {"stopping", "cleanup_failed"}:
                             slot["fault_latched"] = True
@@ -323,7 +382,7 @@ class DeviceTools:
                         self.arm_guard(slot["owner"], slot["config"])
                 except Exception as exc:
                     with self.lock:
-                        if slot["phase"] not in {"stopping", "cleanup_failed"}:
+                        if hand is self.hand and slot["connected"] and slot["phase"] not in {"stopping", "cleanup_failed"}:
                             self._stop_locked("dexhand", disconnect=False, reason=str(exc))
             with self.lock:
                 for kind, slot in self.slots.items():
@@ -339,7 +398,7 @@ class DeviceTools:
     def stop_owner(self, owner):
         with self.lock:
             slot = self.slots["dexhand"]
-            if slot["owner"] == owner:
+            if owner is not None and slot["owner"] == owner:
                 self._stop_locked("dexhand", disconnect=False, reason="手臂停止请求，同时停止灵巧手")
 
     def close(self, *, owner=None):

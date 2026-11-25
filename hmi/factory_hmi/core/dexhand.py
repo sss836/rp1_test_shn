@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import time
 from types import SimpleNamespace
 
@@ -110,6 +111,64 @@ def run_motion(hand, settings, cancel, publish, record, arm_guard=lambda: None, 
     return {"passed": True, "criterion": "movement_observed", "cycles": settings["cycles"],
             "axes": axes, "movements": movements,
             "note": "受测轴去程、回程均观察到位置变化；不考核目标位置误差或实际运动幅度。"}
+
+
+def wave_target(seconds):
+    """Normalized six-axis targets from the RP Hand 50 Hz wave example."""
+    phase = seconds % 10.0
+    values = [0] * 6
+    if phase < 4:
+        axis = int(phase // 2)
+        values[axis] = math.floor(5000 * (1 - math.cos(math.pi * (phase - 2 * axis))) + .5)
+    else:
+        t = phase - 4
+        edge = min(1.0, t, 6 - t)
+        envelope = (1 - math.cos(math.pi * edge)) / 2
+        for finger in range(4):
+            angle = 2 * math.pi * t + finger * math.pi / 2
+            values[2 + finger] = math.floor(3000 * envelope * (1 - math.cos(angle)) + .5)
+    return values
+
+
+def run_wave(hand, cancel, finished, guard, record, *, clock=time.monotonic):
+    """Repeat the demo until requested to finish. Require measured motion in both directions."""
+    previous = snapshot(hand)["positions"]
+    rising, falling = set(), set()
+    start = tick = clock()
+    rounds = 0
+    samples = 0
+    while True:
+        if cancel.is_set():
+            raise RuntimeError("手指运动已中断")
+        guard()
+        state = snapshot(hand)
+        require_healthy(state, enabled=True, homed=True)
+        elapsed = clock() - start
+        for axis, (old, new) in enumerate(zip(previous, state["positions"])):
+            if new > old:
+                rising.add(axis)
+            elif new < old:
+                falling.add(axis)
+        previous = state["positions"]
+        if int(elapsed // 10) > rounds:
+            missing = set(range(6)) - (rising & falling)
+            if missing:
+                raise RuntimeError("未观察到往返运动：" + "、".join(AXES[i] for i in sorted(missing)))
+            rounds += 1
+            rising.clear()
+            falling.clear()
+        if finished.is_set():
+            passed = rounds > 0 or len(rising & falling) == 6
+            return {"passed": passed, "rounds": rounds, "feedback": state,
+                    "note": "已观察到六轴往返运动" if passed else "已停止，本次尚未观察到六轴完整往返"}
+        target = wave_target(elapsed)
+        checked(hand, "set_positions", target)
+        # Retain the first minute at 10 Hz, then one sample per 10-second round.
+        if (elapsed < 60 and samples % 5 == 0) or samples % 500 == 0:
+            record({"elapsed_s": elapsed, "target": target, **state})
+        samples += 1
+        tick = max(tick + .02, clock())
+        finished.wait(max(0., tick - clock()))
 
 
 class MockHand:

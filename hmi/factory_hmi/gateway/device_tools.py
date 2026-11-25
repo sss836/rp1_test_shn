@@ -63,7 +63,8 @@ class DeviceAccess:
                     raise RuntimeError("手臂与灵巧手必须同时使用真实设备，或同时使用模拟设备")
                 cfg.update(interface=next(iter(buses)), config_revision=snap.get("config_revision"),
                            arm_positions=[m.get("position_rad") for m in snap.get("motors", [])])
-                self.arm_guard(owner, cfg, fresh=True)
+                if cfg.get("operation") != "read-state":
+                    self.arm_guard(owner, cfg, fresh=True)
             elif kind == "dexhand" and cfg["backend"] != "mock":
                 raise RuntimeError("真实灵巧手必须跟随当前七自由度手臂；独立模式仅供离线模拟")
             if kind == "imu" and cfg["backend"] != "hardware":
@@ -177,8 +178,8 @@ def register_device_routes(app, hub, require_token, owner_id, monitor_only):
     @app.post("/api/v1/device-tools/{kind}/{action}")
     def action(kind: Literal["imu", "dexhand"], action: str, body: DeviceRequest, request: Request,
                x_rp1_client_id: str | None = Header(default=None), x_rp1_operator_token: str | None = Header(default=None)):
-        owner = authenticate(request, x_rp1_client_id, x_rp1_operator_token, control=action not in {"stop", "disconnect"})
-        allowed = {"initialize", "check", "stop", "recover", "heartbeat"} if kind == "imu" else {"connect", "enable", "home", "check", "run", "stop", "disconnect", "heartbeat"}
+        owner = authenticate(request, x_rp1_client_id, x_rp1_operator_token, control=action not in {"stop", "disconnect", "finish-wave"})
+        allowed = {"initialize", "check", "stop", "recover", "heartbeat"} if kind == "imu" else {"read-state", "wave", "finish-wave", "connect", "enable", "home", "check", "run", "stop", "disconnect", "heartbeat"}
         if action not in allowed:
             raise HTTPException(404, "未知设备操作")
         try:

@@ -580,3 +580,46 @@ def test_hand_follows_configured_arm_through_station_worker(isolated_app):
             assert status["owner"] is None
         finally:
             post("motors/disable")
+
+
+def test_one_click_wave_reads_and_moves_on_shared_station(isolated_app):
+    headers = {"X-RP1-Client-ID": "wave-demo-worker"}
+    prefix = "/api/v1/"
+    with TestClient(isolated_app) as client:
+        def post(route, body=None):
+            r = client.post(prefix + route, headers=headers, json=body)
+            assert r.status_code == 200, r.text
+            return r.json()
+
+        def wait_status(condition):
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                state = client.get(prefix + "device-tools/dexhand", headers=headers).json()
+                if condition(state):
+                    return state
+                time.sleep(.02)
+            pytest.fail(str(state))
+
+        config = post("configure", {"config_path": "left_arm_motors.yaml", "limb": "left_arm", "backend": "fake",
+            "bus_bindings": [{"index": 0, "interface": "can3", "mode": "canfd", "bitrate": 1000000, "dbitrate": 5000000}]})
+        headers["X-RP1-Lease-Generation"] = str(config["snapshot"]["lease"]["generation"])
+        post("can/connect")
+        post("device-tools/dexhand/read-state", {"backend": "mock"})
+        read = wait_status(lambda s: not s["owner"])
+        assert read["last_report"]["passed"] and not any(read["last_report"]["result"]["feedback"]["enabled"])
+        post("motors/discover")
+        post("motors/enable", {"physical_estop_confirmed": True})
+        try:
+            accepted = post("device-tools/dexhand/wave", {"backend": "mock"})
+            assert accepted["config"]["interface"] == "can3"
+            body = {"generation": accepted["generation"]}
+            wait_status(lambda s: s["phase"] == "waving")
+            for _ in range(11):
+                post("device-tools/dexhand/heartbeat", body)
+                post("lease/heartbeat")
+                time.sleep(1)
+            post("device-tools/dexhand/finish-wave", body)
+            result = wait_status(lambda s: not s["owner"])["last_report"]["result"]
+            assert result["passed"] and result["rounds"] >= 1 and not any(result["feedback"]["enabled"])
+        finally:
+            post("motors/disable")
