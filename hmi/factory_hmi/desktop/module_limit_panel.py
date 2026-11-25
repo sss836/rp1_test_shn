@@ -116,8 +116,12 @@ class ModuleLimitPanel(QWidget):
                 text = (f"{module} · 样机 {serial} · 工装 {fixture}\n"
                         f"确认工装独立供电、机构支撑、回位通道畅通且物理急停可用。"
                         f"确认后从当前姿态自动回到轨迹起点，再检查 {count} 个方向。")
-                if (speed := plan.get("transfer_speed_deg_s")) is not None:
+                if not plan["profile"].get("left_leg_fixture") and (speed := plan.get("transfer_speed_deg_s")) is not None:
                     text += f"\n本工位转场速度上限 {speed:g}°/s。"
+                rates = plan["profile"].get("left_leg_fixture")
+                if rates:
+                    text += (f"\n左髋内摆在 −20° 截止。空行程最高 {rates['transfer_deg_s']:g}°/s，"
+                             f"远端搜索最高 {rates['far_search_deg_s']:g}°/s。")
                 choice = QMessageBox.question(self, "确认启动真机检查", text,
                                               QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                               QMessageBox.StandardButton.No)

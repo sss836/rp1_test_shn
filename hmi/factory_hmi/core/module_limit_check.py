@@ -25,6 +25,17 @@ class ScheduledPoint(BaseModel):
     via_deg: Annotated[tuple[VEC, ...], Field(max_length=12)] = ()
 
 
+class LeftLegFixtureRates(BaseModel):
+    """Commissioned clear-path speeds for the left five-axis leg on the post fixture."""
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    transfer_deg_s: Annotated[float, Field(ge=20, le=60)]
+    far_search_deg_s: Annotated[float, Field(ge=10, le=40)]
+
+
+FIXTURE_ROLL = "left_hip_roll_joint"
+FIXTURE_ROLL_MIN_DEG = -20.
+
+
 class ModuleProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     schema_version: Literal[1]
@@ -44,6 +55,7 @@ class ModuleProfile(BaseModel):
     windows: Annotated[tuple[ScheduledPoint, ...], Field(min_length=4, max_length=14)]
     joint_peak_nm: POS_VEC | None = None
     transfer_speed_deg_s: Annotated[float, Field(gt=0, le=20)] | None = None
+    left_leg_fixture: LeftLegFixtureRates | None = None
     use_builtin_trajectory: bool = False
     use_builtin_order: bool = False
 
@@ -66,7 +78,25 @@ class ModuleProfile(BaseModel):
     def require_site_author(self):
         if self.source == "site" and self.approved_by is None:
             raise ValueError("外置工位方案须保留核定人")
+        if self.left_leg_fixture and (self.source != "site" or self.limb != "left_short_leg" or not self.approved_by.strip()):
+            raise ValueError("立柱工装速度只适用于核定的五轴左腿工位")
         return self
+
+    def fixture_cap(self, point):
+        if self.left_leg_fixture and point.joint == FIXTURE_ROLL and point.direction < 0:
+            return FIXTURE_ROLL_MIN_DEG
+        return None
+
+    def window_rates(self, point):
+        # Both directions through the narrow part of the negative-yaw arc use
+        # the existing rates. The inward roll keeps the original slow approach.
+        rates = self.left_leg_fixture
+        if rates and point.search_pose_deg[0] >= 0 and point.search_pose_deg[1] >= -60. and not (
+                point.joint == FIXTURE_ROLL and point.direction < 0):
+            transfer = (self.transfer_speed if point.joint == "left_hip_yaw_joint" and point.direction < 0
+                        else rates.transfer_deg_s)
+            return rates.far_search_deg_s, transfer
+        return point.search_speed_deg_s, min(self.transfer_speed, point.positioning_speed_deg_s)
 
     @property
     def transfer_speed(self) -> float:
@@ -144,6 +174,15 @@ def validate_module_plan(config, profile, serial, config_revision):
         raise ValueError("检查顺序与轨迹转场不能同时启用")
     if profile.use_builtin_trajectory or profile.use_builtin_order:
         profile = apply_builtin_trajectory(coords, profile)
+    if profile.left_leg_fixture:
+        from .module_limit_defaults import builtin_module_profile
+        standard = builtin_module_profile(config)
+        def geometry(plan):
+            return (plan.home_deg, plan.entry_via_deg, plan.return_via_deg,
+                    tuple((w.point.joint, w.point.direction, w.via_deg, w.point.staging_pose_deg,
+                           w.point.search_pose_deg) for w in plan.windows))
+        if geometry(profile) != geometry(standard):
+            raise ValueError("此立柱工装速度方案要求内置左腿顺序、保持姿态和转场航点")
     # Every whole-module inspection uses the same feedback-driven executor.
     # Keep fixture geometry, order, gains and torque budgets; do not copy an
     # arm pose onto legs or waist. The historic field name stays wire-compatible.
@@ -152,7 +191,12 @@ def validate_module_plan(config, profile, serial, config_revision):
         point = window.point
         direction = directions[(point.joint, point.direction)]
         data = point.model_dump()
-        if point.search_extension is None:
+        if profile.fixture_cap(point) is not None:
+            if point.search_extension is not None:
+                raise ValueError("工装内摆截止不能与限位延伸搜索同时设置")
+            if point.search_pose_deg[direction.index] <= FIXTURE_ROLL_MIN_DEG:
+                raise ValueError("髋内摆搜索必须从工装停止角内侧开始")
+        elif point.search_extension is None:
             data["search_extension"] = {
                 "actual_limit_deg": direction.reference_deg + direction.sign * MEASURED_SEARCH_MARGIN_DEG,
             }
@@ -176,6 +220,15 @@ def validate_module_plan(config, profile, serial, config_revision):
                 raise ValueError("转场姿态超出量产参考区间")
         if config.limb == "waist_hip" and (pose[2:] != profile.home_deg[2:] or any(abs(v) >= 164. for v in pose[2:])):
             raise ValueError("腰部检查的所有转场必须保持两个髋轴固定")
+    if profile.left_leg_fixture:
+        roll = coords.names.index(FIXTURE_ROLL)
+        if any(p[roll] < FIXTURE_ROLL_MIN_DEG for p in waypoints):
+            raise ValueError("左腿转场不能越过工装内摆停止角")
+        for window, description in zip(profile.windows, descriptions, strict=True):
+            p = window.point
+            description["fixture_stop_deg"] = profile.fixture_cap(p)
+            search, transfer = profile.window_rates(p)
+            description.update(far_search_deg_s=search, transfer_deg_s=transfer)
     context = {"source_kind": "physical", "mode": "module", "serial": serial, "profile": profile.model_dump(),
                "limb": config.limb, "station_sha256": profile.station_sha256, "config_revision": config_revision,
                "windows": descriptions, "joint_names": list(coords.names),
@@ -197,7 +250,10 @@ def path_segments(profile, names):
         yield from zip(route, route[1:])
         search_end = list(point.search_pose_deg)
         axis = names.index(point.joint)
-        if point.search_extension is None:
+        cap = profile.fixture_cap(point)
+        if cap is not None:
+            search_end[axis] = cap
+        elif point.search_extension is None:
             search_end[axis] += point.direction * point.permitted_travel_deg
         else:
             extension = point.search_extension
@@ -219,6 +275,8 @@ def entry_poses(coords, profile, q):
     for direction in coords.directions:
         if direction.sign * (measured[direction.index] - direction.reference_deg) > 1e-8:
             raise FeedbackError("当前姿态超出模块参考行程，无法自动回轨迹起点")
+    if profile.left_leg_fixture and measured[coords.names.index(FIXTURE_ROLL)] < FIXTURE_ROLL_MIN_DEG - 1e-8:
+        raise FeedbackError("当前左髋内摆已越过工装停止角")
     poses = tuple(np.array(pose, dtype=float) for pose in (profile.entry_via_deg + (profile.home_deg,)))
     if coords.station.limb == "waist_hip":
         hips = profile.waist_hip_hold_bounds_deg or tuple((p-.12, p+.12) for p in profile.home_deg[2:])
@@ -265,6 +323,7 @@ class ModuleCycle:
         self.transfer_joint = np.min([w.point.joint_abort_nm for w in profile.windows], axis=0)
         self.transfer_error = min(w.point.following_error_deg for w in profile.windows)
         self.transfer_speed = profile.transfer_speed
+        self.fixture_roll_axis = coords.names.index(FIXTURE_ROLL) if profile.left_leg_fixture else None
         self.homing = True
         self.via = iter(poses[1:])
         self._move("gain_transition", q, (self.point.reset_kp_scale, self.point.reset_kd_scale))
@@ -294,7 +353,19 @@ class ModuleCycle:
         self.gains_from = self.gains
         self.gains_to = self.gains if scales is None else scales
         speed = min(self.transfer_speed, self.point.positioning_speed_deg_s) if phase == "clearance" else self.transfer_speed
-        self.move = PositionMove(self.target, goal, speed,
+        acceleration = None
+        if self.profile.left_leg_fixture and not self.homing:
+            # Do not accelerate a transfer through the near-post yaw or inward-roll arc.
+            roll, yaw = self.fixture_roll_axis, self.coords.names.index("left_hip_yaw_joint")
+            if min(self.target[yaw], goal[yaw]) >= math.radians(-60.) and min(self.target[roll], goal[roll]) >= 0:
+                speed = self.profile.left_leg_fixture.transfer_deg_s
+                acceleration = 120.
+            elif (phase == "clearance" and self.point.joint == "left_hip_yaw_joint"
+                  and self.point.direction < 0 and min(self.target[roll], goal[roll]) >= 0):
+                # Return through the column corridor at the legacy 20 deg/s ceiling.
+                speed = min(self.transfer_speed, self.profile.left_leg_fixture.transfer_deg_s)
+                acceleration = 45.
+        self.move = PositionMove(self.target, goal, speed, acceleration=acceleration,
                                  gain_transition=self.gains_from != self.gains_to,
                                  settling=PositionSettling.for_point(self.point))
 
@@ -319,7 +390,9 @@ class ModuleCycle:
             else:
                 self.phase = "finished"
         else:
-            self.probe = ProbeCycle(self.coords, self.point, q, now, target=self.target)
+            far_speed, _ = self.profile.window_rates(self.point)
+            self.probe = ProbeCycle(self.coords, self.point, q, now, target=self.target,
+                                    far_speed=far_speed, fixture_cap=self.profile.fixture_cap(self.point))
             self.phase = self.probe.phase
 
     def _verify_load(self, q, joint_tau, motor_tau, now):
@@ -327,6 +400,8 @@ class ModuleCycle:
             raise FeedbackError("检查中逐电机反馈不连续")
         if self.fixed_hips is not None and np.max(abs(q[2:] - self.fixed_hips)) > math.radians(.20):
             raise FeedbackError("腰部检查时髋轴离开保持位")
+        if self.fixture_roll_axis is not None and q[self.fixture_roll_axis] < math.radians(FIXTURE_ROLL_MIN_DEG) - 1e-9:
+            raise FeedbackError("左髋实测内摆越过工装 −20° 停止角，整轮中止")
         if self.probe is not None:
             return
         check_torque(self.coords, joint_tau, motor_tau, self.transfer_joint, self.transfer_motor,
@@ -407,6 +482,8 @@ class ModuleWorker(ProbeWorker):
     def __init__(self, backend, coords, profile, context, read, limits, publish, destination, entry_position, *, prepared_completion=None):
         super().__init__(backend, coords, profile.windows[0].point, context, read, limits, publish)
         self.profile = profile
+        if profile.left_leg_fixture:
+            self.command_interval_s = .005
         self.destination = Path(destination)
         self.entry_position = entry_position.copy()
         self.report_file = None
@@ -419,6 +496,13 @@ class ModuleWorker(ProbeWorker):
         if coords.station.limb in ARM_LIMBS and prepared_completion is None:
             from .limit_arm_completion import prepare_arm_completion
             self._prepared_arm_completion = prepare_arm_completion(coords, np.deg2rad(profile.home_deg))
+
+    def _check_received_loads(self, tau, motor_tau, q=None):
+        super()._check_received_loads(tau, motor_tau, q)
+        if self.profile.left_leg_fixture and q is not None:
+            roll = self.coords.names.index(FIXTURE_ROLL)
+            if q[roll] < math.radians(FIXTURE_ROLL_MIN_DEG) - 1e-9:
+                raise FeedbackError("收到左髋越过工装 −20° 停止角的实测反馈")
 
     def _new_cycle(self, q, now):
         # The station was holding during preflight. Reject a changed entrance,
@@ -464,12 +548,15 @@ class ModuleWorker(ProbeWorker):
                           direction_total=len(self.profile.windows), results=list(cycle.results) if cycle else [],
                           current_candidate=candidate,
                           checks=self.checks, report_file=self.report_file, record_error=self.record_error)
-            point = self.profile.windows[0].point
+            point = cycle.point if cycle else self.profile.windows[0].point
+            far_speed, transfer_speed = self.profile.window_rates(point)
             result["motion_rates"] = {
-                "search_deg_s": point.search_speed_deg_s,
+                "search_deg_s": far_speed,
                 "near_limit_deg_s": point.contact_speed_deg_s,
-                "return_deg_s": min(self.profile.transfer_speed, point.positioning_speed_deg_s),
+                "return_deg_s": transfer_speed,
                 "home_deg_s": self.profile.transfer_speed}
+            if self.profile.left_leg_fixture:
+                result["motion_rates"]["minimum_command_interval_s"] = self.command_interval_s
             if cycle:
                 result["last_transfer"] = cycle.last_transfer
                 result["completion"] = (cycle.arm_completion.snapshot() if cycle.arm_completion is not None

@@ -1,0 +1,556 @@
+{
+  "schema_version": 1,
+  "limb": "left_short_leg",
+  "model": "RP1.3.4",
+  "power_source": "existing_station",
+  "fixture": "左腿立柱工装（核对实际工装标识）",
+  "revision": "left-leg-post-roll20-fast-v1",
+  "approved_by": null,
+  "source": "site",
+  "torque_limit_source": "station_cap_and_production_range",
+  "station_sha256": "320ad1191faec019419bf7613503b0627f71aad1f2f834ca59c10cd0e94249a9",
+  "home_deg": [
+    0.0,
+    0.0,
+    -17.188733853924695,
+    -11.459155902616466,
+    0.0
+  ],
+  "entry_via_deg": [],
+  "return_via_deg": [],
+  "waist_hip_hold_bounds_deg": null,
+  "windows": [
+    {
+      "point": {
+        "joint": "left_hip_roll_joint",
+        "direction": -1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          -145.0,
+          -11.459155902616466,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          -145.0,
+          -11.459155902616466,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 45.629999999999995,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": [
+        [
+          0.0,
+          0.0,
+          -145.0,
+          -11.459155902616466,
+          0.0
+        ]
+      ]
+    },
+    {
+      "point": {
+        "joint": "left_hip_roll_joint",
+        "direction": 1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          -145.0,
+          -11.459155902616466,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          -145.0,
+          -11.459155902616466,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 152.77,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": [
+        [
+          0.0,
+          0.0,
+          -145.0,
+          -11.459155902616466,
+          0.0
+        ]
+      ]
+    },
+    {
+      "point": {
+        "joint": "left_knee_joint",
+        "direction": 1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          0.0,
+          -11.459155902616466,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          0.0,
+          -11.459155902616466,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 5.04,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": [
+        [
+          0.0,
+          0.0,
+          -145.0,
+          -11.459155902616466,
+          0.0
+        ]
+      ]
+    },
+    {
+      "point": {
+        "joint": "left_hip_yaw_joint",
+        "direction": 1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          -11.459155902616466,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          -11.459155902616466,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 160.70000000000002,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": []
+    },
+    {
+      "point": {
+        "joint": "left_knee_joint",
+        "direction": -1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          0.0,
+          -11.459155902616466,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          0.0,
+          -11.459155902616466,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 165.76000000000002,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": []
+    },
+    {
+      "point": {
+        "joint": "left_hip_yaw_joint",
+        "direction": -1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          -11.459155902616466,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          -11.459155902616466,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 160.70000000000002,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": []
+    },
+    {
+      "point": {
+        "joint": "left_ankle_pitch_joint",
+        "direction": -1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          0.0,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          0.0,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 47.9,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": []
+    },
+    {
+      "point": {
+        "joint": "left_ankle_roll_joint",
+        "direction": -1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          -11.459155902616466,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          -11.459155902616466,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 17.9,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": []
+    },
+    {
+      "point": {
+        "joint": "left_ankle_pitch_joint",
+        "direction": 1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          0.0,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          0.0,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 37.9,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": []
+    },
+    {
+      "point": {
+        "joint": "left_ankle_roll_joint",
+        "direction": 1,
+        "staging_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          -11.459155902616466,
+          0.0
+        ],
+        "search_pose_deg": [
+          0.0,
+          0.0,
+          -17.188733853924695,
+          -11.459155902616466,
+          0.0
+        ],
+        "full_range_search": true,
+        "permitted_travel_deg": 17.9,
+        "search_extension": null,
+        "search_speed_deg_s": 10.0,
+        "positioning_speed_deg_s": 20.0,
+        "reset_kp_scale": 1.0,
+        "reset_kd_scale": 1.0,
+        "search_kp_scale": 1.0,
+        "search_kd_scale": 1.0,
+        "motor_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "joint_abort_nm": [
+          35.0,
+          35.0,
+          35.0,
+          35.0,
+          35.0
+        ],
+        "contact_floor_nm": 0.5,
+        "contact_rise_nm": 0.5,
+        "following_error_deg": 5.0,
+        "motor_step_deg": 0.5,
+        "retreat_deg": 1.0,
+        "comparison_tolerance_deg": 3.0
+      },
+      "via_deg": []
+    }
+  ],
+  "joint_peak_nm": null,
+  "transfer_speed_deg_s": 20.0,
+  "left_leg_fixture": {
+    "far_search_deg_s": 40.0,
+    "transfer_deg_s": 60.0
+  },
+  "use_builtin_trajectory": false,
+  "use_builtin_order": false
+}

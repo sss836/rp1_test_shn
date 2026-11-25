@@ -290,8 +290,11 @@ def render_pose_status(panel, s, *, online, pending, serial):
         panel.progress_text.setText("检查已记录 · 电机失能未全部确认")
         if completion.get("normal_completed"):
             panel.current_value.setText("肘部缓降完成 · 失能待确认")
-    errors = sum(row.get("outcome") != "within_reference" for row in results)
+    limited = sum(row.get("outcome") == "fixture_limited" for row in results)
+    errors = sum(row.get("outcome") != "within_reference" for row in results) - limited
     panel.counts.setText(f"{done} 已记录    {errors} 异常    {max(0,total-done-(1 if active and current else 0))} 待检查")
+    if limited:
+        panel.counts.setText(panel.counts.text() + f"    {limited} 工装限行")
     if s.get("record_error"):
         panel.record_path.setText("自动保存失败：" + s["record_error"])
     elif s.get("report_file"):
@@ -305,7 +308,7 @@ def render_pose_status(panel, s, *, online, pending, serial):
     panel._table_stamp = stamp
     measured = {(r["joint"], r["sign"]): r for r in results}
     panel.results.setRowCount(total)
-    outcomes = {"within_reference": "参考范围内", "early": "提前阻挡", "late": "超出参考", "not_detected": "未检出"}
+    outcomes = {"fixture_limited": "工装 −20° 截止 · 机械下限未测", "within_reference": "参考范围内", "early": "提前阻挡", "late": "超出参考", "not_detected": "未检出"}
     for index, ref in enumerate(rows):
         key = (ref["joint"], ref["sign"]); result = measured.get(key)
         is_current = key == (current.get("joint"), current.get("sign"))

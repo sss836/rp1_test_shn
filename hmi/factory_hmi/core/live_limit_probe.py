@@ -259,17 +259,37 @@ def advance_motion(coords, point, dt, pose, progress, proposed):
 
 
 class PositionMove:
-    def __init__(self, origin, goal, speed, *, gain_transition=False, settling=None):
+    def __init__(self, origin, goal, speed, *, gain_transition=False, settling=None, acceleration=None):
         self.origin, self.goal = origin.copy(), goal.copy()
         self.duration = max(.5 if gain_transition else 0.,
                             1.875 * np.max(abs(np.rad2deg(goal - origin))) / speed)
+        self.ramp = 0.
+        if acceleration is not None and not gain_transition:
+            travel = float(np.max(abs(np.rad2deg(goal-origin))))
+            if travel > 0:
+                # Half-cosine velocity ramps join a constant-speed middle segment.
+                # Their integrated area is v*ramp and peak acceleration is pi*v/(2*ramp).
+                peak = min(speed, math.sqrt(2.*travel*acceleration/math.pi))
+                self.ramp = math.pi*peak/(2.*acceleration)
+                self.duration = travel/peak + self.ramp
         self.progress = 0.
         self.commanded_at = None
         self.settling = settling or PositionSettling()
 
     def pose(self, elapsed):
         x = elapsed / self.duration if self.duration else 1.
-        curve = x**3 * (10 - 15*x + 6*x*x)
+        if self.ramp:
+            ramp = self.ramp
+            edge = min(elapsed, self.duration-elapsed)
+            if edge < ramp:
+                area = .5*(edge-ramp/math.pi*math.sin(math.pi*edge/ramp))
+            else:
+                area = edge - ramp/2.
+            curve = area/(self.duration-ramp)
+            if elapsed > self.duration/2:
+                curve = 1.-curve
+        else:
+            curve = x**3 * (10 - 15*x + 6*x*x)
         return self.origin + (self.goal - self.origin) * curve
 
     def step(self, coords, point, now, dt, q, timeout_message):
@@ -297,7 +317,7 @@ class PositionMove:
 
 class ProbeCycle:
     """Pure state machine shared by the live executor and simulated evidence."""
-    def __init__(self, coords, point, q, now, *, target=None):
+    def __init__(self, coords, point, q, now, *, target=None, far_speed=None, fixture_cap=None):
         self.coords, self.point = coords, point
         self.axis = coords.names.index(point.joint)
         self.direction = next(d for d in coords.directions if d.joint == point.joint and d.sign == point.direction)
@@ -327,6 +347,8 @@ class ProbeCycle:
         self.samples = deque(maxlen=5000)
         self.sample_count = 0
         self.samples_started = now
+        self.far_speed = point.search_speed_deg_s if far_speed is None else far_speed
+        self.fixture_cap = fixture_cap
         self.feedback_search = None
         if point.full_range_search:
             from .feedback_limit_search import FeedbackLimitSearch
@@ -509,6 +531,7 @@ class ProbeWorker:
     def __init__(self, backend, coords, point, report_context, read, limits, on_samples):
         self.backend, self.coords, self.point = backend, coords, point
         self.context, self.read, self.limits, self.on_samples = report_context, read, limits, on_samples
+        self.command_interval_s = .025
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self._handoff_lock = None
@@ -678,7 +701,7 @@ class ProbeWorker:
             self.feedback_events.append({"event": "failed", "time_s": now, "reason": message,
                                          "received": received, "skew_ms": group["skew_ms"] if group else None})
 
-    def _check_received_loads(self, tau, motor_tau):
+    def _check_received_loads(self, tau, motor_tau, q=None):
         """A repeated group must not hide new drive faults or an overload."""
         cycle = self.cycle
         point = cycle.point if cycle is not None else self.point
@@ -706,19 +729,19 @@ class ProbeWorker:
                     self._feedback_state("waiting_empty", now)
                     if now - last_cohort >= SETTINGS.max_feedback_age_s:
                         raise FeedbackError("没有收到完整的新鲜逐电机反馈")
-                    self.stop_event.wait(.008)
+                    self.stop_event.wait(min(.008, self.command_interval_s))
                     continue
                 # Validate current identities, individual freshness and faults
                 # before the repeated-group wait; no stale/fault/overload is
                 # swallowed by that wait. Skew is recorded but never a gate.
                 q, tau, received_stamp = self.coords.decode(samples, now, ())
                 motor_tau = np.asarray([s.torque_nm for s in samples])
-                self._check_received_loads(tau, motor_tau)
+                self._check_received_loads(tau, motor_tau, q)
                 if stamp and not all(a > old for a, old in zip(received_stamp, stamp, strict=True)):
                     self._feedback_state("waiting_repeated", now)
                     if now - last_cohort >= SETTINGS.max_feedback_age_s:
                         raise FeedbackError("没有收到完整的新鲜逐电机反馈")
-                    self.stop_event.wait(.008)
+                    self.stop_event.wait(min(.008, self.command_interval_s))
                     continue
                 # Before takeover the hold owner is servicing the drives. A
                 # delayed first read may still return a fully fresh group.
@@ -757,7 +780,7 @@ class ProbeWorker:
                     self._send_first_target(target, kp_scale, kd_scale, stamp)
                 last_motor = target
                 last_command = now
-                self.stop_event.wait(.025)
+                self.stop_event.wait(self.command_interval_s)
             self.reason = "工位停止、租约撤销或操作员中止"
         except Exception as exc:
             self.reason = str(exc)

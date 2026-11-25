@@ -95,6 +95,7 @@ class FeedbackLimitSearch:
             self.actual_limit = sign * (self.extension.actual_limit_deg - origin)
             if self.extension.command_limit_deg is not None:
                 self.command_limit = sign * (self.extension.command_limit_deg - origin)
+        self.far_rate = 0.
         self.attempts = []
         self.initial_loads = deque()
         self.hold_since = None
@@ -171,9 +172,34 @@ class FeedbackLimitSearch:
                             command_cap = self.command_limit
                     elif self.command_limit is not None:
                         command_cap = min(command_cap, self.command_limit)
-                remaining = s*(c.direction.reference_deg-angle)
+                limit = c.direction.reference_deg if c.fixture_cap is None else c.fixture_cap
+                if c.fixture_cap is not None:
+                    cap = s * (limit - math.degrees(c.start[a]))
+                    command_cap = cap  # A fixture boundary never gets load-offset compensation.
+                    if travel >= cap - 1e-9 or progress >= cap - 1e-9:
+                        self.cap_reason = "fixture_limit"
+                        self._begin_retreat(now, q, joint_tau[a])
+                        c.previous, c.actual = now, q.copy()
+                        return
+                remaining = s*(limit-angle)
                 speed = p.contact_speed_deg_s if remaining <= 6. or (
                     c.window.frozen and abs(joint_tau[a]) >= c.window.threshold_nm) else p.search_speed_deg_s
+                if c.far_speed != p.search_speed_deg_s:
+                    # Use the nearer of measured and commanded position for braking.
+                    distance = min(remaining, s*(limit-target)) - 6.
+                    rate = min(c.far_speed, math.sqrt(p.contact_speed_deg_s**2 + 120.*max(distance, 0.)))
+                    if p.joint == "left_hip_yaw_joint" and s < 0 and max(angle,target) >= -125.:
+                        # The post is close between -69 and -111 deg in the fixture preview.
+                        # Allow braking before the corridor; accelerate only after both positions clear it.
+                        buffer = max(0., min(angle,target) + 60.)
+                        rate = min(rate, math.sqrt(p.search_speed_deg_s**2 + 120.*buffer))
+                    self.far_rate = min(rate, self.far_rate + 60.*dt)
+                    speed = min(self.far_rate, p.contact_speed_deg_s) if (
+                        c.window.frozen and abs(joint_tau[a]) >= c.window.threshold_nm) else self.far_rate
+                    # Do not accumulate rapid commands in front of a stalled joint.
+                    lead = max(0., s*(target-angle)-c.window.load_offset_deg)
+                    if speed > p.contact_speed_deg_s:
+                        speed = min(speed, max(0., 2.-lead)/dt)
                 if self.attempt > 1 or self.extending:
                     speed = min(speed, CONTACT_CONFIRM_SPEED_DEG_S)
                 proposed = max(progress, min(command_cap, progress+dt*speed))
@@ -235,7 +261,7 @@ class FeedbackLimitSearch:
 
     def _begin_retreat(self, now, q, torque):
         c, p = self.c, self.c.point
-        if self.attempt_limit > 1 or self.extension is not None:
+        if self.attempt_limit > 1 or self.extension is not None or c.fixture_cap is not None:
             self.attempts.append({"attempt": self.attempt,
                                   "end_reason": "contact" if c.candidate else self.cap_reason,
                                   "search_end_actual_deg": math.degrees(q[c.axis]),
@@ -274,6 +300,11 @@ class FeedbackLimitSearch:
                     "requested_retreat_deg": p.retreat_deg, "available_retreat_deg": self.retreat_required,
                     "search_end_reason": "contact" if evidence else self.cap_reason,
                     "baseline_nm": c.window.baseline, "threshold_nm": c.window.threshold_nm, **evidence}
+        if c.fixture_cap is not None:
+            c.result["fixture_stop_deg"] = c.fixture_cap
+            c.result["search_end_actual_deg"] = math.degrees(self.retreat_origin)
+            if not evidence and self.cap_reason == "fixture_limit":
+                c.result["outcome"] = "fixture_limited"
         if self.attempts:
             c.result["search_attempts"] = self.attempts
         if self.extension is not None:
