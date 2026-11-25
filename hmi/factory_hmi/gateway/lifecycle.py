@@ -16,6 +16,8 @@ SITE_ISOLATED_HEADER = "X-RP1-Site-Isolated"
 # exact routes cannot start/reconfigure a test; endpoint auth, lease, PLC
 # revision and mechanical-support checks still apply after admission.
 SAFETY_PATHS = frozenset({
+    "/api/v1/device-tools/dexhand/stop", "/api/v1/device-tools/dexhand/disconnect",
+    "/api/v1/device-tools/imu/stop",
     "/api/v1/plc/stop", "/api/v1/plc/all-stop",
     "/api/v1/motors/disable", "/api/v1/playback/disable",
     "/api/v1/manual/stop", "/api/v1/disconnect", "/api/v1/quick/abort",
@@ -24,6 +26,7 @@ SAFETY_PATHS = frozenset({
 # Fault reset is allowed only after close has failed, with the existing PLC
 # LIVE/all-output-requests-OFF/revision checks. It does not enable any output.
 RECOVERY_PATHS = SAFETY_PATHS | frozenset({
+    "/api/v1/device-tools/imu/recover",
     "/api/v1/lease/recover", "/api/v1/plc/reset-fault",
 })
 HEARTBEAT_PATH = "/api/v1/lease/heartbeat"

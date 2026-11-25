@@ -124,6 +124,31 @@ class GatewayClient:
         query = parse.urlencode(parameters)
         return parse.urlunsplit((scheme, parsed.netloc, "/ws/status", query, ""))
 
+    def device_status(self, kind: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/device-tools/{kind}", timeout=2.0)
+
+    def device_action(self, kind: str, action: str, settings: Mapping[str, Any]) -> dict[str, Any]:
+        return self._request("POST", f"/api/v1/device-tools/{kind}/{action}", settings, timeout=2.0)
+
+    def device_report(self, report_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/api/v1/device-reports/{report_id}/report.json", timeout=2.0)
+
+    def export_device_report(self, report_id: str, directory: str) -> str:
+        import hashlib
+        report_id = str(uuid.UUID(report_id))
+        report = self.device_report(report_id)
+        req = request.Request(self._url(f"/api/v1/device-reports/{report_id}/samples.csv"),
+                              headers={"X-RP1-Operator-Token": self.operator_token})
+        with self._open(req, timeout=10.0) as response:
+            samples = response.read(64 * 1024 * 1024 + 1)
+        if len(samples) > 64 * 1024 * 1024 or hashlib.sha256(samples).hexdigest() != report["evidence_sha256"]:
+            raise GatewayError("设备样本大小超限或 SHA256 校验失败")
+        destination = Path(directory) / report_id
+        destination.mkdir(exist_ok=False)
+        (destination / "samples.csv").write_bytes(samples)
+        (destination / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(destination)
+
     @property
     def ws_url(self) -> str:
         """Backward-friendly alias for the status WebSocket URL."""

@@ -81,6 +81,7 @@ except ModuleNotFoundError as exc:
 
 from factory_hmi.client import GatewayClient, GatewayError, GatewayHTTPError, is_loopback_gateway
 from factory_hmi.core.factory_quality import execution_check_values, format_quality_value, quality_status_label
+from factory_hmi.desktop.device_tools_page import DeviceToolsPage
 from factory_hmi.desktop.lease_heartbeat import LeaseHeartbeat
 from factory_hmi.desktop.feedback_freshness import (
     DISPLAY_STALE_S, STATUS_SILENCE_S, feedback_age_s, finite_number, snapshot_key,
@@ -449,6 +450,12 @@ class FactoryMainWindow(QMainWindow):
         self.tabs.addTab(self.diagnostics_page, "诊断助手")
         self.module_limit_panel = ModuleLimitPanel(self)
         self.tabs.addTab(self._wrap_workspace_page(self.module_limit_panel, "moduleLimitScroll"), "姿态验证")
+        self.imu_page = DeviceToolsPage("imu", self.client, self._run_rest, lambda: self._last_snapshot, self)
+        self.dexhand_page = DeviceToolsPage("dexhand", self.client, self._run_rest, lambda: self._last_snapshot, self)
+        self._device_close_pending = False
+        for page, label in ((self.imu_page, "IMU 初始化与检查"), (self.dexhand_page, "灵巧手测试")):
+            page.changed.connect(self._devices_changed)
+            self.tabs.addTab(self._wrap_workspace_page(page, "deviceToolsScroll"), label)
         body_layout.addWidget(self.tabs, 1)
 
         shell = QWidget()
@@ -538,6 +545,15 @@ class FactoryMainWindow(QMainWindow):
         self._nav_group.addButton(self.diagnostics_nav_button, 8)
         self.diagnostics_nav_button.clicked.connect(lambda: self._select_main_page(5))
         layout.addWidget(self.diagnostics_nav_button)
+        self.device_nav_buttons = []
+        for index, label in ((7, "IMU 初始化与检查"), (8, "灵巧手测试")):
+            button = QPushButton(label)
+            button.setObjectName("navButton")
+            button.setCheckable(True)
+            self._nav_group.addButton(button, index + 3)
+            button.clicked.connect(lambda checked=False, i=index: self._select_main_page(i))
+            self.device_nav_buttons.append(button)
+            layout.addWidget(button)
         self.new_window_button = QPushButton("＋ 新开窗口")
         self.new_window_button.setObjectName("outlineButton")
         self.new_window_button.clicked.connect(self._new_module_window)
@@ -556,6 +572,8 @@ class FactoryMainWindow(QMainWindow):
         self._sync_nav_to_tab(index)
 
     def _sync_nav_to_tab(self, index: int) -> None:
+        if hasattr(self, "device_nav_buttons") and index in {7, 8}:
+            self.device_nav_buttons[index - 7].setChecked(True)
         if hasattr(self, "limit_block_nav_button") and index == 6:
             self.limit_block_nav_button.setChecked(True)
         if hasattr(self, "diagnostics_nav_button") and index == 5:
@@ -6523,6 +6541,20 @@ class FactoryMainWindow(QMainWindow):
         elif action == "abort":
             self.zero_dialog.reject()
 
+    def _devices_changed(self) -> None:
+        if not self._device_close_pending:
+            return
+        pages = (self.imu_page, self.dexhand_page)
+        if any(p.state.get("phase") == "cleanup_failed" for p in pages if p.owned()):
+            self._device_close_pending = False
+            for page in pages: page.closing_requested = False
+            QMessageBox.warning(self, "设备尚未安全停止", "设备收尾失败，窗口保持打开。请检查设备状态并重试停止 / 断开。")
+            return
+        for page in pages: page.request_close()
+        if not any(page.active() for page in pages):
+            self._device_close_pending = False
+            QTimer.singleShot(0, self.close)
+
     def closeEvent(self, event: Any) -> None:
         if self._close_verified:
             self._finish_window_close(event)
@@ -6533,6 +6565,11 @@ class FactoryMainWindow(QMainWindow):
         protection = ((self._last_snapshot or {}).get("station") or {}).get("protective_damping") or {}
         if protection.get("active") is True:
             QMessageBox.warning(self,"保护阻尼仍在运行","请先可靠支撑机构并点击软件失能，再关闭窗口。关闭控制进程无法保证持续阻尼。")
+            return
+        if any(page.active() for page in (self.imu_page, self.dexhand_page)):
+            event.ignore()
+            self._device_close_pending = True
+            self._devices_changed()
             return
         if self._new_window_fd is None and not (
                 self._lease_enabled or self._motors_enabled or self._motors_discovered
@@ -6608,6 +6645,8 @@ class FactoryMainWindow(QMainWindow):
 
     def _finish_window_close(self, event: Any) -> None:
         self._closing = True
+        self.imu_page.shutdown()
+        self.dexhand_page.shutdown()
         self.module_limit_panel.shutdown()
         self._can_command_timer.stop()
         self.diagnostics_page.stop()

@@ -542,3 +542,41 @@ def test_pilot_routes_inspect_but_do_not_advance_fake_or_unauthorized_station(is
         assert start_module.status_code == 409, start_module.text
         status = client.get("/api/v1/limit-probe", headers=local).json()["result"]
         assert status["phase"] == "idle" and not status["motors_enabled"]
+
+
+def test_hand_follows_configured_arm_through_station_worker(isolated_app):
+    headers = {"X-RP1-Client-ID": "hand-station-worker"}
+    with TestClient(isolated_app) as client:
+        def post(path, payload=None):
+            response = client.post("/api/v1/" + path, headers=headers, json=payload)
+            assert response.status_code == 200, (path, response.text)
+            return response.json()
+
+        configured = post("configure", {
+            "config_path": "left_arm_motors.yaml", "limb": "left_arm", "backend": "fake",
+            "bus_bindings": [{"index": 0, "interface": "can3", "mode": "canfd",
+                              "bitrate": 1000000, "dbitrate": 5000000}],
+        })
+        headers["X-RP1-Lease-Generation"] = str(configured["snapshot"]["lease"]["generation"])
+        post("can/connect")
+        post("motors/discover")
+        post("motors/enable", {"physical_estop_confirmed": True})
+        try:
+            state = post("device-tools/dexhand/connect", {"backend": "mock"})
+            assert state["config"]["interface"] == "can3"
+            settings = {"backend": "mock", "generation": state["generation"]}
+            for action in ["connect", "enable", "home", "run", "disconnect"]:
+                if action != "connect":
+                    post("device-tools/dexhand/" + action, settings)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    status = client.get("/api/v1/device-tools/dexhand", headers=headers).json()
+                    if not status["busy"]:
+                        break
+                    time.sleep(.02)
+                assert not status["busy"]
+                if action != "disconnect":
+                    assert status["last_report"]["passed"], status
+            assert status["owner"] is None
+        finally:
+            post("motors/disable")

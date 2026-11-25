@@ -40,6 +40,7 @@ from .lifecycle import LIFECYCLE_PATH, SAFETY_PATHS, SITE_ISOLATED_HEADER, Shutd
 from .lease import ControlLease, LeaseConflict, DEFAULT_LEASE_TIMEOUT_S, validate_lease_timeout
 from .display import DisplayPublisher
 from .can_connect import CanConnectCommands
+from .device_tools import DeviceAccess, register_device_routes
 from .station_process import StationProcess, StationUnavailable
 from .trajectory_upload import configured_trajectory_limit, receive_trajectory
 from .software_updates import SoftwareUpdates, installation_readiness
@@ -935,6 +936,7 @@ class GatewayHub:
         self._retired_sessions: dict[str, None] = {}
         self._close_lock = threading.Lock()
         self._closed = False
+        self.device_access = DeviceAccess(self)
         self.shutdown = ShutdownCoordinator(self.close, close_isolated=lambda: self.close(site_isolated=True))
 
     def apply_live_execution_code(self, session_key: str, execution_code: str) -> None:
@@ -1000,6 +1002,7 @@ class GatewayHub:
     def start(self) -> None:
         with self._lock:
             self._started = True
+            self.device_access.tools.start()
             self.plc.start()
             if self.isolate_stations:
                 from factory_hmi.core.report_jobs import resume_report_jobs
@@ -1018,6 +1021,7 @@ class GatewayHub:
         with self._close_lock:
             if self._closed:
                 return
+            self.device_access.tools.close()
             with self._lock:
                 runtimes = list(self._sessions.items())
             errors = []
@@ -1206,6 +1210,7 @@ class GatewayHub:
         """Atomically release a client's control lease and CAN ownership."""
         runtime = self.session(owner, create=False)
         with runtime._lease_guard:
+            self.device_access.check_arm_command(owner, "/api/v1/lease/release")
             runtime.lease.release(owner)
             if not self.isolate_stations:
                 self.release_interfaces(self._key(owner))
@@ -1230,6 +1235,7 @@ class GatewayHub:
                 if lease.owner is not None and (lease.owner != owner or lease.generation != generation):
                     raise LeaseConflict("工位关闭身份或控制代次不匹配")
                 runtime._close_generation = generation
+            self.device_access.tools.close(owner=owner)
             runtime.close()
             self.release_interfaces(key)
             with self._lock:
@@ -1322,6 +1328,8 @@ def create_app(
         if not local_maintenance_allowed(request, client_id):
             raise HTTPException(status_code=403, detail="本机维护需要从当前常规桌面上位机窗口操作")
 
+    register_device_routes(app, hub, require_token, owner_id, monitor_only)
+
     def mutate(
         request: Request,
         client_id: str | None,
@@ -1384,6 +1392,7 @@ def create_app(
                     runtime.lease.refresh(owner, require_active=True)
                 else:
                     runtime.lease.refresh(owner)
+                hub.device_access.check_arm_command(owner, request.url.path)
                 result = operation(runtime)
                 # The guard excludes expiry cleanup for this accepted command.
                 if not action_receipt_only:
@@ -2382,6 +2391,7 @@ def create_app(
         def import_in_worker() -> tuple[Any, dict[str, Any]]:
             with runtime._lease_guard:
                 runtime.lease.refresh(owner)
+                hub.device_access.check_arm_command(owner, request.url.path)
                 previous = temporary.with_suffix(".previous")
                 if target.exists():
                     target.replace(previous)
@@ -2914,6 +2924,7 @@ def create_app(
             if not isinstance(status,dict) or status.get("active") is not True:
                 raise HTTPException(409, "当前没有活动的保护阻尼")
             if runtime._process is not None:
+                hub.device_access.tools.stop_owner(owner)
                 runtime._process.disable_protection()
             else:
                 runtime._invoke(("disable_motors",))

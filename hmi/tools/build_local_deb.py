@@ -82,6 +82,11 @@ def main() -> None:
     for module in ("PySide6", "pymodbus", "pyroute2", "yaml", "numpy"):
         if not (runtime / module).is_dir():
             raise RuntimeError(f"Runtime must include {module}")
+    # Verify the offline hand extension with only the staged runtime on the import path.
+    subprocess.run([sys.executable, "-I", "-S", "-c",
+                    "import sys; sys.path.insert(0, sys.argv[1]); import rphand; "
+                    "assert rphand.HMI_SAFETY_API == 1; assert hasattr(rphand.HandState, 'emergency_stopped')",
+                    str(runtime)], check=True, env=dict(os.environ, LD_LIBRARY_PATH=str(runtime)))
     if bool(args.python_binary) != bool(args.python_stdlib):
         raise RuntimeError("Bundled Python requires both --python-binary and --python-stdlib")
     if args.depends_profile == "jammy" and not args.python_binary:
@@ -137,6 +142,7 @@ def main() -> None:
                  "TORQUE_ESTIMATION_3.0.31.md", "OFFLINE_MOTOR_BUNDLE_3.0.32.md", "LIVE_LIMIT_PROBE_PILOT.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, target_source / "docs" / name)
     shutil.copy2(SOURCE / "docs/CONTINUOUS_LIMIT_REPLAY.md", target_source / "docs/CONTINUOUS_LIMIT_REPLAY.md")
+    shutil.copy2(SOURCE / "docs/DEVICE_TOOLS.md", target_source / "docs/DEVICE_TOOLS.md")
     shutil.copy2(SOURCE / "docs/MODULE_LIMIT_CONTROL.md", target_source / "docs/MODULE_LIMIT_CONTROL.md")
     (target_source / "config/examples").mkdir(parents=True)
     shutil.copy2(SOURCE / "config/examples/motion_completion.unverified.yaml",

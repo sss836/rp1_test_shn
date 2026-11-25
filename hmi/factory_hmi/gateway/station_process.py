@@ -51,6 +51,23 @@ _MAX_MESSAGE = 32 * 1024 * 1024
 _RECOVERY_COMMANDS = frozenset({"stop", "disable", "disable_motors", "disconnect", "can_disconnect", "manual_stop"})
 
 
+def lock_can_interface(root: Path, interface: str) -> int:
+    digest = hashlib.sha256(interface.encode()).hexdigest()[:24]
+    path = root / f"rp1-hmi-can-{digest}.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise LeaseConflict(f"CAN 接口 {interface} 的锁不属于当前服务账号")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception as exc:
+        os.close(fd)
+        if isinstance(exc, BlockingIOError):
+            raise LeaseConflict(f"CAN 接口 {interface} 已由另一个工位占用") from exc
+        raise
+    return fd
+
+
 class StationUnavailable(RuntimeError):
     pass
 
@@ -134,19 +151,7 @@ def _run_station(channels, ready, data_root, report_root, outbox_path, lease_tim
         wanted = {(backend, interface) for interface in interfaces}
         try:
             for key in sorted(wanted.difference(previous)):
-                digest = hashlib.sha256(key[1].encode()).hexdigest()[:24]
-                path = root / f"rp1-hmi-can-{digest}.lock"
-                fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-                try:
-                    metadata = os.fstat(fd)
-                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
-                        raise LeaseConflict(f"CAN 接口 {key[1]} 的锁不属于当前服务账号")
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except Exception as exc:
-                    os.close(fd)
-                    if isinstance(exc, BlockingIOError):
-                        raise LeaseConflict(f"CAN 接口 {key[1]} 已由另一个工位占用") from exc
-                    raise
+                fd = lock_can_interface(root, key[1])
                 can_claims[key] = fd
         except Exception:
             release_can(previous)
