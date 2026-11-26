@@ -888,7 +888,7 @@ class ProbeWorker:
                 holding_before_takeover = not stamp and self._hold_stop is not None and not self._hold_stop.is_set()
                 if not holding_before_takeover and now - last_cohort >= SETTINGS.max_feedback_age_s:
                     check_feedback_interval(now-last_cohort, self.cycle.phase if self.cycle else "waiting_feedback",
-                                            source="完整反馈组超过允许间隔", inclusive=True)
+                                            source="整组反馈超过允许间隔", inclusive=True)
                 if stamp:
                     gap_ms = (now - last_cohort) * 1000
                     with self.lock:
