@@ -109,7 +109,9 @@ class ArmCompletion:
         self.coords = coords
         self.started_at = now
         self.previous_at = now
-        self.previous_actual = actual.copy()
+        self.speed_window = deque([(now, actual.copy())])
+        self.settling_since = None
+        self.blocking = None
         self.actual = actual.copy()
         self.target = command.copy()
         self.goal = prepared.goal.copy()
@@ -145,8 +147,12 @@ class ArmCompletion:
 
     def step(self, now, actual, point):
         dt = now-self.previous_at
-        self.actual_speed = (actual-self.previous_actual)/dt
-        self.previous_actual = actual.copy()
+        self.speed_window.append((now, actual.copy()))
+        while len(self.speed_window) > 1 and now - self.speed_window[1][0] >= .2:
+            self.speed_window.popleft()
+        window_s = now - self.speed_window[0][0]
+        if window_s > 0:
+            self.actual_speed = (actual - self.speed_window[0][1]) / window_s
         self.previous_at = now
         self.actual = actual.copy()
         self.actual_elapsed = now-self.started_at
@@ -165,9 +171,14 @@ class ArmCompletion:
             self.stable_seconds = 0.
             if self.commanded_complete:
                 self.phase = "arm_settling"
+                self.settling_since = now
             return self.target.copy(), False
-        speed_ok = bool(np.all(abs(self.actual_speed) <= SPEED_TOLERANCE))
-        if not speed_ok:
+        self.blocking = None
+        axis = int(np.argmax(abs(self.actual_speed)))
+        if window_s < .2 or abs(self.actual_speed[axis]) > SPEED_TOLERANCE:
+            if window_s >= .2:
+                self.blocking = {"joint": self.coords.names[axis], "reason": "speed",
+                                 "value": float(abs(self.actual_speed[axis])), "unit": "rad/s"}
             self.stable.clear()
             self.stable_seconds = 0.
             return self.target.copy(), False
@@ -176,7 +187,12 @@ class ArmCompletion:
             self.stable.popleft()
         self.stable_seconds = now-self.stable[0][0]
         span = np.ptp([row[1] for row in self.stable], axis=0)
-        if self.stable_seconds+1e-9 < STABLE_SECONDS or np.max(span)>math.radians(.2):
+        axis = int(np.argmax(span))
+        if span[axis] > math.radians(.2):
+            self.blocking = {"joint": self.coords.names[axis], "reason": "span",
+                             "value": math.degrees(span[axis]), "unit": "°"}
+            return self.target.copy(), False
+        if self.stable_seconds+1e-9 < STABLE_SECONDS:
             return self.target.copy(), False
         self.finished = True
         self.phase = "completed"
@@ -205,7 +221,8 @@ class ArmCompletion:
                 "normal_completed": self.finished, "alarm": self.alarm,
                 "progress": self.progress/self.duration if self.duration else 0.,
                 "planned_seconds": self.duration, "actual_seconds": self.actual_elapsed,
-                "stable_seconds": self.stable_seconds,
+                "stable_seconds": self.stable_seconds, "blocking": self.blocking,
+                "waiting_seconds": self.previous_at - self.settling_since if self.settling_since is not None else 0.,
                 "target_speed_deg_s": self.speed_deg_s,
                 "target_joint_deg": np.rad2deg(self.goal).tolist(),
                 "actual_joint_deg": np.rad2deg(self.actual).tolist(),

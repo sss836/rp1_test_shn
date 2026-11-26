@@ -69,7 +69,7 @@ def wait_kt(backend):
     pytest.fail('Kt worker did not finish')
 
 
-def test_109_background_b0_refresh_keeps_limit_probe_torque(open_backend):
+def test_109_pre_enable_b0_refresh_keeps_limit_probe_torque(open_backend):
     class StateBitMotor(ActualKtMotor):
         state_bit = False
         def version_payload(self, code):
@@ -79,11 +79,8 @@ def test_109_background_b0_refresh_keeps_limit_probe_torque(open_backend):
     backend = open_backend((motor, None))
     wait_kt(backend)
     backend.prepare_motor_protocols()
-    backend.enable_motors()
     motor.state_bit = True
-    # Trigger the same worker pass as its periodic refresh while the synthetic
-    # drive is enabled; the public manual-refresh API intentionally rejects it.
-    backend._versions.request_refresh()
+    backend.request_motor_version_refresh()
     end = time.monotonic()+2
     while backend.motor_version_refresh_status()["state"] != "complete" and time.monotonic() < end:
         time.sleep(.01)
@@ -91,6 +88,9 @@ def test_109_background_b0_refresh_keeps_limit_probe_torque(open_backend):
     row = backend.motor_versions()[0]
     assert row["status"] == "known" and row["raw_responses"]["0x31"].startswith("b031")
     assert row["kt_raw_response"].startswith("b016")
+    backend.enable_motors()
+    with pytest.raises(ValueError, match="使能"):
+        backend._versions.request_refresh()
     sample = backend.limit_probe_samples()[0]
     assert sample.torque_nm == pytest.approx(17.4)
     assert sample.torque_source == "device_kt_times_iq" and sample.lro_protocol_profile == "v1.03"

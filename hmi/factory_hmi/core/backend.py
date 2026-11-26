@@ -113,6 +113,10 @@ class MotorBackend(ABC):
         return [{k: v for k, v in MotorVersions._empty(e).items() if k != "_monotonic"}
                 for e in self.entries]
 
+    def version_query_events(self, since=None) -> list[dict]:
+        versions = self._versions
+        return versions.events_snapshot(since) if versions is not None else []
+
     def request_motor_version_refresh(self) -> dict:
         with self._lock:
             if self._enabled:
@@ -227,7 +231,7 @@ class MotorBackend(ABC):
             self._require_connected()
             if self._enabled:
                 raise BackendInUseError("motors are already enabled")
-            self.prepare_motor_protocols()
+            self._prepare_enable()
             try:
                 handshake = self._enable_motors_impl()
             except Exception:
@@ -258,6 +262,9 @@ class MotorBackend(ABC):
 
     def prepare_motor_protocols(self, check_cancelled: Callable[[], None] | None = None) -> None:
         """Confirm any drive-specific control protocols before enabling motors."""
+
+    def _prepare_enable(self):
+        self.prepare_motor_protocols()
 
     def motor_protocols_pending(self) -> bool:
         """Whether initial background protocol observation is incomplete."""
@@ -636,6 +643,7 @@ class MotorsPyBackend(MotorBackend):
         self._protocol_conflict = threading.Event()
         self._selected_protocols: list[str | None] = [None] * len(self.entries)
         self._selected_protocol_sources: list[str | None] = [None] * len(self.entries)
+        self._enable_evidence = None
         self._configured_v103_protocols = {
             entry.lro_protocol.protocol for entry in self.entries if entry.lro_protocol_profile == "v1.03"
         }
@@ -765,6 +773,7 @@ class MotorsPyBackend(MotorBackend):
 
     def _open_transport_impl(self) -> None:
         self._invalidate_disable_confirmation()
+        self._enable_evidence = None
         self._host_enable_attempt_epoch = None
         try:
             import motors_py
@@ -836,6 +845,7 @@ class MotorsPyBackend(MotorBackend):
                     self._connected and not self._protocol_conflicts[index]
                 ) else None
                 row["profile_error"] = self._protocol_conflicts[index]
+                row["bound_to_enable"] = self._enable_evidence is not None and row["active_profile"] is not None
                 row["protocol_confirmation_source"] = self._selected_protocol_sources[index] if row["active_profile"] else None
                 row["protocol_confirmation_evidence"] = (self._local_evidence.evidence
                     if row["protocol_confirmation_source"] == "local_numeric_evidence" and self._local_evidence else None)
@@ -897,6 +907,11 @@ class MotorsPyBackend(MotorBackend):
                 conflict = "LRO 身份与工位核实值不符（" + ", ".join(mismatched) + "）"
         with self._protocol_observation_lock:
             local_match = self._local_legacy_match(index, row)
+            if self._enable_evidence is not None:
+                bound = self._enable_evidence[1][index] or {}
+                fields = ("raw_firmware", "numeric_software", "hardware", "protocol", "torque_kt_nm_a")
+                if any(row.get(k) is not None and bound.get(k) is not None and row[k] != bound[k] for k in fields):
+                    conflict = "读回与本次使能绑定的身份或 Kt 不符，请停机后重新核对"
             if expected is None and self._selected_protocols[index] is not None:
                 new_profile = {108:"legacy",109:"v1.03"}.get(generation) or fixed_profile(row)
                 if new_profile is not None and new_profile != self._selected_protocols[index]:
@@ -913,6 +928,10 @@ class MotorsPyBackend(MotorBackend):
                 self._protocol_conflict.set()
 
     def _check_protocol_conflicts(self, index: int | None = None) -> None:
+        # Binding is created only after the reader has gone idle and all
+        # identities were verified. Explicit conflicts always win.
+        if self._enable_evidence is not None and not self._protocol_conflict.is_set():
+            return
         if not self._protocol_conflict.is_set() and not any(
                 source in {"local_numeric_evidence", "automatic_numeric_version"}
                 for source in self._selected_protocol_sources):
@@ -923,7 +942,8 @@ class MotorsPyBackend(MotorBackend):
             # if its worker wedges or exits without a callback, do not keep
             # sending motion commands indefinitely using the last identity.
             now = time.monotonic()
-            for i, source in enumerate(self._selected_protocol_sources):
+            sources = self._selected_protocol_sources if self._enable_evidence is None else ()
+            for i, source in enumerate(sources):
                 if source not in {"local_numeric_evidence", "automatic_numeric_version"}:
                     continue
                 row = self._protocol_observations[i]
@@ -952,7 +972,8 @@ class MotorsPyBackend(MotorBackend):
             if self._protocol_conflicts[index] or row is None or row.get("status") != "known":
                 return False
             observed_at = row.get("_monotonic")
-            if observed_at is None or time.monotonic() - observed_at > self._versions.stale:
+            if (type(observed_at) not in (float, int)
+                    or not 0 <= time.monotonic() - observed_at <= self._versions.stale):
                 return False
             if expected is None:
                 profile = fixed_profile(row)
@@ -996,6 +1017,20 @@ class MotorsPyBackend(MotorBackend):
                 return
             if self._versions is None:
                 raise MotorSafetyError("LRO 版本查询未启动")
+            if self._enable_evidence is None and isinstance(self._versions, MotorVersions):
+                now = time.monotonic()
+                with self._protocol_observation_lock:
+                    expired = any(
+                        value is not None and not 0 <= now - value <= self._versions.stale
+                        for i in indices for value in (
+                            (self._protocol_observations[i] or {}).get("_monotonic"),
+                            (self._protocol_observations[i] or {}).get("kt_monotonic")))
+                    retryable = any((self._protocol_observations[i] or {}).get("status") == "timeout"
+                                    or (self._protocol_observations[i] or {}).get("kt_error") == "Kt读取失败：版本查询超时"
+                                    for i in indices)
+                if (expired or retryable) and not self._protocol_conflict.is_set():
+                    self._versions.request_refresh()
+                    raise MotorProtocolPending("使能前身份或 Kt 已过期或上次读取超时，正在重新读取，本次未使能")
             # Extend individual reads without extending the pre-existing
             # control-path wait budget. In particular fault reset reopens the
             # transport and may otherwise outlive the desktop request. An
@@ -1019,6 +1054,37 @@ class MotorsPyBackend(MotorBackend):
                         "请核对固件、硬件、协议读回及当前 SDK"
                     )
             self._check_protocol_conflicts()
+
+    def _prepare_enable(self):
+        self.prepare_motor_protocols()
+        versions = self._versions
+        if versions is None or not any(e.motor_type.upper() == "LRO" for e in self.entries):
+            return
+        if not versions.pause_for_enable():
+            raise MotorProtocolPending("电机版本查询尚未结束，本次未下发使能")
+        try:
+            # A final callback can land between the earlier check and pausing.
+            self._check_protocol_conflicts()
+            now = time.monotonic()
+            for i, entry in enumerate(self.entries):
+                if entry.motor_type.upper() != "LRO":
+                    continue
+                if not self._select_verified_protocol(i):
+                    raise MotorSafetyError(f"{entry.interface}#{entry.motor_id} 使能前协议身份未确认")
+                if self._selected_protocols[i] == "v1.03":
+                    _, kt, source = estimate_torque(entry, self._protocol_observations[i], 0.,
+                                                    stale=versions.stale, now=now)
+                    if not math.isfinite(kt):
+                        raise MotorSafetyError(f"{entry.interface}#{entry.motor_id} 使能前 Kt 未确认（{source}）")
+            self._enable_evidence = (now, copy.deepcopy(self._protocol_observations))
+        except BaseException:
+            versions.resume_after_disable()
+            raise
+
+    def _end_enable_evidence(self):
+        self._enable_evidence = None
+        if isinstance(self._versions, MotorVersions):
+            self._versions.resume_after_disable()
 
     def _enable_motors_impl(self) -> list[MotorSample] | None:
         self._invalidate_disable_confirmation()
@@ -1127,6 +1193,7 @@ class MotorsPyBackend(MotorBackend):
 
     def _close_transport_impl(self) -> None:
         first_error: Exception | None = None
+        self._enable_evidence = None
         if self._versions is not None:
             self._versions.close()
         for motor in self._motors:
@@ -1233,14 +1300,20 @@ class MotorsPyBackend(MotorBackend):
                      for entry, motor in zip(self.entries, self._motors, strict=True)]
             if before != after:
                 return []  # RX raced the sample read. The caller retries without commanding.
+            problems = []
             for row in rows:
                 axis = f"电机 {row.bus}#{row.motor_id} {row.joint_name}"
                 if row.lro_protocol_profile not in {"legacy", "v1.03"}:
-                    raise MotorSafetyError(f"{axis} 的 LRO 反馈协议未确认")
-                if row.torque_source not in {"drive_reported", "device_kt_times_iq"}:
-                    raise MotorSafetyError(f"{axis} 的力矩来源未确认（{row.torque_source}）")
-                if not math.isfinite(row.torque_nm):
-                    raise MotorSafetyError(f"{axis} 力矩反馈无效")
+                    reason = "的 LRO 反馈协议未确认"
+                elif row.torque_source not in {"drive_reported", "device_kt_times_iq"}:
+                    reason = "的力矩来源未确认"
+                elif not math.isfinite(row.torque_nm):
+                    reason = "力矩反馈无效"
+                else:
+                    continue
+                problems.append(f"{axis} {reason}（协议 {row.lro_protocol_profile}，力矩来源 {row.torque_source}）")
+            if problems:
+                raise MotorSafetyError("；".join(problems))
             return rows
 
     def _read_samples_impl(self) -> list[MotorSample]:
@@ -1281,9 +1354,13 @@ class MotorsPyBackend(MotorBackend):
             torque = float(motor.get_motor_current()) if known_units and not v103 else float("nan")
             if v103:
                 with self._protocol_observation_lock:
-                    observation = self._protocol_observations[index]
+                    if self._enable_evidence is None:
+                        kt_check_time, observation = now, self._protocol_observations[index]
+                    else:
+                        kt_check_time, bound = self._enable_evidence
+                        observation = bound[index]
                 torque, kt, torque_status = estimate_torque(entry, observation, iq,
-                    stale=self._versions.stale if self._versions else 180., now=now)
+                    stale=self._versions.stale if self._versions else 180., now=kt_check_time)
             age = time.monotonic() - feedback_at
             result.append(
                 MotorSample(
@@ -1441,6 +1518,7 @@ class MotorsPyBackend(MotorBackend):
 
     def _disable_impl(self, index: int | None) -> None:
         if index is None and self._reuse_confirmed_disable():
+            self._end_enable_evidence()
             return
         indices = list(range(len(self._motors))) if index is None else [index]
         started = time.monotonic()
@@ -1569,6 +1647,7 @@ class MotorsPyBackend(MotorBackend):
             raise MotorDisableError("电机失能反馈未确认：" + detail,
                                     send_failed=any(row["request_error"] for row in failed))
         if index is None:
+            self._end_enable_evidence()
             self._disable_confirmation_key = (tuple(id(m) for m in self._motors), tuple(self._selected_protocols))
             self._disable_confirmation_epoch = self._enable_open_epoch
             self._disable_status_data["confirmation_generation"] = self.control_generation

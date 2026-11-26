@@ -124,7 +124,8 @@ def test_other_modules_do_not_get_arm_defaults():
     assert profile.limb == "left_short_leg"
     assert len(profile.windows) == 10
     assert all("shoulder" not in name and "wrist" not in name for name in coords.names)
-    assert context["runtime_policy"] == "all-module-feedback-v1"
+    assert context["runtime_policy"] == "all-module-feedback-extension-v1"
+    assert all(window.point.full_range_search for window in profile.windows)
 
 
 def test_zero_search_still_uses_fresh_feedback_and_station_load_caps():

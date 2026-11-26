@@ -18,12 +18,20 @@ _cached_geometry = None
 _cached_completion = None
 
 
-def check_bounds(safety, q, motor):
-    for value, lower, upper in ((q, safety.joint_min_rad, safety.joint_max_rad),
-                                (motor, safety.motor_min_rad, safety.motor_max_rad)):
-        if (not np.all(np.isfinite(value)) or lower is not None and np.any(value < lower)
-                or upper is not None and np.any(value > upper)):
-            raise FeedbackError("目标超出工位配置的位置边界")
+def check_bounds(safety, q, motor, names=None):
+    for kind, value, lower, upper in (("关节", q, safety.joint_min_rad, safety.joint_max_rad),
+                                     ("电机", motor, safety.motor_min_rad, safety.motor_max_rad)):
+        invalid = ~np.isfinite(value)
+        if lower is not None:
+            invalid |= value < lower
+        if upper is not None:
+            invalid |= value > upper
+        if np.any(invalid):
+            i = int(np.flatnonzero(invalid)[0])
+            low = None if lower is None else np.broadcast_to(lower, invalid.shape)[i]
+            high = None if upper is None else np.broadcast_to(upper, invalid.shape)[i]
+            raise FeedbackError(f"目标超出工位配置的位置边界，{kind} {names[i] if names is not None else i} "
+                               f"目标 {value[i]:g} rad，范围 [{low}, {high}] rad")
 
 
 def check_path(coords, bounds, segments):
@@ -59,7 +67,7 @@ def prepare(config, revision, serial, entry):
     key = (revision, plan["station_sha256"], profile)
 
     def bounds(q, motor):
-        check_bounds(config.safety_limits, q, motor)
+        check_bounds(config.safety_limits, q, motor, coords.names)
 
     reused = key == _cached_geometry
     if not reused:

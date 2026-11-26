@@ -238,6 +238,10 @@ class FactoryController:
                     [sample.pos_rad for sample in self._last_samples], dtype=np.float64
                 )
                 self._start_position_hold(positions, self._last_samples, first_deadline)
+            except MotorProtocolPending:
+                # This click scheduled a read-only scan or met an in-flight
+                # one. No deferred enable and no station fault.
+                raise
             except Exception as exc:
                 if self.state is not StationState.FAULT or not self._fault or self._fault.kind != "ControlTimeout":
                     self._set_fault(exc, samples=self._last_samples)

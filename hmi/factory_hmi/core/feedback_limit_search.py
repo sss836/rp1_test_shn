@@ -109,7 +109,7 @@ class FeedbackLimitSearch:
         a, s = c.axis, p.direction
         dt = now-c.previous
         if not 0 < dt <= SETTINGS.max_feedback_age_s:
-            raise FeedbackError("检查中逐电机反馈不连续")
+            raise FeedbackError(f"检查中逐电机反馈不连续，阶段 {c.phase}，间隔 {dt*1000:.1f} ms")
         attempt = self.attempt
         c.samples.append({"time_s": now-c.samples_started, "phase": c.phase,
             "actual_deg": np.rad2deg(q).tolist(), "target_deg": np.rad2deg(c.target).tolist(),
@@ -119,7 +119,7 @@ class FeedbackLimitSearch:
                      "实测力矩达到工位中止门限")
         travel = s*math.degrees(q[a]-c.start[a])
         if self.extension is not None and c.phase in {"search", "retreat"} and travel > self.actual_limit + 1e-9:
-            raise FeedbackError("实际搜索姿态超过核定行程")
+            raise FeedbackError(f"实际搜索姿态超过核定行程，{p.joint} 实测 {travel:g}°，上限 {self.actual_limit:g}°")
         # MIT target error generates load/contact torque. Fixed target-error
         # gates must not reappear in reset, baseline, held axes or unloading.
         # Torque, fresh valid feedback and actual search travel stay enforced.
@@ -145,7 +145,8 @@ class FeedbackLimitSearch:
         elif c.phase == "search":
             angle, target = math.degrees(q[a]), math.degrees(c.target[a])
             if self.extension is None and travel > p.permitted_travel_deg+p.motor_step_deg:
-                raise FeedbackError("实际搜索姿态超过核定行程")
+                raise FeedbackError(f"实际搜索姿态超过核定行程，{p.joint} 实测 {travel:g}°，"
+                                   f"上限 {p.permitted_travel_deg+p.motor_step_deg:g}°")
             c.candidate = c.window.observe(now, angle, joint_tau[a], target)
             if c.candidate is not None:
                 self._begin_retreat(now, q, joint_tau[a])
@@ -314,6 +315,8 @@ class FeedbackLimitSearch:
     def diagnostics(self):
         c = self.c
         data = {}
+        if c.phase in {"baseline", "retreat"}:
+            data["settle_blocking"] = c.settling.blocking_joint(c.coords.names)
         if self.attempt_limit > 1:
             data.update(search_attempt=self.attempt, search_attempt_limit=self.attempt_limit)
         if self.extension is not None:

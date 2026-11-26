@@ -285,6 +285,14 @@ def render_pose_status(panel, s, *, online, pending, serial):
         if completion.get("alarm"):
             panel.fault_banner.setText(completion["alarm"])
             panel.fault_banner.show()
+    blocking = (completion.get("blocking") if phase == "arm_settling"
+                else current.get("settle_blocking") if current else transfer.get("settle_blocking"))
+    if active and blocking:
+        reason = {"speed": "速度", "span": "角度波动", "tolerance": "目标角差"}.get(blocking["reason"], blocking["reason"])
+        message = f"等待 {joint_label(blocking['joint'])} 停稳 · {reason} {blocking['value']:.3g}{blocking['unit']}"
+        if phase == "arm_settling":
+            message += f" · 已等 {completion.get('waiting_seconds', 0):.1f} s"
+        panel.contact_detail.setText(message)
     if unconfirmed and (disabled.get("state") in {"unconfirmed", "request_failed"}
                         or (s.get("disable") or {}).get("request") == "failed"):
         panel.progress_text.setText("检查已记录 · 电机失能未全部确认")

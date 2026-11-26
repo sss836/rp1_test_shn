@@ -238,6 +238,7 @@ def validate_module_plan(config, profile, serial, config_revision):
                "order_source": "builtin_order_only" if profile.use_builtin_order else "profile_or_legacy_route",
                "startup_action": "move_to_joint_zero" if all(v == 0 for v in profile.home_deg)
                else "move_to_profile_home"}
+    context["entry_beyond_reference_margin_deg"] = _entry_margin(config)
     context["digest"] = _sha(context)
     return coords, profile, context
 
@@ -267,14 +268,29 @@ def path_segments(profile, names):
     yield from zip(route, route[1:])
 
 
-def entry_poses(coords, profile, q):
+def _entry_margin(config):
+    options = config.raw.get("factory_hmi", {}).get("limit_check", {})
+    margin = options.get("entry_beyond_reference_margin_deg", 0.)
+    if type(margin) not in (int, float) or not 0 <= margin <= MEASURED_SEARCH_MARGIN_DEG:
+        raise ValueError(f"entry_beyond_reference_margin_deg 须为 0 至 {MEASURED_SEARCH_MARGIN_DEG:g} 的有限数值")
+    return margin
+
+
+def entry_poses(coords, profile, q, *, evidence=None):
     """Build the first return from feedback before acquiring motion ownership."""
     measured = np.rad2deg(q)
     if measured.shape != (len(coords.names),) or not np.all(np.isfinite(measured)):
         raise FeedbackError("自动回轨迹起点缺少有效的当前姿态")
+    margin = _entry_margin(coords.station)
     for direction in coords.directions:
-        if direction.sign * (measured[direction.index] - direction.reference_deg) > 1e-8:
-            raise FeedbackError("当前姿态超出模块参考行程，无法自动回轨迹起点")
+        angle = float(measured[direction.index])
+        excess = direction.sign * (angle - direction.reference_deg)
+        if excess > margin + 1e-8:
+            raise FeedbackError(f"当前姿态超出模块参考行程，{coords.names[direction.index]} 实测 {angle:g}°，"
+                f"参考 {direction.reference_deg:g}°，超出 {excess:g}°，允许 {margin:g}°，无法自动回轨迹起点")
+        if excess > 1e-8 and evidence is not None:
+            evidence.append({"joint": coords.names[direction.index], "actual_deg": angle,
+                             "reference_deg": direction.reference_deg, "excess_deg": excess})
     if profile.left_leg_fixture and measured[coords.names.index(FIXTURE_ROLL)] < FIXTURE_ROLL_MIN_DEG - 1e-8:
         raise FeedbackError("当前左髋内摆已越过工装停止角")
     poses = tuple(np.array(pose, dtype=float) for pose in (profile.entry_via_deg + (profile.home_deg,)))
@@ -317,7 +333,8 @@ class ModuleCycle:
             # Direct state-machine users prepare before their first step.
             # The live ModuleWorker supplies this before acquiring motion.
             self._prepared_arm_completion = prepare_arm_completion(coords, self._fixed(profile.home_deg))
-        poses = entry_poses(coords, profile, q)
+        self.entry_beyond_reference = []
+        poses = entry_poses(coords, profile, q, evidence=self.entry_beyond_reference)
         # Use the most conservative commissioned limits across transfers.
         self.transfer_motor = np.min([w.point.motor_abort_nm for w in profile.windows], axis=0)
         self.transfer_joint = np.min([w.point.joint_abort_nm for w in profile.windows], axis=0)
@@ -397,7 +414,7 @@ class ModuleCycle:
 
     def _verify_load(self, q, joint_tau, motor_tau, now):
         if not 0 < now-self.last_time <= SETTINGS.max_feedback_age_s:
-            raise FeedbackError("检查中逐电机反馈不连续")
+            raise FeedbackError(f"检查中逐电机反馈不连续，阶段 {self.phase}，间隔 {(now-self.last_time)*1000:.1f} ms")
         if self.fixed_hips is not None and np.max(abs(q[2:] - self.fixed_hips)) > math.radians(.20):
             raise FeedbackError("腰部检查时髋轴离开保持位")
         if self.fixture_roll_axis is not None and q[self.fixture_roll_axis] < math.radians(FIXTURE_ROLL_MIN_DEG) - 1e-9:
@@ -462,6 +479,9 @@ class ModuleCycle:
     def _position(self, q, now):
         self.target, ratio, settled = self.move.step(
             self.coords, self.point, now, now-self.last_time, q, "转场命令已发完，未确认到位")
+        self.last_transfer["settle_blocking"] = self.move.settling.blocking_joint(self.coords.names)
+        if self.transfer_history and self.transfer_history[-1]["time_s"] == now:
+            self.transfer_history[-1]["settle_blocking"] = self.last_transfer["settle_blocking"]
         curve = ratio**3 * (10 - 15*ratio + 6*ratio*ratio)
         self.gains = (self.gains_to if ratio == 1. else
                       tuple(a + curve*(b-a) for a,b in zip(self.gains_from, self.gains_to)))
@@ -558,6 +578,7 @@ class ModuleWorker(ProbeWorker):
             if self.profile.left_leg_fixture:
                 result["motion_rates"]["minimum_command_interval_s"] = self.command_interval_s
             if cycle:
+                result["entry_beyond_reference"] = list(cycle.entry_beyond_reference)
                 result["last_transfer"] = cycle.last_transfer
                 result["completion"] = (cycle.arm_completion.snapshot() if cycle.arm_completion is not None
                     else {"required": self.profile.limb in {"left_arm", "left_short_arm", "right_arm", "right_short_arm"},
@@ -596,6 +617,16 @@ class ModuleWorker(ProbeWorker):
                 if self.cycle is not None and self.cycle.arm_completion is not None and self.reason:
                     self.cycle.arm_completion.interrupt(self.reason)
             report = self.snapshot(include_samples=True)
+            events = getattr(self.backend, "version_query_events", None)
+            if callable(events):
+                first = self.feedback_diagnostics.get("first_dispatch_monotonic_s") or self._started_at
+                try:
+                    history = events(first - 5.)
+                    if isinstance(history, list):
+                        json.dumps(history, allow_nan=False)
+                        report["version_query_events"] = history
+                except Exception as exc:
+                    report["version_query_events_error"] = str(exc)
             report.update(active=False, moving=False)
             self.destination.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(mode="w", dir=self.destination.parent, encoding="utf-8", delete=False) as tmp:

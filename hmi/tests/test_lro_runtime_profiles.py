@@ -33,10 +33,14 @@ class OfflineLro:
         self.read_only_status_responds = True
 
     def request_version(self, code):
+        if code == 0x16:
+            return True
         return (self.label is not None if code == 0x31 else self.numeric is not None) if code in (0x31,0x1e) else False
 
     def version_payload(self, code):
         head = bytes((0xA0, code))
+        if code == 0x16:
+            return head + bytes.fromhex("00c8")
         if code == 0x31:
             return (head + self.label.encode("ascii")).ljust(20, b"\0")
         return head + bytes(self.numeric)
@@ -109,9 +113,10 @@ def open_backend(monkeypatch):
     backends = []
     monkeypatch.setitem(sys.modules, "motors_py", SimpleNamespace(MotorControlMode=SimpleNamespace(MIT="MIT")))
 
-    def open_for(*nodes):
+    def open_for(*nodes, models=None):
         template = FakeMotorBackend(len(nodes)).entries
-        entries = [replace(entry, interface_type="canfd", motor_type="LRO", motor_model=0, lro_protocol=expected)
+        entries = [replace(entry, interface_type="canfd", motor_type="LRO",
+                           motor_model=models[entry.index] if models else 0, lro_protocol=expected)
                    for entry, (_, expected) in zip(template, nodes)]
         monkeypatch.setattr("factory_hmi.core.backend.create_motor_driver", lambda e, _: nodes[e.index][0])
         backend = MotorsPyBackend(entries)
@@ -136,7 +141,8 @@ def test_mixed_bus_uses_verified_109_and_legacy_108_telemetry(open_backend):
     assert legacy.drive_enabled is None
     assert verified.iq_current_a == 10 and verified.bus_current_a == -2
     assert verified.bus_voltage_v == 48 and verified.drive_enabled is True
-    assert verified.feedback_header == 0x30 and verified.to_dict()["torque_nm"] is None
+    assert verified.feedback_header == 0x30 and verified.torque_is_estimated
+    assert verified.to_dict()["estimated_torque_nm"] == 20.
     rows = backend.motor_versions()
     assert [row["active_profile"] for row in rows] == ["legacy", "v1.03"]
 
@@ -156,7 +162,7 @@ def test_mixed_bus_uses_verified_109_and_legacy_108_telemetry(open_backend):
     stats = _RunStatistics(StationConfig(limb="left_arm", entries=backend.entries, raw={}))
     stats.update(samples, np.zeros(2))
     joint = stats.snapshot()["joints"][1]
-    assert joint["torque_peak_nm"] is None and joint["torque_mean_abs_nm"] is None
+    assert joint["torque_is_estimated"] and joint["torque_peak_nm"] == 20.
 
 
 def test_service_pending_version_scan_never_enables_or_disconnects(open_backend, tmp_path, monkeypatch):

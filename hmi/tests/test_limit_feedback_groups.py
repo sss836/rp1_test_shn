@@ -121,7 +121,9 @@ def test_expired_motor_frame_stops_and_preserves_actual_rejected_group(monkeypat
 
 def test_repeated_frames_never_advance_and_expiry_budget_is_not_extended(monkeypatch):
     worker, backend, clock = exercise(monkeypatch, "repeated", stop_after=100)
-    assert len(backend.commands) == 1 and backend.disabled
+    assert 1 <= len(backend.commands) <= 4 and backend.disabled
+    for target in backend.commands:
+        np.testing.assert_array_equal(target, backend.commands[0])
     assert clock.now < 1.2
     report = worker.snapshot(include_samples=True)
     assert "超时" in report["fault"] or "新鲜" in report["fault"]

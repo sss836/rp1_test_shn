@@ -11,10 +11,9 @@ from test_lro_runtime_profiles import open_backend,OfflineLro
 @pytest.mark.parametrize('versions',[(108,)*7,(109,)*7,(108,109,108,109,108,109,108)])
 def test_all_old_all_new_and_mixed_without_manual_profile(open_backend,versions):
     motors=[OfflineLro(None if v==108 else 'V5.0.0.109',(0,1,v-100,0,1,0,0,0,1,17)) for v in versions]
-    backend=open_backend(*[(m,None) for m in motors])
     # Four supported model IDs use the same version resolver; native per-model
     # encoding tables remain unchanged and have separate wire-level coverage.
-    backend.entries=[replace(e,motor_model=i%4) for i,e in enumerate(backend.entries)]
+    backend=open_backend(*[(m,None) for m in motors], models=[i%4 for i in range(len(motors))])
     backend.prepare_motor_protocols()
     assert not any(m.enables for m in motors)
     expected=['legacy' if v==108 else 'v1.03' for v in versions]
@@ -23,7 +22,7 @@ def test_all_old_all_new_and_mixed_without_manual_profile(open_backend,versions)
     assert all(m.enables==1 for m in motors)
     samples=backend.read_samples()
     for v,s in zip(versions,samples):
-        if v==109:assert s.drive_enabled is True and s.iq_current_a==10 and math.isnan(s.torque_nm)
+        if v==109:assert s.drive_enabled is True and s.iq_current_a==10 and s.torque_is_estimated and s.torque_nm==20.
         else:assert s.drive_enabled is None and s.torque_nm==3
     row=sample_row(backend.entries,samples,elapsed_s=0,sample=1)
     assert set(row)==set(csv_fieldnames(backend.entries))
@@ -56,6 +55,7 @@ def test_auto_109_keeps_disabled_feedback_requirement(open_backend):
     b.prepare_motor_protocols();m.read_only_status_responds=False
     with pytest.raises(MotorSafetyError,match='失能反馈'):b.enable_motors()
     assert m.enables==0
+    m.read_only_status_responds=True  # allow the fixture to confirm its cleanup
 
 def test_auto_109_zero_uses_109_path(open_backend):
     m=OfflineLro('V5.0.0.109',(0,1,9,0,1,0,0,0,1,17));b=open_backend((m,None))

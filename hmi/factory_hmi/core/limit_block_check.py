@@ -159,14 +159,18 @@ class Coordinates:
         if identity != self.identity:
             raise FeedbackError("反馈的接口、ID 或具名关节与方案不一致")
         stamps = tuple(s.timestamp_s for s in samples)
+        problems = []
         for sample in samples:
             node = f"{sample.bus}#{sample.motor_id} {sample.joint_name}"
             issue = sample.feedback_issue(SETTINGS.max_feedback_age_s, now)
             if issue:
-                raise FeedbackError(f"电机 {node} {issue}")
+                problems.append(f"电机 {node} {issue}")
+                continue
             reasons = []
             if sample.error_id:
-                reasons.append(f"驱动故障 error_id={sample.error_id}")
+                profile = sample.lro_protocol_profile
+                name = LRO_ERROR_NAMES.get(profile, {}).get(sample.error_id)
+                reasons.append(f"驱动故障 error_id={sample.error_id}" + (f"（{name}）" if name else ""))
             if sample.drive_enabled is False:
                 reasons.append("驱动反馈未使能")
             if not math.isfinite(sample.pos_rad):
@@ -174,7 +178,10 @@ class Coordinates:
             if not math.isfinite(sample.torque_nm):
                 reasons.append("力矩反馈无效")
             if reasons:
-                raise FeedbackError(f"电机 {node}：" + "，".join(reasons))
+                problems.append(f"电机 {node} " + "，".join(reasons))
+        if problems:
+            count = f"全部 {len(samples)} 台同时" if len(problems) == len(samples) else f"{len(problems)}/{len(samples)} 台"
+            raise FeedbackError(f"反馈无效（{count}）：" + "；".join(problems))
         # Each motor must be fresh and advance independently. CAN responses
         # need not share a 35 ms group deadline; group skew is diagnostic only.
         if last_stamps and not all(a > b for a, b in zip(stamps, last_stamps)):
@@ -187,6 +194,13 @@ class Coordinates:
         if not np.all(np.isfinite(q)) or not np.all(np.isfinite(tau)):
             raise FeedbackError("逻辑关节反馈不完整")
         return q, tau, stamps
+
+
+LRO_ERROR_NAMES = {
+    "legacy": {1: "电机过温", 2: "过流", 3: "欠压", 4: "编码器", 6: "制动过压", 7: "DRV_ERROR"},
+    "v1.03": {1: "电机或 MOS 过温", 2: "过流", 3: "欠压", 4: "编码器",
+              5: "缺相或电流采样偏置", 6: "过压", 7: "OTHER_ERROR"},
+}
 
 
 class ContactWindow:

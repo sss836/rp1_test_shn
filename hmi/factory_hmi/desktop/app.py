@@ -3046,10 +3046,13 @@ class FactoryMainWindow(QMainWindow):
                     version_status = firmware_failure or ("部分读取" if errors or firmware == "—" else "已读取")
                 else:
                     version_status = {"timeout": "读取超时", "stale": "已过期", "unsupported": "不支持", "unknown": "未知"}.get(status, "未知")
-                version_stale = (read_error or local_gap > DISPLAY_STALE_S or
+                offline = (read_error or local_gap > DISPLAY_STALE_S or
                     (isinstance(station, Mapping) and station.get("backend_connected") is False) or
-                    snapshot.get("connected") is False or status == "stale")
-                if version_stale:
+                    snapshot.get("connected") is False)
+                if not offline and version.get("bound_to_enable") and version.get("active_profile"):
+                    version_status = "使能前已读取"
+                    protocol_confirmation = f"本次使能已核对（{version['active_profile']}）"
+                elif offline or status == "stale":
                     version_status = "过期·" + firmware_failure if firmware_failure else "已过期"
                     if numeric_identity != "—":
                         numeric_identity = "过期 · " + numeric_identity

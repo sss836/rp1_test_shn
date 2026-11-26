@@ -191,7 +191,11 @@ def test_repeated_motor_feedback_cannot_keep_worker_moving():
         worker.thread.join(2.)
         snapshot = worker.snapshot()
         assert snapshot["phase"] == "aborted" and any(text in snapshot["fault"] for text in ("新鲜", "超时"))
-        assert len(fake.command_history) == 1
+        assert 1 <= len(fake.command_history) <= 4
+        first = fake.command_history[0]
+        for row in fake.command_history:
+            np.testing.assert_array_equal(row["target"], first["target"])
+            assert (row["kp_scale"], row["kd_scale"]) == (first["kp_scale"], first["kd_scale"])
         assert not fake.motors_enabled and snapshot["disable"]["feedback"] == "confirmed_mock"
     finally:
         fake.close_transport()

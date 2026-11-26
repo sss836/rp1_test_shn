@@ -850,20 +850,28 @@ class FactoryService:
         backend = controller.backend
         safety = controller.config.safety_limits
         temperature_limit = controller._diagnosis.thresholds.overtemperature_c
+        names = tuple(e.joint_name for e in controller.config.entries)
 
         def bounds(q, motor):
-            check_bounds(safety, q, motor)
+            check_bounds(safety, q, motor, names)
 
         def read():
             samples = backend.limit_probe_samples()
+            problems = []
             for row in samples:
                 axis = f"电机 {row.bus}#{row.motor_id} {row.joint_name}"
+                reasons = []
                 if not math.isfinite(row.temp_c):
-                    raise FeedbackError(f"{axis} 温度反馈无效")
-                if row.temp_c >= temperature_limit:
-                    raise FeedbackError(f"{axis} 温度 {row.temp_c:g} °C 达到阈值 {temperature_limit:g} °C")
+                    reasons.append(f"温度反馈无效（{row.temp_c} °C）")
+                elif row.temp_c >= temperature_limit:
+                    reasons.append(f"温度 {row.temp_c:g} °C 达到阈值 {temperature_limit:g} °C")
                 if not math.isfinite(row.spd_rad_s):
-                    raise FeedbackError(f"{axis} 速度反馈无效")
+                    reasons.append(f"速度反馈无效（{row.spd_rad_s} rad/s）")
+                if reasons:
+                    problems.append(f"{axis} " + "，".join(reasons) +
+                                    f"（协议 {row.lro_protocol_profile}，力矩来源 {row.torque_source}）")
+            if problems:
+                raise FeedbackError("；".join(problems))
             return samples
 
         def publish(samples):

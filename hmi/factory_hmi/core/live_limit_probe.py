@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict, replace
 import hashlib
+import gc
 import json
 import logging
 import math
@@ -26,6 +27,9 @@ POS = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 VEC = Annotated[tuple[Annotated[float, Field(allow_inf_nan=False)], ...], Field(min_length=2, max_length=7)]
 POS_VEC = Annotated[tuple[POS, ...], Field(min_length=2, max_length=7)]
 MEASURED_SEARCH_MARGIN_DEG = 10.
+REPOLL_LIMIT_PER_GAP = 3
+REPOLL_WINDOW_S = 10.
+REPOLL_MAX_IN_WINDOW = 20
 
 
 class SearchExtension(BaseModel):
@@ -202,13 +206,23 @@ class PositionSettling:
     def __init__(self, tolerance_deg=.12, jitter_deg=0.):
         self.window = deque()
         self.tolerance_deg, self.jitter_deg = tolerance_deg, jitter_deg
+        self.blocking = None
+
+    def blocking_joint(self, names):
+        if self.blocking is None:
+            return None
+        axis, reason, value = self.blocking
+        return {"joint": names[axis], "reason": reason, "value": value, "unit": "°"}
 
     @classmethod
     def for_point(cls, point):
         return cls(point.arrival_tolerance_deg, SETTINGS.stall_deg if point.full_range_search else 0.)
 
     def settled(self, now, q, target):
+        self.blocking = None
         if self.tolerance_deg is not None and np.max(abs(q - target)) > math.radians(self.tolerance_deg):
+            axis = int(np.argmax(abs(q - target)))
+            self.blocking = (axis, "tolerance", math.degrees(abs(q[axis] - target[axis])))
             self.window.clear()
             return False
         self.window.append((now, q.copy()))
@@ -218,7 +232,11 @@ class PositionSettling:
         if duration < .20:
             return False
         span = np.ptp([row[1] for row in self.window], axis=0)
-        return bool(np.max(span) <= math.radians(max(self.jitter_deg, .15 * duration)))
+        axis = int(np.argmax(span))
+        if span[axis] > math.radians(max(self.jitter_deg, .15 * duration)):
+            self.blocking = (axis, "span", math.degrees(span[axis]))
+            return False
+        return True
 
 
 def motor_step_cap(coords, point, dt):
@@ -254,7 +272,11 @@ def advance_motion(coords, point, dt, pose, progress, proposed):
         else:
             high = middle
     if low == progress:
-        raise FeedbackError("按工位核定的电机单步和速度限制，本段无法继续推进")
+        delta = abs(coords.motor_target(pose(high)) - last)
+        axis = int(np.argmax(delta-cap))
+        bound = np.broadcast_to(cap, delta.shape)[axis]
+        raise FeedbackError(f"按工位核定的电机单步和速度限制，本段无法继续推进，{coords.names[axis]} "
+                           f"单步 {math.degrees(delta[axis]):g}°，上限 {math.degrees(bound):g}°")
     return low
 
 
@@ -377,7 +399,7 @@ class ProbeCycle:
         p, a, s = self.point, self.axis, self.point.direction
         elapsed, dt = now - self.since, now - self.previous
         if not (0 < dt <= SETTINGS.max_feedback_age_s):
-            raise FeedbackError("检查中逐电机反馈不连续")
+            raise FeedbackError(f"检查中逐电机反馈不连续，阶段 {self.phase}，间隔 {dt*1000:.1f} ms")
         check_torque(self.coords, joint_tau, motor_tau, p.joint_abort_nm, p.motor_abort_nm,
                      "实测力矩达到工位中止门限")
         if np.max(abs(np.rad2deg(q - self.target))) > p.following_error_deg:
@@ -433,7 +455,8 @@ class ProbeCycle:
             cap = math.radians(p.permitted_travel_deg)
             displacement = s * (q[a] - self.start[a])
             if displacement > cap + math.radians(.12):
-                raise FeedbackError("实际搜索姿态超过核定行程")
+                raise FeedbackError(f"实际搜索姿态超过核定行程，{p.joint} 实测 {math.degrees(displacement):g}°，"
+                                   f"上限 {math.degrees(cap)+.12:g}°")
             if self.candidate is not None or self.progress >= cap:
                 self.unload_from = self.target.copy()
                 self.unload_to = self.start.copy()
@@ -542,8 +565,20 @@ class ProbeWorker:
         self.reason = ""
         self.disable = {"request": "pending", "feedback": "unknown"}
         self.started = False
+        self._started_at = time.monotonic()
+        self._sent = None
+        self._sent_at = 0.
+        self._gap_repolls = 0
+        self._repoll_times = deque()
+        self._gap_noted = False
+        self.reply_misses = deque(maxlen=256)
+        self.gc_pauses = deque(maxlen=256)
+        self._gc_start = None
         self.feedback_diagnostics = {"received_groups": 0, "accepted_groups": 0,
             "repeated_groups": 0, "empty_reads": 0, "recovery_count": 0,
+            "repoll_count": 0, "missing_events": 0, "missed_by_motor": {},
+            "whole_bus_missed": 0, "max_accept_gap_ms": 0.,
+            "accept_gap_buckets": dict.fromkeys(("<=40", "<=80", "<=120", "<=150", ">150"), 0),
             "last_group_skew_ms": None, "max_group_skew_ms": 0.,
             "latest_status": "waiting_feedback", "last_error": None}
         self.latest_feedback_group = None
@@ -619,8 +654,11 @@ class ProbeWorker:
                     "result": dict(c.result) if c and c.result else None,
                     "positions_rad": c.actual.tolist() if c else None}
             base["control_thread_running"] = self.thread.is_alive()
-            base["feedback_diagnostics"] = dict(self.feedback_diagnostics)
+            base["feedback_diagnostics"] = {**self.feedback_diagnostics,
+                "missed_by_motor": dict(self.feedback_diagnostics["missed_by_motor"]),
+                "accept_gap_buckets": dict(self.feedback_diagnostics["accept_gap_buckets"])}
             if include_samples:
+                base.update(reply_misses=list(self.reply_misses), gc_pauses=list(self.gc_pauses))
                 base.update(context=self.context, calibration_passed=None,
                             samples=list(c.samples) if c else [])
                 base.update(latest_feedback_group=self.latest_feedback_group,
@@ -710,12 +748,71 @@ class ProbeWorker:
         motor = cycle.transfer_motor if in_transfer else point.motor_abort_nm
         check_torque(self.coords, tau, motor_tau, joint, motor, "实测力矩达到工位中止门限")
 
+    def _observe_gc(self, phase, info):
+        # GC can run on a thread already holding the worker lock.
+        if phase == "start":
+            self._gc_start = time.monotonic()
+        elif self._gc_start is not None:
+            end = time.monotonic()
+            ms = (end - self._gc_start) * 1000.
+            if info["generation"] == 2 or ms > 20:
+                self.gc_pauses.append({"time_s": end, "generation": info["generation"],
+                                       "duration_ms": ms, "collected": info["collected"]})
+            self._gc_start = None
+
+    @property
+    def repoll_after_s(self):
+        return max(self.command_interval_s, .015)
+
+    def _wait_for_reply(self, now, last_cohort, stamp, samples, q=None):
+        deadline = last_cohort + SETTINGS.max_feedback_age_s
+        if stamp:
+            oldest = min(s.timestamp_s for s in samples) if samples else min(stamp)
+            deadline = min(deadline, oldest + SETTINGS.max_feedback_age_s)
+        missing = [(row.bus, row.motor_id, round((now-row.timestamp_s)*1000, 1))
+                   for row, old in zip(samples, stamp) if row.timestamp_s <= old]
+        if missing and not self._gap_noted:
+            labels = [f"{bus}#{node}" for bus, node, age in missing]
+            whole = [bus for bus in dict.fromkeys(s.bus for s in samples)
+                     if sum(b == bus for b, _, _ in missing) == sum(s.bus == bus for s in samples)]
+            with self.lock:
+                diag = self.feedback_diagnostics
+                diag["missing_events"] += 1
+                diag["whole_bus_missed"] += len(whole)
+                for label in labels:
+                    diag["missed_by_motor"][label] = diag["missed_by_motor"].get(label, 0) + 1
+                self.reply_misses.append({"time_s": now, "missing": labels,
+                    "age_ms": [age for _, _, age in missing], "whole_buses": whole,
+                    "phase": self.cycle.phase if self.cycle else None,
+                    "joint_deg": np.round(np.rad2deg(q), 2).tolist() if q is not None else None})
+            self._gap_noted = True
+        if now >= deadline:
+            detail = "，".join(f"{bus}#{node} {age:g} ms" for bus, node, age in missing)
+            raise FeedbackError(f"没有收到完整的新鲜逐电机反馈，间隔 {(now-last_cohort)*1000:.1f} ms " + detail)
+        if (self._sent is not None and self._handoff_lock is None and not self.stop_event.is_set()
+                and self._gap_repolls < REPOLL_LIMIT_PER_GAP and now - self._sent_at >= self.repoll_after_s):
+            while self._repoll_times and now - self._repoll_times[0] >= REPOLL_WINDOW_S:
+                self._repoll_times.popleft()
+            if len(self._repoll_times) >= REPOLL_MAX_IN_WINDOW:
+                raise FeedbackError(f"反馈补询过于频繁（链路劣化），缺帧计数 {self.feedback_diagnostics['missed_by_motor']}")
+            target, kp, kd = self._sent
+            self.backend.command_mit(target, kp_scale=kp, kd_scale=kd, dispatch_before=deadline,
+                                     expected_generation=self._handoff_generation, cancelled=self.stop_event)
+            self._sent_at = time.monotonic()
+            self._repoll_times.append(self._sent_at)
+            self._gap_repolls += 1
+            with self.lock:
+                self.feedback_diagnostics["repoll_count"] += 1
+                self.feedback_events.append({"event": "repoll", "time_s": self._sent_at})
+        self.stop_event.wait(max(0., min(.008, self.command_interval_s, deadline - time.monotonic())))
+
     def _run(self):
         stamp = ()
-        last_cohort = time.monotonic()
+        self._started_at = last_cohort = time.monotonic()
         last_motor = None
         last_command = None
         received = False
+        gc.callbacks.append(self._observe_gc)
         try:
             while not self.stop_event.is_set():
                 received = False
@@ -727,9 +824,7 @@ class ProbeWorker:
                 self._observe_feedback(samples, now)
                 if not samples:
                     self._feedback_state("waiting_empty", now)
-                    if now - last_cohort >= SETTINGS.max_feedback_age_s:
-                        raise FeedbackError("没有收到完整的新鲜逐电机反馈")
-                    self.stop_event.wait(min(.008, self.command_interval_s))
+                    self._wait_for_reply(now, last_cohort, stamp, samples)
                     continue
                 # Validate current identities, individual freshness and faults
                 # before the repeated-group wait; no stale/fault/overload is
@@ -739,15 +834,22 @@ class ProbeWorker:
                 self._check_received_loads(tau, motor_tau, q)
                 if stamp and not all(a > old for a, old in zip(received_stamp, stamp, strict=True)):
                     self._feedback_state("waiting_repeated", now)
-                    if now - last_cohort >= SETTINGS.max_feedback_age_s:
-                        raise FeedbackError("没有收到完整的新鲜逐电机反馈")
-                    self.stop_event.wait(min(.008, self.command_interval_s))
+                    self._wait_for_reply(now, last_cohort, stamp, samples, q)
                     continue
                 # Before takeover the hold owner is servicing the drives. A
                 # delayed first read may still return a fully fresh group.
                 holding_before_takeover = not stamp and self._hold_stop is not None and not self._hold_stop.is_set()
                 if not holding_before_takeover and now - last_cohort >= SETTINGS.max_feedback_age_s:
-                    raise FeedbackError("逐电机反馈超过允许间隔")
+                    raise FeedbackError(f"逐电机反馈超过允许间隔，实测 {(now-last_cohort)*1000:.1f} ms")
+                if stamp:
+                    gap_ms = (now - last_cohort) * 1000
+                    with self.lock:
+                        diag = self.feedback_diagnostics
+                        diag["max_accept_gap_ms"] = max(gap_ms, diag["max_accept_gap_ms"])
+                        bucket = next((f"<={ms}" for ms in (40, 80, 120, 150) if gap_ms <= ms), ">150")
+                        diag["accept_gap_buckets"][bucket] += 1
+                self._gap_noted = False
+                self._gap_repolls = 0
                 stamp = received_stamp
                 self._feedback_state("accepted", now)
                 self.on_samples(samples)
@@ -768,8 +870,12 @@ class ProbeWorker:
                     target = self.coords.motor_target(self.cycle.target)
                     change = abs(target - last_motor)
                     dt = None if last_command is None else now - last_command
-                    if np.any(change > motor_step_cap(self.coords, self.cycle.point, dt)):
-                        raise FeedbackError("映射到电机的单步或速度超出工位核定值")
+                    cap = np.broadcast_to(motor_step_cap(self.coords, self.cycle.point, dt), change.shape)
+                    if np.any(change > cap):
+                        i = int(np.argmax(change-cap))
+                        node = self.coords.entries[i]
+                        raise FeedbackError(f"映射到电机的单步或速度超出工位核定值，{node.interface}#{node.motor_id} "
+                            f"{node.joint_name} 变化 {math.degrees(change[i]):g}°，上限 {math.degrees(cap[i]):g}°，dt={dt} s")
                     self.limits(self.cycle.target, target)
                     kp_scale, kd_scale = self.cycle.gains
                 if self.stop_event.is_set():
@@ -778,6 +884,11 @@ class ProbeWorker:
                     self.backend.command_mit(target, kp_scale=kp_scale, kd_scale=kd_scale)
                 else:
                     self._send_first_target(target, kp_scale, kd_scale, stamp)
+                self._sent = (target.copy(), kp_scale, kd_scale)
+                self._sent_at = time.monotonic()
+                if last_command is None:
+                    with self.lock:
+                        self.feedback_diagnostics.setdefault("first_dispatch_monotonic_s", self._sent_at)
                 last_motor = target
                 last_command = now
                 self.stop_event.wait(self.command_interval_s)
@@ -786,6 +897,7 @@ class ProbeWorker:
             self.reason = str(exc)
             self._feedback_failure(self.reason, time.monotonic(), received)
         finally:
+            gc.callbacks.remove(self._observe_gc)
             self._disable()
             with self.lock:
                 if self.cycle and (self.reason or self.cycle.phase != "finished"):
