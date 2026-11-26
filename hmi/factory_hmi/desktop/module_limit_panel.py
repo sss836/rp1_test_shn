@@ -120,8 +120,8 @@ class ModuleLimitPanel(QWidget):
                     text += f"\n本工位转场速度上限 {speed:g}°/s。"
                 rates = plan["profile"].get("left_leg_fixture")
                 if rates:
-                    text += (f"\n左髋内摆在 −20° 截止。空行程最高 {rates['transfer_deg_s']:g}°/s，"
-                             f"远端搜索最高 {rates['far_search_deg_s']:g}°/s。")
+                    text += (f"\n立柱工装提速已暂停，内摆在 −20° 截止。"
+                             f"转场最高 {plan['transfer_speed_deg_s']:g}°/s，远端搜索最高 10°/s。")
                 choice = QMessageBox.question(self, "确认启动真机检查", text,
                                               QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                               QMessageBox.StandardButton.No)

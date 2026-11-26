@@ -439,7 +439,7 @@ class MotorBackend(ABC):
         self._damping_cancelled.set()
         with self._control_generation_lock:self._control_generation += 1
 
-    def begin_protective_damping(self, expected_generation=None):
+    def begin_protective_damping(self, expected_generation=None, *, limit_stop=None):
         """Fence normal commands; this never connects or enables a motor."""
         with self._lock:
             self._require_connected()
@@ -453,19 +453,27 @@ class MotorBackend(ABC):
                 if self._command_inhibit.is_set():
                     raise MotorSafetyError("emergency inhibit cannot be overridden by damping")
                 self._damping_owner = object()
+                self._damping_limit_stop = limit_stop
                 self._damping_owner_generation = self.control_generation
                 self._damping_cancelled.clear()
             self._command_inhibit.set()
             return self._damping_owner
 
-    def command_protective_damping(self, owner, kd: float = 1.0) -> None:
+    def command_protective_damping(self, owner, kd: float = 1.0, *, feedback_deadline=None) -> None:
         # Absolute Kd, not a multiplier on the trajectory's configured gains.
-        if not math.isfinite(kd) or not 0 < kd <= 1.0:
-            raise ValueError("protective damping Kd must be finite and in (0, 1]")
         with self._lock:
             self._require_connected()
             if owner is None or owner is not self._damping_owner or not self._enabled or self._damping_cancelled.is_set() or self._damping_owner_generation != self.control_generation:
                 raise MotorSafetyError("protective damping authority is no longer active")
+            stop = self._damping_limit_stop
+            if stop is not None and stop.is_set():
+                raise MotorSafetyError("限位保护阻尼已被显式停止")
+            if stop is not None and (feedback_deadline is None or not math.isfinite(feedback_deadline)
+                                     or time.monotonic() >= feedback_deadline):
+                raise MotorSafetyError("限位保护阻尼发送前反馈已过期")
+            maximum = 2.0 if stop is not None else 1.0
+            if not math.isfinite(kd) or not 0 < kd <= maximum:
+                raise ValueError(f"protective damping Kd must be in (0, {maximum:g}]")
             self._command_protective_damping_impl(kd)
             if self._command_watchdog is not None:
                 self._command_watchdog.touch()
@@ -831,7 +839,8 @@ class MotorsPyBackend(MotorBackend):
         self._protocol_conflict.clear()
         self._selected_protocols = [None] * len(self.entries)
         self._selected_protocol_sources = [None] * len(self.entries)
-        self._versions = MotorVersions(self.entries, self._motors, on_observation=self._observe_motor_protocol)
+        self._versions = MotorVersions(self.entries, self._motors, on_observation=self._observe_motor_protocol,
+                                       numeric_nodes=self._local_evidence.nodes if self._local_evidence else frozenset())
         self._versions.start()
 
     def motor_versions(self) -> list[dict]:
@@ -869,7 +878,10 @@ class MotorsPyBackend(MotorBackend):
         if (evidence is None or entry.lro_protocol is not None
                 or entry.lro_protocol_profile != "legacy" or row.get("raw_firmware") is not None
                 or row.get("status") != "known" or not isinstance(row.get("errors"), dict)
-                or row["errors"].get("0x31") != "版本查询超时" or "0x1e" in row["errors"]
+                or "0x1e" in row["errors"]
+                or (row.get("firmware_read_state") not in {"timeout", "station_numeric"}
+                    and row["errors"].get("0x31") != "版本查询超时")
+                or "0x31" in (row.get("raw_responses") or {})
                 or not isinstance(row.get("raw_responses"), dict)
                 or self._versions is None or type(observed_at) not in {float, int}
                 or not math.isfinite(observed_at)
@@ -890,7 +902,7 @@ class MotorsPyBackend(MotorBackend):
         if entry.motor_type.upper() != "LRO":
             return
         expected = entry.lro_protocol
-        conflict = None
+        conflict = row.get("errors", {}).get("0x1e") if row.get("status") == "conflict" else None
         generation = firmware_generation(row.get("raw_firmware"))
         if expected is not None and entry.lro_protocol_profile == "legacy" and (
             generation == 109 or row.get("protocol") in self._configured_v103_protocols
@@ -919,7 +931,7 @@ class MotorsPyBackend(MotorBackend):
             if self._selected_protocol_sources[index] == "local_numeric_evidence":
                 if generation == 108:
                     self._selected_protocol_sources[index] = "firmware_readback"
-                elif row.get("raw_firmware") is None and not local_match:
+                elif row.get("raw_firmware") is None and not local_match and not row.get("last_refresh_errors"):
                     conflict = conflict or "本地核实身份的版本回读已变化或不可用"
             self._protocol_observations[index] = ({**row, "confirmed_firmware_generation": 108}
                                                    if local_match else row)

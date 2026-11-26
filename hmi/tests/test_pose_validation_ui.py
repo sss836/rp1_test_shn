@@ -229,3 +229,17 @@ def test_hide_during_preflight_cannot_start_late_job(window, monkeypatch):
                              digest="a"*64, profile={"use_builtin_order": True})})
     assert len(operations) == 1
     assert not panel.pending
+
+
+def test_limit_wait_and_fault_damping_are_distinct(window):
+    panel = window.module_limit_panel
+    state = dict(limb="left_arm", mode="module", active=True, phase="homing",
+                 wait_warning=dict(phase="homing", elapsed_s=35., blocking={"joint": "left_elbow_joint"}))
+    panel._take_result({"result": state})
+    assert "停稳等待 35 秒" in panel.fault_banner.text()
+    panel._take_result({"result": dict(state, active=False, phase="aborted", stop_phase="homing",
+                                      fault="测试停止", fault_protection=dict(active=True,kd=2.0))})
+    assert "中止前" in panel.fault_banner.text() and "Kd=2" in panel.fault_banner.text()
+    panel._take_result({"result": dict(state, active=False, phase="aborted", fault="测试停止",
+                                      current_fault_protection=dict(active=False, error="链路中断"))})
+    assert "链路中断" in panel.fault_banner.text() and "已交接" not in panel.fault_banner.text()

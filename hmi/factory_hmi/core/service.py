@@ -770,6 +770,10 @@ class FactoryService:
             if report and probe.thread.is_alive():
                 raise ValueError("请在复位和搜索结束后导出报告")
             result = probe.snapshot(include_samples=report)
+            damping = getattr(controller, "_protective_damping", None)
+            probe_ref = getattr(damping, "limit_probe_ref", None)
+            if result.get("fault_protection") and probe_ref and probe_ref() is probe:
+                result["current_fault_protection"] = damping.snapshot()
         else:
             result = {"active": False, "phase": "idle"}
         if controller is not None and controller.config.limb in PRESET_KEYS:
@@ -890,6 +894,7 @@ class FactoryService:
             hold_stop = controller._position_hold_stop if hold and hold.is_alive() else None
             generation = controller.backend.control_generation if preparation is None else preparation.generation
             worker.take_over_hold(controller._position_dispatch_lock, hold_stop, generation)
+            worker.fault_handoff = controller.limit_fault_damping
             controller._manual = worker
         try:
             if hold_stop is None:

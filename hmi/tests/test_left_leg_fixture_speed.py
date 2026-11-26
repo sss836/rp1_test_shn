@@ -18,7 +18,7 @@ def site_profile():
     return station, doc
 
 
-def test_whole_real_executor_with_fast_fixture(monkeypatch):
+def test_prior_fast_profile_uses_standard_rate_and_preserves_fixture_geometry(monkeypatch):
     import factory_hmi.core.module_limit_check as module
     station, doc = site_profile()
     monkeypatch.setattr(module, "read_site_profile", lambda path: ModuleProfile.model_validate(doc).model_dump_json().encode())
@@ -28,7 +28,7 @@ def test_whole_real_executor_with_fast_fixture(monkeypatch):
     cycle = ModuleCycle(coords, profile, coords.home.copy(), 0.)
     dt = .01
     max_search = max_return = 0.
-    for step in range(1, 12001):
+    for step in range(1, 60001):
         measured = cycle.target.copy()
         tau = np.full(len(measured), .2)
         probe, phase = cycle.probe, cycle.phase
@@ -58,8 +58,8 @@ def test_whole_real_executor_with_fast_fixture(monkeypatch):
                 assert abs(rates[1]) <= 20.00001
         if cycle.phase=="finished":
             break
-    assert step*dt < 120 and cycle.phase == "finished"
-    assert max_search>30 and max_return>40
+    assert cycle.phase == "finished"
+    assert 0 < max_search <= 10.00001 and 0 < max_return <= 20.00001
     first, *measured = cycle.results
     assert first["outcome"]=="fixture_limited" and first["deviation_deg"] is None
     assert first["search_end_actual_deg"]==pytest.approx(-20.) and first["retreat_completed"]
@@ -108,11 +108,11 @@ def test_obstruction_before_user_cap_is_recorded_as_early_contact():
     assert cycle.results[0]["actual_deg"]==pytest.approx(-12.)
 
 
-def test_only_site_worker_accelerates_and_checks_partial_feedback(tmp_path):
+def test_site_worker_keeps_standard_interval_and_checks_partial_feedback(tmp_path):
     from factory_hmi.core.module_limit_check import ModuleWorker
 
     station, doc = site_profile()
-    for source, interval in ((builtin_module_profile(station), .025), (ModuleProfile(**doc), .005)):
+    for source, interval in ((builtin_module_profile(station), .025), (ModuleProfile(**doc), .025)):
         coords, profile, context = validate_module_plan(station, source, "TEST", "1")
         worker = ModuleWorker(None, coords, profile, context, None, None, None, tmp_path/"unused", coords.home)
         assert not worker.started and worker.command_interval_s == interval

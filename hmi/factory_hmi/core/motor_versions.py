@@ -51,11 +51,12 @@ def version_relation(raw_firmware, numeric_software):
 class MotorVersions:
     # Match the native SDK's 500 ms receive window. Starting the next command
     # earlier replaces the pending query and discards matching late replies.
-    def __init__(self, entries, motors, *, timeout=.5, refresh=None, stale=180., on_observation=None):
+    def __init__(self, entries, motors, *, timeout=.5, refresh=None, stale=180., on_observation=None, numeric_nodes=frozenset()):
         self.entries, self.motors = tuple(entries), tuple(motors)
         # refresh is accepted for callers of earlier releases. Only explicit
         # requests can start another pass after the initial connection scan.
         self.timeout, self.stale = timeout, stale
+        self.numeric_nodes = numeric_nodes
         self._on_observation = on_observation
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -226,7 +227,17 @@ class MotorVersions:
                 else:
                     successes = 0
                     unsupported = False
-                    for code in (0x31, 0x1E):
+                    previous = self._rows[i]
+                    node = (e.interface, e.motor_id, e.motor_model, previous.get("numeric_software"),
+                            previous.get("hardware"), previous.get("protocol"))
+                    numeric_only = (requested and node in self.numeric_nodes
+                                    and e.lro_protocol is None and e.lro_protocol_profile == "legacy"
+                                    and previous.get("numeric_software") == "0.1.8"
+                                    and previous.get("firmware_read_state") in {"timeout", "station_numeric"}
+                                    and previous.get("status") == "known")
+                    if numeric_only:
+                        row["firmware_read_state"] = "station_numeric"
+                    for code in ((0x1E,) if numeric_only else (0x31, 0x1E)):
                         if self._stop.is_set():
                             break
                         try:
@@ -237,12 +248,20 @@ class MotorVersions:
                                 row["numeric_software"] = fields["software"]
                             row.update(fields)
                             successes += 1
+                        except TimeoutError as exc:
+                            row["errors"][hex(code)] = str(exc)
+                            if code == 0x31:
+                                row["firmware_read_state"] = "timeout"
                         except NotImplementedError as exc:
                             unsupported = True
                             row["errors"][hex(code)] = str(exc)
                         except (OSError, ValueError, RuntimeError, TypeError, AttributeError) as exc:
                             row["errors"][hex(code)] = str(exc)
                     row["status"] = "known" if successes else ("unsupported" if unsupported else ("timeout" if not row["raw_responses"] else "unknown"))
+                    if numeric_only and successes and any(row.get(field) != previous.get(field)
+                            for field in ("numeric_software", "hardware", "protocol")):
+                        row["status"] = "conflict"
+                        row["errors"]["0x1e"] = "数值身份已变化，须重新连接核对完整版本"
                     if row.get("raw_firmware") and row.get("numeric_software"):
                         row["version_relation"] = version_relation(row["raw_firmware"], row["numeric_software"])
                     # Serialize this read with version requests on the same receive

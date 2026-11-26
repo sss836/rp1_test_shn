@@ -13,7 +13,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from factory_hmi.limit_replay_assets import PRESET_KEYS, RESOURCE_ROOT, read_manifest, verified_asset
-from .limit_block_check import Coordinates, FeedbackError, SETTINGS
+from .limit_block_check import Coordinates, FeedbackError, ProbeSoftwareFault, SETTINGS, check_feedback_interval
 from .live_limit_probe import (MEASURED_SEARCH_MARGIN_DEG, POS_VEC, PROFILE_ROOT, VEC, PositionMove,
                                PositionSettling, ProbeCycle, ProbePoint, ProbeWorker, _sha, check_torque,
                                point_description, read_site_profile, station_sha)
@@ -52,6 +52,7 @@ class ModuleProfile(BaseModel):
     entry_via_deg: Annotated[tuple[VEC, ...], Field(max_length=12)] = ()
     return_via_deg: Annotated[tuple[VEC, ...], Field(max_length=12)] = ()
     waist_hip_hold_bounds_deg: tuple[tuple[float, float], tuple[float, float]] | None = None
+    waist_hip_hold_drift_deg: Annotated[float, Field(gt=0., allow_inf_nan=False)] = .2
     windows: Annotated[tuple[ScheduledPoint, ...], Field(min_length=4, max_length=14)]
     joint_peak_nm: POS_VEC | None = None
     transfer_speed_deg_s: Annotated[float, Field(gt=0, le=20)] | None = None
@@ -80,6 +81,11 @@ class ModuleProfile(BaseModel):
             raise ValueError("外置工位方案须保留核定人")
         if self.left_leg_fixture and (self.source != "site" or self.limb != "left_short_leg" or not self.approved_by.strip()):
             raise ValueError("立柱工装速度只适用于核定的五轴左腿工位")
+        if self.waist_hip_hold_drift_deg != .2:
+            if (self.limb != "waist_hip" or self.source != "site" or not (self.approved_by or "").strip()
+                    or not self.waist_hip_hold_bounds_deg
+                    or any(self.waist_hip_hold_drift_deg > high-low for low, high in self.waist_hip_hold_bounds_deg)):
+                raise ValueError("调整髋轴位移门限需要核定的腰部工位保持范围和核定人")
         return self
 
     def fixture_cap(self, point):
@@ -88,18 +94,15 @@ class ModuleProfile(BaseModel):
         return None
 
     def window_rates(self, point):
-        # Both directions through the narrow part of the negative-yaw arc use
-        # the existing rates. The inward roll keeps the original slow approach.
-        rates = self.left_leg_fixture
-        if rates and point.search_pose_deg[0] >= 0 and point.search_pose_deg[1] >= -60. and not (
-                point.joint == FIXTURE_ROLL and point.direction < 0):
-            transfer = (self.transfer_speed if point.joint == "left_hip_yaw_joint" and point.direction < 0
-                        else rates.transfer_deg_s)
-            return rates.far_search_deg_s, transfer
-        return point.search_speed_deg_s, min(self.transfer_speed, point.positioning_speed_deg_s)
+        search = point.search_speed_deg_s
+        if self.left_leg_fixture:
+            search = min(search, 10.)
+        return search, min(self.transfer_speed, point.positioning_speed_deg_s)
 
     @property
     def transfer_speed(self) -> float:
+        if self.left_leg_fixture:
+            return min(20., self.transfer_speed_deg_s or 20., min(w.point.positioning_speed_deg_s for w in self.windows))
         if self.transfer_speed_deg_s is not None:
             return self.transfer_speed_deg_s
         return min(window.point.positioning_speed_deg_s for window in self.windows)
@@ -238,6 +241,8 @@ def validate_module_plan(config, profile, serial, config_revision):
                "order_source": "builtin_order_only" if profile.use_builtin_order else "profile_or_legacy_route",
                "startup_action": "move_to_joint_zero" if all(v == 0 for v in profile.home_deg)
                else "move_to_profile_home"}
+    if profile.left_leg_fixture:
+        context["fixture_acceleration_suspended"] = True
     context["entry_beyond_reference_margin_deg"] = _entry_margin(config)
     context["digest"] = _sha(context)
     return coords, profile, context
@@ -318,6 +323,8 @@ class ModuleCycle:
         self.probe = None
         self.arm_completion = None
         self.last_packet = []
+        self.wait_warning = None
+        self.last_wait_warning = None
         self.samples = []
         self.last_transfer = None
         self.transfer_history = deque(maxlen=5000)
@@ -370,19 +377,7 @@ class ModuleCycle:
         self.gains_from = self.gains
         self.gains_to = self.gains if scales is None else scales
         speed = min(self.transfer_speed, self.point.positioning_speed_deg_s) if phase == "clearance" else self.transfer_speed
-        acceleration = None
-        if self.profile.left_leg_fixture and not self.homing:
-            # Do not accelerate a transfer through the near-post yaw or inward-roll arc.
-            roll, yaw = self.fixture_roll_axis, self.coords.names.index("left_hip_yaw_joint")
-            if min(self.target[yaw], goal[yaw]) >= math.radians(-60.) and min(self.target[roll], goal[roll]) >= 0:
-                speed = self.profile.left_leg_fixture.transfer_deg_s
-                acceleration = 120.
-            elif (phase == "clearance" and self.point.joint == "left_hip_yaw_joint"
-                  and self.point.direction < 0 and min(self.target[roll], goal[roll]) >= 0):
-                # Return through the column corridor at the legacy 20 deg/s ceiling.
-                speed = min(self.transfer_speed, self.profile.left_leg_fixture.transfer_deg_s)
-                acceleration = 45.
-        self.move = PositionMove(self.target, goal, speed, acceleration=acceleration,
+        self.move = PositionMove(self.target, goal, speed,
                                  gain_transition=self.gains_from != self.gains_to,
                                  settling=PositionSettling.for_point(self.point))
 
@@ -413,10 +408,19 @@ class ModuleCycle:
             self.phase = self.probe.phase
 
     def _verify_load(self, q, joint_tau, motor_tau, now):
-        if not 0 < now-self.last_time <= SETTINGS.max_feedback_age_s:
-            raise FeedbackError(f"检查中逐电机反馈不连续，阶段 {self.phase}，间隔 {(now-self.last_time)*1000:.1f} ms")
-        if self.fixed_hips is not None and np.max(abs(q[2:] - self.fixed_hips)) > math.radians(.20):
-            raise FeedbackError("腰部检查时髋轴离开保持位")
+        if self.probe is None:
+            check_feedback_interval(now-self.last_time, self.phase, source="整模块转场或收尾")
+        if self.fixed_hips is not None:
+            threshold = self.profile.waist_hip_hold_drift_deg
+            for i, initial in enumerate(self.fixed_hips):
+                actual = math.degrees(q[i + 2])
+                start = math.degrees(initial)
+                bounds = self.profile.waist_hip_hold_bounds_deg
+                if bounds and not bounds[i][0] <= actual <= bounds[i][1]:
+                    raise FeedbackError(f"{self.coords.names[i+2]} 实测 {actual:.3f}° 越过核定保持范围 {bounds[i]}°")
+                if abs(actual-start) > threshold + 1.e-10:
+                    raise FeedbackError(f"腰部检查时髋轴离开保持位：{self.coords.names[i+2]}，起始 {start:.3f}°，"
+                                        f"实测 {actual:.3f}°，位移 {actual-start:+.3f}°，允许 ±{threshold:.3f}°")
         if self.fixture_roll_axis is not None and q[self.fixture_roll_axis] < math.radians(FIXTURE_ROLL_MIN_DEG) - 1e-9:
             raise FeedbackError("左髋实测内摆越过工装 −20° 停止角，整轮中止")
         if self.probe is not None:
@@ -424,7 +428,7 @@ class ModuleCycle:
         check_torque(self.coords, joint_tau, motor_tau, self.transfer_joint, self.transfer_motor,
                      "转场中超过核定中止力矩")
         if not self.point.full_range_search and np.max(abs(np.rad2deg(q - self.target))) > self.transfer_error:
-            raise FeedbackError("转场跟踪偏差超过核定值")
+            raise ProbeSoftwareFault("转场跟踪偏差超过核定值")
 
     def step(self, now, q, joint_tau, motor_tau):
         # Save the current measurement even when a verification raises below.
@@ -459,7 +463,42 @@ class ModuleCycle:
             self._position(q, now)
         if self.fixed_hips is not None:
             self.target[2:] = self.fixed_hips
-        self.actual, self.last_time = q.copy(), now
+        self.last_time = now
+        self._update_wait_warning(now)
+
+    def _update_wait_warning(self, now):
+        # Count only the wait at a commanded target, not the preceding motion.
+        since = None
+        blocking = None
+        if self.probe is not None:
+            if self.phase == "baseline":
+                since = self.probe.since
+                settling = self.probe.settling
+            elif self.phase == "retreat" and self.probe.feedback_search is not None:
+                since = self.probe.feedback_search.retreat_settling_since
+                settling = self.probe.settling
+            elif self.phase == "reset":
+                since = self.probe.reset.commanded_at
+                settling = self.probe.reset.settling
+            if since is not None and now - since >= 30.:
+                blocking = settling.blocking_joint(self.coords.names)
+        elif self.arm_completion is not None:
+            since = self.arm_completion.settling_since
+            if self.phase == "arm_holding":
+                since = self.arm_completion.started_at
+            blocking = self.arm_completion.blocking
+        elif self.phase != "finished":
+            since = self.move.commanded_at
+            if since is not None and now - since >= 30.:
+                blocking = self.move.settling.blocking_joint(self.coords.names)
+        if since is not None and now - since >= 30.:
+            if self.wait_warning and self.wait_warning["phase"] == self.phase and int(now-since) == int(self.wait_warning["elapsed_s"]):
+                return
+            self.wait_warning = {"phase": self.phase, "elapsed_s": now - since,
+                                 "threshold_s": 30., "blocking": blocking}
+            self.last_wait_warning = self.wait_warning
+        else:
+            self.wait_warning = None
 
     def _complete_window(self, probe, q, joint_tau, motor_tau):
         self.result = {**probe.result, "joint": self.point.joint, "sign": self.point.direction,
@@ -467,7 +506,8 @@ class ModuleCycle:
                        "motor_nm_after_retreat": motor_tau.tolist(), "retreat_completed": True}
         self.results.append(self.result)
         self.direction_evidence.append({"joint": self.point.joint, "sign": self.point.direction,
-            "samples": list(probe.samples), "samples_truncated": probe.sample_count > len(probe.samples)})
+            "samples": list(probe.samples), "samples_truncated": probe.sample_count > len(probe.samples),
+            **probe.history.snapshot()})
         self.probe = None
         if not self.point.full_range_search and self.result["outcome"] != "within_reference":
             raise FeedbackError(f"{probe.direction.label} {probe.direction.label_direction}结果异常，整模块检查已中止")
@@ -502,8 +542,6 @@ class ModuleWorker(ProbeWorker):
     def __init__(self, backend, coords, profile, context, read, limits, publish, destination, entry_position, *, prepared_completion=None):
         super().__init__(backend, coords, profile.windows[0].point, context, read, limits, publish)
         self.profile = profile
-        if profile.left_leg_fixture:
-            self.command_interval_s = .005
         self.destination = Path(destination)
         self.entry_position = entry_position.copy()
         self.report_file = None
@@ -535,15 +573,15 @@ class ModuleWorker(ProbeWorker):
     def begin(self):
         raise ValueError("整模块任务已自动执行")
 
-    def _record_feedback(self, samples):
+    def _record_feedback(self, samples, packet=None, now=None):
         cycle = self.cycle
-        cycle.last_packet = [row.to_dict() for row in samples]
+        cycle.last_packet = packet if packet is not None else [row.to_dict() for row in samples]
         # Preserve the raw Iq and torque provenance alongside the logical
         # angle/load trace, without sending the whole trace on every UI poll.
         new_result = len(cycle.samples) < len(cycle.results)
         trace = cycle.probe.samples if cycle.probe else (
             cycle.direction_evidence[-1]["samples"] if new_result else ())
-        if trace:
+        if trace and (now is None or not cycle.probe or trace[-1]["time_s"] == now-cycle.probe.samples_started):
             trace[-1]["drive_load"] = [
                 {key: row.get(key) for key in ("motor_id", "bus", "joint_name", "iq_current_a",
                   "torque_nm", "torque_kt_nm_a", "torque_source", "torque_is_estimated")}
@@ -580,6 +618,8 @@ class ModuleWorker(ProbeWorker):
             if cycle:
                 result["entry_beyond_reference"] = list(cycle.entry_beyond_reference)
                 result["last_transfer"] = cycle.last_transfer
+                result["wait_warning"] = cycle.wait_warning
+                result["last_wait_warning"] = cycle.last_wait_warning
                 result["completion"] = (cycle.arm_completion.snapshot() if cycle.arm_completion is not None
                     else {"required": self.profile.limb in {"left_arm", "left_short_arm", "right_arm", "right_short_arm"},
                           "phase": "pending", "active": False, "normal_completed": False})
@@ -604,7 +644,8 @@ class ModuleWorker(ProbeWorker):
                 result["last_drive_feedback"] = list(cycle.last_packet)
                 result["direction_evidence"] = list(cycle.direction_evidence)
                 result["unfinished_search"] = ({"joint": probe.point.joint, "sign": probe.point.direction,
-                    "samples": list(probe.samples), "samples_truncated": probe.sample_count > len(probe.samples)}
+                    "samples": list(probe.samples), "samples_truncated": probe.sample_count > len(probe.samples),
+                    **probe.history.snapshot()}
                     if probe else None)
                 if probe and probe.feedback_search and probe.feedback_search.attempts:
                     result["unfinished_search"]["search_attempts"] = list(probe.feedback_search.attempts)

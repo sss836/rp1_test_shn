@@ -86,6 +86,23 @@ class FeedbackError(RuntimeError):
     pass
 
 
+class ProbeSoftwareFault(FeedbackError):
+    """Execution stopped; damping is eligible only after fresh independent feedback."""
+
+
+class ProbeFeedbackGap(ProbeSoftwareFault):
+    """Require a newly advanced cohort before handing off after a feedback gap."""
+
+
+def check_feedback_interval(interval, phase, *, source, inclusive=False):
+    limit = SETTINGS.max_feedback_age_s
+    within_budget = interval < limit if inclusive else interval <= limit
+    if not (0 < interval and within_budget):
+        raise ProbeFeedbackGap(f"检查中逐电机反馈不连续，阶段 {phase}，间隔 {interval*1000:.1f} ms，"
+                                 f"门限 {limit*1000:g} ms，来源 {source}")
+
+
+
 def nominal_station(limb: str) -> StationConfig:
     if limb not in dict(MODULES):
         raise ValueError("限位块检查仅支持独立单腿、单臂和腰部")

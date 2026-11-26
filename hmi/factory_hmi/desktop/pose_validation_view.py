@@ -219,8 +219,25 @@ def render_pose_status(panel, s, *, online, pending, serial):
         link = "失能未确认 · " + "、".join(f"{row['bus']}#{row['motor_id']}" for row in unconfirmed)
     panel.link_value.setText(link)
     fault = s.get("fault") if phase == "aborted" else None
-    panel.fault_banner.setText("检查中止：" + fault if fault else "")
-    panel.fault_banner.setVisible(bool(fault))
+    warning = s.get("wait_warning") or {}
+    message = "检查中止：" + fault if fault else ""
+    if warning and active:
+        waiting_joint = (warning.get("blocking") or {}).get("joint")
+        joint = f" · {joint_label(waiting_joint)}" if waiting_joint else ""
+        message = f"停稳等待 {warning['elapsed_s']:.0f} 秒{joint}，仍在保持目标，请检查工位。"
+    if fault:
+        if warning:
+            joint = (warning.get("blocking") or {}).get("joint")
+            message += f" · 中止前 {s.get('stop_phase') or warning['phase']} 等待 {warning['elapsed_s']:.0f} 秒"
+            if joint:
+                message += f"（{joint_label(joint)}）"
+        protection = s.get("current_fault_protection") or s.get("fault_protection") or {}
+        if protection.get("active"):
+            message += f" · 已交接保护阻尼 Kd={protection['kd']:g}，承重未确认"
+        elif protection.get("error"):
+            message += f" · 保护阻尼失败：{protection['error']}"
+    panel.fault_banner.setText(message)
+    panel.fault_banner.setVisible(bool(message))
     panel.progress_text.setText("正在启动…" if pending else f"检查中 · {min(done+1,total)} / {total} 项" if active
                                else "已中止" if phase == "aborted" else "检查完成" if phase == "finished" else "等待开始")
     transfer = s.get("last_transfer") or {}

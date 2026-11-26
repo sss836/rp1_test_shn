@@ -862,7 +862,29 @@ class FactoryController:
             with self._shutdown_intent_guard:
                 self._protective_requests -= 1
 
-    def _enter_protective_damping(self, reason: str, kd: float = 1.0, expected_generation=None):
+    def limit_fault_damping(self, worker, reason):
+        """Hand off on the exiting probe thread. Never wait behind a caller joining it."""
+        if not self._damping_guard.acquire(blocking=False):
+            return None
+        try:
+            if (self._manual is not worker or worker.stop_event.is_set()
+                    or worker.thread is not threading.current_thread()
+                    or worker._handoff_lock is not None):
+                return None
+            with self._shutdown_intent_guard:
+                if self._shutdown_committed:
+                    return None
+                self._protective_requests += 1
+            try:
+                return self._enter_protective_damping(reason, 2.0, worker._handoff_generation,
+                                                       probe_owner=worker)
+            finally:
+                with self._shutdown_intent_guard:
+                    self._protective_requests -= 1
+        finally:
+            self._damping_guard.release()
+
+    def _enter_protective_damping(self, reason: str, kd: float = 1.0, expected_generation=None, *, probe_owner=None):
         from .protective_damping import ProtectiveDamping
         with self._damping_guard:
             origin_generation=self.backend.control_generation if expected_generation is None else expected_generation
@@ -880,10 +902,11 @@ class FactoryController:
                     else:
                         playback._stop_event.set()
                         if not playback.wait(2):raise TimeoutError('playback did not stop for protective damping')
-                self._stop_manual_session()
-                self._stop_position_hold()
-                # A supported limit fixture requests disable on cancellation.
-                # Do not re-enter damping after that owner has disabled the drive.
+                if probe_owner is None:
+                    self._stop_manual_session()
+                    self._stop_position_hold()
+                elif probe_owner.stop_event.is_set():
+                    return None
                 if not self.backend.motors_enabled:
                     return None
                 def observe(samples):
@@ -891,7 +914,8 @@ class FactoryController:
                     self.telemetry_hub.publish(samples)
                 session = ProtectiveDamping(self.backend,rate_hz=min(200.,self.config.control_rate_hz),
                     kd=kd,on_samples=observe,overtemperature_c=self._diagnosis.thresholds.overtemperature_c,
-                    expected_generation=origin_generation)
+                    expected_generation=origin_generation,
+                    limit_probe=probe_owner)
                 self._protective_damping = session
                 self._fault = FaultStatus(message=f'{reason}；保护阻尼 Kd={kd:g}，承重未确认',
                     kind='OperatorControlLost' if reason=='operator lease expired' else 'SoftwareFaultProtectiveStop',timestamp_s=time.monotonic())
@@ -1003,6 +1027,9 @@ class FactoryController:
     def disable_motors(self, *, reason: str = "software disable") -> None:
         """Immediately remove motor torque without closing the transport."""
 
+        from .live_limit_probe import ProbeWorker
+        if isinstance(self._manual, ProbeWorker):
+            self._manual.request_stop(f"收到显式失能请求（{reason}）")
         self._stop_protective_damping(request_only=True)
         self.request_motion_stop()
         self._stop_manual_session()

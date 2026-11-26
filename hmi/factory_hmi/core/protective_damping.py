@@ -3,15 +3,20 @@ from __future__ import annotations
 import math
 import threading
 import time
+import weakref
 
 
 class ProtectiveDamping:
     def __init__(self, backend, *, rate_hz=200., kd=1., on_samples=None,
-                 overtemperature_c=100., expected_generation=None):
+                 overtemperature_c=100., expected_generation=None, limit_probe=None):
         if not math.isfinite(rate_hz) or not 0 < rate_hz <= 200:
             raise ValueError('protective damping rate must be in (0, 200] Hz')
-        if not math.isfinite(kd) or not 0 < kd <= 1:
-            raise ValueError('protective damping Kd must be in (0, 1]')
+        maximum_kd = 2.0 if limit_probe is not None else 1.0
+        if not math.isfinite(kd) or not 0 < kd <= maximum_kd:
+            raise ValueError(f'protective damping Kd must be in (0, {maximum_kd:g}]')
+        self.feedback_deadline = None
+        self.limit_probe = limit_probe
+        self.limit_probe_ref = weakref.ref(limit_probe) if limit_probe is not None else None
         self.backend=backend;self.rate_hz=rate_hz;self.kd=kd
         self.generation=backend.control_generation if expected_generation is None else expected_generation
         self.on_samples=on_samples;self.overtemperature_c=overtemperature_c
@@ -29,7 +34,12 @@ class ProtectiveDamping:
         with self._guard:self._status.update(fields)
 
     def start(self):
-        with self._lifecycle:self._start()
+        with self._lifecycle:
+            try:
+                self._start()
+            except Exception:
+                self.limit_probe = None
+                raise
 
     def _check_drives(self, samples):
         faults = []
@@ -48,16 +58,25 @@ class ProtectiveDamping:
         if faults:
             raise RuntimeError("，".join(faults))
 
+    def _command(self):
+        if self.limit_probe is None:
+            self.backend.command_protective_damping(self.owner, self.kd)
+        else:
+            self.backend.command_protective_damping(self.owner, self.kd, feedback_deadline=self.feedback_deadline)
+
     def _start(self):
         if self.stop_event.is_set():return
         if self.thread and self.thread.is_alive():return
         try:samples=self.backend.read_samples()
         except Exception as exc:
             self._update(feedback="unknown",feedback_error=str(exc));samples=[]
+        if self.limit_probe is not None:
+            self.feedback_deadline = self.limit_probe.check_damping_feedback(samples, self.kd)
         self._check_drives(samples)
-        self.owner=self.backend.begin_protective_damping(self.generation)
+        self.owner=(self.backend.begin_protective_damping(self.generation, limit_stop=self.limit_probe.stop_event)
+                    if self.limit_probe is not None else self.backend.begin_protective_damping(self.generation))
         try:
-            self.backend.command_protective_damping(self.owner,self.kd)
+            self._command()
             self._update(active=True,phase='commanded',command_count=1,
                          last_command_monotonic_s=time.monotonic())
             if self.stop_event.is_set():
@@ -79,6 +98,8 @@ class ProtectiveDamping:
                     try:samples=self.backend.read_samples()
                     except Exception as exc:
                         self._update(feedback='unknown',feedback_error=str(exc));samples=[]
+                    if self.limit_probe is not None:
+                        self.feedback_deadline = self.limit_probe.check_damping_feedback(samples, self.kd)
                     if samples:
                         self._check_drives(samples)
                         fresh=all(math.isfinite(s.feedback_age_s) and s.feedback_age_s<.5 for s in samples)
@@ -86,7 +107,7 @@ class ProtectiveDamping:
                         if self.on_samples:self.on_samples(samples)
                     last_read=now
                 if self.stop_event.is_set():break
-                self.backend.command_protective_damping(self.owner,self.kd)
+                self._command()
                 with self._guard:
                     self._status['command_count']+=1
                     self._status['last_command_monotonic_s']=time.monotonic()
@@ -104,6 +125,7 @@ class ProtectiveDamping:
         finally:
             self.backend.end_protective_damping(self.owner)
             self._update(active=False)
+            self.limit_probe = None
 
     def stop(self, timeout=2.):
         self.stop_event.set()

@@ -19,7 +19,7 @@ from typing import Annotated, Literal
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .limit_block_check import ContactWindow, Coordinates, FeedbackError, SETTINGS
+from .limit_block_check import ContactWindow, Coordinates, FeedbackError, ProbeFeedbackGap, ProbeSoftwareFault, SETTINGS, check_feedback_interval
 
 PILOT_LIMBS = {"left_short_leg", "right_short_leg"}
 PROFILE_ROOT = Path("/etc/rp1-factory-hmi/limit-probe.d")
@@ -331,10 +331,30 @@ class PositionMove:
         if not settled and not point.full_range_search and now - self.commanded_at > 3.:
             error = abs(np.rad2deg(q-self.goal))
             axis = int(np.argmax(error))
-            raise FeedbackError(f"{timeout_message}：{coords.names[axis]} 实测 {math.degrees(q[axis]):.2f}°，"
+            raise ProbeSoftwareFault(f"{timeout_message}：{coords.names[axis]} 实测 {math.degrees(q[axis]):.2f}°，"
                                 f"目标 {math.degrees(self.goal[axis]):.2f}°，偏差 {error[axis]:.2f}°，"
                                 f"到位范围 ±{self.settling.tolerance_deg:g}°；须同时停稳")
         return target, ratio, settled
+
+
+class DirectionEvidence:
+    """Keep a bounded overview of records evicted from the full-resolution tail."""
+    def __init__(self):
+        self.earlier = []
+        self.stride = 1
+        self.evicted = 0
+
+    def retain(self, sample):
+        if self.evicted % self.stride == 0:
+            self.earlier.append(sample)
+            if len(self.earlier) == 512:
+                self.earlier = self.earlier[::2]
+                self.stride *= 2
+        self.evicted += 1
+
+    def snapshot(self):
+        return {"earlier_samples": list(self.earlier), "earlier_stride": self.stride,
+                "evicted_from_full_resolution": self.evicted}
 
 
 class ProbeCycle:
@@ -367,6 +387,7 @@ class ProbeCycle:
         self.candidate = None
         self.result = None
         self.samples = deque(maxlen=5000)
+        self.history = DirectionEvidence()
         self.sample_count = 0
         self.samples_started = now
         self.far_speed = point.search_speed_deg_s if far_speed is None else far_speed
@@ -375,6 +396,12 @@ class ProbeCycle:
         if point.full_range_search:
             from .feedback_limit_search import FeedbackLimitSearch
             self.feedback_search = FeedbackLimitSearch(self)
+
+    def record_sample(self, sample):
+        if len(self.samples) == self.samples.maxlen:
+            self.history.retain(self.samples[0])
+        self.samples.append(sample)
+        self.sample_count += 1
 
     def _phase(self, name, now):
         self.phase, self.since = name, now
@@ -398,20 +425,18 @@ class ProbeCycle:
             return self.feedback_search.step(now, q, joint_tau, motor_tau)
         p, a, s = self.point, self.axis, self.point.direction
         elapsed, dt = now - self.since, now - self.previous
-        if not (0 < dt <= SETTINGS.max_feedback_age_s):
-            raise FeedbackError(f"检查中逐电机反馈不连续，阶段 {self.phase}，间隔 {dt*1000:.1f} ms")
+        check_feedback_interval(dt, self.phase, source="单方向检查")
         check_torque(self.coords, joint_tau, motor_tau, p.joint_abort_nm, p.motor_abort_nm,
                      "实测力矩达到工位中止门限")
         if np.max(abs(np.rad2deg(q - self.target))) > p.following_error_deg:
-            raise FeedbackError("实际姿态与最近指令偏差超过核定值")
+            raise ProbeSoftwareFault("实际姿态与最近指令偏差超过核定值")
         held = self.held_actual if p.full_range_search else self.start
         held_tolerance = p.arrival_tolerance_deg if p.full_range_search else .35
         if np.max(abs(np.rad2deg(np.delete(q - held, a)))) > held_tolerance:
             raise FeedbackError("非搜索轴离开核定保持位")
-        self.samples.append({"time_s": now - self.samples_started, "phase": self.phase,
+        self.record_sample({"time_s": now - self.samples_started, "phase": self.phase,
             "actual_deg": np.rad2deg(q).tolist(), "target_deg": np.rad2deg(self.target).tolist(),
             "joint_nm": joint_tau.tolist(), "motor_nm": motor_tau.tolist(), "kp_kd_scale": self.gains})
-        self.sample_count += 1
         if self.phase == "reset":
             self.target, _, settled = self.reset.step(
                 self.coords, p, now, dt, q, "目标时程已发完，复位实测到位未确认")
@@ -440,7 +465,7 @@ class ProbeCycle:
             else:
                 self.recent_load.clear()
             if elapsed > 3:
-                raise FeedbackError("搜索增益切换后未取得稳定基线")
+                raise ProbeSoftwareFault("搜索增益切换后未取得稳定基线")
         elif self.phase == "search":
             self.trace.append((now, q.copy()))
             if p.full_range_search:
@@ -515,7 +540,7 @@ class ProbeCycle:
             self.commanded_at = now
         settled = self.settling.settled(now, q, self.target)
         if not settled and now - self.commanded_at > 3.:
-            raise FeedbackError(timeout_message)
+            raise ProbeSoftwareFault(timeout_message)
         return settled
 
     def _plan_retreat(self, now, q):
@@ -563,6 +588,11 @@ class ProbeWorker:
         self.thread = threading.Thread(target=self._run, daemon=True, name="limit-probe")
         self.cycle = None
         self.reason = ""
+        self.stop_phase = None
+        self.stop_reason = None
+        self.fault_handoff = None
+        self.protection = None
+        self._damping_after_stamps = ()
         self.disable = {"request": "pending", "feedback": "unknown"}
         self.started = False
         self._started_at = time.monotonic()
@@ -623,7 +653,9 @@ class ProbeWorker:
     def active(self):
         return self.thread.is_alive() or (self.started and self.disable["request"] == "failed")
 
-    def request_stop(self):
+    def request_stop(self, reason=None):
+        if reason and not self.stop_reason:
+            self.stop_reason = reason
         self.stop_event.set()
         if self._hold_stop is not None:
             self._hold_stop.set()
@@ -653,6 +685,7 @@ class ProbeWorker:
                     "fault": self.reason or None, "disable": dict(self.disable),
                     "result": dict(c.result) if c and c.result else None,
                     "positions_rad": c.actual.tolist() if c else None}
+            base.update(stop_phase=self.stop_phase, fault_protection=self.protection)
             base["control_thread_running"] = self.thread.is_alive()
             base["feedback_diagnostics"] = {**self.feedback_diagnostics,
                 "missed_by_motor": dict(self.feedback_diagnostics["missed_by_motor"]),
@@ -665,7 +698,7 @@ class ProbeWorker:
                             last_rejected_feedback_group=self.last_rejected_feedback_group,
                             feedback_events=list(self.feedback_events))
                 if isinstance(c, ProbeCycle):
-                    base.update(candidate=c.candidate, samples_truncated=c.sample_count > len(c.samples))
+                    base.update(candidate=c.candidate, samples_truncated=c.sample_count > len(c.samples), **c.history.snapshot())
             return base
 
     def _disable(self):
@@ -689,9 +722,9 @@ class ProbeWorker:
     def _new_cycle(self, q, now):
         return ProbeCycle(self.coords, self.point, q, now)
 
-    def _record_feedback(self, samples):
-        if self.cycle.samples:
-            self.cycle.samples[-1]["drive_feedback"] = [row.to_dict() for row in samples]
+    def _record_feedback(self, samples, packet=None, now=None):
+        if self.cycle.samples and (now is None or self.cycle.samples[-1]["time_s"] == now-self.cycle.samples_started):
+            self.cycle.samples[-1]["drive_feedback"] = packet if packet is not None else [row.to_dict() for row in samples]
 
     def _record_end(self):
         pass
@@ -711,6 +744,8 @@ class ProbeWorker:
             if skew is not None and skew > diag["max_group_skew_ms"]:
                 diag["max_group_skew_ms"] = skew
                 self.feedback_events.append({"event": "observed_skew", "time_s": now, "skew_ms": skew})
+
+        return group["samples"]
 
     def _feedback_state(self, state, now):
         with self.lock:
@@ -747,6 +782,18 @@ class ProbeWorker:
         joint = cycle.transfer_joint if in_transfer else point.joint_abort_nm
         motor = cycle.transfer_motor if in_transfer else point.motor_abort_nm
         check_torque(self.coords, tau, motor_tau, joint, motor, "实测力矩达到工位中止门限")
+
+    def check_damping_feedback(self, samples, kd):
+        if self.stop_event.is_set():
+            raise FeedbackError("限位检查已收到停止请求")
+        q, torque, _ = self.coords.decode(samples, time.monotonic(), self._damping_after_stamps)
+        if any(not math.isfinite(row.temp_c) or not math.isfinite(row.spd_rad_s) for row in samples):
+            raise FeedbackError("阻尼交接缺少温度或速度反馈")
+        self._check_received_loads(torque, np.asarray([s.torque_nm for s in samples]), q)
+        damping_torque = -kd * np.asarray([s.spd_rad_s for s in samples])
+        self._check_received_loads(self.coords.jacobian(q).T @ damping_torque, damping_torque, q)
+        self.limits(q, np.asarray([s.pos_rad for s in samples]))
+        return min(s.timestamp_s for s in samples) + SETTINGS.max_feedback_age_s
 
     def _observe_gc(self, phase, info):
         # GC can run on a thread already holding the worker lock.
@@ -788,7 +835,7 @@ class ProbeWorker:
             self._gap_noted = True
         if now >= deadline:
             detail = "，".join(f"{bus}#{node} {age:g} ms" for bus, node, age in missing)
-            raise FeedbackError(f"没有收到完整的新鲜逐电机反馈，间隔 {(now-last_cohort)*1000:.1f} ms " + detail)
+            raise ProbeFeedbackGap(f"没有收到完整的新鲜逐电机反馈，间隔 {(now-last_cohort)*1000:.1f} ms " + detail)
         if (self._sent is not None and self._handoff_lock is None and not self.stop_event.is_set()
                 and self._gap_repolls < REPOLL_LIMIT_PER_GAP and now - self._sent_at >= self.repoll_after_s):
             while self._repoll_times and now - self._repoll_times[0] >= REPOLL_WINDOW_S:
@@ -821,7 +868,7 @@ class ProbeWorker:
                     break
                 now = time.monotonic()
                 received = True
-                self._observe_feedback(samples, now)
+                packet = self._observe_feedback(samples, now)
                 if not samples:
                     self._feedback_state("waiting_empty", now)
                     self._wait_for_reply(now, last_cohort, stamp, samples)
@@ -840,7 +887,8 @@ class ProbeWorker:
                 # delayed first read may still return a fully fresh group.
                 holding_before_takeover = not stamp and self._hold_stop is not None and not self._hold_stop.is_set()
                 if not holding_before_takeover and now - last_cohort >= SETTINGS.max_feedback_age_s:
-                    raise FeedbackError(f"逐电机反馈超过允许间隔，实测 {(now-last_cohort)*1000:.1f} ms")
+                    check_feedback_interval(now-last_cohort, self.cycle.phase if self.cycle else "waiting_feedback",
+                                            source="完整反馈组超过允许间隔", inclusive=True)
                 if stamp:
                     gap_ms = (now - last_cohort) * 1000
                     with self.lock:
@@ -864,7 +912,7 @@ class ProbeWorker:
                         try:
                             self.cycle.step(now, q, tau, motor_tau)
                         finally:
-                            self._record_feedback(samples)
+                            self._record_feedback(samples, packet, now)
                     if self.cycle.phase == "finished":
                         return
                     target = self.coords.motor_target(self.cycle.target)
@@ -892,14 +940,26 @@ class ProbeWorker:
                 last_motor = target
                 last_command = now
                 self.stop_event.wait(self.command_interval_s)
-            self.reason = "工位停止、租约撤销或操作员中止"
+            self.reason = self.stop_reason or "工位停止、租约撤销或操作员中止"
         except Exception as exc:
             self.reason = str(exc)
             self._feedback_failure(self.reason, time.monotonic(), received)
+            if isinstance(exc, ProbeSoftwareFault) and self.fault_handoff and not self.stop_event.is_set():
+                try:
+                    if isinstance(exc, ProbeFeedbackGap):
+                        self._damping_after_stamps = stamp
+                    self.protection = self.fault_handoff(self, self.reason) or {
+                        "active": False, "error": "限位控制权、控制代次或停止状态不允许交接"}
+                    if self.protection.get("active"):
+                        self.disable = {"request": "not_requested", "feedback": "unknown"}
+                except Exception as error:
+                    self.protection = {"active": False, "error": str(error)}
         finally:
             gc.callbacks.remove(self._observe_gc)
-            self._disable()
+            if not self.protection or not self.protection.get("active"):
+                self._disable()
             with self.lock:
+                self.stop_phase = self.cycle.phase if self.cycle else "waiting_feedback"
                 if self.cycle and (self.reason or self.cycle.phase != "finished"):
                     self.cycle.phase = "aborted"
             self._record_end()

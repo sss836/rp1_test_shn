@@ -10,7 +10,7 @@ import statistics
 
 import numpy as np
 
-from .limit_block_check import FeedbackError, SETTINGS
+from .limit_block_check import FeedbackError, SETTINGS, check_feedback_interval
 
 
 WRIST_RECHECK_DIRECTIONS = {("left_wrist_yaw_joint", -1), ("left_wrist_pitch_joint", 1)}
@@ -95,6 +95,7 @@ class FeedbackLimitSearch:
             self.actual_limit = sign * (self.extension.actual_limit_deg - origin)
             if self.extension.command_limit_deg is not None:
                 self.command_limit = sign * (self.extension.command_limit_deg - origin)
+        self.extension_evidence = self.extension.model_dump() if self.extension is not None else None
         self.far_rate = 0.
         self.attempts = []
         self.initial_loads = deque()
@@ -102,19 +103,18 @@ class FeedbackLimitSearch:
         self.cap_reason = None
         self.release_since = None
         self.retreat_distance = 0.
+        self.retreat_settling_since = None
 
     def step(self, now, q, joint_tau, motor_tau):
         from .live_limit_probe import check_torque
         c, p = self.c, self.c.point
         a, s = c.axis, p.direction
         dt = now-c.previous
-        if not 0 < dt <= SETTINGS.max_feedback_age_s:
-            raise FeedbackError(f"检查中逐电机反馈不连续，阶段 {c.phase}，间隔 {dt*1000:.1f} ms")
+        check_feedback_interval(dt, c.phase, source="整行程搜索")
         attempt = self.attempt
-        c.samples.append({"time_s": now-c.samples_started, "phase": c.phase,
+        c.record_sample({"time_s": now-c.samples_started, "phase": c.phase,
             "actual_deg": np.rad2deg(q).tolist(), "target_deg": np.rad2deg(c.target).tolist(),
             "joint_nm": joint_tau.tolist(), "motor_nm": motor_tau.tolist(), "kp_kd_scale": c.gains})
-        c.sample_count += 1
         check_torque(c.coords, joint_tau, motor_tau, p.joint_abort_nm, p.motor_abort_nm,
                      "实测力矩达到工位中止门限")
         travel = s*math.degrees(q[a]-c.start[a])
@@ -228,6 +228,8 @@ class FeedbackLimitSearch:
             # alone must never certify unloading while still pushing it.
             released = s*math.degrees(c.target[a]-q[a]) <= c.window.load_offset_deg+SETTINGS.stall_deg
             if distance >= self.retreat_required-1e-7 and released:
+                if self.retreat_settling_since is None:
+                    self.retreat_settling_since = now
                 if c.settling.settled(now, q, c.target):
                     self._finish_retreat(now, distance)
             else:
@@ -261,6 +263,7 @@ class FeedbackLimitSearch:
         c.target = pose(advance_motion(c.coords, c.point, dt, pose, 0., 1.))
 
     def _begin_retreat(self, now, q, torque):
+        self.retreat_settling_since = None
         c, p = self.c, self.c.point
         if self.attempt_limit > 1 or self.extension is not None or c.fixture_cap is not None:
             self.attempts.append({"attempt": self.attempt,
@@ -321,7 +324,7 @@ class FeedbackLimitSearch:
             data.update(search_attempt=self.attempt, search_attempt_limit=self.attempt_limit)
         if self.extension is not None:
             data.update(search_extension_active=self.extending,
-                        search_extension=self.extension.model_dump())
+                        search_extension=self.extension_evidence)
         if hasattr(c, "window"):
             data.update(baseline_nm=c.window.baseline, contact_threshold_nm=c.window.threshold_nm,
                         baseline_frozen=c.window.frozen, load_offset_deg=c.window.load_offset_deg,

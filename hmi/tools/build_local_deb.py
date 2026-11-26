@@ -138,7 +138,7 @@ def main() -> None:
     for name in ("NPZ_UPLOAD_LIMITS.md", "QUICK_VERIFICATION.md", "SAMPLE_SELECTION.md",
                  "WAISTHIP_SUPPORT.md", "UBUNTU22_DEPLOYMENT.md", "LONG_RUN_SAFETY.md",
                  "MOTION_COMPLETION.md", "MUJOCO_COMPLETION.md", "SOFTWARE_UPDATES.md", "MOTOR_VERSIONS_AND_DOWNLOADS.md",
-                 "LIMIT_CHECK_3_0_40.md", "MODULE_FIRMWARE_MAINTENANCE.md", "MODULE_PARAMETERS.md", "MOTOR_MAINTENANCE_OFFLINE_20261112.md", "PLC_HMI_LRO_108_109.md",
+                 "LIMIT_CHECK_3_0_40.md", "LIMIT_CHECK_3_0_41.md", "MODULE_FIRMWARE_MAINTENANCE.md", "MODULE_PARAMETERS.md", "MOTOR_MAINTENANCE_OFFLINE_20261112.md", "PLC_HMI_LRO_108_109.md",
                  "TORQUE_ESTIMATION_3.0.31.md", "OFFLINE_MOTOR_BUNDLE_3.0.32.md", "LIVE_LIMIT_PROBE_PILOT.md", "HMI_V1_IMPLEMENTATION.md", "LOCAL_EXECUTION_RECORDS.md", "COPY_UPDATE_DOWNLOAD_COMMAND.md"):
         shutil.copy2(SOURCE / "docs" / name, target_source / "docs" / name)
     shutil.copy2(SOURCE / "docs/CONTINUOUS_LIMIT_REPLAY.md", target_source / "docs/CONTINUOUS_LIMIT_REPLAY.md")
@@ -214,7 +214,7 @@ def main() -> None:
     examples = doc / "examples"
     examples.mkdir()
     shutil.copytree(SOURCE / "config/examples/limit-profiles", examples / "limit-profiles")
-    for name in ("MODULE_LIMIT_CONTROL.md", "CONTINUOUS_LIMIT_REPLAY.md", "LIMIT_CHECK_3_0_40.md"):
+    for name in ("MODULE_LIMIT_CONTROL.md", "CONTINUOUS_LIMIT_REPLAY.md", "LIMIT_CHECK_3_0_40.md", "LIMIT_CHECK_3_0_41.md"):
         shutil.copy2(SOURCE / "docs" / name, doc / name)
     for name in ("10-rp1-test-hmi-local-admin.pkla", "49-rp1-test-hmi-local-admin.rules"):
         shutil.copy2(SOURCE / "packaging" / name, examples / name)
