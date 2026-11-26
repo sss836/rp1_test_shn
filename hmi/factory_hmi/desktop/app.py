@@ -79,6 +79,7 @@ except ModuleNotFoundError as exc:
         ) from exc
     raise
 
+from factory_hmi.core.fault_response import disable_result_text
 from factory_hmi.client import GatewayClient, GatewayError, GatewayHTTPError, is_loopback_gateway
 from factory_hmi.core.factory_quality import execution_check_values, format_quality_value, quality_status_label
 from factory_hmi.desktop.device_tools_page import DeviceToolsPage
@@ -265,6 +266,7 @@ class FactoryMainWindow(QMainWindow):
         self._telemetry_received_at: float | None = None
         self._feedback_expired_locally = False
         self._snapshot_pending = False
+        self._snapshot_retry_at = 0.0
         self._heartbeat_pending = False
         self._lease_heartbeat = LeaseHeartbeat(self.client, lambda: self._lease_enabled, self)
         self._lease_heartbeat.failed.connect(self._lease_heartbeat_failed)
@@ -2372,6 +2374,7 @@ class FactoryMainWindow(QMainWindow):
         # station. Motor age is derived separately from the sample identity.
         self._last_ws_status_at = time.monotonic()
         self._ws_status_generation += 1
+        self._snapshot_retry_at = 0.0
         self._render_snapshot(dict(status))
         self._set_status_stream_badge("● 实时状态已连接", "statusOk")
 
@@ -2397,7 +2400,7 @@ class FactoryMainWindow(QMainWindow):
             self._render_snapshot(dict(self._last_snapshot), refresh_state=False)
 
     def _poll_snapshot(self) -> None:
-        if self._closing or self._snapshot_pending:
+        if self._closing or self._snapshot_pending or time.monotonic() < self._snapshot_retry_at:
             return
         if (self._ws_connected and self._last_ws_status_at is not None
                 and time.monotonic() - self._last_ws_status_at < STATUS_SILENCE_S):
@@ -2472,6 +2475,11 @@ class FactoryMainWindow(QMainWindow):
         if self._closing:
             return
         detail = str(exc.detail or "") if isinstance(exc, GatewayError) else ""
+        if quiet and action in {"同步状态", "刷新状态"} and detail == "尚无新鲜工位快照":
+            if self._last_ws_status_at is None or time.monotonic() - self._last_ws_status_at >= STATUS_SILENCE_S:
+                self._snapshot_retry_at = time.monotonic() + 2.0
+                self._set_status_stream_badge("● 等待新鲜工位快照", "statusWarning")
+            return
         if action == "进入 Armed":
             self._preflight_pending = False
             self._preflight_ok = False
@@ -2548,19 +2556,12 @@ class FactoryMainWindow(QMainWindow):
                 f"{safety}请检查对应 CAN、电机及供电；"
                 "确认状态后断开电机连接再扫描，无需把整柜断电当作必选步骤。"
             )
-        elif "error_id=7" in detail:
-            motor_id = "未知"
-            match = re.search(r"\bid=(\d+)", detail)
-            if match:
-                motor_id = match.group(1)
-            error_name = ("其他报警（OTHER_ERROR）" if "protocol_profile=v1.03" in detail
-                          else "驱动器故障（DRV_ERROR）" if "protocol_profile=legacy" in detail
-                          else "电机报警")
-            message = (
-                f"{action}失败：电机 ID {motor_id} 报告{error_name}，error_id=7。"
-                "系统已撤销全部电机使能。请检查该电机驱动器、电源和线束，"
-                "必要时断电复位；排除故障后重新扫描，禁止强制忽略。"
-            )
+        elif re.search(r"\berror_id=[1-9]\d*\b", detail):
+            # Keep the axis, protocol and fault code from each individual record together.
+            axes = re.sub(r"\bid=(\d+):error_id=(\d+)\b", r"电机 ID \1（error_id=\2）", detail)
+            message = f"{action}失败：{axes}"
+            if "本次故障保护：" not in detail:
+                message += "。此次请求未提供失能结果，请核对工位逐轴反馈。"
         elif "disconnect the current station before configuring" in detail:
             message = (
                 f"{action}失败：当前电机连接尚未断开。"
@@ -2671,6 +2672,7 @@ class FactoryMainWindow(QMainWindow):
 
     def _snapshot_received(self, payload: Any) -> None:
         if not self._closing and isinstance(payload, Mapping):
+            self._snapshot_retry_at = 0.0
             self._render_snapshot(dict(payload))
 
     @staticmethod
@@ -3163,10 +3165,8 @@ class FactoryMainWindow(QMainWindow):
                                       (" · " + str(completion["alarm"]) if completion.get("alarm") else ""))
         response = snapshot.get("fault_response") or (playback.get("fault_response") if isinstance(playback, Mapping) else None)
         if response:
-            request_text = {"requested": "失能请求中", "sent": "失能请求已发送", "failed": "失能请求失败"}.get(response.get("disable_request"), "失能请求未知")
-            feedback_text = "mock反馈已失能" if response.get("disable_feedback") == "confirmed_mock" else "实际失能反馈未知"
             self.completion_label.setText("故障：播放" + ("已停止" if response.get("playback_stop") == "stopped" else "停止请求中") +
-                                          " · " + request_text + " · " + feedback_text + "；机械安全未确认")
+                                          " · " + disable_result_text(response) + "；机械安全未确认")
         self.stop_button.setToolTip("请求正常结束；有收尾参数时按配置减速回位，否则保持位置。失能使用软件失能按钮。")
         self.completion_label.setToolTip(str(completion.get("evidence_path") or ""))
         if not isinstance(playback, Mapping):
@@ -3644,7 +3644,8 @@ class FactoryMainWindow(QMainWindow):
         elif not self._motors_discovered:
             self._motors_enabled = False
         disable = self._motor_disable_view(snapshot)
-        self._motor_disable_pending = disable["pending"]
+        closing = state == "closing"
+        self._motor_disable_pending = closing or disable["pending"]
         self._preflight_ok = bool(
             state == "armed" and self._trajectory_imported and self._motors_enabled
             and not self._preflight_pending and not self._default_return_pending
@@ -3655,6 +3656,7 @@ class FactoryMainWindow(QMainWindow):
         self.motor_discovery_label.setText(
             "电机\n"
             + (
+                "关闭中 · 反馈未确认" if closing else
                 "扫描中，等待上电就绪" if self._motor_discovery_pending else
                 f"已发现 {active_motor_count} 台"
                 if self._motors_discovered
@@ -3662,6 +3664,7 @@ class FactoryMainWindow(QMainWindow):
             )
         )
         self.motor_enable_label.setText("使能\n" + (
+            "关闭中 · 失能未确认" if closing else
             "失能待确认" if disable["pending"] else
             "已失能 · 已逐台确认" if disable["confirmed"] else
             "失能指令已发出" if disable["legacy"] else
@@ -3669,12 +3672,14 @@ class FactoryMainWindow(QMainWindow):
         self.motor_enable_label.setToolTip(disable["tooltip"])
         protection = station.get("protective_damping") if isinstance(station, Mapping) else None
         self.position_hold_label.setText(
+            "位置保持\n关闭中 · 状态未知" if closing else
             "保护阻尼\nKd=1 · 承重未确认" if isinstance(protection, Mapping) and protection.get("active") is True
             else f"位置保持\n{'运行中' if station_hold is True else '未运行'}"
         )
         self.feedback_read_label.setText(
             "状态读取\n"
             + (
+                "关闭中 · 无实时电机反馈" if closing else
                 "失能待确认 · 控制下发已阻止" if disable["pending"] else
                 "失能已逐台确认" if disable["confirmed"] else
                 "旧协议无使能位 · 失能指令已发出" if disable["legacy"] else
@@ -3816,8 +3821,8 @@ class FactoryMainWindow(QMainWindow):
             label = "3. 确认使能"
         self.enable_motors_button.setText(label)
         self.enable_motors_button.setEnabled(
-            self._can_command_id is None and self._motors_discovered and not self._motors_enabled
-            and not reading and not self._motor_enable_pending
+            snapshot.get("state") != "closing" and self._can_command_id is None
+            and self._motors_discovered and not self._motors_enabled and not reading and not self._motor_enable_pending
             and not self._motor_fault_reset_pending and not self._motor_discovery_pending
             and not self._motor_disable_pending
         )
@@ -4306,7 +4311,8 @@ class FactoryMainWindow(QMainWindow):
         self._refresh_configuration_buttons()
 
     def _refresh_configuration_buttons(self) -> None:
-        available = not self._configuration_pending and self._can_command_id is None
+        available = (not self._configuration_pending and self._can_command_id is None
+                     and self._last_snapshot.get("state") != "closing")
         can_apply = bool(self._config_preview) and available
         self.configure_button.setEnabled(can_apply)
         self.apply_editor_button.setEnabled(can_apply)
@@ -6571,7 +6577,7 @@ class FactoryMainWindow(QMainWindow):
             self._device_close_pending = True
             self._devices_changed()
             return
-        if self._new_window_fd is None and not (
+        if self._new_window_fd is None and self._last_snapshot.get("state") != "closing" and not (
                 self._lease_enabled or self._motors_enabled or self._motors_discovered
                 or self._can_connected or self._can_command_id is not None):
             event.accept()

@@ -1512,6 +1512,9 @@ class FactoryController:
             self._fault_response = new_fault_response()
             request_fault_disable(self.backend,self._fault_response)
             self._fault_response["playback_stop"] = "requested" if playback and playback.running else "stopped"
+        if "error_id=" in str(exc):
+            # Bind the protective action to this exception before another command or retry can replace it.
+            exc.motor_fault_response = dict(self._fault_response)
 
 
 __all__ = ["FactoryController", "FactoryControllerError"]

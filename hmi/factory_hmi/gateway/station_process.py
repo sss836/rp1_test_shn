@@ -21,6 +21,7 @@ import threading
 import time
 
 from .lease import LeaseConflict
+from factory_hmi.core.fault_response import fault_error_detail
 from factory_hmi.core.can_manager import CanConnectOutcomeUnknown
 from factory_hmi.core.backend import MotorProtocolPending
 
@@ -366,7 +367,7 @@ def _run_station(channels, ready, data_root, report_root, outbox_path, lease_tim
                     _send(connection, ("ok", result))
                 except Exception as exc:
                     kind = next((name for name, error in _ERROR_TYPES.items() if isinstance(exc, error)), "RuntimeError")
-                    _send(connection, (kind, str(exc)))
+                    _send(connection, (kind, fault_error_detail(exc)))
                 else:
                     if name == "close" and channel == "safety":
                         finished.set()

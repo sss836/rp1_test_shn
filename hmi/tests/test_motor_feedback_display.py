@@ -194,3 +194,33 @@ def test_enable_waits_for_protocol_readback_and_ignores_duplicate_clicks(window,
     assert len(confirmations) == len(calls) == 1
     calls[0][1]["on_finished"]()
     assert window.enable_motors_button.isEnabled()
+
+
+def test_multi_axis_popup_keeps_codes_and_fault_action_together(window, monkeypatch):
+    from factory_hmi.client import GatewayHTTPError
+    from factory_hmi.core.fault_response import fault_error_detail
+    dialogs = []
+    monkeypatch.setattr("factory_hmi.desktop.app.QMessageBox.critical", lambda *args: dialogs.append(args[-1]))
+    error = RuntimeError("id=7:error_id=2, id=3:error_id=7")
+    error.motor_fault_response = {"disable_request": "failed", "disable_feedback": "unknown", "error": "CAN timeout"}
+    window._rest_failed("进入 Armed", GatewayHTTPError("failed", status_code=409, detail=fault_error_detail(error)), False)
+    assert "ID 7（error_id=2）" in dialogs[-1] and "ID 3（error_id=7）" in dialogs[-1]
+    assert "失能请求失败" in dialogs[-1] and "实际失能反馈未知" in dialogs[-1] and "CAN timeout" in dialogs[-1]
+    window._rest_failed("进入 Armed", GatewayHTTPError("failed", status_code=409, detail="can1#3 报警 error_id=7"), False)
+    assert "can1#3" in dialogs[-1] and "此次请求未提供失能结果" in dialogs[-1]
+
+
+def test_snapshot_503_keeps_operator_error_and_backs_off(window, monkeypatch):
+    from factory_hmi.client import GatewayHTTPError
+    window.statusBar().showMessage("首次关闭失败")
+    window._rest_failed("刷新状态", GatewayHTTPError("failed", status_code=503, detail="尚无新鲜工位快照"), True)
+    assert window.statusBar().currentMessage() == "首次关闭失败"
+    calls = []
+    monkeypatch.setattr(window, "_run_rest", lambda *args, **kwargs: calls.append(args))
+    window._poll_snapshot()
+    assert not calls and "等待新鲜" in window.connection_badge.text()
+    window._receive_ws_status({"state": "closing", "fault": {"message": "首次关闭失败"}})
+    assert window._snapshot_retry_at == 0 and "首次关闭失败" in window.global_fault.text()
+    assert "失能未确认" in window.motor_enable_label.text()
+    assert "未知" in window.position_hold_label.text()
+    assert not window.enable_motors_button.isEnabled()

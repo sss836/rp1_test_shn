@@ -29,6 +29,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
+from factory_hmi.core.fault_response import fault_error_detail
 from factory_hmi.plc.service import PlcCabinetService, PlcControlDisabledError
 from factory_hmi.plc.coordination import PlcRequestConflict
 from factory_hmi.sync.outbox import Outbox
@@ -1411,7 +1412,7 @@ def create_app(
         except LeaseConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ValueError, RuntimeError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=fault_error_detail(exc)) from exc
         finally:
             if interrupt_registered:
                 with runtime._motion_epoch_guard:

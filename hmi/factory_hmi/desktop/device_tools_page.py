@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QFileDialog, QFrame, QGridLayo
     QVBoxLayout, QWidget)
 
 from factory_hmi.client import is_loopback_gateway
-from factory_hmi.core.dexhand import AXES
+from factory_hmi.core.dexhand import AXES, arm_busy_for_hand
 
 
 class DeviceHeartbeat(QObject):
@@ -304,8 +304,18 @@ class DeviceToolsPage(QWidget):
         wave.setText("重试断开" if own and state.get("phase") == "cleanup_failed" else
                      "停止运动" if own and (state.get("config") or {}).get("operation") == "wave" else "开始运动")
         can_stop = own and ((state.get("config") or {}).get("operation") == "wave" or state.get("phase") == "cleanup_failed")
-        wave.setEnabled((can_stop and state.get("phase") != "stopping") or (free and not busy))
+        arm_busy = arm_busy_for_hand(arm)
+        wave.setEnabled((can_stop and state.get("phase") != "stopping") or (free and not busy and not arm_busy))
         feedback = state.get("feedback") if state.get("owner") else result.get("feedback")
+        if not state.get("owner") and arm_busy:
+            cached = (report.get("owner") == self.client.client_id and report.get("config_revision") is not None
+                      and report["config_revision"] == arm.get("config_revision") and report.get("node_id") == 1
+                      and buses == [report.get("interface")] and report.get("created_at") and feedback)
+            if cached:
+                self.status_label.setText(f"手臂当前仅可查看历史反馈 · {report['created_at']}")
+            else:
+                feedback = None
+                self.status_label.setText("手臂当前无法新建共线连接，此工位暂无匹配的历史反馈")
         for i in range(6):
             for j, key in enumerate(("positions", "velocities", "currents", "enabled", "fault_codes"), start=1):
                 value = feedback[key][i] if feedback and key in feedback else None
@@ -313,7 +323,8 @@ class DeviceToolsPage(QWidget):
                 self.feedback.item(i, j).setText(text)
 
     def command(self, action, *, closing=False):
-        if action == "read-state" and self.owned() and self.state.get("phase") == "waving":
+        if action == "read-state" and ((self.owned() and self.state.get("phase") == "waving")
+                                      or arm_busy_for_hand(self.arm_snapshot() or {})):
             self.poll()
             return
         if action == "wave" and self.owned():

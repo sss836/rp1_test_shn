@@ -45,6 +45,14 @@ class MotorSafetyError(MotorBackendError):
     pass
 
 
+class MotorDisableError(MotorSafetyError):
+    """One or more drives failed the current disable handshake."""
+
+    def __init__(self, message, *, send_failed):
+        super().__init__(message)
+        self.send_failed = send_failed
+
+
 class MotorProtocolPending(MotorBackendError):
     """Read-only protocol discovery is incomplete; no enable was sent."""
 
@@ -1208,10 +1216,13 @@ class MotorsPyBackend(MotorBackend):
             if before != after:
                 return []  # RX raced the sample read. The caller retries without commanding.
             for row in rows:
-                if (row.lro_protocol_profile not in {"legacy", "v1.03"}
-                        or row.torque_source not in {"drive_reported", "device_kt_times_iq"}
-                        or not math.isfinite(row.torque_nm)):
-                    raise MotorSafetyError("限位检查未取得确认的协议和实际力矩来源")
+                axis = f"电机 {row.bus}#{row.motor_id} {row.joint_name}"
+                if row.lro_protocol_profile not in {"legacy", "v1.03"}:
+                    raise MotorSafetyError(f"{axis} 的 LRO 反馈协议未确认")
+                if row.torque_source not in {"drive_reported", "device_kt_times_iq"}:
+                    raise MotorSafetyError(f"{axis} 的力矩来源未确认（{row.torque_source}）")
+                if not math.isfinite(row.torque_nm):
+                    raise MotorSafetyError(f"{axis} 力矩反馈无效")
             return rows
 
     def _read_samples_impl(self) -> list[MotorSample]:
@@ -1533,7 +1544,8 @@ class MotorsPyBackend(MotorBackend):
             detail = "; ".join(f"{r['bus']}#{r['motor_id']} enabled={r['drive_enabled']} "
                 f"feedback={r['request_feedback_count']}->{r['feedback_count']} attempts={r['attempts']} "
                 f"{r['request_error'] or r['feedback_error'] or ''}" for r in failed)
-            raise MotorSafetyError("电机失能反馈未确认：" + detail)
+            raise MotorDisableError("电机失能反馈未确认：" + detail,
+                                    send_failed=any(row["request_error"] for row in failed))
         if index is None:
             self._disable_confirmation_key = (tuple(id(m) for m in self._motors), tuple(self._selected_protocols))
             self._disable_confirmation_epoch = self._enable_open_epoch

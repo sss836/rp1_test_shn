@@ -537,3 +537,36 @@ def test_wave_button_stops_disables_and_releases(tmp_path):
         assert released == ["claim"] and not hand.is_connected()
     finally:
         tools.close()
+
+
+def test_running_arm_rejects_new_shared_read_before_sdk_connect(tmp_path):
+    arm = Arm()
+    app = create_app(arm, data_root=tmp_path)
+    headers = {"X-RP1-Client-ID": "window-a"}
+    with TestClient(app) as client:
+        hub = app.state.runtime
+        hub.session("window-a").lease.claim("window-a")
+        hub._reserve_interfaces("shared", ["can1"])
+        arm.snap["state"] = "running"
+        hub.device_access.tools.hand_factory = lambda _: pytest.fail("busy arm opened the hand SDK")
+        response = client.post("/api/v1/device-tools/dexhand/read-state", headers=headers, json={"backend": "mock"})
+        assert response.status_code == 409 and "共线" in response.json()["detail"]
+        assert not hub.device_access.borrowed("window-a") and not arm.calls
+
+
+def test_shared_read_after_confirmed_stop_does_not_require_reenable(tmp_path):
+    arm = Arm()
+    arm.snap["station"].update(motors_enabled=False, position_hold_active=False, commands_inhibited=True)
+    arm.snap["motor_disable"] = {"state": "confirmed", "scope": "all"}
+    app = create_app(arm, data_root=tmp_path)
+    with TestClient(app) as client:
+        hub = app.state.runtime
+        hub.session("a").lease.claim("a")
+        hub._reserve_interfaces("shared", ["can1"])
+        def read():
+            return client.post("/api/v1/device-tools/dexhand/read-state", headers={"X-RP1-Client-ID": "a"},
+                               json={"backend": "mock"})
+        assert read().status_code == 200
+        wait_for(lambda: hub.device_access.tools.status("dexhand")["owner"] is None)
+        arm.snap["motor_disable"]["state"] = "unconfirmed"
+        assert read().status_code == 409 and not arm.calls

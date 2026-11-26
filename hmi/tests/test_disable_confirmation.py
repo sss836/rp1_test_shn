@@ -433,3 +433,13 @@ def test_site_isolated_release_retains_a_real_prior_confirmation():
     assert status["state"] == "confirmed" and status["reused_confirmation"] is True
     assert status["finished_at_monotonic_s"] == acknowledged
     assert status["site_isolated_release"] is True and not b.connected
+
+
+@pytest.mark.parametrize("failed, expected", [(False, "sent"), (True, "failed")])
+def test_alarm_distinguishes_disable_send_failure_from_unconfirmed_reply(failed, expected):
+    from factory_hmi.core.fault_response import request_fault_disable
+    b = backend(Drive(fail_send=failed, replies=False))
+    response = request_fault_disable(b)
+    assert response["disable_request"] == expected
+    assert response["disable_feedback"] == "unconfirmed" and not response["safe_confirmed"]
+    assert "offline-disable#1" in response["error"] and b.commands_inhibited

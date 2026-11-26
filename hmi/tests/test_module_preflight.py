@@ -302,3 +302,61 @@ def test_blocked_first_dispatch_still_trips_station_watchdog(monkeypatch):
     finally:
         release.set()
         controller.disconnect()
+
+
+@pytest.mark.parametrize("changes,reason", [
+    ({"timestamp_s": 0.}, "时间戳无效"),
+    ({"feedback_age_s": .16}, "反馈超时 160.0 ms"),
+    ({"error_id": 7}, "驱动故障 error_id=7"),
+    ({"fault_code_available": False}, "故障码不可用"),
+    ({"drive_enabled": False}, "未使能"),
+    ({"torque_nm": float("nan")}, "力矩反馈无效"),
+    ({"pos_rad": float("inf")}, "位置反馈无效"),
+])
+def test_pose_error_identifies_axis_and_reason(changes, reason):
+    from factory_hmi.core.limit_block_check import Coordinates, FeedbackError
+    from factory_hmi.models import MotorSample
+    coords = Coordinates(nominal_station("left_arm"))
+    rows = [MotorSample(pos_rad=0., bus=b, motor_id=i, joint_name=j, timestamp_s=1.) for b, i, j in coords.identity]
+    rows[-1] = replace(rows[-1], **changes)
+    with pytest.raises(FeedbackError) as fault:
+        coords.decode(rows, 1.01, ())
+    assert f"{rows[-1].bus}#7" in str(fault.value) and reason in str(fault.value)
+
+
+def test_one_empty_batch_can_recover_for_both_pose_entry_points(tmp_path, monkeypatch):
+    service, backend = station("left_arm", tmp_path, monkeypatch)
+    try:
+        fresh = backend.limit_probe_samples
+        reads = []
+        def read():
+            reads.append(None)
+            return [] if len(reads) == 1 else fresh()
+        monkeypatch.setattr(backend, "limit_probe_samples", read)
+        ticket = uuid.uuid4().hex
+        service.limit_module_prepare("MOCK", ticket, 1)
+        assert len(reads) == 2
+        job = service._module_preflight.job
+        plan, _ = job.future.result(timeout=30)
+        reads.clear()
+        service.limit_module_start("MOCK", plan["digest"], True, ticket, 1)
+        assert len(reads) >= 2
+    finally:
+        service.close()
+
+
+def test_pose_empty_retry_expires_and_driver_exceptions_propagate(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from factory_hmi.core import service as module
+    now = [100.]
+    def wait(dt):
+        now[0] += dt
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: now[0], sleep=wait))
+    with pytest.raises(ValueError, match="150 ms"):
+        FactoryService._read_probe_entry(lambda: [])
+    assert now[0] == pytest.approx(100.15)
+    read = Mock(side_effect=RuntimeError("driver fault"))
+    with pytest.raises(RuntimeError, match="driver fault"):
+        FactoryService._read_probe_entry(read)
+    read.assert_called_once()

@@ -72,8 +72,10 @@ def test_fault_reset_confirms_replies_then_leaves_disabled(station):
     controller, backend, hold = station
     backend.inject_error(0, 7)
     controller.discover_motors()
-    with pytest.raises(RuntimeError, match="before motor enable.*error_id=7"):
+    with pytest.raises(RuntimeError, match="before motor enable.*error_id=7") as failure:
         controller.enable_motors()
+    from factory_hmi.core.fault_response import fault_error_detail
+    assert "失能请求已发送 · mock反馈已失能" in fault_error_detail(failure.value)
     assert "enable" not in backend.events
     assert controller.state is StationState.FAULT
 

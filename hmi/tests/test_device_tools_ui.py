@@ -98,3 +98,19 @@ def test_same_button_stops_wave_and_retries_disconnect(page, monkeypatch):
     pending[-1][0]()
     assert [a for a, _ in actions] == ["wave", "finish-wave"]
     assert actions[0][1]["backend"] == "mock" and actions[1][1]["generation"] == "demo"
+
+
+def test_read_while_arm_runs_uses_only_matching_timestamped_cache(page, monkeypatch):
+    widget, calls = page
+    arm = {"state": "running", "config_revision": 3, "configured_motors": [{"bus": "can1"}]}
+    monkeypatch.setattr(widget, "arm_snapshot", lambda: arm)
+    report = {"owner": "ui-test", "config_revision": 3, "node_id": 1, "interface": "can1",
+              "created_at": "2026-11-26T04:00:00+00:00", "result": {"feedback": {"positions": [7]*6}}}
+    widget.apply({"owner": None, "last_report": report})
+    assert report["created_at"] in widget.status_label.text() and widget.feedback.item(0, 1).text() == "7"
+    assert not widget.buttons["wave"].isEnabled() and widget.buttons["read-state"].isEnabled()
+    widget.command("read-state")
+    assert len(calls) == 1 and widget.poll_pending and not widget.action_pending
+    for changed in ({"owner": "other"}, {"interface": "can3"}, {"config_revision": 4}, {"node_id": 2}):
+        widget.apply({"owner": None, "last_report": {**report, **changed}})
+        assert "暂无匹配" in widget.status_label.text() and widget.feedback.item(0, 1).text() == "—"

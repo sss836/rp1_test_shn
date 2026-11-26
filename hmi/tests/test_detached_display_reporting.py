@@ -310,3 +310,57 @@ def test_configure_uses_the_same_parsed_config_as_can_ownership(tmp_path, monkey
     assert service.controller.config is loaded
     reread.assert_not_called()
     assert service.close()["closed"]
+
+
+def test_close_failure_keeps_first_reason_visible_without_sampling_devices(tmp_path):
+    service = FactoryService(data_root=tmp_path)
+    controller = Mock()
+    controller.disconnect_for_shutdown.side_effect = [RuntimeError("first disable unconfirmed"), RuntimeError("second"), None]
+    service._controller = controller
+    # No protective damping or active recording in this isolated station.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(service, "protective_damping_snapshot", lambda: None)
+        patch.setattr(service, "_require_recording_closed", lambda: None)
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="station disconnect failed"):
+                service.close()
+            view = service.collect_display_snapshot()
+            assert view["state"] == "closing" and view["station"]["commands_inhibited"]
+            assert "first disable unconfirmed" in view["fault"]["message"] and "motors" not in view
+            with pytest.raises(RuntimeError, match="closing or closed"):
+                service.enable_motors(physical_estop_confirmed=True)
+        controller.sample_display_feedback.assert_not_called()
+        assert service.close()["closed"]
+
+
+def test_restarted_publisher_serves_closing_snapshot_over_http(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from factory_hmi.gateway.app import create_app
+    from test_module_preflight import station
+    service, _ = station("left_arm", tmp_path / "station", monkeypatch)
+    app = create_app(service, data_root=tmp_path / "gateway")
+    with TestClient(app) as client:
+        runtime = app.state.runtime.session("close-test")
+        process = SimpleNamespace(close=service.close, close_pending=False,
+                                  collect_display_snapshot=service.collect_display_snapshot,
+                                  lease_status=lambda: ({"owner": "close-test"}, False))
+        def snapshot():
+            return client.get("/api/v1/snapshot", headers={"X-RP1-Client-ID": "close-test"})
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime, "_process", process)
+            publisher = DisplayPublisher(lambda: runtime.snapshot(display=True))
+            patch.setattr(runtime, "display", publisher)
+            patch.setattr(service.controller, "disconnect_for_shutdown", Mock(side_effect=RuntimeError("stop unconfirmed")))
+            publisher.start()
+            try:
+                wait_for(publisher.latest)
+                assert snapshot().json()["state"] == "connected"
+                with pytest.raises(RuntimeError, match="stop unconfirmed"):
+                    runtime.close()
+                wait_for(publisher.latest)
+                for _ in range(3):
+                    response = snapshot()
+                    assert response.status_code == 200 and response.json()["state"] == "closing"
+                    assert "stop unconfirmed" in response.json()["fault"]["message"]
+            finally:
+                publisher.stop()

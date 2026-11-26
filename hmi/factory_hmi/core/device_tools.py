@@ -182,7 +182,11 @@ class DeviceTools:
             with self.lock:
                 slot["last_report"] = {"id": report_id, "path": str(folder / "report.json"),
                                        "passed": result.get("passed", False), "action": action,
-                                       "source_kind": report["source_kind"], "result": result}
+                                       "source_kind": report["source_kind"], "result": result,
+                                       "created_at": report["created_at"], "owner": report["owner"],
+                                       "interface": report["config"].get("interface"),
+                                       "node_id": report["config"].get("node_id"),
+                                       "config_revision": report["config"].get("config_revision")}
         except Exception as exc:
             error = f"记录保存失败：{exc}" + (f"；{error}" if error else "")
         with self.lock:

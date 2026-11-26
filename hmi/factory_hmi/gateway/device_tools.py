@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from factory_hmi.core.can_manager import CanManager
 from factory_hmi.core.device_tools import DeviceTools
+from factory_hmi.core.dexhand import arm_busy_for_hand
 
 
 class DeviceRequest(BaseModel):
@@ -63,8 +64,7 @@ class DeviceAccess:
                     raise RuntimeError("手臂与灵巧手必须同时使用真实设备，或同时使用模拟设备")
                 cfg.update(interface=next(iter(buses)), config_revision=snap.get("config_revision"),
                            arm_positions=[m.get("position_rad") for m in snap.get("motors", [])])
-                if cfg.get("operation") != "read-state":
-                    self.arm_guard(owner, cfg, fresh=True)
+                self.arm_guard(owner, cfg, fresh=True)
             elif kind == "dexhand" and cfg["backend"] != "mock":
                 raise RuntimeError("真实灵巧手必须跟随当前七自由度手臂；独立模式仅供离线模拟")
             if kind == "imu" and cfg["backend"] != "hardware":
@@ -141,12 +141,12 @@ class DeviceAccess:
         station = snap.get("station") or {}
         if snap.get("config_revision") != cfg["config_revision"]:
             raise RuntimeError("手臂配置发生变化，停止灵巧手")
-        if (not station.get("motors_enabled") or not station.get("position_hold_active")
-                or station.get("manual_control_active") or snap.get("state") in {"running", "armed", "stopping"}
-                or (station.get("protective_damping") or {}).get("active")
-                or (snap.get("motor_maintenance") or {}).get("active")
-                or (snap.get("motor_parameters") or {}).get("active")
-                or snap.get("fault") or station.get("commands_inhibited")):
+        if arm_busy_for_hand(snap):
+            raise RuntimeError("手臂当前不满足静止保持条件，无法新建灵巧手共线连接")
+        if (cfg.get("operation") == "read-state" and station.get("motors_enabled") is False
+                and snap.get("state") in {"disconnected", "connected", "completed"}):
+            return
+        if not station.get("motors_enabled") or not station.get("position_hold_active"):
             raise RuntimeError("灵巧手测试要求手臂已使能并静止保持；当前手臂状态不满足")
         motors = snap.get("motors", [])
         baseline = cfg["arm_positions"]

@@ -12,6 +12,21 @@ FIELDS = ("positions", "velocities", "currents", "enabled", "homed",
           "torque_reached", "fault_codes", "emergency_stopped", "stopped")
 
 
+def arm_busy_for_hand(snapshot):
+    station = snapshot.get("station") or {}
+    disable = snapshot.get("motor_disable") or {}
+    idle_disabled = (station.get("motors_enabled") is False
+                     and disable.get("state") in {"confirmed", "confirmed_mock"}
+                     and disable.get("scope", "all") == "all"
+                     and not any(m.get("drive_enabled") is True for m in snapshot.get("motors") or []))
+    return bool(snapshot.get("state") in {"armed", "running", "paused", "stopping", "fault", "closing"}
+                or snapshot.get("fault") or (station.get("commands_inhibited") and not idle_disabled)
+                or station.get("manual_control_active") or (station.get("protective_damping") or {}).get("active")
+                or (snapshot.get("quick") or {}).get("active") or (snapshot.get("motor_maintenance") or {}).get("active")
+                or (snapshot.get("motor_parameters") or {}).get("active")
+                or station.get("motors_enabled") and not station.get("position_hold_active"))
+
+
 def build_hand(backend):
     if backend == "mock":
         return MockHand()

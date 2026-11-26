@@ -160,12 +160,27 @@ class Coordinates:
             raise FeedbackError("反馈的接口、ID 或具名关节与方案不一致")
         stamps = tuple(s.timestamp_s for s in samples)
         for sample, stamp in zip(samples, stamps):
-            if (not 0 < stamp <= now or not 0 <= sample.feedback_age_s < SETTINGS.max_feedback_age_s
-                    or now - stamp >= SETTINGS.max_feedback_age_s or sample.error_id
-                    or not getattr(sample, "fault_code_available", True)
-                    or getattr(sample, "drive_enabled", None) is False
-                    or not math.isfinite(sample.pos_rad) or not math.isfinite(sample.torque_nm)):
-                raise FeedbackError(f"电机 {sample.bus}#{sample.motor_id} 反馈无效、超时或驱动故障")
+            reasons = []
+            if not 0 < stamp <= now:
+                reasons.append("反馈时间戳无效")
+            if not math.isfinite(sample.feedback_age_s) or sample.feedback_age_s < 0:
+                reasons.append("反馈帧龄无效")
+            elif 0 < stamp <= now:
+                age = max(sample.feedback_age_s, now - stamp)
+                if age >= SETTINGS.max_feedback_age_s:
+                    reasons.append(f"反馈超时 {age * 1000:.1f} ms（上限 {SETTINGS.max_feedback_age_s * 1000:g} ms）")
+            if not sample.fault_code_available:
+                reasons.append("驱动故障码不可用")
+            elif sample.error_id:
+                reasons.append(f"驱动故障 error_id={sample.error_id}")
+            if sample.drive_enabled is False:
+                reasons.append("驱动反馈未使能")
+            if not math.isfinite(sample.pos_rad):
+                reasons.append("位置反馈无效")
+            if not math.isfinite(sample.torque_nm):
+                reasons.append("力矩反馈无效")
+            if reasons:
+                raise FeedbackError(f"电机 {sample.bus}#{sample.motor_id} {sample.joint_name}：" + "，".join(reasons))
         # Each motor must be fresh and advance independently. CAN responses
         # need not share a 35 ms group deadline; group skew is diagnostic only.
         if last_stamps and not all(a > b for a, b in zip(stamps, last_stamps)):

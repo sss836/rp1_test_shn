@@ -87,6 +87,7 @@ class FactoryService:
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
         self._closing = threading.Event()
+        self._first_close_error: str | None = None
         self._closed = False
         self._maintenance = None
         self._parameters = None
@@ -216,32 +217,43 @@ class FactoryService:
             with self._lock:
                 self._closing.set()
                 controller = self._controller
-            self._module_preflight.close()
-            for task in self.maintenance_tasks():
-                task.cancel(timeout)
-            disconnect_error = None
-            if controller is not None:
-                try:
-                    shutdown_disconnect = getattr(controller, "disconnect_for_shutdown", controller.disconnect)
-                    if site_isolated:
-                        shutdown_disconnect(site_isolated=True)
-                    else:
-                        shutdown_disconnect()
-                except Exception as exc:
-                    disconnect_error = exc
-                    with self._lock:
-                        self._report_errors["shutdown-disconnect"] = str(exc)
-            self._wait_for_report_staging(timeout)
-            self._require_recording_closed()
-            if disconnect_error is not None:
-                raise RuntimeError("station disconnect failed during close") from disconnect_error
-            if disconnect_can:
+            try:
+                return self._finish_close(controller, timeout, disconnect_can, site_isolated)
+            except Exception as exc:
                 with self._lock:
-                    if self._can_interfaces:
-                        self._disconnect_can_locked("工位安全退出")
-            self._zeroing = None
-            self._closed = True
-            return {"closed": True, "report_errors": dict(self._report_errors)}
+                    if self._first_close_error is None:
+                        self._first_close_error = str(exc.__cause__ or exc)
+                raise
+
+    def _finish_close(self, controller, timeout, disconnect_can, site_isolated):
+        self._module_preflight.close()
+        for task in self.maintenance_tasks():
+            task.cancel(timeout)
+        disconnect_error = None
+        if controller is not None:
+            try:
+                shutdown_disconnect = getattr(controller, "disconnect_for_shutdown", controller.disconnect)
+                if site_isolated:
+                    shutdown_disconnect(site_isolated=True)
+                else:
+                    shutdown_disconnect()
+            except Exception as exc:
+                disconnect_error = exc
+                with self._lock:
+                    self._report_errors["shutdown-disconnect"] = str(exc)
+                    if self._first_close_error is None:
+                        self._first_close_error = str(exc)
+        self._wait_for_report_staging(timeout)
+        self._require_recording_closed()
+        if disconnect_error is not None:
+            raise RuntimeError(f"station disconnect failed during close: {disconnect_error}") from disconnect_error
+        if disconnect_can:
+            with self._lock:
+                if self._can_interfaces:
+                    self._disconnect_can_locked("工位安全退出")
+        self._zeroing = None
+        self._closed = True
+        return {"closed": True, "report_errors": dict(self._report_errors)}
 
     def __enter__(self):
         self._require_open()
@@ -805,10 +817,23 @@ class FactoryService:
         search_end[coords.names.index(point.joint)] += point.direction * point.permitted_travel_deg
         self._check_probe_path(coords, bounds, ((point.staging_pose_deg, point.search_pose_deg),
                                                (point.search_pose_deg, search_end)))
-        if not read():
-            raise ValueError("当前逐电机反馈刷新中，请重新核对")
+        self._read_probe_entry(read)
         worker = ProbeWorker(controller.backend, coords, point, context, read, bounds, publish)
         return self._attach_probe_worker(controller, worker)
+
+    @staticmethod
+    def _read_probe_entry(read):
+        from .limit_block_check import SETTINGS
+        deadline = time.monotonic() + SETTINGS.max_feedback_age_s
+        while time.monotonic() < deadline:
+            samples = read()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if samples:
+                return samples
+            time.sleep(min(.008, remaining))
+        raise ValueError(f"姿态验证在 {SETTINGS.max_feedback_age_s * 1000:g} ms 内未取得完整一致的逐轴反馈")
 
     def _require_probe_ready(self, controller):
         controller.state_machine.require(StationState.CONNECTED)
@@ -831,9 +856,14 @@ class FactoryService:
 
         def read():
             samples = backend.limit_probe_samples()
-            if any(not math.isfinite(row.temp_c) or row.temp_c >= temperature_limit
-                   or not math.isfinite(row.spd_rad_s) for row in samples):
-                raise FeedbackError("电机的温度或速度反馈异常")
+            for row in samples:
+                axis = f"电机 {row.bus}#{row.motor_id} {row.joint_name}"
+                if not math.isfinite(row.temp_c):
+                    raise FeedbackError(f"{axis} 温度反馈无效")
+                if row.temp_c >= temperature_limit:
+                    raise FeedbackError(f"{axis} 温度 {row.temp_c:g} °C 达到阈值 {temperature_limit:g} °C")
+                if not math.isfinite(row.spd_rad_s):
+                    raise FeedbackError(f"{axis} 速度反馈无效")
             return samples
 
         def publish(samples):
@@ -895,9 +925,7 @@ class FactoryService:
             return self.limit_module_preparation(preparation_id)
         coords = Coordinates(controller.config, include_waist_holds=True)
         read, _, _ = self._probe_io(controller)
-        samples = read()
-        if not samples:
-            raise ValueError("当前逐电机反馈刷新中，请重试")
+        samples = self._read_probe_entry(read)
         entry, _, _ = coords.decode(samples, time.monotonic(), ())
         if job:
             job.future.cancel()
@@ -947,9 +975,7 @@ class FactoryService:
             raise ValueError("模块、工装或方案已变化，请重新启动并核对")
         self._require_probe_ready(controller)
         read, bounds, publish = self._probe_io(controller)
-        samples = read()
-        if not samples:
-            raise ValueError("当前逐电机反馈刷新中，请重试")
+        samples = self._read_probe_entry(read)
         now = time.monotonic()
         q, _, _ = coords.decode(samples, now, ())
         completion = None
@@ -1923,6 +1949,11 @@ class FactoryService:
     def collect_display_snapshot(self) -> dict[str, Any]:
         """Called only by this runtime's periodic display producer."""
         with self._lock:
+            if self._closing.is_set() and not self._closed:
+                reason = self._first_close_error
+                message = f"工位关闭未完成，首次失败原因：{reason}" if reason else "工位正在关闭，等待释放确认"
+                return {"state": "closing", "station": {"state": "closing", "commands_inhibited": True},
+                        "fault": {"message": message}, "feedback_read_error": "关闭期间无实时电机反馈"}
             self._require_open()
             controller = self._controller
             revision = self._config_revision
