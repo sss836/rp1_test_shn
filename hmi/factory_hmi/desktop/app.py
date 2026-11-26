@@ -2548,19 +2548,11 @@ class FactoryMainWindow(QMainWindow):
                 f"{safety}请检查对应 CAN、电机及供电；"
                 "确认状态后断开电机连接再扫描，无需把整柜断电当作必选步骤。"
             )
-        elif "error_id=7" in detail:
-            motor_id = "未知"
-            match = re.search(r"\bid=(\d+)", detail)
-            if match:
-                motor_id = match.group(1)
-            error_name = ("其他报警（OTHER_ERROR）" if "protocol_profile=v1.03" in detail
-                          else "驱动器故障（DRV_ERROR）" if "protocol_profile=legacy" in detail
-                          else "电机报警")
-            message = (
-                f"{action}失败：电机 ID {motor_id} 报告{error_name}，error_id=7。"
-                "系统已撤销全部电机使能。请检查该电机驱动器、电源和线束，"
-                "必要时断电复位；排除故障后重新扫描，禁止强制忽略。"
-            )
+        elif "CAN-FD TX " in detail:
+            message = f"{action}失败，主机 CAN 写入未完成。{detail}"
+        elif re.search(r"\berror_id=\d+\b", detail):
+            # Keep bus, address, code and protocol together, even for multiple drives.
+            message = f"{action}失败。网关记录为 {detail}。请在电机状态页核对逐轴反馈和失能确认。"
         elif "disconnect the current station before configuring" in detail:
             message = (
                 f"{action}失败：当前电机连接尚未断开。"
@@ -2713,7 +2705,7 @@ class FactoryMainWindow(QMainWindow):
         labels = {
             "multi_motor_bus_stale": "通信反馈超时（触发时）",
             "single_motor_stale": "通信反馈超时（触发时）",
-            "motor_error": "驱动器硬件故障",
+            "motor_error": "驱动报码（触发时）",
             "tracking_error": "轨迹跟踪误差",
             "undervoltage": "母线欠压",
             "motor_overtemperature": "电机过温",
@@ -2926,16 +2918,20 @@ class FactoryMainWindow(QMainWindow):
                 diagnostic += "；状态数据已过期"
             if diagnostic.startswith("通信反馈超时") and not stale:
                 diagnostic += "；当前反馈已恢复"
-            profile = motor.get("lro_protocol_profile", "legacy")
+            profile = motor.get("lro_protocol_profile")
             if profile is None and motor.get("feedback_header") is not None and not stale:
                 pending = "LRO 协议待核实；显示原始反馈头"
                 diagnostic = pending if diagnostic in {"", "正常", "—"} else f"{diagnostic}；{pending}"
-            error_id = str(self._pick(motor, "error_id", default=0))
+            raw_error = motor.get("error_id")
+            error_id = str(raw_error)
+            displayed_error = "—" if raw_error is None else raw_error
+            if stale:
+                displayed_error = f"{raw_error}（上次读数）" if raw_error not in {None, 0, "0"} else "—"
             alarm_name = ({"5": "缺相或电流采样偏置", "6": "过压", "7": "其他报警 OTHER_ERROR"}.get(error_id)
                           if profile == "v1.03" else None)
             if error_id == "7" and alarm_name is None:
-                alarm_name = ("驱动器故障 DRV_ERROR" if profile == "legacy" or motor.get("feedback_header") is None
-                              else "电机报警 0x07")
+                alarm_name = ("驱动器故障 DRV_ERROR" if profile == "legacy"
+                              else "电机报码 0x07，协议待核实")
             if alarm_name and not stale:
                 warning = f"{alarm_name}；温度为上报值，故障时可能冻结"
                 diagnostic = warning if diagnostic in {"", "正常", "—"} else f"{diagnostic}；{warning}"
@@ -3000,12 +2996,7 @@ class FactoryMainWindow(QMainWindow):
                         "current_a",
                     )
                 ),
-                (
-                    "—"
-                    if never_received
-                    and self._pick(motor, "error_id", default=0) in {None, 0, "0"}
-                    else self._pick(motor, "error_id", default=0)
-                ),
+                displayed_error,
                 diagnostic,
                 feedback_age,
                 "—" if stale else self._pick(motor, "iq_current_a"),
@@ -3164,7 +3155,8 @@ class FactoryMainWindow(QMainWindow):
         response = snapshot.get("fault_response") or (playback.get("fault_response") if isinstance(playback, Mapping) else None)
         if response:
             request_text = {"requested": "失能请求中", "sent": "失能请求已发送", "failed": "失能请求失败"}.get(response.get("disable_request"), "失能请求未知")
-            feedback_text = "mock反馈已失能" if response.get("disable_feedback") == "confirmed_mock" else "实际失能反馈未知"
+            feedback_text = {"confirmed_mock": "模拟反馈已失能", "confirmed": "驱动已确认失能",
+                             "unconfirmed": "驱动失能未确认"}.get(response.get("disable_feedback"), "实际失能反馈未知")
             self.completion_label.setText("故障：播放" + ("已停止" if response.get("playback_stop") == "stopped" else "停止请求中") +
                                           " · " + request_text + " · " + feedback_text + "；机械安全未确认")
         self.stop_button.setToolTip("请求正常结束；有收尾参数时按配置减速回位，否则保持位置。失能使用软件失能按钮。")

@@ -40,7 +40,8 @@ class WP1DesktopTests(unittest.TestCase):
         QCoreApplication.sendPostedEvents(None,QEvent.Type.DeferredDelete)
 
     def test_fault_text_distinguishes_request_feedback_and_no_safety_claim(self):
-        for request,feedback,want in [('sent','unknown','实际失能反馈未知'),('failed','unknown','失能请求失败'),('sent','confirmed_mock','mock反馈已失能')]:
+        for request,feedback,want in [('sent','unknown','实际失能反馈未知'),('failed','unknown','失能请求失败'),('sent','confirmed_mock','模拟反馈已失能'),
+                                      ('sent','confirmed','驱动已确认失能'),('failed','unconfirmed','驱动失能未确认')]:
             with self.subTest(request=request,feedback=feedback):
                 response=dict(playback_stop='stopped',disable_request=request,disable_feedback=feedback,safe_confirmed=False)
                 self.window._render_aging_status({'playback':None,'fault_response':response})

@@ -11,9 +11,15 @@ def request_fault_disable(backend, response=None):
     try:
         backend.disable()
         response["disable_request"] = "sent"
-        # A local enabled flag only describes command state. Hardware drivers
-        # currently expose no independent disable acknowledgement.
+        # The backend reports what the drive feedback actually confirms.
         response["disable_feedback"] = backend.disable_feedback()
     except Exception as exc:
         response.update(disable_request="failed", error=f"{type(exc).__name__}: {exc}")
+        # Preserve an explicit failure to confirm. Never promote an earlier
+        # successful stop to confirmation of this failed request.
+        try:
+            if backend.disable_feedback() == "unconfirmed":
+                response["disable_feedback"] = "unconfirmed"
+        except Exception:
+            pass
     return response

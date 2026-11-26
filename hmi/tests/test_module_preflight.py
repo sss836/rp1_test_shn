@@ -105,9 +105,11 @@ def test_initial_feedback_failure_distinguishes_expired_frame_and_drive_alarm():
     from factory_hmi.models import MotorSample
     row = MotorSample(pos_rad=0., timestamp_s=1., feedback_age_s=.95,
                       motor_id=2, bus="can1", joint_name="left_shoulder_roll_joint")
-    rig = SimpleNamespace(backend=SimpleNamespace(read_samples=lambda: [row]),
-                          config=SimpleNamespace(entries=[1]),
-                          _parameters=SimpleNamespace(feedback_stale_seconds=.5))
+    rig = object.__new__(PlaybackController)
+    rig._lock = threading.RLock()
+    rig.backend = SimpleNamespace(read_samples=lambda: [row])
+    rig.config = SimpleNamespace(entries=[1])
+    rig._parameters = SimpleNamespace(feedback_stale_seconds=.5)
     with pytest.raises(PlaybackError, match="can1#2.*反馈延迟 0.950 s") as stale:
         PlaybackController._sample_feedback(rig, None, 0, update_statistics=False)
     assert "error_id=" not in str(stale.value)
@@ -115,6 +117,7 @@ def test_initial_feedback_failure_distinguishes_expired_frame_and_drive_alarm():
     with pytest.raises(PlaybackError, match="can1#2.*error_id=7") as fault:
         PlaybackController._sample_feedback(rig, None, 0, update_statistics=False)
     assert "反馈延迟" not in str(fault.value)
+    assert rig.last_samples() == [row]
 
 class DelayedLegFeedback(FakeMotorBackend):
     """ID 6 can keep its pre-enable frame while the other four reply."""

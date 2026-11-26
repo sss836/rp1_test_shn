@@ -333,6 +333,12 @@ class FactoryController:
                     and np.isfinite(sample.feedback_age_s)
                     and 0 <= sample.feedback_age_s < stale_seconds
                 )
+                if (fresh and sample.timestamp_s > stamps[index] and not allow_errors
+                        and sample.fault_code_available and sample.error_id):
+                    raise FactoryControllerError(
+                        f"{phase}: motor error: bus={sample.bus}:id={sample.motor_id}:error_id={sample.error_id} "
+                        f"protocol_profile={sample.lro_protocol_profile}"
+                    )
                 if (not fresh or (not allow_errors and not sample.fault_code_available)
                         or (require_drive_enabled and sample.lro_protocol_profile == "v1.03"
                             and sample.drive_enabled is not True)):
@@ -340,11 +346,6 @@ class FactoryController:
                 elif sample.timestamp_s > stamps[index]:
                     if not np.isfinite(sample.pos_rad):
                         raise FactoryControllerError(f"{phase}: non-finite position: bus={sample.bus}:id={sample.motor_id}")
-                    if not allow_errors and sample.error_id != 0:
-                        raise FactoryControllerError(
-                            f"{phase}: motor error: bus={sample.bus}:id={sample.motor_id}:error_id={sample.error_id} "
-                            f"protocol_profile={sample.lro_protocol_profile}"
-                        )
                     # Two replies separated by an expired interval do not
                     # establish stable readiness in the longer startup window.
                     if sample.timestamp_s - stamps[index] >= stale_seconds:
@@ -495,12 +496,18 @@ class FactoryController:
             samples = self.backend.read_samples()
             self._last_samples = samples
             self.telemetry_hub.publish(samples)
+            for sample in samples:
+                issue = sample.feedback_issue(self._diagnosis.thresholds.stale_seconds)
+                if issue:
+                    error = FactoryControllerError(f"arm feedback: {sample.bus}#{sample.motor_id} {issue}")
+                    self._set_fault(error, samples=samples)
+                    raise error
             faulted = [sample for sample in samples if sample.error_id != 0]
             if faulted:
                 error = FactoryControllerError(
                     "cannot arm while motors report errors: "
                     + ", ".join(
-                        f"id={sample.motor_id}:error_id={sample.error_id}"
+                        f"bus={sample.bus}:id={sample.motor_id}:error_id={sample.error_id}"
                         for sample in faulted
                     )
                 )
@@ -724,6 +731,7 @@ class FactoryController:
                 if state is StationState.FAULT or not self.backend.motors_enabled:
                     raise FactoryControllerError("reset motor faults and explicitly enable before returning to default")
                 samples = self.backend.read_samples()
+                self._last_samples = samples
                 self._check_default_return_feedback(samples)
                 faulted = [sample for sample in samples if sample.error_id != 0]
                 if faulted:
@@ -828,24 +836,16 @@ class FactoryController:
 
     def _check_motor_feedback(self, samples: list[MotorSample], phase: str) -> None:
         for sample in samples:
+            issue = sample.feedback_issue(self._diagnosis.thresholds.stale_seconds)
+            if issue:
+                raise FactoryControllerError(f"{phase} feedback stale: id={sample.motor_id} bus={sample.bus} {issue}")
             if sample.error_id != 0:
                 raise FactoryControllerError(
-                    f"{phase} feedback error: id={sample.motor_id}:"
-                    f"error_id={sample.error_id}"
+                    f"{phase} feedback error: id={sample.motor_id}:error_id={sample.error_id} "
+                    f"bus={sample.bus} protocol_profile={sample.lro_protocol_profile}"
                 )
             if not np.isfinite(sample.pos_rad):
-                raise FactoryControllerError(
-                    f"{phase} has non-finite feedback: id={sample.motor_id}"
-                )
-            if (
-                not np.isfinite(sample.feedback_age_s)
-                or not np.isfinite(sample.timestamp_s)
-                or sample.timestamp_s <= 0
-                or sample.feedback_age_s >= self._diagnosis.thresholds.stale_seconds
-            ):
-                raise FactoryControllerError(
-                    f"{phase} feedback stale: id={sample.motor_id}"
-                )
+                raise FactoryControllerError(f"{phase} has non-finite feedback: id={sample.motor_id}")
 
     def enter_protective_damping(self, reason: str, kd: float = 1.0, expected_generation=None):
         # Register before waiting on the transition lock. Ordinary shutdown

@@ -286,3 +286,21 @@ def test_sdk_without_receive_counters_cannot_refresh_cached_sample_age():
         assert second.feedback_age_s > 2.0
     finally:
         backend._connected = False
+
+
+def test_failed_write_does_not_refresh_the_command_watchdog(monkeypatch):
+    backend = FakeMotorBackend(7)
+    backend.connect()
+    try:
+        backend.command_mit(np.zeros(7))
+        last_success = backend.last_mit_success_s
+        with mock.patch.object(backend, "_command_watchdog") as watchdog:
+            error = OSError("CAN-FD TX can0 CAN ID 0x8080: No buffer space available")
+            monkeypatch.setattr(backend, "_command_mit_impl", mock.Mock(side_effect=error))
+            with pytest.raises(OSError, match="CAN ID 0x8080"):
+                backend.command_mit(np.zeros(7))
+            assert backend.last_mit_success_s == last_success
+            assert "下发失败" in backend._mit_dispatch[0]
+            watchdog.touch.assert_not_called()
+    finally:
+        backend.disconnect()

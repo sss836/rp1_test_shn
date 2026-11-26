@@ -544,7 +544,12 @@ class DiagnosisTests(unittest.TestCase):
                 feedback_age_s=3.0,
             ),
         ]
+        # A third motor has a fresh fault while the first two have timed out.
+        samples.append(MotorSample(pos_rad=0., cmd_pos_rad=1., temp_c=100., error_id=3,
+                                   bus_voltage_v=30., motor_id=3, index=2, bus="can0",
+                                   timestamp_s=time.monotonic()))
         diagnoses = diagnose_faults(samples, heartbeat_age_s=1.0)
+        self.assertEqual([d.affected_motor_ids for d in diagnoses if d.rule == "motor_error"], [(3,)])
         rules = {item.rule for item in diagnoses}
         self.assertTrue(
             {
@@ -577,14 +582,14 @@ class DiagnosisTests(unittest.TestCase):
             )
         )
         initial = MotorSample(
-            pos_rad=0.0,
+            timestamp_s=10.0, pos_rad=0.0,
             torque_nm=12.0,
             temp_c=30.0,
             motor_id=1,
             index=0,
         )
         hot = MotorSample(
-            pos_rad=0.0,
+            timestamp_s=12.1, pos_rad=0.0,
             torque_nm=12.0,
             temp_c=37.0,
             motor_id=1,

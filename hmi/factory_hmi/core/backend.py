@@ -400,12 +400,16 @@ class MotorBackend(ABC):
             if dispatch_before is not None and began >= dispatch_before:
                 raise MotorSafetyError("控制首帧已过期，未下发")
             self._mit_dispatch = ("调用电机后端", began, previous_duration)
-            self._command_mit_impl(
-                target_array,
-                torque=torque_array,
-                kp_scale=float(kp_scale),
-                kd_scale=float(kd_scale),
-            )
+            try:
+                self._command_mit_impl(
+                    target_array,
+                    torque=torque_array,
+                    kp_scale=float(kp_scale),
+                    kd_scale=float(kd_scale),
+                )
+            except Exception as exc:
+                self._mit_dispatch = (f"下发失败 {exc}", time.monotonic(), previous_duration)
+                raise
             finished = time.monotonic()
             self.last_mit_success_s = finished
             self._mit_dispatch = ("下发已返回", finished, finished - began)
@@ -766,6 +770,10 @@ class MotorsPyBackend(MotorBackend):
                     f"failed to import motors_py; rebuild the bundled SDK: {exc}"
                 ) from exc
 
+        driver_type = getattr(motors_py, "MotorDriver", None)
+        if (driver_type is not None and any(e.motor_type.upper() == "LRO" for e in self.entries)
+                and not hasattr(driver_type, "get_lro_feedback_observation")):
+            raise MotorBackendError("当前 LRO SDK 缺少接收时间和主机写入回执，请使用配套构建。")
         self._motors_py = motors_py
         created: list[Any] = []
         try:
@@ -1021,11 +1029,20 @@ class MotorsPyBackend(MotorBackend):
                 # Include the attempted node in rollback even if native init
                 # sends enable and then raises or returns a hardware error.
                 initialized.append(motor)
+                previous_count = self._feedback_count(entry, motor)
+                init_started = time.monotonic()
                 error_id = int(motor.init_motor())
                 errors.append(error_id)
                 if error_id != 0:
+                    if entry.motor_type.upper() == "LRO" and hasattr(motor, "get_lro_feedback_observation"):
+                        sample = self._read_samples_impl()[index]
+                        if (previous_count is None or sample.feedback_sequence is None
+                                or sample.feedback_sequence <= previous_count or sample.timestamp_s < init_started
+                                or sample.feedback_issue(.1) or sample.error_id != error_id):
+                            raise MotorSafetyError(f"{entry.interface}#{entry.motor_id} 使能中止，"
+                                                   "缺少本次使能期间与返回码一致的新鲜驱动反馈")
                     raise MotorSafetyError(
-                        f"motor[{entry.index}] id={entry.motor_id} "
+                        f"motor[{entry.index}] bus={entry.interface} id={entry.motor_id} "
                         f"failed to enable with error_id={error_id} protocol_profile={self._selected_protocols[index]}"
                     )
                 motor.set_motor_control_mode(self._motors_py.MotorControlMode.MIT)
@@ -1062,12 +1079,13 @@ class MotorsPyBackend(MotorBackend):
             pending = {}
             for index, count in baseline.items():
                 sample = samples[index]
-                current = self._feedback_count(self.entries[index], self._motors[index])
+                current = (sample.feedback_sequence if sample.feedback_sequence is not None
+                           else self._feedback_count(self.entries[index], self._motors[index]))
                 fresh = (count is not None and current is not None and current > count
                          and math.isfinite(sample.feedback_age_s) and 0 <= sample.feedback_age_s <= .1)
                 if fresh and sample.error_id != 0:
                     raise MotorSafetyError(f"{sample.bus}#{sample.motor_id} 使能反馈硬件故障 error_id={sample.error_id}")
-                if not fresh or sample.drive_enabled is not True:
+                if not fresh or not sample.fault_code_available or sample.drive_enabled is not True:
                     pending[index] = (sample, current)
             if not pending:
                 logging.getLogger(__name__).info("109 enable feedback confirmed: motors=%d elapsed_s=%.3f",
@@ -1218,39 +1236,21 @@ class MotorsPyBackend(MotorBackend):
         now = time.monotonic()
         result: list[MotorSample] = []
         for index, (entry, motor) in enumerate(zip(self.entries, self._motors)):
-            feedback_count = self._feedback_count(entry, motor)
-            response_count = self._response_count(motor)
-            if (
-                feedback_count is not None
-                and feedback_count != self._last_feedback_counts[index]
-            ):
-                # LRO's receive callback increments a monotonic sequence for
-                # every valid feedback frame. Unlike response_count, this
-                # cannot be missed when commands are sent much faster than
-                # Python samples status.
-                self._last_feedback_counts[index] = feedback_count
-                self._last_feedback_at[index] = now
-            elif feedback_count is not None:
-                pass
-            elif response_count is None:
-                # An absent/broken receive counter supplies no evidence of a
-                # reply. Reading cached positions must not refresh its age.
-                pass
-            elif (
-                self._enabled
-                and response_count == 0
-                and now - self._last_mit_command_at <= 0.1
-            ):
-                # The SDK increments every motor's counter when a batched MIT
-                # command is sent and resets that motor's counter only when its
-                # feedback frame arrives. A zero count after a recent command
-                # therefore proves that this specific motor replied.
-                self._last_response_counts[index] = response_count
-                self._last_feedback_at[index] = now
-            elif self._enabled:
-                self._last_response_counts[index] = response_count
-            feedback_at = float(self._last_feedback_at[index])
             is_lro = entry.motor_type.upper() == "LRO"
+            observe = getattr(motor, "get_lro_feedback_observation", None) if is_lro else None
+            count = None
+            if observe is not None:
+                observation = observe()
+                if observation is None:
+                    feedback_at, header = 0.0, None
+                else:
+                    count, feedback_at, header = observation
+                    self._last_feedback_counts[index] = count
+                self._last_feedback_at[index] = feedback_at
+            else:
+                feedback_at = self._legacy_feedback_timestamp(index, entry, motor, now)
+                read_header = getattr(motor, "get_motor_feedback_header", None) if is_lro else None
+                header = read_header() if read_header else None
             profile = self._selected_protocols[index]
             if is_lro and self._versions is not None and (
                 self._protocol_conflicts[index] or self._protocol_observations[index] is None
@@ -1258,7 +1258,13 @@ class MotorsPyBackend(MotorBackend):
                 profile = None
             v103 = profile == "v1.03"
             known_units = not is_lro or self._versions is None or profile is not None
-            get_header = getattr(motor, "get_motor_feedback_header", None) if is_lro else None
+            if observe is not None:
+                known_units = known_units and header is not None
+                error_id = (header & (0x07 if v103 else 0x1F)) if known_units else 0
+                enabled = bool(header & 0x10) if v103 and header is not None else None
+            else:
+                error_id = int(motor.get_error_id()) if known_units else 0
+                enabled = motor.get_motor_drive_enabled() if v103 else None
             iq = _optional_float(motor, "get_motor_iq_current") if v103 else float("nan")
             kt, torque_status = float("nan"), "drive_reported" if known_units else "unknown_protocol"
             torque = float(motor.get_motor_current()) if known_units and not v103 else float("nan")
@@ -1267,6 +1273,7 @@ class MotorsPyBackend(MotorBackend):
                     observation = self._protocol_observations[index]
                 torque, kt, torque_status = estimate_torque(entry, observation, iq,
                     stale=self._versions.stale if self._versions else 180., now=now)
+            age = time.monotonic() - feedback_at
             result.append(
                 MotorSample(
                     pos_rad=float(motor.get_motor_pos()),
@@ -1277,7 +1284,7 @@ class MotorsPyBackend(MotorBackend):
                     torque_kt_nm_a=kt,
                     torque_source=torque_status,
                     temp_c=float(motor.get_motor_temperature()),
-                    error_id=int(motor.get_error_id()) if known_units else 0,
+                    error_id=error_id,
                     bus_voltage_v=_optional_float(motor, "get_motor_dc_bus_voltage") if known_units else float("nan"),
                     bus_current_a=_optional_float(motor, "get_motor_dc_bus_current") if known_units else float("nan"),
                     motor_id=int(entry.motor_id),
@@ -1285,15 +1292,30 @@ class MotorsPyBackend(MotorBackend):
                     joint_name=entry.joint_name,
                     bus=entry.interface,
                     timestamp_s=feedback_at,
-                    feedback_age_s=max(0.0, now - feedback_at),
+                    feedback_age_s=age if feedback_at > 0 and age >= 0 else math.inf,
                     iq_current_a=iq,
-                    drive_enabled=motor.get_motor_drive_enabled() if v103 else None,
-                    feedback_header=get_header() if get_header is not None else None,
+                    drive_enabled=enabled,
+                    feedback_header=header,
                     lro_protocol_profile=profile,
                     fault_code_available=known_units,
+                    feedback_sequence=count,
                 )
             )
         return result
+
+    def _legacy_feedback_timestamp(self, index: int, entry: MotorEntry, motor: Any, now: float) -> float:
+        feedback_count = self._feedback_count(entry, motor)
+        if feedback_count is not None:
+            if feedback_count != self._last_feedback_counts[index]:
+                self._last_feedback_counts[index] = feedback_count
+                self._last_feedback_at[index] = now
+        elif self._enabled:
+            response_count = self._response_count(motor)
+            if response_count is not None:
+                self._last_response_counts[index] = response_count
+                if response_count == 0 and now - self._last_mit_command_at <= 0.1:
+                    self._last_feedback_at[index] = now
+        return float(self._last_feedback_at[index])
 
     @staticmethod
     def _response_count(motor: Any) -> int | None:

@@ -75,13 +75,13 @@ def test_lost_feedback_reports_timeout_and_retains_observed_motor_error(window):
     receive(window, feedback_age_s=0.3, error_id=7)
     assert cell(window, 12) == "通信反馈超时"
     assert cell(window, 4) == "—"
-    assert cell(window, 11) == "7"
+    assert cell(window, 11) == "7（上次读数）"
     assert cell(window, 13) != "—"
 
 
 def test_nonzero_error_is_not_hidden_by_missing_timestamp(window):
     receive(window, timestamp_s=0.0, error_id=7)
-    assert cell(window, 11) == "7"
+    assert cell(window, 11) == "7（上次读数）"
     assert cell(window, 12) == "未收到电机反馈"
 
 
@@ -92,7 +92,7 @@ def test_existing_software_alarm_is_not_replaced(window):
 
 
 def test_fresh_driver_fault_warns_temperature_can_freeze_without_rewriting_value(window):
-    receive(window, error_id=7, temperature_c=32.0)
+    receive(window, error_id=7, temperature_c=32.0, lro_protocol_profile="legacy")
     assert cell(window, 8) == "32.000"
     assert "DRV_ERROR" in cell(window, 12)
     assert "温度为上报值" in cell(window, 12)
@@ -194,3 +194,23 @@ def test_enable_waits_for_protocol_readback_and_ignores_duplicate_clicks(window,
     assert len(confirmations) == len(calls) == 1
     calls[0][1]["on_finished"]()
     assert window.enable_motors_button.isEnabled()
+
+
+def test_multiple_motor_faults_retain_address_code_pairs(window):
+    from factory_hmi.client import GatewayError
+    detail = "cannot arm: bus=can0:id=7:error_id=2, bus=can0:id=3:error_id=7"
+    window._rest_failed("进入 Armed", GatewayError(detail, status_code=409, detail=detail), quiet=True)
+    message = window.statusBar().currentMessage()
+    assert detail in message
+    assert "id=7:error_id=7" not in message and "已撤销" not in message
+
+
+def test_unknown_code_and_no_frame_do_not_display_zero(window):
+    receive(window, error_id=None, timestamp_s=0.)
+    assert cell(window, 11) == "—"
+
+
+@pytest.mark.parametrize("profile,label", [(None, "协议待核实"), ("v1.03", "OTHER_ERROR")])
+def test_fault_seven_label_follows_verified_profile(window, profile, label):
+    receive(window, error_id=7, lro_protocol_profile=profile)
+    assert label in cell(window, 12) and "DRV_ERROR" not in cell(window, 12)

@@ -283,26 +283,13 @@ class ManualControlSession:
                 self.backend.command_mit(self.joint_to_motor(joint_command))
                 if now - last_sample_at >= 0.05:
                     samples = self.backend.read_samples()
-                    faulted = [sample for sample in samples if sample.error_id != 0]
-                    if faulted:
-                        raise ManualControlError(
-                            "manual feedback contains errors: "
-                            + ", ".join(
-                                f"id={sample.motor_id}:error_id={sample.error_id}"
-                                for sample in faulted
-                            )
-                        )
-                    stale = [
-                        sample for sample in samples if sample.feedback_age_s > 2.0
-                    ]
-                    if stale:
-                        raise ManualControlError(
-                            "manual feedback timed out: "
-                            + ", ".join(
-                                f"id={sample.motor_id}:age={sample.feedback_age_s:.3f}s"
-                                for sample in stale
-                            )
-                        )
+                    for sample in samples:
+                        issue = sample.feedback_issue(2.0)
+                        if issue:
+                            raise ManualControlError(f"manual feedback: {sample.bus}#{sample.motor_id} {issue}")
+                        if sample.error_id:
+                            raise ManualControlError(f"manual feedback contains errors: bus={sample.bus}:"
+                                                     f"id={sample.motor_id}:error_id={sample.error_id}")
                     feedback = self.motor_to_joint(
                         np.asarray(
                             [sample.pos_rad for sample in samples],

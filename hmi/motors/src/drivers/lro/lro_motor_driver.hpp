@@ -154,6 +154,14 @@ class LroMotorDriver : public MotorDriver {
     virtual int get_response_count() const override { 
         return response_count_; 
     }
+    std::optional<LroObservation> get_lro_feedback_observation() const override {
+        std::lock_guard<std::mutex> guard(protocol_mutex_);
+        const int header = feedback_header_;
+        if (header < 0) return std::nullopt;
+        return LroObservation{feedback_count_.load(),
+            std::chrono::duration<double>(last_feedback_at_.time_since_epoch()).count(),
+            static_cast<uint8_t>(header)};
+    }
     virtual uint64_t get_feedback_count() const override {
         return feedback_count_;
     }

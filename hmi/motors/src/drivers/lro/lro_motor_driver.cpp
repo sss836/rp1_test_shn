@@ -89,7 +89,7 @@ void LroMotorDriver::lock_motor() {
         tx_frame.data[2] = 0x00;
         tx_frame.data[3] = LRO_CMD_ENABLE;
         
-        canfd_->transmit(tx_frame);
+        canfd_->transmit_checked(tx_frame);
     }
     {
         response_count_++;
@@ -479,7 +479,7 @@ void LroMotorDriver::motor_mit_cmd(float f_p, float f_v, float f_kp, float f_kd,
         tx_frame.len = 0x08;
         tx_frame.flags = CANFD_BRS;
         pack_mit(f_p, f_v, f_kp, f_kd, f_t, tx_frame.data);
-        canfd_->transmit(tx_frame);
+        canfd_->transmit_checked(tx_frame);
     }
     {
         response_count_++;
@@ -516,7 +516,7 @@ void LroMotorDriver::motor_mit_cmd(float* f_p, float* f_v, float* f_kp, float* f
         }
     }
 
-    canfd_->transmit(tx_frame);
+    canfd_->transmit_checked(tx_frame);
 }
 
 void LroMotorDriver::set_motor_control_mode(uint8_t motor_control_mode) {

@@ -159,13 +159,17 @@ class Coordinates:
         if identity != self.identity:
             raise FeedbackError("反馈的接口、ID 或具名关节与方案不一致")
         stamps = tuple(s.timestamp_s for s in samples)
-        for sample, stamp in zip(samples, stamps):
-            if (not 0 < stamp <= now or not 0 <= sample.feedback_age_s < SETTINGS.max_feedback_age_s
-                    or now - stamp >= SETTINGS.max_feedback_age_s or sample.error_id
-                    or not getattr(sample, "fault_code_available", True)
-                    or getattr(sample, "drive_enabled", None) is False
-                    or not math.isfinite(sample.pos_rad) or not math.isfinite(sample.torque_nm)):
-                raise FeedbackError(f"电机 {sample.bus}#{sample.motor_id} 反馈无效、超时或驱动故障")
+        for sample in samples:
+            node = f"{sample.bus}#{sample.motor_id} {sample.joint_name}"
+            issue = sample.feedback_issue(SETTINGS.max_feedback_age_s, now)
+            if issue:
+                raise FeedbackError(f"电机 {node} {issue}")
+            if sample.error_id:
+                raise FeedbackError(f"电机 {node} 驱动故障 error_id={sample.error_id}")
+            if sample.drive_enabled is False:
+                raise FeedbackError(f"电机 {node} 反馈为未使能")
+            if not math.isfinite(sample.pos_rad) or not math.isfinite(sample.torque_nm):
+                raise FeedbackError(f"电机 {node} 位置或力矩读数无效")
         # Each motor must be fresh and advance independently. CAN responses
         # need not share a 35 ms group deadline; group skew is diagnostic only.
         if last_stamps and not all(a > b for a, b in zip(stamps, last_stamps)):

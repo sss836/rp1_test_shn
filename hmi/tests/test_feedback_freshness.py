@@ -72,7 +72,7 @@ def test_read_failure_ages_cached_evidence_and_recovers_without_changing_error(w
         assert original_sample.feedback_age_s == 0.
         window._render_snapshot(failed)
         assert cell(window, 4) == cell(window, 8) == "—"
-        assert cell(window, 11) == "7"
+        assert cell(window, 11) == "7（上次读数）"
         assert "读取失败" in cell(window, 12)
 
         clock[0] = 111.
@@ -87,7 +87,7 @@ def test_read_failure_ages_cached_evidence_and_recovers_without_changing_error(w
         assert recovered["motors"][0]["temperature_c"] == 47.
         window._render_snapshot(recovered)
         assert cell(window, 8) == "47.000"
-        assert "DRV_ERROR" in cell(window, 12)  # Recovery did not clear device error 7.
+        assert "电机报码 0x07" in cell(window, 12)  # No verified wire profile in this snapshot.
     finally:
         backend.close_transport()
 
@@ -122,7 +122,7 @@ def test_local_silence_expires_values_and_local_rerender_does_not_rejuvenate_the
     clock[0] = 100.31
     window._refresh_feedback_freshness()
     assert cell(window, 4) == cell(window, 8) == "—"
-    assert cell(window, 11) == "7"
+    assert cell(window, 11) == "7（上次读数）"
     assert "数据已过期" in cell(window, 12)
     clock[0] = 101.
     window._render_snapshot(dict(window._last_snapshot))

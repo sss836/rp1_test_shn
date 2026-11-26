@@ -63,7 +63,17 @@ class DeviceAccess:
                     raise RuntimeError("手臂与灵巧手必须同时使用真实设备，或同时使用模拟设备")
                 cfg.update(interface=next(iter(buses)), config_revision=snap.get("config_revision"),
                            arm_positions=[m.get("position_rad") for m in snap.get("motors", [])])
-                if cfg.get("operation") != "read-state":
+                if cfg.get("operation") == "read-state":
+                    # The hand SDK configures feedback on connect, even for a single read.
+                    station = snap.get("station") or {}
+                    if (station.get("state", snap.get("state")) in {"running", "armed", "paused", "stopping"}
+                            or station.get("manual_control_active")
+                            or (station.get("protective_damping") or {}).get("active")
+                            or (runtime.quick is not None and runtime.quick.snapshot().get("active"))
+                            or (snap.get("motor_maintenance") or {}).get("active")
+                            or (snap.get("motor_parameters") or {}).get("active")):
+                        raise RuntimeError("手臂正在测试或切换状态，请在工位空闲后读取灵巧手状态")
+                else:
                     self.arm_guard(owner, cfg, fresh=True)
             elif kind == "dexhand" and cfg["backend"] != "mock":
                 raise RuntimeError("真实灵巧手必须跟随当前七自由度手臂；独立模式仅供离线模拟")
@@ -88,7 +98,7 @@ class DeviceAccess:
                 if kind == "dexhand" and cfg["backend"] == "hardware":
                     status = CanManager().status([interface])[0]
                     if not (status.exists and status.up and status.fd and status.bitrate == 1000000
-                            and status.dbitrate == 5000000 and status.bus_state != "BUS-OFF"):
+                            and status.dbitrate == 5000000 and (status.bus_state or "").lower() != "bus-off"):
                         raise RuntimeError("手臂 CAN 必须已运行 CAN FD 1 Mbps / 5 Mbps；灵巧手不会重配共享总线")
             except Exception:
                 self.release(token)
