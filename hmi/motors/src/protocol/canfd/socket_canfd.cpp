@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <cctype>
+#include <system_error>
 
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -212,40 +213,53 @@ void MotorsSocketCANFD::open(const std::string& interface) {
             logger_->error("Failed to bind CANFD TX thread to Core {}", cpu_id);
         }
 
-        canfd_frame tx_frame;
-        int count = 0;
         while (receiving_) {
+            PendingFrame pending;
             {
                 std::unique_lock<std::mutex> lock(tx_mutex_);
                 tx_cv_.wait(lock, [this]() { return !tx_queue_.empty() || !receiving_; });
                 if (!receiving_) break;
-                if (!tx_queue_.pop(tx_frame)) continue;
+                pending = std::move(tx_queue_.front());
+                tx_queue_.pop_front();
             }
-            ssize_t written;
-            int write_error = 0;
-            while ((written = ::write(sockfd_, &tx_frame, sizeof(canfd_frame))) < 0 &&
-                   count < FD_MAX_RETRY_COUNT) {
-                write_error = errno;
-                if (is_fatal_canfd_error(write_error)) {
-                    break;
+            int error = 0;
+            for (int attempt = 0; attempt <= FD_MAX_RETRY_COUNT; ++attempt) {
+                // Serialize cancellation with the nonblocking syscall. A timed-out
+                // queued frame can never be written later by this worker.
+                {
+                    std::lock_guard<std::mutex> lock(tx_mutex_);
+                    auto receipt = pending.receipt;
+                    if (!receiving_) {
+                        error = ENETDOWN;
+                    } else if (receipt && (receipt->error != EINPROGRESS ||
+                               std::chrono::steady_clock::now() >= receipt->deadline)) {
+                        error = ETIMEDOUT;
+                    } else {
+                        auto written = ::write(sockfd_, &pending.frame, sizeof(canfd_frame));
+                        error = written < 0 ? errno : 0;
+                        if (written >= 0 && written != sizeof(canfd_frame)) error = EIO;
+                    }
+                    if (!error || error == ETIMEDOUT || is_fatal_canfd_error(error) ||
+                        attempt == FD_MAX_RETRY_COUNT) {
+                        if (receipt) {
+                            receipt->error = error;
+                            receipt->finished.notify_one();
+                        }
+                        break;
+                    }
                 }
-                count += 1;
-                std::this_thread::sleep_for(std::chrono::microseconds(1000));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            if (written < 0) {
-                write_error = errno;
-                logger_->error(
-                    "Failed to transmit CAN-FD frame on {}: {}",
-                    interface_,
-                    strerror(write_error));
-                if (is_fatal_canfd_error(write_error)) {
+            if (error) {
+                logger_->error("Failed to transmit CAN-FD frame on {} CAN ID 0x{:X}: {}",
+                               interface_, pending.frame.can_id & CAN_EFF_MASK, strerror(error));
+                if (is_fatal_canfd_error(error)) {
                     invalidate();
                     break;
                 }
             } else if (send_sleep_us_ > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(send_sleep_us_));
             }
-            count = 0;
         }
     });
 }
@@ -255,6 +269,13 @@ void MotorsSocketCANFD::invalidate() {
         std::lock_guard<std::mutex> lock(tx_mutex_);
         healthy_ = false;
         receiving_ = false;
+        for (const auto& pending : tx_queue_) {
+            if (pending.receipt) {
+                pending.receipt->error = ENETDOWN;
+                pending.receipt->finished.notify_one();
+            }
+        }
+        tx_queue_.clear();
     }
     tx_cv_.notify_all();
 }
@@ -278,6 +299,27 @@ void MotorsSocketCANFD::transmit(const canfd_frame &frame) {
     try_transmit(frame);
 }
 
+void MotorsSocketCANFD::transmit_checked(const canfd_frame& frame) {
+    auto receipt = std::make_shared<WriteReceipt>();
+    receipt->deadline = std::chrono::steady_clock::now() + FD_WRITE_TIMEOUT;
+    std::unique_lock<std::mutex> lock(tx_mutex_);
+    int error = 0;
+    if (!receiving_) {
+        error = ENETDOWN;
+    } else if (tx_queue_.full()) {
+        error = ENOBUFS;
+    } else {
+        tx_queue_.push_back({frame, receipt});
+        tx_cv_.notify_one();
+        if (!receipt->finished.wait_until(lock, receipt->deadline, [&] {
+                return receipt->error != EINPROGRESS;
+            })) receipt->error = ETIMEDOUT;
+        error = receipt->error;
+    }
+    if (error) throw std::system_error(error, std::generic_category(),
+        fmt::format("CAN-FD TX {} CAN ID 0x{:X}", interface_, frame.can_id & CAN_EFF_MASK));
+}
+
 bool MotorsSocketCANFD::try_transmit(const canfd_frame &frame) {
     bool queued = false;
     {
@@ -286,7 +328,8 @@ bool MotorsSocketCANFD::try_transmit(const canfd_frame &frame) {
             logger_->error("Unable to transmit: Socket not open");
             return false;
         }
-        queued = tx_queue_.bounded_push(frame);
+        queued = !tx_queue_.full();
+        if (queued) tx_queue_.push_back({frame, nullptr});
     }
     if (!queued) {
         logger_->error("CAN-FD transmit queue on {} is full; dropping frame 0x{:X}",

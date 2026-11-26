@@ -27,6 +27,7 @@ inline bool lro_native_feedback_checks() {
     lro_check(!motor.get_motor_feedback_header() && !motor.get_motor_drive_enabled(), "initial feedback is fabricated");
     lro_check(!motor.set_lro_protocol_profile("109"), "firmware suffix selected a wire profile");
 
+    lro_check(!motor.get_lro_feedback_observation(), "unreceived frame has a timestamp");
     const auto legacy = lro_feedback(1, 0x38, 12);
     bus->feed(legacy);
     lro_check(motor.get_feedback_count() == 1 && motor.get_error_id() == 0x18, "legacy fault bits changed");
@@ -48,6 +49,9 @@ inline bool lro_native_feedback_checks() {
               std::abs(motor.get_motor_dc_bus_current() + 50.0f) < 0.002f, "DC bus scaling mismatch");
     lro_check(!motor.set_lro_protocol_profile("legacy"), "profile changed while drive reported enabled");
 
+    const auto observation = motor.get_lro_feedback_observation();
+    lro_check(observation && std::get<0>(*observation) == 2 && std::get<1>(*observation) > 0
+              && std::get<2>(*observation) == 0x38, "inconsistent receive evidence");
     auto invalid = lro_feedback(1, 0x20, 9);
     bus->feed(invalid);
     invalid.len = 12;
@@ -61,6 +65,7 @@ inline bool lro_native_feedback_checks() {
     lro_check(motor.get_feedback_count() == 2 && motor.get_motor_feedback_header() == 0x38,
               "invalid data updated feedback or freshness");
 
+    lro_check(motor.get_lro_feedback_observation() == observation, "invalid frame refreshed receive evidence");
     bus->feed(lro_feedback(1, 0x37, 8));
     lro_check(motor.get_error_id() == 7 && motor.get_motor_drive_enabled() == true, "real V1.03 fault was masked");
     lro_check(std::isnan(motor.get_motor_dc_bus_voltage()) && std::isnan(motor.get_motor_dc_bus_current()),
@@ -69,7 +74,7 @@ inline bool lro_native_feedback_checks() {
     lro_check(motor.get_error_id() == 0 && motor.get_motor_drive_enabled() == false, "disabled state was not observed");
     lro_check(motor.set_lro_protocol_profile("legacy"), "disabled unused driver rejected profile selection");
     lro_check(std::isnan(motor.get_motor_iq_current()) && !motor.get_motor_feedback_header() &&
-              motor.get_feedback_count() == 4, "switch back reused current or feedback age");
+              !motor.get_lro_feedback_observation() && motor.get_feedback_count() == 4, "switch back reused current or feedback age");
     return true;
 }
 

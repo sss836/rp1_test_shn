@@ -54,7 +54,7 @@ PYBIND11_MODULE(RP1_SDK_MODULE_NAME, m) {
         .def("request_lro_zero", &MotorDriver::request_lro_zero, py::call_guard<py::gil_scoped_release>())
         .def("motor_pos_cmd", &MotorDriver::motor_pos_cmd, py::arg("pos"), py::arg("spd"), py::arg("ignore_limit") = false)
         .def("motor_spd_cmd", &MotorDriver::motor_spd_cmd)
-        .def("motor_mit_cmd", static_cast<void (MotorDriver::*)(float, float, float, float, float)>(&MotorDriver::motor_mit_cmd))
+        .def("motor_mit_cmd", static_cast<void (MotorDriver::*)(float, float, float, float, float)>(&MotorDriver::motor_mit_cmd), py::call_guard<py::gil_scoped_release>())
         .def("motors_mit_cmd", [](MotorDriver& self, std::vector<float> f_p, std::vector<float> f_v,
                                         std::vector<float> f_kp, std::vector<float> f_kd, std::vector<float> f_t) {
             float p_arr[8] = {}, v_arr[8] = {}, kp_arr[8] = {}, kd_arr[8] = {}, t_arr[8] = {};
@@ -66,9 +66,10 @@ PYBIND11_MODULE(RP1_SDK_MODULE_NAME, m) {
                 t_arr[i] = i < f_t.size() ? f_t[i] : 0.0f;
             }
             self.motor_mit_cmd(p_arr, v_arr, kp_arr, kd_arr, t_arr);
-        }, py::arg("f_p"), py::arg("f_v"), py::arg("f_kp"), py::arg("f_kd"), py::arg("f_t"))
+        }, py::arg("f_p"), py::arg("f_v"), py::arg("f_kp"), py::arg("f_kd"), py::arg("f_t"), py::call_guard<py::gil_scoped_release>())
         .def("set_motor_control_mode", &MotorDriver::set_motor_control_mode)
         .def("get_response_count", &MotorDriver::get_response_count)
+        .def("get_lro_feedback_observation", &MotorDriver::get_lro_feedback_observation)
         .def("get_feedback_count", &MotorDriver::get_feedback_count)
         .def("refresh_motor_status", &MotorDriver::refresh_motor_status, py::call_guard<py::gil_scoped_release>())
         .def("reset_motor_id", &MotorDriver::reset_motor_id, py::call_guard<py::gil_scoped_release>())

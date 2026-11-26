@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <tuple>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -195,6 +196,10 @@ class MotorDriver {
      * valid feedback frame. The default keeps older drivers source-compatible.
      */
     virtual uint64_t get_feedback_count() const { return 0; }
+
+    // Sequence, monotonic callback time in seconds, and header from the same type-1 frame.
+    using LroObservation = std::tuple<uint64_t, double, uint8_t>;
+    virtual std::optional<LroObservation> get_lro_feedback_observation() const { return std::nullopt; }
 
     /**
      * @brief Requests a real-time status update from the physical motor.

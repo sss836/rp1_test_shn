@@ -19,7 +19,8 @@ def arm_busy_for_hand(snapshot):
                      and disable.get("state") in {"confirmed", "confirmed_mock"}
                      and disable.get("scope", "all") == "all"
                      and not any(m.get("drive_enabled") is True for m in snapshot.get("motors") or []))
-    return bool(snapshot.get("state") in {"armed", "running", "paused", "stopping", "fault", "closing"}
+    busy_states = {"armed", "running", "paused", "stopping", "fault", "closing"}
+    return bool(snapshot.get("state") in busy_states or station.get("state") in busy_states
                 or snapshot.get("fault") or (station.get("commands_inhibited") and not idle_disabled)
                 or station.get("manual_control_active") or (station.get("protective_damping") or {}).get("active")
                 or (snapshot.get("quick") or {}).get("active") or (snapshot.get("motor_maintenance") or {}).get("active")

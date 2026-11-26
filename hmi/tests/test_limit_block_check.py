@@ -107,7 +107,7 @@ def test_ankle_torque_virtual_work_and_motor_pair_provenance():
     q_skewed, _, _ = c.decode(skewed, 1.02, ())
     np.testing.assert_allclose(q_skewed, q, atol=1e-6)
     expired = [*samples[:-1], replace(samples[-1], timestamp_s=.80)]
-    with pytest.raises(FeedbackError, match="无效、超时"):
+    with pytest.raises(FeedbackError, match=r"can0#7 left_ankle_roll_joint 反馈超时，反馈延迟 0\.220 s"):
         c.decode(expired, 1.02, ())
     with pytest.raises(FeedbackError, match="不一致"):
         c.decode(samples[::-1], 1.02, ())

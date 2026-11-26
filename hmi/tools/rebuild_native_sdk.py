@@ -50,7 +50,7 @@ def main() -> None:
     subprocess.run([str(cmake), '--build', str(build), '--target', 'motors_py', '--parallel', '2'], env=env, check=True)
     assert all(hashlib.sha256((SOURCE / name).read_bytes()).hexdigest() == sha for name, sha in source_hashes.items()), 'SDK source changed while compiling'
     if args.verify_concurrency:
-        subprocess.run([str(cmake), '--build', str(build), '--target', 'motors_py_testing', '--parallel', '2'], env=env, check=True)
+        subprocess.run([str(cmake), '--build', str(build), '--target', 'motors_py_testing', 'socketcan_write_receipt', '--parallel', '2'], env=env, check=True)
     module = next(build.glob('motors_py.cpython-312-*.so'))
     shutil.copy2(module, runtime / module.name)
     for name in names:
@@ -62,6 +62,8 @@ def main() -> None:
     (SOURCE / 'packaging/native-sdk-runtime.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n')
     subprocess.run([sys.executable, str(SOURCE / 'tools/verify_native_sdk.py'), '--runtime-dir', str(runtime)], check=True)
     if args.verify_concurrency:
+        subprocess.run([str(build / 'socketcan_write_receipt')], check=True,
+                       env={**env, 'LD_LIBRARY_PATH': str(runtime)})
         subprocess.run([sys.executable, str(SOURCE / 'tools/verify_native_concurrency.py'), '--module-dir', str(build), '--runtime-dir', str(runtime)], check=True)
 
 

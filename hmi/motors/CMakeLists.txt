@@ -126,4 +126,7 @@ if(RP1_BUILD_SDK_TESTS)
     target_compile_definitions(motors_py_testing PRIVATE RP1_SDK_MODULE_NAME=motors_py_testing RP1_SDK_TESTING=1)
     target_include_directories(motors_py_testing PRIVATE include src tests)
     target_link_libraries(motors_py_testing PRIVATE motors)
+    add_executable(socketcan_write_receipt tests/socketcan_write_receipt.cpp)
+    target_link_libraries(socketcan_write_receipt PRIVATE motors_canfd
+        "-Wl,--wrap=socket,--wrap=ioctl,--wrap=bind,--wrap=setsockopt,--wrap=write")
 endif()

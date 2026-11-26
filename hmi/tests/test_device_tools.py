@@ -272,6 +272,11 @@ def test_shared_arm_protocol_mismatch_and_motion_are_rejected(tmp_path):
         hub.session("a").lease.claim("a")
         hub._reserve_interfaces("shared", ["can1"])
         settings = {"backend": "mock", "follow_arm": True, "node_id": 1}
+        arm.snap["state"] = "running"
+        with pytest.raises(RuntimeError, match="工位空闲"):
+            hub.device_access.tools.submit("dexhand", "a", "read-state", settings)
+        assert not hub.device_access.borrowed("a")
+        arm.snap["state"] = "connected"
         arm.snap["configured_motors"][0]["motor_type"] = "EVO"
         with pytest.raises(RuntimeError, match="LRO"):
             hub.device_access.tools.submit("dexhand", "a", "connect", settings)
@@ -284,10 +289,11 @@ def test_shared_arm_protocol_mismatch_and_motion_are_rejected(tmp_path):
 
 def test_hardware_admission_only_reads_shared_can_and_imu_cannot_claim_it(tmp_path, monkeypatch):
     class ReadOnlyCan:
+        bus_state = "bus-off"
         reads = []
         def status(self, names):
             self.reads.append(names)
-            return [SimpleNamespace(exists=True, up=True, fd=True, bitrate=1000000, dbitrate=5000000, bus_state="ERROR-ACTIVE")]
+            return [SimpleNamespace(exists=True, up=True, fd=True, bitrate=1000000, dbitrate=5000000, bus_state=self.bus_state)]
         def connect(self, *args, **kwargs): pytest.fail("must never reconfigure the arm bus")
         def disconnect(self, *args, **kwargs): pytest.fail("must never take down the arm bus")
     monkeypatch.setattr("factory_hmi.gateway.device_tools.CanManager", ReadOnlyCan)
@@ -300,13 +306,17 @@ def test_hardware_admission_only_reads_shared_can_and_imu_cannot_claim_it(tmp_pa
         hub._reserve_interfaces("shared", ["can1"])
         hub.device_access.tools.hand_factory = lambda backend: MockHand()
         cfg = {"backend": "hardware", "follow_arm": True, "node_id": 1}
+        with pytest.raises(RuntimeError, match="CAN FD"):
+            hub.device_access.tools.submit("dexhand", "a", "connect", cfg)
+        assert not hub.device_access.borrowed("a")
+        ReadOnlyCan.bus_state = "ERROR-ACTIVE"
         state = hub.device_access.tools.submit("dexhand", "a", "connect", cfg)
         wait_for(lambda: not hub.device_access.tools.status("dexhand")["busy"])
         with pytest.raises(RuntimeError, match="已被工位占用"):
             hub.device_access.tools.submit("imu", "a", "initialize", {"backend": "hardware", "interface": "can1"})
         hub.device_access.tools.submit("dexhand", "a", "disconnect", {}, state["generation"])
         wait_for(lambda: hub.device_access.tools.status("dexhand")["owner"] is None)
-        assert ReadOnlyCan.reads == [["can1"]]
+        assert ReadOnlyCan.reads == [["can1"], ["can1"]]
         assert hub.interface_owners() == {"can1": "shared"} and not arm.calls
 
 
@@ -539,7 +549,8 @@ def test_wave_button_stops_disables_and_releases(tmp_path):
         tools.close()
 
 
-def test_running_arm_rejects_new_shared_read_before_sdk_connect(tmp_path):
+@pytest.mark.parametrize("state_at", ["top", "station"])
+def test_running_arm_rejects_new_shared_read_before_sdk_connect(tmp_path, state_at):
     arm = Arm()
     app = create_app(arm, data_root=tmp_path)
     headers = {"X-RP1-Client-ID": "window-a"}
@@ -547,7 +558,7 @@ def test_running_arm_rejects_new_shared_read_before_sdk_connect(tmp_path):
         hub = app.state.runtime
         hub.session("window-a").lease.claim("window-a")
         hub._reserve_interfaces("shared", ["can1"])
-        arm.snap["state"] = "running"
+        (arm.snap if state_at == "top" else arm.snap["station"])["state"] = "running"
         hub.device_access.tools.hand_factory = lambda _: pytest.fail("busy arm opened the hand SDK")
         response = client.post("/api/v1/device-tools/dexhand/read-state", headers=headers, json={"backend": "mock"})
         assert response.status_code == 409 and "共线" in response.json()["detail"]

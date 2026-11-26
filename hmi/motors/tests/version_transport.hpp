@@ -26,6 +26,7 @@ public:
             feed(reply);
         }
     }
+    void transmit_checked(const canfd_frame& frame) override { transmit(frame); }
     bool try_transmit(const canfd_frame& frame) override {
         if (!accept_checked_tx) return false;
         transmit(frame);

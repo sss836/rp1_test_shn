@@ -80,6 +80,7 @@ class MotorSample:
     torque_is_estimated: bool = False
     torque_kt_nm_a: float = float("nan")
     torque_source: str = "drive_reported"
+    feedback_sequence: int | None = None
 
     @property
     def position(self) -> float:
@@ -88,6 +89,22 @@ class MotorSample:
     @property
     def velocity(self) -> float:
         return self.spd_rad_s
+
+    def feedback_issue(self, stale_seconds: float, now_s: float | None = None) -> str | None:
+        if not math.isfinite(self.timestamp_s) or self.timestamp_s <= 0:
+            return "缺少有效反馈时间戳"
+        age = self.feedback_age_s
+        if not math.isfinite(age) or age < 0:
+            return "反馈年龄无效"
+        if now_s is not None:
+            if self.timestamp_s > now_s:
+                return "反馈时间戳晚于当前时间"
+            age = max(age, now_s - self.timestamp_s)
+        if age >= stale_seconds:
+            return f"反馈超时，反馈延迟 {age:.3f} s，阈值 {stale_seconds:.3f} s"
+        if not self.fault_code_available:
+            return "故障码未取得有效读回"
+        return None
 
     def with_feedback_age(self, now_s: float) -> "MotorSample":
         """Age a cached observation without changing any measured value/time."""
@@ -122,6 +139,7 @@ class MotorSample:
             "iq_current_a": json_number(self.iq_current_a),
             "drive_enabled": self.drive_enabled,
             "feedback_header": self.feedback_header,
+            "feedback_sequence": self.feedback_sequence,
             "lro_protocol_profile": self.lro_protocol_profile,
         }
 

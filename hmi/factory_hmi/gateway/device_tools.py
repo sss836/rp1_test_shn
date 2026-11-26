@@ -88,7 +88,7 @@ class DeviceAccess:
                 if kind == "dexhand" and cfg["backend"] == "hardware":
                     status = CanManager().status([interface])[0]
                     if not (status.exists and status.up and status.fd and status.bitrate == 1000000
-                            and status.dbitrate == 5000000 and status.bus_state != "BUS-OFF"):
+                            and status.dbitrate == 5000000 and (status.bus_state or "").lower() != "bus-off"):
                         raise RuntimeError("手臂 CAN 必须已运行 CAN FD 1 Mbps / 5 Mbps；灵巧手不会重配共享总线")
             except Exception:
                 self.release(token)
@@ -142,6 +142,8 @@ class DeviceAccess:
         if snap.get("config_revision") != cfg["config_revision"]:
             raise RuntimeError("手臂配置发生变化，停止灵巧手")
         if arm_busy_for_hand(snap):
+            if cfg.get("operation") == "read-state":
+                raise RuntimeError("请在工位空闲后读取共线灵巧手状态")
             raise RuntimeError("手臂当前不满足静止保持条件，无法新建灵巧手共线连接")
         if (cfg.get("operation") == "read-state" and station.get("motors_enabled") is False
                 and snap.get("state") in {"disconnected", "connected", "completed"}):

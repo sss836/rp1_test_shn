@@ -160,3 +160,17 @@ def test_new_speed_fields_keep_legacy_pilot_bounds():
     for field,value in (("search_speed_deg_s", 2.),):
         with pytest.raises(ValueError, match="单方向试点"):
             ProbePoint.model_validate({**legacy, field: value})
+
+
+@pytest.mark.parametrize("age,code,expected", [
+    (.151, 7, "反馈超时"), (.151, 0, "反馈超时"), (.01, 7, "驱动故障 error_id=7")])
+def test_seventh_node_distinguishes_fresh_alarm_from_stale_cache(age, code, expected):
+    coords = Coordinates(nominal_station("left_arm"))
+    rows = [MotorSample(pos_rad=0., timestamp_s=10., bus=e.interface, motor_id=e.motor_id,
+                        joint_name=e.joint_name) for e in coords.entries]
+    rows[-1] = replace(rows[-1], timestamp_s=10.-age, feedback_age_s=age, error_id=code)
+    with pytest.raises(FeedbackError) as caught:
+        coords.decode(rows, 10., ())
+    message = str(caught.value)
+    assert f"{rows[-1].bus}#7 " in message and expected in message
+    assert ("error_id=" in message) == (age < .15)

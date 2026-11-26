@@ -306,8 +306,7 @@ class PlaybackController:
             self._parameters = automatic_completion_parameters(self.config)
             samples = self.backend.read_samples()
             self._last_samples = samples
-            if len(samples) != len(self.config.entries) or any(sample.error_id for sample in samples):
-                raise PlaybackError('电机反馈不完整或存在故障，禁止启动')
+            self._validate_feedback(samples)
             current = np.asarray([sample.pos_rad for sample in samples], dtype=float)
             # The file's peak speed is informational for playback. Live speed
             # feedback and the approach/braking/return constraints still apply.
@@ -929,30 +928,28 @@ class PlaybackController:
             return now
         return next_tick
 
-    def _sample_feedback(self, target: np.ndarray, active_time: float,
-                         *, update_statistics: bool, check_speed_limit: bool = True) -> list[MotorSample]:
-        samples = self.backend.read_samples()
+    def _validate_feedback(self, samples: list[MotorSample]) -> None:
         stale_seconds = (self._parameters.feedback_stale_seconds if self._parameters is not None
                          else self._diagnosis.thresholds.stale_seconds)
         if len(samples) != len(self.config.entries):
             raise PlaybackError("电机反馈数量不完整")
         for sample in samples:
-            if (sample.error_id or not math.isfinite(sample.pos_rad)
-                    or not math.isfinite(sample.spd_rad_s)
-                    or not math.isfinite(sample.feedback_age_s)
-                    or sample.feedback_age_s >= stale_seconds
-                    or not math.isfinite(sample.timestamp_s) or sample.timestamp_s <= 0):
-                reasons = []
-                if sample.error_id:
-                    reasons.append(f"error_id={sample.error_id}")
-                if not math.isfinite(sample.pos_rad) or not math.isfinite(sample.spd_rad_s):
-                    reasons.append(f"角度或速度无效（{sample.pos_rad:g} rad，{sample.spd_rad_s:g} rad/s）")
-                if not math.isfinite(sample.feedback_age_s) or sample.feedback_age_s >= stale_seconds:
-                    reasons.append(f"反馈延迟 {sample.feedback_age_s:.3f} s，阈值 {stale_seconds:.3f} s")
-                if not math.isfinite(sample.timestamp_s) or sample.timestamp_s <= 0:
-                    reasons.append(f"反馈时间戳无效（{sample.timestamp_s:g}）")
-                raise PlaybackError(f"电机故障或反馈失效: {sample.bus}#{sample.motor_id} "
-                                    f"{sample.joint_name}，" + "，".join(reasons))
+            node = f"{sample.bus}#{sample.motor_id} {sample.joint_name}"
+            issue = sample.feedback_issue(stale_seconds)
+            if issue:
+                raise PlaybackError(f"{node} {issue}")
+            if sample.error_id:
+                raise PlaybackError(f"{node} 驱动故障 error_id={sample.error_id}")
+            if not math.isfinite(sample.pos_rad) or not math.isfinite(sample.spd_rad_s):
+                raise PlaybackError(f"{node} 角度或速度无效（{sample.pos_rad:g} rad，{sample.spd_rad_s:g} rad/s）")
+
+    def _sample_feedback(self, target: np.ndarray, active_time: float,
+                         *, update_statistics: bool, check_speed_limit: bool = True) -> list[MotorSample]:
+        samples = self.backend.read_samples()
+        # The fault handler needs the rejected sample, including its drive flags.
+        with self._lock:
+            self._last_samples = samples
+        self._validate_feedback(samples)
         positions = np.array([s.pos_rad for s in samples])
         if self._parameters is not None:
             self._parameters.check_target(self.config, positions)
@@ -971,7 +968,6 @@ class PlaybackController:
                 np.abs([s.spd_rad_s for s in samples]) > speed_limit):
             raise PlaybackError("实际电机速度超过当前配置上限")
         with self._lock:
-            self._last_samples = samples
             if update_statistics and not self._test_finished.is_set():
                 self._record_samples = samples
         if self.telemetry_hub is not None:

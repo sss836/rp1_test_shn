@@ -314,3 +314,42 @@ def test_109_enable_failure_rolls_back_and_preserves_guard(open_backend,fault):
         assert '300毫秒' in str(error.value) and 'feedback=' in str(error.value)
     elif fault=='stop':assert '停止请求' in str(error.value)
     else:assert '硬件故障' in str(error.value)
+
+
+def test_type1_callback_time_is_preserved_even_on_first_python_read(open_backend):
+    node = OfflineLro(EXPECTED.raw_firmware)
+    backend = open_backend((node, EXPECTED))
+    backend.prepare_motor_protocols()
+    received = time.monotonic() - 1.
+    node.get_lro_feedback_observation = lambda: (15, received, 0x27)
+    sample = backend.read_samples()[0]
+    assert sample.timestamp_s == received and sample.feedback_age_s >= 1
+    assert sample.feedback_sequence == 15 and sample.error_id == 7
+    assert "反馈超时" in sample.feedback_issue(.15)
+    assert backend.read_samples()[0].timestamp_s == received
+    node.get_lro_feedback_observation = lambda: None
+    missing = backend.read_samples()[0]
+    assert missing.to_dict()["error_id"] is None and missing.drive_enabled is None
+
+
+@pytest.mark.parametrize("reply_after_init", [False, True])
+def test_enable_return_code_requires_matching_current_frame(open_backend, reply_after_init):
+    node = OfflineLro("108", numeric=None)
+    backend = open_backend((node, None))
+    backend.prepare_motor_protocols()
+    node.reply_count = 10
+    timestamp = time.monotonic() - 1.
+    node.get_lro_feedback_observation = lambda: (node.reply_count, timestamp, 0x27)
+
+    def init():
+        nonlocal timestamp
+        if reply_after_init:
+            node.reply_count += 1
+            timestamp = time.monotonic()
+        return 7
+
+    node.init_motor = init
+    with pytest.raises(MotorSafetyError) as caught:
+        backend.enable_motors()
+    assert ("error_id=7" in str(caught.value)) == reply_after_init
+    assert not backend.motors_enabled

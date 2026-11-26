@@ -83,7 +83,13 @@ class FaultDiagnosisEngine:
 
         stale_by_bus: dict[str, list[MotorSample]] = defaultdict(list)
         for sample in current:
-            if sample.error_id != 0:
+            sample = sample.with_feedback_age(now)
+            if sample.feedback_age_s >= self.thresholds.stale_seconds:
+                stale_by_bus[sample.bus or "unknown"].append(sample)
+                self._high_torque_since.pop(sample.index, None)
+                self._temperatures.pop(sample.index, None)
+                continue
+            if sample.fault_code_available and sample.error_id:
                 result.append(
                     FaultDiagnosis(
                         suspected_component=self._motor_label(sample),
@@ -98,9 +104,6 @@ class FaultDiagnosisEngine:
                         affected_motor_ids=(int(sample.motor_id),),
                     )
                 )
-
-            if sample.feedback_age_s >= self.thresholds.stale_seconds:
-                stale_by_bus[sample.bus or "unknown"].append(sample)
 
             tracking = self._tracking_error(sample)
             if tracking is not None and tracking >= self.thresholds.tracking_error_rad:

@@ -37,6 +37,10 @@ class ProtectiveDamping:
             overtemp = math.isfinite(sample.temp_c) and sample.temp_c >= self.overtemperature_c
             if sample.error_id or overtemp:
                 motor = f"{sample.bus}#{sample.motor_id} {sample.joint_name}"
+                issue = sample.feedback_issue(.5)
+                if issue:
+                    faults.append(f"{motor} {issue}，上次读数触发保护")
+                    continue
                 if sample.error_id:
                     faults.append(f"{motor} 驱动故障 error_id={sample.error_id}")
                 if overtemp:

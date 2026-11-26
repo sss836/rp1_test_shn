@@ -2475,6 +2475,7 @@ class FactoryMainWindow(QMainWindow):
         if self._closing:
             return
         detail = str(exc.detail or "") if isinstance(exc, GatewayError) else ""
+        primary_detail, protection_marker, protection = detail.partition("\n本次故障保护：")
         if quiet and action in {"同步状态", "刷新状态"} and detail == "尚无新鲜工位快照":
             if self._last_ws_status_at is None or time.monotonic() - self._last_ws_status_at >= STATUS_SILENCE_S:
                 self._snapshot_retry_at = time.monotonic() + 2.0
@@ -2545,8 +2546,8 @@ class FactoryMainWindow(QMainWindow):
             or "motor operation interrupted by stop request" in detail
         ):
             message = f"{action}未完成：已被失能或断开请求中止。"
-        elif "fresh feedback timeout" in detail:
-            pending = re.search(r"; pending=(.+)$", detail)
+        elif "fresh feedback timeout" in primary_detail:
+            pending = re.search(r"; pending=(.+)$", primary_detail)
             missing = f"缺少反馈：{pending.group(1)}。" if pending else ""
             safety = ("未自动清错或使能。" if detail.startswith("motor discovery:")
                       else "本次反馈确认未通过，禁止继续运动。")
@@ -2556,10 +2557,14 @@ class FactoryMainWindow(QMainWindow):
                 f"{safety}请检查对应 CAN、电机及供电；"
                 "确认状态后断开电机连接再扫描，无需把整柜断电当作必选步骤。"
             )
-        elif re.search(r"\berror_id=[1-9]\d*\b", detail):
-            # Keep the axis, protocol and fault code from each individual record together.
-            axes = re.sub(r"\bid=(\d+):error_id=(\d+)\b", r"电机 ID \1（error_id=\2）", detail)
-            message = f"{action}失败：{axes}"
+            if protection_marker:
+                message += protection_marker + protection
+        elif "CAN-FD TX " in primary_detail:
+            message = f"{action}失败，主机 CAN 写入未完成。{detail}"
+        elif re.search(r"\berror_id=[1-9]\d*\b", primary_detail):
+            pairs = re.findall(r"\bid=(\d+):error_id=(\d+)\b", primary_detail)
+            axes = "、".join(f"电机 ID {axis}（error_id={code}）" for axis, code in pairs)
+            message = f"{action}失败：" + (axes + "。网关原文：" if axes else "") + detail
             if "本次故障保护：" not in detail:
                 message += "。此次请求未提供失能结果，请核对工位逐轴反馈。"
         elif "disconnect the current station before configuring" in detail:
@@ -2715,7 +2720,7 @@ class FactoryMainWindow(QMainWindow):
         labels = {
             "multi_motor_bus_stale": "通信反馈超时（触发时）",
             "single_motor_stale": "通信反馈超时（触发时）",
-            "motor_error": "驱动器硬件故障",
+            "motor_error": "驱动报码（触发时）",
             "tracking_error": "轨迹跟踪误差",
             "undervoltage": "母线欠压",
             "motor_overtemperature": "电机过温",
@@ -2928,16 +2933,20 @@ class FactoryMainWindow(QMainWindow):
                 diagnostic += "；状态数据已过期"
             if diagnostic.startswith("通信反馈超时") and not stale:
                 diagnostic += "；当前反馈已恢复"
-            profile = motor.get("lro_protocol_profile", "legacy")
+            profile = motor.get("lro_protocol_profile")
             if profile is None and motor.get("feedback_header") is not None and not stale:
                 pending = "LRO 协议待核实；显示原始反馈头"
                 diagnostic = pending if diagnostic in {"", "正常", "—"} else f"{diagnostic}；{pending}"
-            error_id = str(self._pick(motor, "error_id", default=0))
+            raw_error = motor.get("error_id")
+            error_id = str(raw_error)
+            displayed_error = "—" if raw_error is None else raw_error
+            if stale:
+                displayed_error = f"{raw_error}（上次读数）" if raw_error not in {None, 0, "0"} else "—"
             alarm_name = ({"5": "缺相或电流采样偏置", "6": "过压", "7": "其他报警 OTHER_ERROR"}.get(error_id)
                           if profile == "v1.03" else None)
             if error_id == "7" and alarm_name is None:
-                alarm_name = ("驱动器故障 DRV_ERROR" if profile == "legacy" or motor.get("feedback_header") is None
-                              else "电机报警 0x07")
+                alarm_name = ("驱动器故障 DRV_ERROR" if profile == "legacy"
+                              else "电机报码 0x07，协议待核实")
             if alarm_name and not stale:
                 warning = f"{alarm_name}；温度为上报值，故障时可能冻结"
                 diagnostic = warning if diagnostic in {"", "正常", "—"} else f"{diagnostic}；{warning}"
@@ -3002,12 +3011,7 @@ class FactoryMainWindow(QMainWindow):
                         "current_a",
                     )
                 ),
-                (
-                    "—"
-                    if never_received
-                    and self._pick(motor, "error_id", default=0) in {None, 0, "0"}
-                    else self._pick(motor, "error_id", default=0)
-                ),
+                displayed_error,
                 diagnostic,
                 feedback_age,
                 "—" if stale else self._pick(motor, "iq_current_a"),

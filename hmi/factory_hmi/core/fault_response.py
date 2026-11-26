@@ -18,6 +18,13 @@ def request_fault_disable(backend, response=None):
         return response
     except Exception as exc:
         response.update(disable_request="failed", disable_feedback="unknown", error=f"{type(exc).__name__}: {exc}")
+        # Failed calls may still have an explicit negative acknowledgement.
+        # A previous confirmed stop cannot confirm this request.
+        try:
+            if backend.disable_feedback() == "unconfirmed":
+                response["disable_feedback"] = "unconfirmed"
+        except Exception:
+            pass
         return response
     response["disable_request"] = "sent"
     try:
@@ -30,8 +37,8 @@ def request_fault_disable(backend, response=None):
 def disable_result_text(response):
     request = {"requested": "失能请求中", "sent": "失能请求已发送", "failed": "失能请求失败",
                "not_requested": "未发出失能请求"}.get(response.get("disable_request"), "失能请求未知")
-    feedback = {"confirmed_mock": "mock反馈已失能", "confirmed": "本次失能反馈已确认",
-                "unconfirmed": "实际失能反馈未确认"}.get(response.get("disable_feedback"), "实际失能反馈未知")
+    feedback = {"confirmed_mock": "模拟反馈已失能", "confirmed": "驱动已确认失能",
+                "unconfirmed": "驱动失能未确认"}.get(response.get("disable_feedback"), "实际失能反馈未知")
     return f"{request} · {feedback}"
 
 

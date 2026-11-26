@@ -21,7 +21,9 @@
 #include <fcntl.h>
 
 #include <atomic>
-#include <boost/lockfree/queue.hpp>
+#include <boost/circular_buffer.hpp>
+#include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -37,7 +39,8 @@ constexpr const int FD_TIMEOUT_USEC = 1000;
 constexpr const int FD_TX_QUEUE_SIZE = 4096;
 constexpr const int FD_MAX_RETRY_COUNT = 3;
 
-using LFQueueFD = boost::lockfree::queue<canfd_frame, boost::lockfree::fixed_sized<true>>;
+// Bounds a pending host write, not a motor response.
+constexpr auto FD_WRITE_TIMEOUT = std::chrono::milliseconds(30);
 
 class MotorsSocketCANFD : public MotorsCANFD {
    private:
@@ -45,7 +48,16 @@ class MotorsSocketCANFD : public MotorsCANFD {
     int sockfd_ = -1;
     std::atomic<bool> receiving_;
     std::atomic<bool> healthy_{false};
-    LFQueueFD tx_queue_;
+    struct WriteReceipt {
+        std::chrono::steady_clock::time_point deadline;
+        std::condition_variable finished;
+        int error = EINPROGRESS;
+    };
+    struct PendingFrame {
+        canfd_frame frame;
+        std::shared_ptr<WriteReceipt> receipt;
+    };
+    boost::circular_buffer<PendingFrame> tx_queue_;
     std::mutex tx_mutex_;
     std::condition_variable tx_cv_;
 
@@ -85,6 +97,7 @@ class MotorsSocketCANFD : public MotorsCANFD {
     static std::shared_ptr<MotorsSocketCANFD> get(const std::string& interface);
 
     void transmit(const canfd_frame& frame) override;
+    void transmit_checked(const canfd_frame& frame) override;
     bool try_transmit(const canfd_frame& frame) override;
     void add_canfd_callback(const CanFdCbkFunc& callback, CanFdCbkId id) override;
     void remove_canfd_callback(CanFdCbkId id) override;
